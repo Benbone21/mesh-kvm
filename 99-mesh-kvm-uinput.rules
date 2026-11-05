@@ -1,0 +1,4 @@
+# /etc/udev/rules.d/99-mesh-kvm-uinput.rules
+# Grants members of the 'input' group read/write access to /dev/uinput and /dev/input/event*
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", MODE="0660", GROUP="input", TAG+="uaccess"

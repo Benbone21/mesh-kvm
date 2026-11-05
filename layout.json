@@ -1,0 +1,32 @@
+{
+  "debian_monitors": [
+    {
+      "name": "DP-3 (240Hz Native)",
+      "x": 0,
+      "y": 360,
+      "w": 1920,
+      "h": 1080
+    },
+    {
+      "name": "DP-2 (360Hz Native)",
+      "x": 1920,
+      "y": 0,
+      "w": 2560,
+      "h": 1440
+    }
+  ],
+  "deb_total_w": 4480,
+  "deb_total_h": 1440,
+  "win_x": 2240,
+  "win_y": 1440,
+  "win_w": 1920,
+  "win_h": 1080,
+  "win_native_w": 1920,
+  "win_native_h": 1080,
+  "resolution_mode": "native",
+  "attach_side": "Bottom",
+  "mouse_speed": 0.35,
+  "edge_resistance": 55,
+  "auto_game_lock": true,
+  "manual_game_lock": false
+}
