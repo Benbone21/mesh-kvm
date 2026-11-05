@@ -3,18 +3,21 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
+use super::{apply, InputBackend, PeerSender};
 use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
-use crate::spatial::{studio_handler, SharedSpatialState, TouchSide};
+use crate::router::{Action, DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
+use crate::spatial::{studio_handler, SharedSpatialState, SpatialConfig};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::io::RawFd;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,7 @@ const EV_ABS: u16 = 0x03;
 const EV_REP: u16 = 0x14;
 
 const SYN_REPORT: u16 = 0x00;
+const SYN_DROPPED: u16 = 0x03;
 
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
@@ -44,6 +48,7 @@ const BTN_EXTRA: u16 = 0x114;
 // uinput ioctl constants (x86_64 Linux)
 const UI_SET_EVBIT: libc::c_ulong = 0x40045564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;
+const UI_SET_RELBIT: libc::c_ulong = 0x40045566;
 const UI_SET_ABSBIT: libc::c_ulong = 0x40045567;
 const UI_DEV_SETUP: libc::c_ulong = 0x405c5503;
 const UI_ABS_SETUP: libc::c_ulong = 0x401c5504;
@@ -357,6 +362,179 @@ impl Drop for VirtualMouse {
     }
 }
 
+/// Wheel units per notch on the wire (the Windows `WHEEL_DELTA`).
+const WHEEL_DELTA: i32 = 120;
+
+/// Adds `delta` wire units to `carry` and returns the whole notches now due.
+fn take_notches(carry: &mut i32, delta: i32) -> i32 {
+    *carry = carry.saturating_add(delta);
+    let notches = *carry / WHEEL_DELTA;
+    *carry -= notches * WHEEL_DELTA;
+    notches
+}
+
+/// The `MOUSE_BTN_*` id of an evdev button code.
+fn button_id(code: u16) -> Option<u8> {
+    match code {
+        BTN_LEFT => Some(MOUSE_BTN_LEFT),
+        BTN_RIGHT => Some(MOUSE_BTN_RIGHT),
+        BTN_MIDDLE => Some(MOUSE_BTN_MIDDLE),
+        BTN_SIDE => Some(MOUSE_BTN_SIDE),
+        BTN_EXTRA => Some(MOUSE_BTN_EXTRA),
+        _ => None,
+    }
+}
+
+/// The evdev button code of a `MOUSE_BTN_*` id.
+fn button_code(button: u8) -> Option<u16> {
+    match button {
+        MOUSE_BTN_LEFT => Some(BTN_LEFT),
+        MOUSE_BTN_RIGHT => Some(BTN_RIGHT),
+        MOUSE_BTN_MIDDLE => Some(BTN_MIDDLE),
+        MOUSE_BTN_SIDE => Some(BTN_SIDE),
+        MOUSE_BTN_EXTRA => Some(BTN_EXTRA),
+        _ => None,
+    }
+}
+
+/// Relative pointer that replays the laptop's mouse on Debian. Its name must keep the
+/// `mesh-kvm` prefix: `discover_devices` would otherwise read it back as a physical mouse.
+pub struct VirtualRelMouse {
+    fd: RawFd,
+    held_buttons: HashSet<u16>,
+    wheel_carry_x: i32,
+    wheel_carry_y: i32,
+}
+
+impl VirtualRelMouse {
+    pub fn new() -> Result<Self, String> {
+        let path = CString::new("/dev/uinput").unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            return Err("Failed to open /dev/uinput for Virtual Relative Mouse".to_string());
+        }
+
+        unsafe {
+            libc::ioctl(fd, UI_SET_EVBIT, EV_SYN as libc::c_int);
+            libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int);
+            for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+                libc::ioctl(fd, UI_SET_KEYBIT, button as libc::c_int);
+            }
+            libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int);
+            for axis in [REL_X, REL_Y, REL_WHEEL, REL_HWHEEL] {
+                libc::ioctl(fd, UI_SET_RELBIT, axis as libc::c_int);
+            }
+
+            let mut setup = UinputSetup {
+                id: InputId {
+                    bustype: 0x03,
+                    vendor: 0x1d6b,
+                    product: 0x0106,
+                    version: 1,
+                },
+                name: [0u8; 80],
+                ff_effects_max: 0,
+            };
+            let dev_name = b"mesh-kvm Relative Pointer";
+            setup.name[..dev_name.len()].copy_from_slice(dev_name);
+
+            if libc::ioctl(fd, UI_DEV_SETUP, &setup as *const UinputSetup) < 0
+                || libc::ioctl(fd, UI_DEV_CREATE) < 0
+            {
+                libc::close(fd);
+                return Err("Failed to create mesh-kvm Relative Pointer".to_string());
+            }
+        }
+
+        Ok(Self {
+            fd,
+            held_buttons: HashSet::new(),
+            wheel_carry_x: 0,
+            wheel_carry_y: 0,
+        })
+    }
+
+    pub fn move_rel(&self, dx: i32, dy: i32) {
+        if dx != 0 {
+            self.write_event(EV_REL, REL_X, dx);
+        }
+        if dy != 0 {
+            self.write_event(EV_REL, REL_Y, dy);
+        }
+        self.write_event(EV_SYN, SYN_REPORT, 0);
+    }
+
+    pub fn button(&mut self, button: u8, pressed: bool) {
+        let Some(code) = button_code(button) else {
+            return;
+        };
+        if pressed {
+            self.held_buttons.insert(code);
+        } else {
+            self.held_buttons.remove(&code);
+        }
+        self.write_event(EV_KEY, code, pressed as i32);
+        self.write_event(EV_SYN, SYN_REPORT, 0);
+    }
+
+    /// `dx`, `dy` are in wire units, `WHEEL_DELTA` per notch.
+    pub fn wheel(&mut self, dx: i32, dy: i32) {
+        let notches_x = take_notches(&mut self.wheel_carry_x, dx);
+        let notches_y = take_notches(&mut self.wheel_carry_y, dy);
+        if notches_x != 0 {
+            self.write_event(EV_REL, REL_HWHEEL, notches_x);
+        }
+        if notches_y != 0 {
+            self.write_event(EV_REL, REL_WHEEL, notches_y);
+        }
+        if notches_x != 0 || notches_y != 0 {
+            self.write_event(EV_SYN, SYN_REPORT, 0);
+        }
+    }
+
+    pub fn release_held(&mut self) {
+        if self.held_buttons.is_empty() {
+            return;
+        }
+        for code in std::mem::take(&mut self.held_buttons) {
+            self.write_event(EV_KEY, code, 0);
+        }
+        self.write_event(EV_SYN, SYN_REPORT, 0);
+    }
+
+    pub fn any_held(&self) -> bool {
+        !self.held_buttons.is_empty()
+    }
+
+    #[inline]
+    fn write_event(&self, type_: u16, code: u16, value: i32) {
+        let ev = InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            type_,
+            code,
+            value,
+        };
+        unsafe {
+            let _ = libc::write(
+                self.fd,
+                &ev as *const InputEvent as *const libc::c_void,
+                std::mem::size_of::<InputEvent>(),
+            );
+        }
+    }
+}
+
+impl Drop for VirtualRelMouse {
+    fn drop(&mut self) {
+        self.release_held();
+        unsafe {
+            libc::ioctl(self.fd, UI_DEV_DESTROY);
+            libc::close(self.fd);
+        }
+    }
+}
+
 #[inline]
 fn test_bit(bits: &[u8], bit: usize) -> bool {
     let byte_idx = bit / 8;
@@ -369,9 +547,45 @@ pub struct EvdevDevice {
     pub name: String,
     pub fd: RawFd,
     pub grabbed: bool,
+    /// Keys and buttons physically down on this device.
+    pub held: HashSet<u16>,
+}
+
+/// Updates `held` from one event read off a device.
+fn track_held(held: &mut HashSet<u16>, ev: &InputEvent) {
+    match ev.type_ {
+        EV_KEY if ev.value == 0 => {
+            held.remove(&ev.code);
+        }
+        EV_KEY => {
+            held.insert(ev.code);
+        }
+        // The kernel lost events, possibly a release. Forget rather than never grab again.
+        EV_SYN if ev.code == SYN_DROPPED => held.clear(),
+        _ => {}
+    }
+}
+
+/// Whether a device should be grabbed now. A grab hides the release of any key already down from
+/// the desktop, leaving that key stuck on Debian, so a new grab waits until the device is idle.
+/// Letting go never waits.
+fn should_grab(wanted: bool, grabbed: bool, idle: bool) -> bool {
+    wanted && (grabbed || idle)
 }
 
 impl EvdevDevice {
+    /// Reads pending events into `buf` and returns how many; 0 when there are none.
+    fn read_events(&self, buf: &mut [InputEvent]) -> usize {
+        let n = unsafe {
+            libc::read(
+                self.fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                std::mem::size_of_val(buf),
+            )
+        };
+        n.max(0) as usize / std::mem::size_of::<InputEvent>()
+    }
+
     pub fn set_grab(&mut self, enable: bool) {
         if self.grabbed == enable {
             return;
@@ -415,6 +629,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                     name,
                     fd,
                     grabbed: false,
+                    held: HashSet::new(),
                 });
             }
         }
@@ -476,6 +691,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                 name,
                 fd,
                 grabbed: false,
+                held: HashSet::new(),
             });
         } else if has_kbd_keys {
             keyboards.push(EvdevDevice {
@@ -483,6 +699,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                 name,
                 fd,
                 grabbed: false,
+                held: HashSet::new(),
             });
         } else {
             unsafe { libc::close(fd) };
@@ -648,6 +865,209 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+const DEBIAN: DeviceId = NodeId::Debian as DeviceId;
+const WINDOWS: DeviceId = NodeId::Windows as DeviceId;
+
+/// Time after any focus change during which Debian's edges cannot be crossed.
+const EDGE_SETTLE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hotkey {
+    ManualSwitch,
+    Panic,
+    GameLock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyRoute {
+    Hotkey(Hotkey),
+    /// Repeat or release of a key that fired a hotkey.
+    Consumed,
+    Forward { scancode: u16, pressed: bool },
+}
+
+/// Finds hotkeys in the physical key stream, so a hotkey's own key never reaches the router.
+/// Ctrl and Alt are ordinary keys here: they are tracked and passed on.
+#[derive(Default)]
+struct HotkeyFilter {
+    ctrl_l: bool,
+    ctrl_r: bool,
+    alt_l: bool,
+    alt_r: bool,
+    /// Hotkey keys still physically down.
+    consumed: HashSet<u16>,
+}
+
+impl HotkeyFilter {
+    /// Classifies one evdev key event: `value` is 1 press, 2 auto-repeat, 0 release.
+    fn feed(&mut self, code: u16, value: i32) -> KeyRoute {
+        let pressed = value != 0;
+        match code {
+            KEY_LEFTCTRL => self.ctrl_l = pressed,
+            KEY_RIGHTCTRL => self.ctrl_r = pressed,
+            KEY_LEFTALT => self.alt_l = pressed,
+            KEY_RIGHTALT => self.alt_r = pressed,
+            _ => {}
+        }
+        if self.consumed.contains(&code) {
+            if !pressed {
+                self.consumed.remove(&code);
+            }
+            return KeyRoute::Consumed;
+        }
+        if value == 1 && (self.ctrl_l || self.ctrl_r) && (self.alt_l || self.alt_r) {
+            let hotkey = match code {
+                KEY_F11 => Some(Hotkey::ManualSwitch),
+                KEY_F12 | KEY_SCROLLLOCK => Some(Hotkey::Panic),
+                KEY_G => Some(Hotkey::GameLock),
+                _ => None,
+            };
+            if let Some(hotkey) = hotkey {
+                self.consumed.insert(code);
+                return KeyRoute::Hotkey(hotkey);
+            }
+        }
+        KeyRoute::Forward { scancode: code, pressed }
+    }
+}
+
+/// False for a focus packet older than one already handled. UDP can reorder a burst.
+fn fresh_focus_seq(last: &mut u64, seq: u64) -> bool {
+    if seq <= *last && seq != 0 {
+        return false;
+    }
+    *last = seq;
+    true
+}
+
+struct LinuxBackend {
+    vkbd: VirtualKeyboard,
+    vmouse: VirtualMouse,
+    vrel: VirtualRelMouse,
+    mice: Vec<EvdevDevice>,
+    keyboards: Vec<EvdevDevice>,
+    block_mice: bool,
+    block_keyboards: bool,
+    kwin_x: Arc<AtomicI32>,
+    kwin_y: Arc<AtomicI32>,
+}
+
+impl LinuxBackend {
+    /// Moves every device toward the wanted grab state. Runs each loop, so a grab put off by a
+    /// held key lands once the key is up, and a failed `EVIOCGRAB` is retried.
+    fn sync_grabs(&mut self) {
+        for (devices, wanted) in [
+            (&mut self.mice, self.block_mice),
+            (&mut self.keyboards, self.block_keyboards),
+        ] {
+            for device in devices {
+                let grab = should_grab(wanted, device.grabbed, device.held.is_empty());
+                device.set_grab(grab);
+            }
+        }
+    }
+
+    fn any_button_held(&self) -> bool {
+        self.vrel.any_held() || self.mice.iter().any(|m| !m.held.is_empty())
+    }
+}
+
+impl InputBackend for LinuxBackend {
+    fn set_blocking(&mut self, mouse: bool, keyboard: bool) {
+        self.block_mice = mouse;
+        self.block_keyboards = keyboard;
+        self.sync_grabs();
+    }
+
+    fn inject_move(&mut self, dx: i32, dy: i32) {
+        self.vrel.move_rel(dx, dy);
+    }
+
+    fn inject_button(&mut self, button: u8, pressed: bool) {
+        self.vrel.button(button, pressed);
+    }
+
+    fn inject_wheel(&mut self, dx: i32, dy: i32) {
+        self.vrel.wheel(dx, dy);
+    }
+
+    fn inject_key(&mut self, scancode: u16, pressed: bool) {
+        self.vkbd.inject_key(scancode, pressed);
+    }
+
+    fn warp_cursor(&mut self, x: i32, y: i32) {
+        self.vmouse.warp_abs(x, y);
+        self.kwin_x.store(x, Ordering::Relaxed);
+        self.kwin_y.store(y, Ordering::Relaxed);
+    }
+
+    fn release_held(&mut self) {
+        self.vkbd.release_all_keys();
+        self.vrel.release_held();
+    }
+}
+
+struct UdpPeer<'a> {
+    socket: &'a UdpSocket,
+    addr: SocketAddr,
+    seq: u64,
+}
+
+impl PeerSender for UdpPeer<'_> {
+    fn send(&mut self, payload: Payload) {
+        let pkt = Packet::new(self.seq, NodeId::Debian, payload);
+        self.seq += 1;
+        if let Ok(bytes) = pkt.encode() {
+            let _ = self.socket.send_to(&bytes, self.addr);
+        }
+    }
+}
+
+/// The router with everything its actions touch, so each event is handled in one call.
+struct Core<'a> {
+    router: Router,
+    backend: LinuxBackend,
+    peer: UdpPeer<'a>,
+    last_focus_change: Instant,
+    edge_pushed: i32,
+}
+
+impl Core<'_> {
+    /// Feeds one event to the router, carries out its actions, and returns them.
+    fn route(&mut self, event: Event) -> Vec<Action> {
+        let before = self.router.active();
+        let actions = self.router.handle(event).actions;
+        apply(&actions, &mut self.backend, &mut self.peer);
+        let after = self.router.active();
+        if after != before {
+            self.last_focus_change = Instant::now();
+            self.edge_pushed = 0;
+            let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
+            println!("[Debian] Focus switched to {name}");
+        }
+        actions
+    }
+
+    /// Counts movement of the Debian cursor by `(dx, dy)` against the shared edge, from either
+    /// device's mouse, and crosses to the laptop when the push completes.
+    fn push_edge(&mut self, cfg: &SpatialConfig, dx: i32, dy: i32) {
+        let can_cross = self.router.online()
+            && !self.router.panicked()
+            && !self.router.captive()
+            && self.router.active() == DEBIAN
+            && !self.backend.any_button_held()
+            && self.last_focus_change.elapsed() >= EDGE_SETTLE;
+        if !can_cross {
+            return;
+        }
+        let cx = self.backend.kwin_x.load(Ordering::Relaxed);
+        let cy = self.backend.kwin_y.load(Ordering::Relaxed);
+        if let Some((x, y)) = cfg.push_debian_edge(cx, cy, dx, dy, &mut self.edge_pushed) {
+            self.route(Event::EdgeCrossed { x, y });
+        }
+    }
+}
+
 pub fn run_debian_node(
     peer_addr: SocketAddr,
     listen_port: u16,
@@ -668,9 +1088,10 @@ pub fn run_debian_node(
         studio_handler(Arc::clone(&spatial_state)),
     )?;
 
-    let mut vkbd = VirtualKeyboard::new()?;
+    let vkbd = VirtualKeyboard::new()?;
     let vmouse = VirtualMouse::new(width, height)?;
-    println!("[Debian] Created /dev/uinput Virtual Keyboard & Absolute Warp Pointer.");
+    let vrel = VirtualRelMouse::new()?;
+    println!("[Debian] Created /dev/uinput Virtual Keyboard, Absolute Warp Pointer & Relative Pointer.");
 
     let kwin_x = Arc::new(AtomicI32::new(3200));
     let kwin_y = Arc::new(AtomicI32::new(720));
@@ -681,7 +1102,7 @@ pub fn run_debian_node(
         Arc::clone(&kwin_game_active),
     );
 
-    let (mut mice, keyboards) = discover_devices(explicit_mouse.as_deref());
+    let (mice, keyboards) = discover_devices(explicit_mouse.as_deref());
     if mice.is_empty() {
         return Err("No physical mouse devices found in /dev/input/event*".to_string());
     }
@@ -693,35 +1114,52 @@ pub fn run_debian_node(
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set UDP socket nonblocking: {}", e))?;
 
-    let active_node = Arc::new(AtomicU8::new(NodeId::Debian as u8));
-    let panic_mode = Arc::new(AtomicBool::new(false));
     // Initialize sequence counter with current Unix timestamp in microseconds so that
     // across daemon restarts `pkt.seq` is always strictly greater than `last_rx_focus_seq` on the peer.
     let init_seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
-    let seq_counter = Arc::new(AtomicU64::new(init_seq));
 
-    let mut was_peer_online = false;
-    let mut win_cursor_x: i32 = 960;
-    let mut win_cursor_y: i32 = 540;
-    let mut frac_dx: f32 = 0.0;
-    let mut frac_dy: f32 = 0.0;
-    let mut edge_push_accum: i32 = 0;
+    let initial_speed = spatial_state
+        .read()
+        .map(|guard| guard.config.mouse_speed)
+        .map_err(|_| "Spatial state lock poisoned".to_string())?;
+    let mut core = Core {
+        router: Router::new(RouterConfig {
+            me: DEBIAN,
+            peer: WINDOWS,
+            main: DEBIAN,
+            sharing: Sharing { mouse: true, keyboard: true },
+            pointer_speed: initial_speed,
+        }),
+        backend: LinuxBackend {
+            vkbd,
+            vmouse,
+            vrel,
+            mice,
+            keyboards,
+            block_mice: false,
+            block_keyboards: false,
+            kwin_x: Arc::clone(&kwin_x),
+            kwin_y: Arc::clone(&kwin_y),
+        },
+        peer: UdpPeer {
+            socket: &socket,
+            addr: peer_addr,
+            seq: init_seq,
+        },
+        last_focus_change: Instant::now() - EDGE_SETTLE,
+        edge_pushed: 0,
+    };
 
-    let mut last_switch_instant = Instant::now() - Duration::from_secs(1);
+    let clock = Instant::now();
+    let now_ms = || clock.elapsed().as_millis() as u64;
+
+    let mut hotkeys = HotkeyFilter::default();
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry_sync = Instant::now();
     let mut last_rx_focus_seq = 0u64;
-    let mut last_peer_seen: Option<Instant> = None;
-    let mut peer_reports_heartbeats = false;
-
-    let mut kbd_ctrl_l = false;
-    let mut kbd_ctrl_r = false;
-    let mut kbd_alt_l = false;
-    let mut kbd_alt_r = false;
-    let mut mouse_buttons_mask: u8 = 0;
 
     let mut udp_buf = [0u8; 512];
     let mut ev_buf = [InputEvent::default(); 64];
@@ -735,19 +1173,19 @@ pub fn run_debian_node(
         "[Debian] Spatial Studio UI ready at: http://localhost:24880 (or http://192.168.8.241:24880)"
     );
 
-    // Immediately sync initial Debian focus state with Windows peer on startup
-    send_burst(
-        &socket,
-        peer_addr,
-        &seq_counter,
-        Payload::FocusSwitch {
-            target_node: NodeId::Debian,
-            cursor_y_ratio: 0.5,
-        },
+    // A laptop that outlived a Debian restart may still think it is active.
+    apply(
+        &[Action::SendFocus { target: DEBIAN, x: KEEP_CURSOR, y: KEEP_CURSOR }],
+        &mut core.backend,
+        &mut core.peer,
     );
 
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            // Input first: the D-Bus call below can hang if KWin does.
+            println!("\n[Debian] Shutting down cleanly; releasing all EVIOCGRAB locks.");
+            core.backend.set_blocking(false, false);
+            core.backend.release_held();
             let _ = Command::new("qdbus6")
                 .args([
                     "org.kde.KWin",
@@ -756,9 +1194,11 @@ pub fn run_debian_node(
                     "mesh_kvm_cursor_watch",
                 ])
                 .output();
-            println!("\n[Debian] Shutting down cleanly; releasing all EVIOCGRAB locks.");
             break Ok(());
         }
+
+        // Every switch is stamped with the newest time the router has seen.
+        core.route(Event::Tick { now_ms: now_ms() });
 
         // Check WebUI actions (manual toggle / panic)
         let (manual_toggle, web_panic, cfg_snapshot) = if let Ok(mut guard) = spatial_state.write()
@@ -771,283 +1211,131 @@ pub fn run_debian_node(
             (false, false, Default::default())
         };
 
+        core.router.set_pointer_speed(cfg_snapshot.mouse_speed);
+        let is_game_captive = cfg_snapshot.manual_game_lock
+            || (cfg_snapshot.auto_game_lock && kwin_game_active.load(Ordering::Relaxed));
+        if core.router.captive() != is_game_captive {
+            core.route(Event::SetCaptive(is_game_captive));
+        }
+
         if web_panic {
-            panic_mode.store(true, Ordering::SeqCst);
-            active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-            vkbd.release_all_keys();
-            for m in &mut mice {
-                m.set_grab(false);
-            }
-            send_burst(&socket, peer_addr, &seq_counter, Payload::PanicRelease);
+            println!("[PANIC] Panic requested from the Studio!");
+            core.route(Event::Panic);
         }
 
         if manual_toggle {
-            panic_mode.store(false, Ordering::SeqCst);
-            let cur = active_node.load(Ordering::SeqCst);
-            let next = if cur == NodeId::Debian as u8 {
-                NodeId::Windows
-            } else {
-                NodeId::Debian
-            };
-            active_node.store(next as u8, Ordering::SeqCst);
-            let grab = next == NodeId::Windows;
-            if grab {
-                vkbd.release_all_keys();
-            }
-            for m in &mut mice {
-                m.set_grab(grab);
-            }
-            last_switch_instant = Instant::now();
-            edge_push_accum = 0;
-            send_burst(
-                &socket,
-                peer_addr,
-                &seq_counter,
-                Payload::FocusSwitch {
-                    target_node: next,
-                    cursor_y_ratio: 0.5,
-                },
-            );
+            core.route(Event::ManualSwitch);
         }
 
         // 1. Drain incoming UDP packets on port 24850
-        while let Ok((len, src_addr)) = socket.recv_from(&mut udp_buf) {
-            if let Ok(pkt) = Packet::decode(&udp_buf[..len]) {
-                last_peer_seen = Some(Instant::now());
-                match pkt.payload {
-                    Payload::KeyEvent { scancode, pressed } => {
-                        if !panic_mode.load(Ordering::Relaxed)
-                            && active_node.load(Ordering::Relaxed) == NodeId::Debian as u8
-                        {
-                            vkbd.inject_key(scancode, pressed);
-                        }
-                    }
-                    Payload::FocusSwitch {
-                        target_node,
-                        cursor_y_ratio,
-                    } => {
-                        if pkt.seq <= last_rx_focus_seq && pkt.seq != 0 {
-                            continue;
-                        }
-                        last_rx_focus_seq = pkt.seq;
-
-                        if target_node == NodeId::Debian {
-                            // Only accept peer's Left-edge FocusSwitch if attach_side is Right (or manual toggle)
-                            let prev = active_node.swap(NodeId::Debian as u8, Ordering::SeqCst);
-                            for m in &mut mice {
-                                m.set_grab(false);
-                            }
-                            last_switch_instant = Instant::now();
-                            edge_push_accum = 0;
-
-                            let wy = ((cursor_y_ratio * cfg_snapshot.win_h as f32) as i32)
-                                .clamp(0, cfg_snapshot.win_h - 1);
-                            let (target_deb_x, target_deb_y) = match cfg_snapshot.attach_side {
-                                TouchSide::Right => (
-                                    (cfg_snapshot.win_x - 100).clamp(0, width - 1),
-                                    (cfg_snapshot.win_y + wy).clamp(0, height - 1),
-                                ),
-                                TouchSide::Left => (
-                                    (cfg_snapshot.win_x + cfg_snapshot.win_w + 100)
-                                        .clamp(0, width - 1),
-                                    (cfg_snapshot.win_y + wy).clamp(0, height - 1),
-                                ),
-                                TouchSide::Bottom => (
-                                    (cfg_snapshot.win_x + win_cursor_x).clamp(0, width - 1),
-                                    (cfg_snapshot.win_y - 100).clamp(0, height - 1),
-                                ),
-                                TouchSide::Top => (
-                                    (cfg_snapshot.win_x + win_cursor_x).clamp(0, width - 1),
-                                    (cfg_snapshot.win_y + cfg_snapshot.win_h + 100)
-                                        .clamp(0, height - 1),
-                                ),
-                            };
-
-                            vmouse.warp_abs(target_deb_x, target_deb_y);
-                            kwin_x.store(target_deb_x, Ordering::Relaxed);
-                            kwin_y.store(target_deb_y, Ordering::Relaxed);
-
-                            if prev != NodeId::Debian as u8 {
-                                println!(
-                                    "[Debian] <-- Focus switched to DEBIAN at ({}, {})",
-                                    target_deb_x, target_deb_y
-                                );
-                            }
-
-                            let ack = Packet::new(
-                                seq_counter.fetch_add(1, Ordering::Relaxed),
-                                NodeId::Debian,
-                                Payload::FocusAck {
-                                    active_node: NodeId::Debian,
-                                    seq_ref: pkt.seq,
-                                },
-                            );
-                            if let Ok(bytes) = ack.encode() {
-                                let _ = socket.send_to(&bytes, src_addr);
-                            }
-                        } else if target_node == NodeId::Windows
-                            && !panic_mode.load(Ordering::Relaxed)
-                        {
-                            active_node.store(NodeId::Windows as u8, Ordering::SeqCst);
-                            vkbd.release_all_keys();
-                            for m in &mut mice {
-                                m.set_grab(true);
-                            }
-                            last_switch_instant = Instant::now();
-                            edge_push_accum = 0;
-                        }
-                    }
-                    Payload::PanicRelease => {
-                        panic_mode.store(true, Ordering::SeqCst);
-                        active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-                        vkbd.release_all_keys();
-                        for m in &mut mice {
-                            m.set_grab(false);
-                        }
-                        println!("[PANIC] Received PanicRelease from Windows!");
-                    }
-                    Payload::PeerDisplayInfo {
-                        width: peer_w,
-                        height: peer_h,
-                    } => {
-                        peer_reports_heartbeats = true;
-                        if peer_w >= 640 && peer_h >= 480 {
-                            if let Ok(mut guard) = spatial_state.write() {
-                                let changed = guard.config.win_native_w != peer_w
-                                    || guard.config.win_native_h != peer_h;
-                                guard.config.win_native_w = peer_w;
-                                guard.config.win_native_h = peer_h;
-                                guard.telemetry.win_peer_reported_res = true;
-                                if guard.config.resolution_mode == "native"
-                                    && (guard.config.win_w != peer_w
-                                        || guard.config.win_h != peer_h)
-                                {
-                                    guard.config.win_w = peer_w;
-                                    guard.config.win_h = peer_h;
-                                    guard.config.resnap_after_resize();
-                                    guard.save();
-                                    println!(
-                                        "[Debian] Auto-synced Windows 11 native display resolution: {}x{}",
-                                        peer_w, peer_h
-                                    );
-                                } else if changed {
-                                    guard.save();
-                                }
-                            }
-                        }
-                    }
-                    Payload::Heartbeat => {
-                        peer_reports_heartbeats = true;
-                    }
-                    _ => {}
+        while let Ok((len, _)) = socket.recv_from(&mut udp_buf) {
+            let Ok(pkt) = Packet::decode(&udp_buf[..len]) else {
+                continue;
+            };
+            core.route(Event::PeerAlive { now_ms: now_ms() });
+            match pkt.payload {
+                Payload::KeyEvent { scancode, pressed } => {
+                    core.route(Event::PeerKey { scancode, pressed });
                 }
+                Payload::MouseMoveDelta { dx, dy } => {
+                    let actions = core.route(Event::PeerMove { dx, dy });
+                    if actions.iter().any(|a| matches!(a, Action::InjectMove { .. })) {
+                        core.push_edge(&cfg_snapshot, dx, dy);
+                    }
+                }
+                Payload::MouseButton { button, pressed } => {
+                    core.route(Event::PeerButton { button, pressed });
+                }
+                Payload::MouseWheel { delta_x, delta_y } => {
+                    core.route(Event::PeerWheel { dx: delta_x, dy: delta_y });
+                }
+                Payload::FocusSwitchAt { target_node, x, y } => {
+                    if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
+                        let (x, y) = cfg_snapshot.laptop_to_debian(x, y);
+                        core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
+                    }
+                }
+                // A laptop still on the previous build: no position, so the cursor stays put.
+                Payload::FocusSwitch { target_node, .. } => {
+                    if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
+                        core.route(Event::PeerFocus {
+                            target: target_node as DeviceId,
+                            x: KEEP_CURSOR,
+                            y: KEEP_CURSOR,
+                        });
+                    }
+                }
+                Payload::PanicRelease => {
+                    println!("[PANIC] Received PanicRelease from Windows!");
+                    core.route(Event::PeerPanic);
+                }
+                Payload::PeerDisplayInfo {
+                    width: peer_w,
+                    height: peer_h,
+                } => {
+                    if peer_w >= 640 && peer_h >= 480 {
+                        if let Ok(mut guard) = spatial_state.write() {
+                            let changed = guard.config.win_native_w != peer_w
+                                || guard.config.win_native_h != peer_h;
+                            guard.config.win_native_w = peer_w;
+                            guard.config.win_native_h = peer_h;
+                            guard.telemetry.win_peer_reported_res = true;
+                            if guard.config.resolution_mode == "native"
+                                && (guard.config.win_w != peer_w || guard.config.win_h != peer_h)
+                            {
+                                guard.config.win_w = peer_w;
+                                guard.config.win_h = peer_h;
+                                guard.config.resnap_after_resize();
+                                guard.save();
+                                println!(
+                                    "[Debian] Auto-synced Windows 11 native display resolution: {}x{}",
+                                    peer_w, peer_h
+                                );
+                            } else if changed {
+                                guard.save();
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        // 2. Check local keyboards on Debian for Panic Hotkey (Ctrl+Alt+ScrollLock / F12) & Toggle (Ctrl+Alt+F11)
-        for kbd in &keyboards {
+        // 2. Read local keyboards. Grabbing only hides events from the desktop, so hotkeys are
+        // seen here whichever device is active.
+        for i in 0..core.backend.keyboards.len() {
             loop {
-                let n = unsafe {
-                    libc::read(
-                        kbd.fd,
-                        ev_buf.as_mut_ptr() as *mut libc::c_void,
-                        std::mem::size_of_val(&ev_buf),
-                    )
-                };
-                if n <= 0 {
+                let count = core.backend.keyboards[i].read_events(&mut ev_buf);
+                if count == 0 {
                     break;
                 }
-                let count = (n as usize) / std::mem::size_of::<InputEvent>();
                 for ev in &ev_buf[..count] {
-                    if ev.type_ == EV_KEY {
-                        let pressed = ev.value != 0;
-                        match ev.code {
-                            KEY_LEFTCTRL => kbd_ctrl_l = pressed,
-                            KEY_RIGHTCTRL => kbd_ctrl_r = pressed,
-                            KEY_LEFTALT => kbd_alt_l = pressed,
-                            KEY_RIGHTALT => kbd_alt_r = pressed,
-                            KEY_SCROLLLOCK | KEY_F12 if ev.value == 1 => {
-                                if (kbd_ctrl_l || kbd_ctrl_r) && (kbd_alt_l || kbd_alt_r) {
-                                    panic_mode.store(true, Ordering::SeqCst);
-                                    active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-                                    vkbd.release_all_keys();
-                                    for m in &mut mice {
-                                        m.set_grab(false);
-                                    }
-                                    send_burst(&socket, peer_addr, &seq_counter, Payload::PanicRelease);
-                                    println!("[PANIC] Local Fail-Safe Hotkey triggered!");
-                                }
-                            }
-                            KEY_F11 if ev.value == 1 => {
-                                if (kbd_ctrl_l || kbd_ctrl_r) && (kbd_alt_l || kbd_alt_r) {
-                                    panic_mode.store(false, Ordering::SeqCst);
-                                    let cur = active_node.load(Ordering::SeqCst);
-                                    let next = if cur == NodeId::Debian as u8 {
-                                        NodeId::Windows
-                                    } else {
-                                        NodeId::Debian
-                                    };
-                                    active_node.store(next as u8, Ordering::SeqCst);
-                                    let grab = next == NodeId::Windows;
-                                    if grab {
-                                        vkbd.release_all_keys();
-                                    }
-                                    for m in &mut mice {
-                                        m.set_grab(grab);
-                                    }
-                                    last_switch_instant = Instant::now();
-                                    edge_push_accum = 0;
-                                    send_burst(
-                                        &socket,
-                                        peer_addr,
-                                        &seq_counter,
-                                        Payload::FocusSwitch {
-                                            target_node: next,
-                                            cursor_y_ratio: 0.5,
-                                        },
-                                    );
-                                    println!("[Debian] Manual focus toggle (Ctrl+Alt+F11) -> {}", next);
-                                }
-                            }
-                            KEY_G if ev.value == 1 => {
-                                if (kbd_ctrl_l || kbd_ctrl_r) && (kbd_alt_l || kbd_alt_r) {
-                                    if let Ok(mut guard) = spatial_state.write() {
-                                        guard.config.manual_game_lock =
-                                            !guard.config.manual_game_lock;
-                                        let locked = guard.config.manual_game_lock;
-                                        guard.save();
-                                        println!(
-                                            "[Debian] Manual Game Captive Lock (Ctrl+Alt+G): {}",
-                                            if locked { "LOCKED" } else { "UNLOCKED" }
-                                        );
-                                    }
-                                }
-                            }
-                            _ => {
-                                // If user types on physical Debian keyboard while Windows had focus,
-                                // automatically bring focus back to Debian!
-                                if ev.value == 1
-                                    && active_node.load(Ordering::Relaxed) == NodeId::Windows as u8
-                                {
-                                    active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-                                    for m in &mut mice {
-                                        m.set_grab(false);
-                                    }
-                                    last_switch_instant = Instant::now();
-                                    edge_push_accum = 0;
-                                    send_burst(
-                                        &socket,
-                                        peer_addr,
-                                        &seq_counter,
-                                        Payload::FocusSwitch {
-                                            target_node: NodeId::Debian,
-                                            cursor_y_ratio: 0.5,
-                                        },
-                                    );
-                                    println!(
-                                        "[Debian] <-- Local Debian keyboard activity detected; focus switched to DEBIAN"
-                                    );
-                                }
+                    track_held(&mut core.backend.keyboards[i].held, ev);
+                    if ev.type_ != EV_KEY {
+                        continue;
+                    }
+                    match hotkeys.feed(ev.code, ev.value) {
+                        KeyRoute::Forward { scancode, pressed } => {
+                            core.route(Event::LocalKey { scancode, pressed });
+                        }
+                        KeyRoute::Consumed => {}
+                        KeyRoute::Hotkey(Hotkey::Panic) => {
+                            println!("[PANIC] Local Fail-Safe Hotkey triggered!");
+                            core.route(Event::Panic);
+                        }
+                        KeyRoute::Hotkey(Hotkey::ManualSwitch) => {
+                            println!("[Debian] Manual focus toggle (Ctrl+Alt+F11)");
+                            core.route(Event::ManualSwitch);
+                        }
+                        KeyRoute::Hotkey(Hotkey::GameLock) => {
+                            if let Ok(mut guard) = spatial_state.write() {
+                                guard.config.manual_game_lock = !guard.config.manual_game_lock;
+                                let locked = guard.config.manual_game_lock;
+                                guard.save();
+                                println!(
+                                    "[Debian] Manual Game Captive Lock (Ctrl+Alt+G): {}",
+                                    if locked { "LOCKED" } else { "UNLOCKED" }
+                                );
                             }
                         }
                     }
@@ -1055,202 +1343,45 @@ pub fn run_debian_node(
             }
         }
 
-        // 3. Read physical mouse events and apply 2D Spatial Transition Engine
-        let peer_online = last_peer_seen
-            .map(|t| t.elapsed() <= Duration::from_millis(1600))
-            .unwrap_or(false);
-
-        // The laptop keyboard can vanish mid-keypress; don't leave those keys held on Debian
-        if was_peer_online && !peer_online {
-            vkbd.release_all_keys();
-        }
-        was_peer_online = peer_online;
-
-        // On-The-Go Watchdog: If Windows was active and its heartbeat dropped for >1.6s, auto-restore Debian!
-        if active_node.load(Ordering::Relaxed) == NodeId::Windows as u8
-            && peer_reports_heartbeats
-            && !peer_online
-        {
-            active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-            for m in &mut mice {
-                m.set_grab(false);
-            }
-            edge_push_accum = 0;
-            println!(
-                "[Debian] Windows laptop went offline/out-of-range -> Auto-released EVIOCGRAB and restored standalone Debian control."
-            );
-        }
-
-        let is_game_captive = cfg_snapshot.manual_game_lock
-            || (cfg_snapshot.auto_game_lock && kwin_game_active.load(Ordering::Relaxed));
-        let mut switch_to_windows_entry: Option<(i32, i32)> = None;
-        let mut switch_to_debian_entry: Option<(i32, i32)> = None;
-        let is_windows_active = !panic_mode.load(Ordering::Relaxed)
-            && active_node.load(Ordering::Relaxed) == NodeId::Windows as u8;
-
-        for mouse in &mut mice {
+        // 3. Read physical mice
+        for i in 0..core.backend.mice.len() {
             let mut acc_dx: i32 = 0;
             let mut acc_dy: i32 = 0;
             let mut acc_wheel_x: i32 = 0;
             let mut acc_wheel_y: i32 = 0;
 
             loop {
-                let n = unsafe {
-                    libc::read(
-                        mouse.fd,
-                        ev_buf.as_mut_ptr() as *mut libc::c_void,
-                        std::mem::size_of_val(&ev_buf),
-                    )
-                };
-                if n <= 0 {
+                let count = core.backend.mice[i].read_events(&mut ev_buf);
+                if count == 0 {
                     break;
                 }
-                let count = (n as usize) / std::mem::size_of::<InputEvent>();
                 for ev in &ev_buf[..count] {
+                    track_held(&mut core.backend.mice[i].held, ev);
                     match ev.type_ {
                         EV_REL => match ev.code {
                             REL_X => acc_dx += ev.value,
                             REL_Y => acc_dy += ev.value,
-                            REL_WHEEL => acc_wheel_y += ev.value * 120,
-                            REL_HWHEEL => acc_wheel_x += ev.value * 120,
+                            REL_WHEEL => acc_wheel_y += ev.value * WHEEL_DELTA,
+                            REL_HWHEEL => acc_wheel_x += ev.value * WHEEL_DELTA,
                             _ => {}
                         },
                         EV_KEY => {
-                            let pressed = ev.value != 0;
-                            let btn_opt = match ev.code {
-                                BTN_LEFT => Some((MOUSE_BTN_LEFT, 0)),
-                                BTN_RIGHT => Some((MOUSE_BTN_RIGHT, 1)),
-                                BTN_MIDDLE => Some((MOUSE_BTN_MIDDLE, 2)),
-                                BTN_SIDE => Some((MOUSE_BTN_SIDE, 3)),
-                                BTN_EXTRA => Some((MOUSE_BTN_EXTRA, 4)),
-                                _ => None,
-                            };
-                            if let Some((btn_id, bit)) = btn_opt {
-                                if pressed {
-                                    mouse_buttons_mask |= 1 << bit;
-                                    if panic_mode.load(Ordering::Relaxed) {
-                                        panic_mode.store(false, Ordering::SeqCst);
-                                    }
-                                } else {
-                                    mouse_buttons_mask &= !(1 << bit);
-                                }
-
-                                if is_windows_active {
-                                    send_payload(
-                                        &socket,
-                                        peer_addr,
-                                        &seq_counter,
-                                        Payload::MouseButton {
-                                            button: btn_id,
-                                            pressed,
-                                        },
-                                    );
-                                }
+                            if let Some(button) = button_id(ev.code) {
+                                core.route(Event::LocalButton {
+                                    button,
+                                    pressed: ev.value != 0,
+                                });
                             }
                         }
                         EV_SYN if ev.code == SYN_REPORT => {
-                            if is_windows_active {
-                                if acc_dx != 0 || acc_dy != 0 {
-                                    frac_dx += acc_dx as f32 * cfg_snapshot.mouse_speed;
-                                    frac_dy += acc_dy as f32 * cfg_snapshot.mouse_speed;
-                                    let mut send_dx = frac_dx.trunc() as i32;
-                                    let send_dy = frac_dy.trunc() as i32;
-                                    frac_dx -= send_dx as f32;
-                                    frac_dy -= send_dy as f32;
-
-                                    win_cursor_x = (win_cursor_x + send_dx)
-                                        .clamp(0, cfg_snapshot.win_w - 1);
-                                    win_cursor_y = (win_cursor_y + send_dy)
-                                        .clamp(0, cfg_snapshot.win_h - 1);
-
-                                    // If Windows is NOT attached on Debian's Right edge, prevent the legacy
-                                    // left-edge check on Windows (pt.x <= 0) from falsely firing when touching x=0
-                                    if cfg_snapshot.attach_side != TouchSide::Right
-                                        && win_cursor_x <= 6
-                                        && send_dx < 0
-                                    {
-                                        send_dx = 0;
-                                    }
-
-                                    if send_dx != 0 || send_dy != 0 {
-                                        send_payload(
-                                            &socket,
-                                            peer_addr,
-                                            &seq_counter,
-                                            Payload::MouseMoveDelta {
-                                                dx: send_dx,
-                                                dy: send_dy,
-                                            },
-                                        );
-                                    }
-
-                                    // Check 2D spatial boundary from Windows back to Debian (disabled when Game Captive Lock is active)
-                                    if !is_game_captive
-                                        && mouse_buttons_mask == 0
-                                        && last_switch_instant.elapsed()
-                                            >= Duration::from_millis(180)
-                                    {
-                                        if let Some(deb_target) = cfg_snapshot
-                                            .check_windows_to_debian(
-                                                win_cursor_x,
-                                                win_cursor_y,
-                                                acc_dx,
-                                                acc_dy,
-                                            )
-                                        {
-                                            edge_push_accum += acc_dx.abs() + acc_dy.abs();
-                                            if edge_push_accum >= cfg_snapshot.edge_resistance {
-                                                switch_to_debian_entry = Some(deb_target);
-                                            }
-                                        } else {
-                                            edge_push_accum = 0;
-                                        }
-                                    }
-
-                                    acc_dx = 0;
-                                    acc_dy = 0;
-                                }
-                                if acc_wheel_x != 0 || acc_wheel_y != 0 {
-                                    send_payload(
-                                        &socket,
-                                        peer_addr,
-                                        &seq_counter,
-                                        Payload::MouseWheel {
-                                            delta_x: acc_wheel_x,
-                                            delta_y: acc_wheel_y,
-                                        },
-                                    );
-                                    acc_wheel_x = 0;
-                                    acc_wheel_y = 0;
-                                }
-                            } else if !panic_mode.load(Ordering::Relaxed) {
-                                // Active node is Debian: use ONLY true KWin Wayland cursor coordinates (zero raw-delta drift!)
-                                if acc_dx != 0 || acc_dy != 0 {
-                                    let real_cx = kwin_x.load(Ordering::Relaxed);
-                                    let real_cy = kwin_y.load(Ordering::Relaxed);
-
-                                    if peer_online
-                                        && !is_game_captive
-                                        && mouse_buttons_mask == 0
-                                        && last_switch_instant.elapsed()
-                                            >= Duration::from_millis(250)
-                                    {
-                                        if let Some(win_entry) = cfg_snapshot
-                                            .check_debian_to_windows(
-                                                real_cx, real_cy, acc_dx, acc_dy,
-                                            )
-                                        {
-                                            edge_push_accum += acc_dx.abs() + acc_dy.abs();
-                                            if edge_push_accum >= cfg_snapshot.edge_resistance {
-                                                switch_to_windows_entry = Some(win_entry);
-                                            }
-                                        } else {
-                                            edge_push_accum = 0;
-                                        }
-                                    }
-                                    acc_dx = 0;
-                                    acc_dy = 0;
-                                }
+                            if acc_dx != 0 || acc_dy != 0 {
+                                core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
+                                core.push_edge(&cfg_snapshot, acc_dx, acc_dy);
+                                acc_dx = 0;
+                                acc_dy = 0;
+                            }
+                            if acc_wheel_x != 0 || acc_wheel_y != 0 {
+                                core.route(Event::LocalWheel { dx: acc_wheel_x, dy: acc_wheel_y });
                                 acc_wheel_x = 0;
                                 acc_wheel_y = 0;
                             }
@@ -1261,93 +1392,20 @@ pub fn run_debian_node(
             }
         }
 
-        // Execute transition: Debian -> Windows
-        if let Some((entry_wx, entry_wy)) = switch_to_windows_entry {
-            active_node.store(NodeId::Windows as u8, Ordering::SeqCst);
-            vkbd.release_all_keys();
-            for m in &mut mice {
-                m.set_grab(true);
-            }
-            last_switch_instant = Instant::now();
-            edge_push_accum = 0;
-            win_cursor_x = entry_wx;
-            win_cursor_y = entry_wy;
-
-            let cursor_y_ratio =
-                (entry_wy as f32 / cfg_snapshot.win_h.max(1) as f32).clamp(0.01, 0.99);
-            send_burst(
-                &socket,
-                peer_addr,
-                &seq_counter,
-                Payload::FocusSwitch {
-                    target_node: NodeId::Windows,
-                    cursor_y_ratio,
-                },
-            );
-
-            // If entering at X != 24 (e.g., Top/Bottom/Left attachment), nudge Windows cursor horizontally to entry_wx
-            if (entry_wx - 24).abs() > 4 {
-                send_payload(
-                    &socket,
-                    peer_addr,
-                    &seq_counter,
-                    Payload::MouseMoveDelta {
-                        dx: entry_wx - 24,
-                        dy: 0,
-                    },
-                );
-            }
-
-            println!(
-                "[Debian] --> Spatial transition ({:?}) to WINDOWS at ({}, {})",
-                cfg_snapshot.attach_side, entry_wx, entry_wy
-            );
-        }
-
-        // Execute transition: Windows -> Debian
-        if let Some((target_deb_x, target_deb_y)) = switch_to_debian_entry {
-            active_node.store(NodeId::Debian as u8, Ordering::SeqCst);
-            for m in &mut mice {
-                m.set_grab(false);
-            }
-            last_switch_instant = Instant::now();
-            edge_push_accum = 0;
-
-            vmouse.warp_abs(target_deb_x, target_deb_y);
-            kwin_x.store(target_deb_x, Ordering::Relaxed);
-            kwin_y.store(target_deb_y, Ordering::Relaxed);
-
-            send_burst(
-                &socket,
-                peer_addr,
-                &seq_counter,
-                Payload::FocusSwitch {
-                    target_node: NodeId::Debian,
-                    cursor_y_ratio: 0.5,
-                },
-            );
-
-            println!(
-                "[Debian] <-- Spatial transition ({:?}) to DEBIAN at ({}, {})",
-                cfg_snapshot.attach_side, target_deb_x, target_deb_y
-            );
-        }
+        core.backend.sync_grabs();
 
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
             last_telemetry_sync = Instant::now();
             if let Ok(mut guard) = spatial_state.write() {
-                guard.telemetry.active_node =
-                    if active_node.load(Ordering::Relaxed) == NodeId::Windows as u8 {
-                        "Windows".to_string()
-                    } else {
-                        "Debian".to_string()
-                    };
-                guard.telemetry.panic_mode = panic_mode.load(Ordering::Relaxed);
+                guard.telemetry.active_node = if core.router.active() == WINDOWS {
+                    "Windows".to_string()
+                } else {
+                    "Debian".to_string()
+                };
+                guard.telemetry.panic_mode = core.router.panicked();
                 guard.telemetry.deb_cursor_x = kwin_x.load(Ordering::Relaxed);
                 guard.telemetry.deb_cursor_y = kwin_y.load(Ordering::Relaxed);
-                guard.telemetry.win_cursor_x = win_cursor_x;
-                guard.telemetry.win_cursor_y = win_cursor_y;
                 guard.telemetry.game_captive_active = is_game_captive;
                 guard.telemetry.game_reason = if cfg_snapshot.manual_game_lock {
                     "Manual Lock (Ctrl+Alt+G)".to_string()
@@ -1374,67 +1432,190 @@ pub fn run_debian_node(
                     crate::audio::AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed);
                 guard.telemetry.audio_tx_source_mode =
                     crate::audio::AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed);
-                guard.telemetry.peer_online = peer_online;
+                guard.telemetry.peer_online = core.router.online();
             }
         }
 
-        // Periodic Heartbeat & State Sync (every 400ms)
+        // Heartbeat, with the edge map the laptop needs to check its own edges (every 400ms)
         if last_heartbeat.elapsed() >= Duration::from_millis(400) {
             last_heartbeat = Instant::now();
-            if !panic_mode.load(Ordering::Relaxed)
-                && active_node.load(Ordering::Relaxed) == NodeId::Debian as u8
-            {
-                // Continuously ensure Windows peer knows Debian is the active node so keyboard hooks stay active
-                send_payload(
-                    &socket,
-                    peer_addr,
-                    &seq_counter,
-                    Payload::FocusSwitch {
-                        target_node: NodeId::Debian,
-                        cursor_y_ratio: 0.5,
-                    },
-                );
-            } else {
-                send_payload(&socket, peer_addr, &seq_counter, Payload::Heartbeat);
-            }
+            core.peer.send(Payload::Heartbeat);
+            let span = cfg_snapshot.laptop_edge_span();
+            core.peer.send(Payload::EdgeMap {
+                edge: span.edge,
+                start: span.start,
+                end: span.end,
+                resistance: cfg_snapshot.edge_resistance,
+            });
         }
 
         std::thread::sleep(Duration::from_micros(500));
     }
 }
 
-#[inline]
-fn send_payload(
-    socket: &UdpSocket,
-    peer_addr: SocketAddr,
-    seq_counter: &AtomicU64,
-    payload: Payload,
-) {
-    let pkt = Packet::new(
-        seq_counter.fetch_add(1, Ordering::Relaxed),
-        NodeId::Debian,
-        payload,
-    );
-    if let Ok(bytes) = pkt.encode() {
-        let _ = socket.send_to(&bytes, peer_addr);
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[inline]
-fn send_burst(
-    socket: &UdpSocket,
-    peer_addr: SocketAddr,
-    seq_counter: &AtomicU64,
-    payload: Payload,
-) {
-    for _ in 0..3 {
-        let pkt = Packet::new(
-            seq_counter.fetch_add(1, Ordering::Relaxed),
-            NodeId::Debian,
-            payload.clone(),
-        );
-        if let Ok(bytes) = pkt.encode() {
-            let _ = socket.send_to(&bytes, peer_addr);
+    fn press(f: &mut HotkeyFilter, code: u16) -> KeyRoute {
+        f.feed(code, 1)
+    }
+    fn forward(scancode: u16, pressed: bool) -> KeyRoute {
+        KeyRoute::Forward { scancode, pressed }
+    }
+    fn ctrl_alt() -> HotkeyFilter {
+        let mut f = HotkeyFilter::default();
+        press(&mut f, KEY_LEFTCTRL);
+        press(&mut f, KEY_LEFTALT);
+        f
+    }
+
+    #[test]
+    fn hotkeys_need_ctrl_and_alt() {
+        let mut f = HotkeyFilter::default();
+        assert_eq!(press(&mut f, KEY_F11), forward(KEY_F11, true));
+        press(&mut f, KEY_RIGHTCTRL);
+        assert_eq!(press(&mut f, KEY_F12), forward(KEY_F12, true));
+        press(&mut f, KEY_RIGHTALT);
+        assert_eq!(press(&mut f, KEY_G), KeyRoute::Hotkey(Hotkey::GameLock));
+    }
+
+    #[test]
+    fn hotkey_table() {
+        for (code, want) in [
+            (KEY_F11, Hotkey::ManualSwitch),
+            (KEY_F12, Hotkey::Panic),
+            (KEY_SCROLLLOCK, Hotkey::Panic),
+            (KEY_G, Hotkey::GameLock),
+        ] {
+            assert_eq!(press(&mut ctrl_alt(), code), KeyRoute::Hotkey(want));
         }
+    }
+
+    #[test]
+    fn ctrl_and_alt_themselves_are_forwarded() {
+        let mut f = HotkeyFilter::default();
+        assert_eq!(f.feed(KEY_LEFTCTRL, 1), forward(KEY_LEFTCTRL, true));
+        assert_eq!(f.feed(KEY_LEFTALT, 1), forward(KEY_LEFTALT, true));
+        assert_eq!(f.feed(KEY_LEFTALT, 2), forward(KEY_LEFTALT, true));
+        assert_eq!(f.feed(KEY_LEFTALT, 0), forward(KEY_LEFTALT, false));
+    }
+
+    #[test]
+    fn repeat_counts_as_pressed_and_zero_as_released() {
+        let mut f = HotkeyFilter::default();
+        assert_eq!(f.feed(30, 1), forward(30, true));
+        assert_eq!(f.feed(30, 2), forward(30, true));
+        assert_eq!(f.feed(30, 0), forward(30, false));
+    }
+
+    #[test]
+    fn hotkey_repeat_and_release_are_never_forwarded() {
+        let mut f = ctrl_alt();
+        assert_eq!(f.feed(KEY_F11, 1), KeyRoute::Hotkey(Hotkey::ManualSwitch));
+        assert_eq!(f.feed(KEY_F11, 2), KeyRoute::Consumed);
+        // Modifiers let go first: the held key is still the hotkey's, not a typed F11.
+        f.feed(KEY_LEFTCTRL, 0);
+        f.feed(KEY_LEFTALT, 0);
+        assert_eq!(f.feed(KEY_F11, 2), KeyRoute::Consumed);
+        assert_eq!(f.feed(KEY_F11, 0), KeyRoute::Consumed);
+        // Released, so the next plain press is an ordinary key.
+        assert_eq!(f.feed(KEY_F11, 1), forward(KEY_F11, true));
+    }
+
+    #[test]
+    fn hotkey_repeat_does_not_fire_again() {
+        let mut f = ctrl_alt();
+        f.feed(KEY_F12, 1);
+        for _ in 0..5 {
+            assert_eq!(f.feed(KEY_F12, 2), KeyRoute::Consumed);
+        }
+    }
+
+    #[test]
+    fn modifier_on_either_side_counts_until_both_are_up() {
+        let mut f = ctrl_alt();
+        f.feed(KEY_RIGHTCTRL, 1);
+        f.feed(KEY_LEFTCTRL, 0);
+        assert_eq!(f.feed(KEY_F12, 1), KeyRoute::Hotkey(Hotkey::Panic));
+        f.feed(KEY_F12, 0);
+        f.feed(KEY_RIGHTCTRL, 0);
+        assert_eq!(f.feed(KEY_F12, 1), forward(KEY_F12, true));
+    }
+
+    fn key_event(code: u16, value: i32) -> InputEvent {
+        InputEvent { type_: EV_KEY, code, value, ..Default::default() }
+    }
+
+    #[test]
+    fn held_set_follows_key_events() {
+        let mut held = HashSet::new();
+        track_held(&mut held, &key_event(30, 1));
+        track_held(&mut held, &key_event(31, 1));
+        track_held(&mut held, &key_event(30, 2));
+        track_held(&mut held, &key_event(30, 0));
+        assert_eq!(held, HashSet::from([31]));
+        let rel = InputEvent { type_: EV_REL, code: 31, value: 0, ..Default::default() };
+        track_held(&mut held, &rel);
+        assert_eq!(held, HashSet::from([31]));
+    }
+
+    #[test]
+    fn dropped_events_forget_held_keys() {
+        // A lost release must not leave the device ungrabbable.
+        let mut held = HashSet::from([31]);
+        let drop = InputEvent { type_: EV_SYN, code: SYN_DROPPED, value: 0, ..Default::default() };
+        track_held(&mut held, &drop);
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn grab_waits_for_held_keys_to_release() {
+        // A release swallowed by the grab would leave the key stuck down on Debian.
+        assert!(!should_grab(true, false, false));
+        assert!(should_grab(true, false, true));
+    }
+
+    #[test]
+    fn grab_stays_on_while_keys_are_held() {
+        assert!(should_grab(true, true, false));
+    }
+
+    #[test]
+    fn ungrab_never_waits() {
+        assert!(!should_grab(false, true, false));
+        assert!(!should_grab(false, true, true));
+        assert!(!should_grab(false, false, true));
+    }
+
+    #[test]
+    fn wheel_keeps_the_remainder_between_events() {
+        let mut carry = 0;
+        assert_eq!(take_notches(&mut carry, 120), 1);
+        assert_eq!(take_notches(&mut carry, -240), -2);
+        assert_eq!(take_notches(&mut carry, 40), 0);
+        assert_eq!(take_notches(&mut carry, 40), 0);
+        assert_eq!(take_notches(&mut carry, 40), 1);
+        assert_eq!(carry, 0);
+    }
+
+    #[test]
+    fn button_ids_round_trip() {
+        for code in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+            assert_eq!(button_code(button_id(code).unwrap()), Some(code));
+        }
+        assert_eq!(button_id(KEY_F11), None);
+        assert_eq!(button_code(0), None);
+        assert_eq!(button_code(6), None);
+    }
+
+    #[test]
+    fn focus_seq_rejects_replays_but_not_seq_zero() {
+        let mut last = 0;
+        assert!(fresh_focus_seq(&mut last, 10));
+        assert!(!fresh_focus_seq(&mut last, 10));
+        assert!(!fresh_focus_seq(&mut last, 9));
+        assert!(fresh_focus_seq(&mut last, 11));
+        assert!(fresh_focus_seq(&mut last, 0));
     }
 }

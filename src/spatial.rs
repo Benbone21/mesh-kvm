@@ -1,3 +1,5 @@
+use crate::protocol::SwitchEdge;
+use crate::router::{EdgeSpan, KEEP_CURSOR};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Command;
@@ -387,52 +389,93 @@ impl SpatialConfig {
         None
     }
 
-    /// Checks if the Windows cursor `(wx, wy)` with movement `(dx, dy)` crossed back into Debian,
-    /// returning the target `(deb_x, deb_y)` on Debian.
-    pub fn check_windows_to_debian(&self, wx: i32, wy: i32, dx: i32, dy: i32) -> Option<(i32, i32)> {
-        let raw_deb_x = self.win_x + wx;
-        let raw_deb_y = self.win_y + wy;
-
-        match self.attach_side {
-            TouchSide::Right => {
-                if dx < 0 && wx <= 4 {
-                    let target_x = (self.win_x - 90).clamp(0, self.deb_total_w - 1);
-                    let target_y = self.clamp_to_debian_y(target_x, raw_deb_y);
-                    return Some((target_x, target_y));
-                }
-            }
-            TouchSide::Left => {
-                if dx > 0 && wx >= self.win_w - 4 {
-                    let target_x = (self.win_x + self.win_w + 90).clamp(0, self.deb_total_w - 1);
-                    let target_y = self.clamp_to_debian_y(target_x, raw_deb_y);
-                    return Some((target_x, target_y));
-                }
-            }
-            TouchSide::Bottom => {
-                if dy < 0 && wy <= 4 {
-                    let target_x = raw_deb_x.clamp(0, self.deb_total_w - 1);
-                    let target_y = (self.win_y - 90).clamp(0, self.deb_total_h - 1);
-                    return Some((target_x, self.clamp_to_debian_y(target_x, target_y)));
-                }
-            }
-            TouchSide::Top => {
-                if dy > 0 && wy >= self.win_h - 4 {
-                    let target_x = raw_deb_x.clamp(0, self.deb_total_w - 1);
-                    let target_y = (self.win_y + self.win_h + 90).clamp(0, self.deb_total_h - 1);
-                    return Some((target_x, self.clamp_to_debian_y(target_x, target_y)));
-                }
-            }
+    /// Adds this movement to the push against the shared boundary in `pushed`, and returns the
+    /// laptop-local entry point once the push reaches `edge_resistance`. Movement that is not
+    /// against the boundary clears the push.
+    pub fn push_debian_edge(
+        &self,
+        cx: i32,
+        cy: i32,
+        dx: i32,
+        dy: i32,
+        pushed: &mut i32,
+    ) -> Option<(i32, i32)> {
+        let Some(entry) = self.check_debian_to_windows(cx, cy, dx, dy) else {
+            *pushed = 0;
+            return None;
+        };
+        *pushed = pushed
+            .saturating_add(dx.saturating_abs())
+            .saturating_add(dy.saturating_abs());
+        if *pushed >= self.edge_resistance {
+            *pushed = 0;
+            return Some(entry);
         }
         None
     }
 
-    fn clamp_to_debian_y(&self, x: i32, y: i32) -> i32 {
-        for m in &self.debian_monitors {
-            if x >= m.x && x < m.x + m.w {
-                return y.clamp(m.y + 4, m.y + m.h - 4);
-            }
+    /// The part of the laptop's edge that touches Debian, in laptop-local pixels along that edge.
+    ///
+    /// Only the monitors closest to the laptop's edge count, so a shorter monitor beside a taller
+    /// one is not treated as touching. With no monitor alongside the laptop the span is empty
+    /// (`start > end`), which no push can cross.
+    pub fn laptop_edge_span(&self) -> EdgeSpan {
+        let (edge, boundary, origin, length) = match self.attach_side {
+            TouchSide::Right => (SwitchEdge::Left, self.win_x, self.win_y, self.win_h),
+            TouchSide::Left => (SwitchEdge::Right, self.win_x + self.win_w, self.win_y, self.win_h),
+            TouchSide::Bottom => (SwitchEdge::Top, self.win_y, self.win_x, self.win_w),
+            TouchSide::Top => (SwitchEdge::Bottom, self.win_y + self.win_h, self.win_x, self.win_w),
+        };
+        // (distance from the laptop's edge, overlap start, overlap end), laptop-local and inclusive.
+        let overlaps: Vec<(i32, i32, i32)> = self
+            .debian_monitors
+            .iter()
+            .filter_map(|m| {
+                let (facing, m_start, m_length) = match self.attach_side {
+                    TouchSide::Right => (m.x + m.w, m.y, m.h),
+                    TouchSide::Left => (m.x, m.y, m.h),
+                    TouchSide::Bottom => (m.y + m.h, m.x, m.w),
+                    TouchSide::Top => (m.y, m.x, m.w),
+                };
+                let start = origin.max(m_start);
+                let end = (origin + length).min(m_start + m_length);
+                (start < end).then_some(((facing - boundary).abs(), start - origin, end - 1 - origin))
+            })
+            .collect();
+        let Some(nearest) = overlaps.iter().map(|o| o.0).min() else {
+            return EdgeSpan { edge, start: 0, end: -1 };
+        };
+        let touching = || overlaps.iter().filter(|o| o.0 == nearest);
+        EdgeSpan {
+            edge,
+            start: touching().map(|o| o.1).min().unwrap_or(0),
+            end: touching().map(|o| o.2).max().unwrap_or(-1),
         }
-        y.clamp(0, self.deb_total_h - 1)
+    }
+
+    /// Converts a laptop-local point to Debian desktop coordinates on the nearest monitor.
+    /// `KEEP_CURSOR` in either coordinate means no warp, so it is returned for both.
+    pub fn laptop_to_debian(&self, x: i32, y: i32) -> (i32, i32) {
+        if x == KEEP_CURSOR || y == KEEP_CURSOR {
+            return (KEEP_CURSOR, KEEP_CURSOR);
+        }
+        self.clamp_to_debian(x.saturating_add(self.win_x), y.saturating_add(self.win_y))
+    }
+
+    /// The closest pixel to `(x, y)` on any Debian monitor.
+    fn clamp_to_debian(&self, x: i32, y: i32) -> (i32, i32) {
+        let on_rect = |left: i32, top: i32, w: i32, h: i32| {
+            (x.clamp(left, left + (w - 1).max(0)), y.clamp(top, top + (h - 1).max(0)))
+        };
+        let distance = |&(px, py): &(i32, i32)| {
+            let (dx, dy) = (i128::from(px) - i128::from(x), i128::from(py) - i128::from(y));
+            dx * dx + dy * dy
+        };
+        self.debian_monitors
+            .iter()
+            .map(|m| on_rect(m.x, m.y, m.w, m.h))
+            .min_by_key(distance)
+            .unwrap_or_else(|| on_rect(0, 0, self.deb_total_w, self.deb_total_h))
     }
 }
 
@@ -601,5 +644,156 @@ fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val:
             g.save();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DP-3 (1920x1080 at 0,360) beside DP-2 (2560x1440 at 1920,0): both end at y = 1440.
+    fn layout(attach_side: TouchSide, win_x: i32, win_y: i32) -> SpatialConfig {
+        SpatialConfig {
+            debian_monitors: vec![
+                MonitorRect { name: "DP-3".into(), x: 0, y: 360, w: 1920, h: 1080 },
+                MonitorRect { name: "DP-2".into(), x: 1920, y: 0, w: 2560, h: 1440 },
+            ],
+            deb_total_w: 4480,
+            deb_total_h: 1440,
+            win_x,
+            win_y,
+            win_w: 1920,
+            win_h: 1080,
+            win_native_w: 1920,
+            win_native_h: 1080,
+            resolution_mode: "native".to_string(),
+            attach_side,
+            mouse_speed: 0.35,
+            edge_resistance: 55,
+            auto_game_lock: true,
+            manual_game_lock: false,
+        }
+    }
+
+    fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {
+        EdgeSpan { edge, start, end }
+    }
+
+    #[test]
+    fn bottom_attachment_gives_top_span() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1919));
+    }
+
+    #[test]
+    fn right_attachment_gives_left_span() {
+        let c = layout(TouchSide::Right, 4480, 200);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Left, 0, 1079));
+    }
+
+    #[test]
+    fn left_attachment_gives_right_span() {
+        // DP-3 starts at y = 360, so the laptop's first 360 rows have no neighbour.
+        let c = layout(TouchSide::Left, -1920, 0);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Right, 360, 1079));
+    }
+
+    #[test]
+    fn top_attachment_gives_bottom_span() {
+        let c = layout(TouchSide::Top, 2240, -1080);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Bottom, 0, 1919));
+    }
+
+    #[test]
+    fn partial_overlap_is_clamped() {
+        // Hanging 640 px past DP-2's right end.
+        let c = layout(TouchSide::Bottom, 3200, 1440);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1279));
+        // Hanging 200 px above DP-2's top.
+        let c = layout(TouchSide::Right, 4480, -200);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Left, 200, 1079));
+    }
+
+    #[test]
+    fn span_covers_every_monitor_on_the_same_line() {
+        let c = layout(TouchSide::Bottom, 1500, 1440);
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1919));
+    }
+
+    #[test]
+    fn monitor_ending_short_of_the_laptop_does_not_count() {
+        let mut c = layout(TouchSide::Bottom, 1500, 1440);
+        c.debian_monitors[0].h = 720; // DP-3 now ends at y = 1080
+        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 420, 1919));
+    }
+
+    #[test]
+    fn no_overlap_gives_an_empty_span() {
+        let c = layout(TouchSide::Bottom, 5000, 1440);
+        let s = c.laptop_edge_span();
+        assert_eq!(s.edge, SwitchEdge::Top);
+        assert!(s.start > s.end);
+    }
+
+    #[test]
+    fn laptop_point_converts_to_debian_coordinates() {
+        // Laptop right of DP-2: (-1, 300) is just outside, so it lands on DP-2's last column.
+        let c = layout(TouchSide::Right, 4480, 200);
+        assert_eq!(c.laptop_to_debian(-1, 300), (4479, 500));
+    }
+
+    #[test]
+    fn laptop_point_clamps_to_nearest_monitor() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.laptop_to_debian(100, -1), (2340, 1439));
+        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1439));
+        // Left of the laptop's origin and below DP-3.
+        assert_eq!(c.laptop_to_debian(-1000, 0), (1240, 1439));
+        // The empty corner above DP-3 goes to the closer of the two monitors.
+        let c = layout(TouchSide::Top, 0, 0);
+        assert_eq!(c.laptop_to_debian(1900, 100), (1920, 100));
+        assert_eq!(c.laptop_to_debian(100, 340), (100, 360));
+    }
+
+    #[test]
+    fn keep_cursor_is_not_converted() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.laptop_to_debian(KEEP_CURSOR, KEEP_CURSOR), (KEEP_CURSOR, KEEP_CURSOR));
+        // A half-set sentinel must not become a warp to a clamped corner.
+        assert_eq!(c.laptop_to_debian(KEEP_CURSOR, 5), (KEEP_CURSOR, KEEP_CURSOR));
+        assert_eq!(c.laptop_to_debian(5, KEEP_CURSOR), (KEEP_CURSOR, KEEP_CURSOR));
+    }
+
+    #[test]
+    fn hostile_laptop_coordinates_stay_on_a_monitor() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.laptop_to_debian(i32::MAX, i32::MAX), (4479, 1439));
+        assert_eq!(c.laptop_to_debian(i32::MIN + 1, i32::MIN + 1), (0, 360));
+    }
+
+    #[test]
+    fn laptop_point_without_monitors_uses_the_desktop_box() {
+        let mut c = layout(TouchSide::Bottom, 2240, 1440);
+        c.debian_monitors.clear();
+        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1439));
+    }
+
+    #[test]
+    fn edge_push_crosses_after_resistance() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let mut pushed = 0;
+        assert_eq!(c.push_debian_edge(2340, 1439, 0, 30, &mut pushed), None);
+        assert_eq!(pushed, 30);
+        assert_eq!(c.push_debian_edge(2340, 1439, 0, 30, &mut pushed), Some((100, 28)));
+        assert_eq!(pushed, 0);
+    }
+
+    #[test]
+    fn edge_push_resets_away_from_the_boundary() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let mut pushed = 0;
+        c.push_debian_edge(2340, 1439, 0, 30, &mut pushed);
+        assert_eq!(c.push_debian_edge(2340, 1000, 0, 30, &mut pushed), None);
+        assert_eq!(pushed, 0);
     }
 }
