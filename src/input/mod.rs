@@ -3,6 +3,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub mod win_logic;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -12,7 +14,6 @@ use crate::router::Action;
 /// Times focus and panic packets are sent, because the UDP link is lossy.
 const REPEAT_CRITICAL: usize = 3;
 
-#[allow(dead_code)]
 pub trait InputBackend {
     fn set_blocking(&mut self, mouse: bool, keyboard: bool);
     fn inject_move(&mut self, dx: i32, dy: i32);
@@ -23,14 +24,21 @@ pub trait InputBackend {
     fn release_held(&mut self);
 }
 
-#[allow(dead_code)]
 pub trait PeerSender {
     fn send(&mut self, payload: Payload);
 }
 
+/// False for a focus packet older than one already handled. UDP can reorder a burst.
+pub fn fresh_focus_seq(last: &mut u64, seq: u64) -> bool {
+    if seq <= *last && seq != 0 {
+        return false;
+    }
+    *last = seq;
+    true
+}
+
 /// Runs router actions against the local backend and the peer link. `x`/`y` on a focus
 /// switch pass through unchanged, including `router::KEEP_CURSOR`.
-#[allow(dead_code)]
 pub fn apply(actions: &[Action], backend: &mut dyn InputBackend, peer: &mut dyn PeerSender) {
     for action in actions {
         match *action {
@@ -111,6 +119,16 @@ mod tests {
         fn send(&mut self, payload: Payload) {
             self.0.push(payload);
         }
+    }
+
+    #[test]
+    fn focus_seq_rejects_replays_but_not_seq_zero() {
+        let mut last = 0;
+        assert!(fresh_focus_seq(&mut last, 10));
+        assert!(!fresh_focus_seq(&mut last, 10));
+        assert!(!fresh_focus_seq(&mut last, 9));
+        assert!(fresh_focus_seq(&mut last, 11));
+        assert!(fresh_focus_seq(&mut last, 0));
     }
 
     #[test]

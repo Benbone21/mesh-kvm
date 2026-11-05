@@ -3,7 +3,7 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::{apply, InputBackend, PeerSender};
+use super::{apply, fresh_focus_seq, InputBackend, PeerSender};
 use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
@@ -957,15 +957,6 @@ impl HotkeyFilter {
     }
 }
 
-/// False for a focus packet older than one already handled. UDP can reorder a burst.
-fn fresh_focus_seq(last: &mut u64, seq: u64) -> bool {
-    if seq <= *last && seq != 0 {
-        return false;
-    }
-    *last = seq;
-    true
-}
-
 struct LinuxBackend {
     vkbd: VirtualKeyboard,
     vmouse: VirtualMouse,
@@ -1679,15 +1670,5 @@ mod tests {
         assert_eq!(button_id(KEY_F11), None);
         assert_eq!(button_code(0), None);
         assert_eq!(button_code(6), None);
-    }
-
-    #[test]
-    fn focus_seq_rejects_replays_but_not_seq_zero() {
-        let mut last = 0;
-        assert!(fresh_focus_seq(&mut last, 10));
-        assert!(!fresh_focus_seq(&mut last, 10));
-        assert!(!fresh_focus_seq(&mut last, 9));
-        assert!(fresh_focus_seq(&mut last, 11));
-        assert!(fresh_focus_seq(&mut last, 0));
     }
 }

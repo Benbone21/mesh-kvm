@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Pure focus router: decides which device is active and where input goes.
 //!
 //! No I/O, no clock, no platform code. Time enters only through `now_ms` carried by
@@ -49,8 +48,10 @@ pub enum Event {
     PeerAlive { now_ms: u64 },
     PeerFocus { target: DeviceId, x: i32, y: i32 },
     /// The main device's view of the active device. Repairs a desync, so it never warps.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PeerActiveView { active: DeviceId },
     /// The peer's manual game lock: refuses crossings like `SetCaptive`, tracked separately.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PeerGameLock(bool),
     PeerPanic,
     Tick { now_ms: u64 },
@@ -144,6 +145,7 @@ impl Router {
     pub fn captive(&self) -> bool {
         self.captive
     }
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn set_pointer_speed(&mut self, speed: f32) {
         self.cfg.pointer_speed = speed;
     }
@@ -402,6 +404,7 @@ impl Router {
 }
 
 /// A stretch of one screen edge, in laptop-local pixels along that edge (`start..=end`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeSpan {
     pub edge: SwitchEdge,
@@ -410,13 +413,15 @@ pub struct EdgeSpan {
 }
 
 /// Accumulates outward pointer push against an edge until it exceeds the resistance.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct EdgeTracker {
     resistance: i32,
     pushed: i32,
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl EdgeTracker {
-    pub fn new(resistance: i32) -> Self {
+    pub const fn new(resistance: i32) -> Self {
         Self { resistance, pushed: 0 }
     }
 

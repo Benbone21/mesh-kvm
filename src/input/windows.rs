@@ -1,16 +1,22 @@
 #![cfg(target_os = "windows")]
 
-use crate::keymap::win_vk_scan_to_evdev;
+use super::win_logic::{self, Hotkey, HotkeyFilter, KeyRoute, KEY_SLOTS};
+use super::{apply, fresh_focus_seq, InputBackend, PeerSender};
+use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
+};
+use crate::router::{
+    Action, DeviceId, EdgeSpan, EdgeTracker, Event, Routed, Router, RouterConfig, Sharing,
+    KEEP_CURSOR,
 };
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -18,35 +24,84 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetDC, GetDeviceCaps, ReleaseDC, DESKTOPHORZRES, DESKTOPVERTRES,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_F11, VK_F12, VK_LCONTROL, VK_LMENU, VK_MENU,
-    VK_RCONTROL, VK_RMENU, VK_SCROLL,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorInfo, GetCursorPos, GetMessageW, GetSystemMetrics,
     SetCursorPos, SetProcessDPIAware, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    CURSORINFO, CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, MSG,
-    SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    XBUTTON1, XBUTTON2,
+    CURSORINFO, CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED,
+    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_MOUSEMOVE, WM_SYSKEYDOWN, WM_SYSKEYUP, XBUTTON1, XBUTTON2,
 };
+
+// `win_logic` restates these so that it builds on Linux.
+const _: () = {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse as kbm;
+    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+    assert!(win_logic::WM_MOUSEMOVE == wm::WM_MOUSEMOVE);
+    assert!(win_logic::WM_LBUTTONDOWN == wm::WM_LBUTTONDOWN);
+    assert!(win_logic::WM_LBUTTONUP == wm::WM_LBUTTONUP);
+    assert!(win_logic::WM_RBUTTONDOWN == wm::WM_RBUTTONDOWN);
+    assert!(win_logic::WM_RBUTTONUP == wm::WM_RBUTTONUP);
+    assert!(win_logic::WM_MBUTTONDOWN == wm::WM_MBUTTONDOWN);
+    assert!(win_logic::WM_MBUTTONUP == wm::WM_MBUTTONUP);
+    assert!(win_logic::WM_MOUSEWHEEL == wm::WM_MOUSEWHEEL);
+    assert!(win_logic::WM_XBUTTONDOWN == wm::WM_XBUTTONDOWN);
+    assert!(win_logic::WM_XBUTTONUP == wm::WM_XBUTTONUP);
+    assert!(win_logic::WM_MOUSEHWHEEL == wm::WM_MOUSEHWHEEL);
+    assert!(win_logic::XBUTTON1 == wm::XBUTTON1 as u32);
+    assert!(win_logic::XBUTTON2 == wm::XBUTTON2 as u32);
+    assert!(win_logic::KEYEVENTF_EXTENDEDKEY == kbm::KEYEVENTF_EXTENDEDKEY);
+    assert!(win_logic::KEYEVENTF_KEYUP == kbm::KEYEVENTF_KEYUP);
+    assert!(win_logic::KEYEVENTF_SCANCODE == kbm::KEYEVENTF_SCANCODE);
+};
+
+const ME: DeviceId = NodeId::Windows as DeviceId;
+const PEER: DeviceId = NodeId::Debian as DeviceId;
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// Heartbeats go out every this many ticks, which is 400 ms.
+const TICKS_PER_HEARTBEAT: u32 = 4;
+/// How long after a focus change the cursor must wait before it can cross back.
+const EDGE_SETTLE_MS: u64 = 250;
+/// Receive poll gaps. The socket is non-blocking, and a laptop on battery has no peer to hurry for.
+const RX_IDLE_LINKED: Duration = Duration::from_millis(1);
+const RX_IDLE_ALONE: Duration = Duration::from_millis(10);
 
 struct GlobalNet {
     socket: UdpSocket,
     peer_addr: SocketAddr,
 }
 
+struct EdgeState {
+    span: Option<EdgeSpan>,
+    tracker: EdgeTracker,
+}
+
 static NET_STATE: OnceLock<GlobalNet> = OnceLock::new();
-/// Starts as Windows (standalone laptop mode) until a live heartbeat/FocusSwitch arrives from Debian!
-static ACTIVE_NODE: AtomicU8 = AtomicU8::new(NodeId::Windows as u8);
-static PANIC_MODE: AtomicBool = AtomicBool::new(false);
+static ROUTER: OnceLock<Mutex<Router>> = OnceLock::new();
+/// Filled by `EdgeMap`. Until one arrives no edge touches Debian.
+static EDGE: Mutex<EdgeState> =
+    Mutex::new(EdgeState { span: None, tracker: EdgeTracker::new(0) });
+static HOTKEYS: Mutex<HotkeyFilter> = Mutex::new(HotkeyFilter::new());
 static MANUAL_GAME_LOCK: AtomicBool = AtomicBool::new(false);
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
-static LAST_PEER_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+/// Buttons injected for the peer and not yet released.
 static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
+/// Keys injected for the peer and not yet released, by evdev code.
+static KEYS_HELD: [AtomicBool; KEY_SLOTS] = [const { AtomicBool::new(false) }; KEY_SLOTS];
+/// Buttons physically down on this laptop, whatever the router did with them.
+static LOCAL_BUTTONS_MASK: AtomicU8 = AtomicU8::new(0);
 static SCREEN_WIDTH: AtomicI32 = AtomicI32::new(1920);
 static SCREEN_HEIGHT: AtomicI32 = AtomicI32::new(1080);
+/// The cursor is parked at `pin_position` while the trackpad drives the peer.
+static MOUSE_PINNED: AtomicBool = AtomicBool::new(false);
+/// Last known cursor position, clamped to the screen.
+static LAST_X: AtomicI32 = AtomicI32::new(0);
+static LAST_Y: AtomicI32 = AtomicI32::new(0);
+static FOCUS_CHANGED_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic on purpose: with the wall clock, a backwards jump (NTP resync after waking away
 /// from home) makes the peer look online until the clock catches up, swallowing the keyboard.
@@ -56,13 +111,82 @@ fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// Returns true only if the Debian desktop has sent a UDP packet within the last 1,350 ms.
-/// When the laptop is taken "on the go" (away from Debian / Wi-Fi disconnected / Debian powered off),
-/// this automatically returns `false` so the laptop keyboard & trackpad work 100% natively!
-#[inline]
-fn is_debian_peer_online() -> bool {
-    let last = LAST_PEER_SEEN_MS.load(Ordering::Relaxed);
-    last > 0 && now_ms().saturating_sub(last) <= 1350
+/// The shared router. Hold the guard only to call it: never across `SendInput`, `SetCursorPos`,
+/// a socket send or `println!`. `SendInput` waits for the hook thread, and the hook thread may be
+/// waiting for this lock.
+fn router() -> MutexGuard<'static, Router> {
+    ROUTER
+        .get_or_init(|| {
+            Mutex::new(Router::new(RouterConfig {
+                me: ME,
+                peer: PEER,
+                main: PEER,
+                sharing: Sharing { mouse: true, keyboard: true },
+                pointer_speed: 1.0,
+            }))
+        })
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn edge_state() -> MutexGuard<'static, EdgeState> {
+    EDGE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Feeds events to the router, then carries out their actions outside the lock. Returns the
+/// actions, and the last event's `swallow`.
+fn route_events(events: &[Event]) -> Routed {
+    let mut routed = Routed::default();
+    {
+        let mut router = router();
+        let before = router.active();
+        for &event in events {
+            let step = router.handle(event);
+            routed.swallow = step.swallow;
+            routed.actions.extend(step.actions);
+        }
+        if router.active() != before {
+            FOCUS_CHANGED_MS.store(now_ms(), Ordering::SeqCst);
+        }
+    }
+    apply(&routed.actions, &mut WindowsBackend, &mut UdpPeer);
+    let may_have_raced = routed.actions.iter().any(|a| {
+        matches!(
+            a,
+            Action::SetBlocking { .. }
+                | Action::InjectKey { pressed: true, .. }
+                | Action::InjectButton { pressed: true, .. }
+        )
+    });
+    if may_have_raced {
+        settle_races();
+    }
+    routed
+}
+
+fn route(event: Event) -> Routed {
+    route_events(&[event])
+}
+
+/// For the hooks. The extra tick means a press finds out about a dead link by itself, so the
+/// laptop's own keyboard does not depend on the watchdog thread still running.
+fn route_local(event: Event) -> Routed {
+    route_events(&[Event::Tick { now_ms: now_ms() }, event])
+}
+
+/// Three threads apply actions outside the lock, so they can land out of order: a key press
+/// injected just after another thread's `ReleaseHeld` would stick, and a stale `SetBlocking`
+/// would leave the pin wrong. Whoever applies last corrects it here against the router.
+fn settle_races() {
+    let (remote, injecting) = {
+        let router = router();
+        let live = router.online() && !router.panicked();
+        (live && router.active() != ME, live && router.active() == ME)
+    };
+    WindowsBackend.set_blocking(remote, remote);
+    if !injecting {
+        WindowsBackend.release_held();
+    }
 }
 
 /// Returns true if a game on Windows is holding the mouse captive (either manual lock Ctrl+Alt+G
@@ -82,10 +206,7 @@ fn is_windows_game_captive() -> bool {
     false
 }
 
-static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
-static ALT_DOWN: AtomicBool = AtomicBool::new(false);
-static SWALLOWED_SCANCODES: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
-
+/// Safe from a hook: the socket is non-blocking, and a failed send is dropped.
 #[inline]
 fn send_udp_payload(payload: Payload) {
     if let Some(net) = NET_STATE.get() {
@@ -96,6 +217,106 @@ fn send_udp_payload(payload: Payload) {
         );
         if let Ok(bytes) = pkt.encode() {
             let _ = net.socket.send_to(&bytes, net.peer_addr);
+        }
+    }
+}
+
+struct UdpPeer;
+
+impl PeerSender for UdpPeer {
+    fn send(&mut self, payload: Payload) {
+        send_udp_payload(payload);
+    }
+}
+
+fn screen_size() -> (i32, i32) {
+    (SCREEN_WIDTH.load(Ordering::Relaxed), SCREEN_HEIGHT.load(Ordering::Relaxed))
+}
+
+/// The screen centre: a cursor pinned on an edge would report no outward movement.
+fn pin_position() -> (i32, i32) {
+    let (w, h) = screen_size();
+    (w / 2, h / 2)
+}
+
+fn cursor_pos() -> Option<(i32, i32)> {
+    let mut pt = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut pt) } != 0).then_some((pt.x, pt.y))
+}
+
+fn remember_cursor(pt: (i32, i32)) {
+    let (w, h) = screen_size();
+    let (x, y) = win_logic::clamp_to_screen(pt, w, h);
+    LAST_X.store(x, Ordering::Relaxed);
+    LAST_Y.store(y, Ordering::Relaxed);
+}
+
+/// A handle only: the hook, UDP and watchdog threads all use it, so its state is in statics.
+struct WindowsBackend;
+
+impl InputBackend for WindowsBackend {
+    /// Only the mouse needs anything here. Each hook call asks the router whether to swallow.
+    fn set_blocking(&mut self, mouse: bool, _keyboard: bool) {
+        let was_pinned = MOUSE_PINNED.swap(mouse, Ordering::SeqCst);
+        if mouse && !was_pinned {
+            let (x, y) = pin_position();
+            unsafe {
+                SetCursorPos(x, y);
+            }
+        } else if !mouse && was_pinned {
+            if let Some(pt) = cursor_pos() {
+                remember_cursor(pt);
+            }
+        }
+    }
+
+    fn inject_move(&mut self, dx: i32, dy: i32) {
+        inject_mouse_move(dx, dy);
+    }
+
+    fn inject_button(&mut self, button: u8, pressed: bool) {
+        // Recorded first, so a release racing this call can always see it.
+        let update = |mask| Some(win_logic::button_mask(mask, button, pressed));
+        let _ = BUTTONS_HELD_MASK.try_update(Ordering::SeqCst, Ordering::SeqCst, update);
+        inject_mouse_button(button, pressed);
+    }
+
+    fn inject_wheel(&mut self, dx: i32, dy: i32) {
+        inject_mouse_wheel(dx, dy);
+    }
+
+    fn inject_key(&mut self, scancode: u16, pressed: bool) {
+        let Some((scan, extended)) = evdev_to_win_scan(scancode) else {
+            return;
+        };
+        // Recorded first, so a release racing this call can always see it.
+        if let Some(held) = KEYS_HELD.get(scancode as usize) {
+            held.store(pressed, Ordering::SeqCst);
+        }
+        send_key(scan, extended, pressed);
+    }
+
+    fn warp_cursor(&mut self, x: i32, y: i32) {
+        if x == KEEP_CURSOR || y == KEEP_CURSOR {
+            return;
+        }
+        unsafe {
+            SetCursorPos(x, y);
+        }
+        remember_cursor((x, y));
+    }
+
+    fn release_held(&mut self) {
+        for (code, held) in KEYS_HELD.iter().enumerate() {
+            if held.swap(false, Ordering::SeqCst) {
+                if let Some((scan, extended)) = evdev_to_win_scan(code as u16) {
+                    send_key(scan, extended, false);
+                }
+            }
+        }
+        let held = BUTTONS_HELD_MASK.swap(0, Ordering::SeqCst);
+        for bit in (0..8u8).filter(|b| held & (1 << b) != 0) {
+            inject_mouse_button(bit + 1, false);
         }
     }
 }
@@ -144,11 +365,11 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                 unsafe {
                     GetCursorPos(&mut pt);
                 }
-                let active = if ACTIVE_NODE.load(Ordering::Relaxed) == NodeId::Debian as u8 {
-                    "Debian"
-                } else {
-                    "Windows"
+                let (peer_online, active_node, panic_mode) = {
+                    let router = router();
+                    (router.online(), router.active(), router.panicked())
                 };
+                let active = if active_node == PEER { "Debian" } else { "Windows" };
                 let manual = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
                 let captive = is_windows_game_captive();
                 let reason = if manual {
@@ -158,10 +379,7 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                 } else {
                     ""
                 };
-                let (w, h) = (
-                    SCREEN_WIDTH.load(Ordering::Relaxed),
-                    SCREEN_HEIGHT.load(Ordering::Relaxed),
-                );
+                let (w, h) = screen_size();
                 Some(
                     serde_json::json!({
                         "node": "windows",
@@ -171,9 +389,9 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                         "peer_ip": peer_ip,
                         "version": env!("CARGO_PKG_VERSION"),
                         "os": "Windows 11",
-                        "peer_online": is_debian_peer_online(),
+                        "peer_online": peer_online,
                         "active_node": active,
-                        "panic_mode": PANIC_MODE.load(Ordering::Relaxed),
+                        "panic_mode": panic_mode,
                         "game_lock": captive,
                         "game_reason": reason,
                         "displays": [{ "name": "Laptop display", "x": 0, "y": 0, "w": w, "h": h }],
@@ -196,11 +414,7 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                             switch_edge,
                         ),
                         "panic" => {
-                            PANIC_MODE.store(true, Ordering::SeqCst);
-                            ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
-                            for _ in 0..3 {
-                                send_udp_payload(Payload::PanicRelease);
-                            }
+                            route(Event::Panic);
                         }
                         "toggle_game_lock" => {
                             MANUAL_GAME_LOCK.fetch_xor(true, Ordering::SeqCst);
@@ -282,6 +496,33 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
     }
 }
 
+/// Handles one physical key. Returns true to keep it from the OS.
+fn local_key(code: u16, pressed: bool) -> bool {
+    let link_up = router().online();
+    let key_route = HOTKEYS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .feed(code, pressed, link_up);
+    match key_route {
+        // Panic stays with the OS: restoring the keyboard must not depend on anything else.
+        KeyRoute::Hotkey(Hotkey::Panic) => {
+            route(Event::Panic);
+            false
+        }
+        KeyRoute::Hotkey(Hotkey::ManualSwitch) => {
+            route(Event::ManualSwitch);
+            true
+        }
+        KeyRoute::Hotkey(Hotkey::GameLock) => {
+            MANUAL_GAME_LOCK.fetch_xor(true, Ordering::SeqCst);
+            true
+        }
+        KeyRoute::ConsumedSwallowed => true,
+        KeyRoute::ConsumedToOs => false,
+        KeyRoute::Route => route_local(Event::LocalKey { scancode: code, pressed }).swallow,
+    }
+}
+
 unsafe extern "system" fn keyboard_hook_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -289,123 +530,138 @@ unsafe extern "system" fn keyboard_hook_proc(
 ) -> LRESULT {
     if n_code == HC_ACTION as i32 && l_param != 0 {
         let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
-
-        // Ignore software-injected events so we never create feedback loops
-        if (kb.flags & LLKHF_INJECTED) != 0 {
-            return CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param);
-        }
-
         let msg = w_param as u32;
         let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let released = msg == WM_KEYUP || msg == WM_SYSKEYUP;
 
-        if pressed || released {
-            let vk = kb.vkCode as u16;
+        // Ignore software-injected events so we never create feedback loops
+        if (kb.flags & LLKHF_INJECTED) == 0 && (pressed || released) {
             let extended = (kb.flags & LLKHF_EXTENDED) != 0;
-
-            if vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL {
-                CTRL_DOWN.store(pressed, Ordering::Relaxed);
-            }
-            if vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU {
-                ALT_DOWN.store(pressed, Ordering::Relaxed);
-            }
-
-            // Fail-Safe / Panic Hotkey: Ctrl + Alt + ScrollLock OR Ctrl + Alt + F12
-            if pressed
-                && CTRL_DOWN.load(Ordering::Relaxed)
-                && ALT_DOWN.load(Ordering::Relaxed)
-                && (vk == VK_SCROLL || vk == VK_F12)
-            {
-                PANIC_MODE.store(true, Ordering::SeqCst);
-                ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
-                for _ in 0..3 {
-                    send_udp_payload(Payload::PanicRelease);
-                }
-                println!(
-                    "[PANIC] Fail-Safe Hotkey (Ctrl+Alt+ScrollLock/F12) triggered! Local Windows keyboard restored and Debian EVIOCGRAB released."
-                );
-                return CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param);
-            }
-
-            // Manual Game Captive Lock Hotkey: Ctrl + Alt + G (0x47)
-            if pressed
-                && CTRL_DOWN.load(Ordering::Relaxed)
-                && ALT_DOWN.load(Ordering::Relaxed)
-                && vk == 0x47
-                && is_debian_peer_online()
-            {
-                let prev = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
-                MANUAL_GAME_LOCK.store(!prev, Ordering::SeqCst);
-                println!(
-                    "[Windows] Game Captive Lock (Ctrl+Alt+G): {}",
-                    if !prev { "LOCKED" } else { "UNLOCKED" }
-                );
-                return 1;
-            }
-
-            // Manual Focus Toggle Hotkey: Ctrl + Alt + F11
-            if pressed
-                && CTRL_DOWN.load(Ordering::Relaxed)
-                && ALT_DOWN.load(Ordering::Relaxed)
-                && vk == VK_F11
-                && is_debian_peer_online()
-            {
-                PANIC_MODE.store(false, Ordering::SeqCst);
-                let cur = ACTIVE_NODE.load(Ordering::SeqCst);
-                let next = if cur == NodeId::Debian as u8 {
-                    NodeId::Windows
-                } else {
-                    NodeId::Debian
-                };
-                ACTIVE_NODE.store(next as u8, Ordering::SeqCst);
-                for _ in 0..3 {
-                    send_udp_payload(Payload::FocusSwitch {
-                        target_node: next,
-                        cursor_y_ratio: 0.5,
-                    });
-                }
-                println!("[Windows] Manual focus toggle (Ctrl+Alt+F11) -> {}", next);
-                return 1;
-            }
-
-            if let Some(scancode) = win_vk_scan_to_evdev(kb.vkCode, kb.scanCode, extended) {
-                let idx = (scancode as usize).min(255);
-                // On-The-Go Safety: Only forward & swallow keys if Debian peer is actively online!
-                let is_debian_focused = !PANIC_MODE.load(Ordering::Relaxed)
-                    && ACTIVE_NODE.load(Ordering::Relaxed) == NodeId::Debian as u8
-                    && is_debian_peer_online();
-
-                if is_debian_focused {
-                    if pressed {
-                        SWALLOWED_SCANCODES[idx].store(true, Ordering::Relaxed);
-                        send_udp_payload(Payload::KeyEvent {
-                            scancode,
-                            pressed: true,
-                        });
-                        return 1; // Swallow keystroke locally on Windows!
-                    } else {
-                        let was_swallowed =
-                            SWALLOWED_SCANCODES[idx].swap(false, Ordering::Relaxed);
-                        send_udp_payload(Payload::KeyEvent {
-                            scancode,
-                            pressed: false,
-                        });
-                        if was_swallowed {
-                            return 1;
-                        }
-                    }
-                } else if released && SWALLOWED_SCANCODES[idx].swap(false, Ordering::Relaxed) {
-                    // Key was pressed while Debian had focus and released after switching to Windows
-                    send_udp_payload(Payload::KeyEvent {
-                        scancode,
-                        pressed: false,
-                    });
+            if let Some(code) = win_vk_scan_to_evdev(kb.vkCode, kb.scanCode, extended) {
+                if local_key(code, pressed) {
+                    return 1;
                 }
             }
         }
     }
 
     CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param)
+}
+
+/// Counts a cursor at `(x, y)` that just moved by `(dx, dy)` against the edge touching Debian,
+/// and crosses when the push completes. Returns true if focus left this laptop.
+fn push_edge(x: i32, y: i32, dx: i32, dy: i32) -> bool {
+    let may_cross = {
+        let router = router();
+        router.online() && !router.panicked() && !router.captive() && router.active() == ME
+    };
+    let settled =
+        now_ms().saturating_sub(FOCUS_CHANGED_MS.load(Ordering::SeqCst)) >= EDGE_SETTLE_MS;
+    if !may_cross || !settled {
+        return false;
+    }
+    let (w, h) = screen_size();
+    let buttons_held = BUTTONS_HELD_MASK.load(Ordering::SeqCst) != 0
+        || LOCAL_BUTTONS_MASK.load(Ordering::SeqCst) != 0;
+    let pushed_through = {
+        let mut edge = edge_state();
+        match edge.span {
+            Some(span) => edge.tracker.push(span, x, y, w, h, dx, dy, buttons_held),
+            None => false,
+        }
+    };
+    pushed_through
+        && route(Event::EdgeCrossed { x, y })
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::SendFocus { .. }))
+}
+
+/// Handles physical pointer movement to `pt`. Returns true to keep it from the OS.
+fn local_move(pt: (i32, i32)) -> bool {
+    let pinned = MOUSE_PINNED.load(Ordering::SeqCst);
+    let pin = pinned.then(pin_position);
+    let cursor = if pinned { cursor_pos() } else { None };
+    let last = (LAST_X.load(Ordering::Relaxed), LAST_Y.load(Ordering::Relaxed));
+    let Some((dx, dy)) = win_logic::move_offset(pt, last, pin, cursor) else {
+        return false;
+    };
+
+    if route_local(Event::LocalMove { dx, dy }).swallow {
+        // Something moved the cursor off the pin. Put it back: blocked moves leave it there.
+        if let (Some((x, y)), true) = (pin, cursor != pin) {
+            unsafe {
+                SetCursorPos(x, y);
+            }
+        }
+        return true;
+    }
+
+    remember_cursor(pt);
+    if pinned {
+        // Blocking ended just now, so the offset was measured from the pin, not a real move.
+        return false;
+    }
+    let (w, h) = screen_size();
+    let (x, y) = win_logic::clamp_to_screen(pt, w, h);
+    // On a crossing the event must not reach the OS, or it would drag the cursor off the pin.
+    push_edge(x, y, dx, dy)
+}
+
+/// Handles one physical mouse event. Returns true to keep it from the OS.
+fn local_mouse(msg: u32, pt: (i32, i32), mouse_data: u32) -> bool {
+    if msg == WM_MOUSEMOVE {
+        return local_move(pt);
+    }
+    if let Some((dx, dy)) = win_logic::wheel_delta(msg, mouse_data) {
+        return route_local(Event::LocalWheel { dx, dy }).swallow;
+    }
+    if let Some((button, pressed)) = win_logic::mouse_button_event(msg, mouse_data) {
+        let update = |mask| Some(win_logic::button_mask(mask, button, pressed));
+        let _ = LOCAL_BUTTONS_MASK.try_update(Ordering::SeqCst, Ordering::SeqCst, update);
+        return route_local(Event::LocalButton { button, pressed }).swallow;
+    }
+    false
+}
+
+unsafe extern "system" fn mouse_hook_proc(
+    n_code: i32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+) -> LRESULT {
+    if n_code == HC_ACTION as i32 && l_param != 0 {
+        let ms = &*(l_param as *const MSLLHOOKSTRUCT);
+        let pt = (ms.pt.x, ms.pt.y);
+        if (ms.flags & LLMHF_INJECTED) != 0 {
+            // Not routed, but it does move the cursor, and local offsets are measured from there.
+            if w_param as u32 == WM_MOUSEMOVE {
+                remember_cursor(pt);
+            }
+        } else if local_mouse(w_param as u32, pt, ms.mouseData) {
+            return 1;
+        }
+    }
+
+    CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param)
+}
+
+#[inline]
+fn send_key(scan: u16, extended: bool, pressed: bool) {
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: 0,
+                wScan: scan,
+                dwFlags: win_logic::key_flags(extended, pressed),
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 #[inline]
@@ -527,11 +783,14 @@ pub fn run_windows_node(
     let sm_h = unsafe { GetSystemMetrics(SM_CYSCREEN) }.max(100);
     let det_w = phys_w.max(sm_w).max(100);
     let det_h = phys_h.max(sm_h).max(100);
-    let width = override_width.unwrap_or(det_w);
-    let height = override_height.unwrap_or(det_h);
+    let width = override_width.unwrap_or(det_w).max(100);
+    let height = override_height.unwrap_or(det_h).max(100);
 
     SCREEN_WIDTH.store(width, Ordering::SeqCst);
     SCREEN_HEIGHT.store(height, Ordering::SeqCst);
+    if let Some(pt) = cursor_pos() {
+        remember_cursor(pt);
+    }
 
     // Ensure auto-boot on Windows login is installed
     ensure_windows_autorun_installed(peer_addr, switch_edge);
@@ -548,6 +807,14 @@ pub fn run_windows_node(
     let rx_socket = socket
         .try_clone()
         .map_err(|e| format!("Failed to clone UDP socket: {}", e))?;
+    // The hooks send on this socket, and must never block. Both handles are set, as the mode may
+    // be shared between them. Sends stay on the listening port: a stateful firewall may be
+    // letting Debian's packets in only as replies to that port.
+    for handle in [&socket, &rx_socket] {
+        handle
+            .set_nonblocking(true)
+            .map_err(|e| format!("Failed to make UDP socket non-blocking: {}", e))?;
+    }
 
     let _ = NET_STATE.set(GlobalNet {
         socket,
@@ -572,44 +839,55 @@ pub fn run_windows_node(
         "[Windows] On-The-Go Watchdog enabled: If Debian peer is unreachable (>1.3s), laptop operates 100% standalone."
     );
 
-    // Spawn periodic heartbeat & liveness watchdog thread (every 400ms)
+    // Spawn the link and game-captive watchdog (every 100ms), which also sends heartbeats.
+    // State changes are logged here because the hooks must not print.
     std::thread::Builder::new()
         .name("mesh-kvm-win-watchdog".to_string())
         .spawn(move || {
-            let mut was_online = false;
+            let mut captive = false;
+            let mut logged = None;
+            let mut ticks = 0u32;
             loop {
-                std::thread::sleep(Duration::from_millis(400));
-                let online = is_debian_peer_online();
-                if !online && was_online {
-                    was_online = false;
-                    ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
-                    // Debian can no longer send the button-up for anything it was holding
-                    let held = BUTTONS_HELD_MASK.swap(0, Ordering::SeqCst);
-                    for bit in (0..8u8).filter(|b| held & (1 << b) != 0) {
-                        inject_mouse_button(bit + 1, false);
-                    }
-                    println!(
-                        "[Windows] Debian peer disconnected/out-of-range -> Switched to Standalone Laptop Mode."
-                    );
-                } else if online && !was_online {
-                    was_online = true;
-                    println!("[Windows] Debian peer online -> Mesh KVM link active.");
+                std::thread::sleep(TICK_INTERVAL);
+                route(Event::Tick { now_ms: now_ms() });
+
+                let now_captive = is_windows_game_captive();
+                if now_captive != captive {
+                    captive = now_captive;
+                    route(Event::SetCaptive(captive));
                 }
-                send_udp_payload(Payload::Heartbeat);
-                send_udp_payload(Payload::PeerDisplayInfo {
-                    width: SCREEN_WIDTH.load(Ordering::Relaxed),
-                    height: SCREEN_HEIGHT.load(Ordering::Relaxed),
-                });
+
+                let status = {
+                    let router = router();
+                    (router.online(), router.active(), router.panicked(), router.captive())
+                };
+                if logged != Some(status) {
+                    logged = Some(status);
+                    let (online, active, panicked, captive) = status;
+                    let active = if active == PEER { "DEBIAN" } else { "WINDOWS" };
+                    println!(
+                        "[Windows] Link {}, active {}, panic {}, game lock {}",
+                        if online { "up" } else { "down" },
+                        active,
+                        panicked,
+                        captive
+                    );
+                }
+
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(TICKS_PER_HEARTBEAT) {
+                    send_udp_payload(Payload::Heartbeat);
+                    send_udp_payload(Payload::PeerDisplayInfo { width, height });
+                }
             }
         })
-        .ok();
+        .map_err(|e| format!("Failed to spawn watchdog thread: {}", e))?;
 
-    // Spawn high-priority UDP receiver and mouse injection / edge-transition worker thread
+    // Spawn the UDP receiver, which feeds peer packets to the router
     std::thread::Builder::new()
         .name("mesh-kvm-win-udp".to_string())
         .spawn(move || {
             let mut buf = [0u8; 512];
-            let mut last_switch_instant = Instant::now() - Duration::from_secs(1);
             let mut last_rx_focus_seq = 0u64;
 
             loop {
@@ -618,175 +896,75 @@ pub fn run_windows_node(
                         if src_addr.ip() != peer_addr.ip() {
                             continue;
                         }
-                        if let Ok(pkt) = Packet::decode(&buf[..len]) {
-                            LAST_PEER_SEEN_MS.store(now_ms(), Ordering::Relaxed);
-                            match pkt.payload {
-                                Payload::MouseMoveDelta { dx, dy } => {
-                                    if !PANIC_MODE.load(Ordering::Relaxed)
-                                        && ACTIVE_NODE.load(Ordering::Relaxed)
-                                            == NodeId::Windows as u8
-                                    {
-                                        inject_mouse_move(dx, dy);
-
-                                        // Check cursor position for screen-edge transition back to Debian
-                                        let mut pt = POINT { x: 0, y: 0 };
-                                        if unsafe { GetCursorPos(&mut pt) } != 0 {
-                                            let w = SCREEN_WIDTH.load(Ordering::Relaxed);
-                                            let h = SCREEN_HEIGHT.load(Ordering::Relaxed);
-
-                                            let hit_edge = match switch_edge {
-                                                SwitchEdge::Left => dx < 0 && pt.x <= 0,
-                                                SwitchEdge::Right => dx > 0 && pt.x >= w - 1,
-                                                SwitchEdge::Top => dy < 0 && pt.y <= 0,
-                                                SwitchEdge::Bottom => dy > 0 && pt.y >= h - 1,
-                                            };
-
-                                            if hit_edge
-                                                && !is_windows_game_captive()
-                                                && BUTTONS_HELD_MASK.load(Ordering::Relaxed) == 0
-                                                && last_switch_instant.elapsed()
-                                                    >= Duration::from_millis(150)
-                                            {
-                                                ACTIVE_NODE
-                                                    .store(NodeId::Debian as u8, Ordering::SeqCst);
-                                                last_switch_instant = Instant::now();
-                                                let cursor_y_ratio =
-                                                    (pt.y as f32 / h as f32).clamp(0.0, 1.0);
-
-                                                // Step Windows cursor slightly away from edge
-                                                let safe_x = match switch_edge {
-                                                    SwitchEdge::Left => 24.min(w - 1),
-                                                    SwitchEdge::Right => (w - 24).max(0),
-                                                    _ => pt.x,
-                                                };
-                                                let safe_y = match switch_edge {
-                                                    SwitchEdge::Top => 24.min(h - 1),
-                                                    SwitchEdge::Bottom => (h - 24).max(0),
-                                                    _ => pt.y,
-                                                };
-                                                unsafe {
-                                                    SetCursorPos(safe_x, safe_y);
-                                                }
-
-                                                let switch_pkt = Packet::new(
-                                                    SEQ_COUNTER.fetch_add(1, Ordering::Relaxed),
-                                                    NodeId::Windows,
-                                                    Payload::FocusSwitch {
-                                                        target_node: NodeId::Debian,
-                                                        cursor_y_ratio,
-                                                    },
-                                                );
-                                                if let Ok(bytes) = switch_pkt.encode() {
-                                                    for _ in 0..3 {
-                                                        let _ =
-                                                            rx_socket.send_to(&bytes, peer_addr);
-                                                    }
-                                                }
-                                                println!(
-                                                    "[Windows] <-- Edge transition ({})! Focus switched to DEBIAN (y_ratio: {:.3})",
-                                                    switch_edge, cursor_y_ratio
-                                                );
-                                            }
-                                        }
+                        let Ok(pkt) = Packet::decode(&buf[..len]) else {
+                            continue;
+                        };
+                        route(Event::PeerAlive { now_ms: now_ms() });
+                        match pkt.payload {
+                            Payload::MouseMoveDelta { dx, dy } => {
+                                let routed = route(Event::PeerMove { dx, dy });
+                                let injected = routed
+                                    .actions
+                                    .iter()
+                                    .any(|a| matches!(a, Action::InjectMove { .. }));
+                                if injected {
+                                    if let Some((x, y)) = cursor_pos() {
+                                        push_edge(x, y, dx, dy);
                                     }
                                 }
-                                Payload::MouseButton { button, pressed } => {
-                                    let bit = button.saturating_sub(1).min(7);
-                                    if pressed {
-                                        BUTTONS_HELD_MASK.fetch_or(1 << bit, Ordering::SeqCst);
-                                    } else {
-                                        BUTTONS_HELD_MASK.fetch_and(!(1 << bit), Ordering::SeqCst);
-                                    }
-
-                                    if !PANIC_MODE.load(Ordering::Relaxed)
-                                        && ACTIVE_NODE.load(Ordering::Relaxed)
-                                            == NodeId::Windows as u8
-                                    {
-                                        inject_mouse_button(button, pressed);
-                                    }
-                                }
-                                Payload::MouseWheel { delta_x, delta_y } => {
-                                    if !PANIC_MODE.load(Ordering::Relaxed)
-                                        && ACTIVE_NODE.load(Ordering::Relaxed)
-                                            == NodeId::Windows as u8
-                                    {
-                                        inject_mouse_wheel(delta_x, delta_y);
-                                    }
-                                }
-                                Payload::FocusSwitch {
-                                    target_node,
-                                    cursor_y_ratio,
-                                } => {
-                                    if pkt.seq <= last_rx_focus_seq && pkt.seq != 0 {
-                                        continue;
-                                    }
-                                    last_rx_focus_seq = pkt.seq;
-                                    PANIC_MODE.store(false, Ordering::SeqCst);
-
-                                    let prev =
-                                        ACTIVE_NODE.swap(target_node as u8, Ordering::SeqCst);
-                                    last_switch_instant = Instant::now();
-
-                                    if target_node == NodeId::Windows {
-                                        let w = SCREEN_WIDTH.load(Ordering::Relaxed);
-                                        let h = SCREEN_HEIGHT.load(Ordering::Relaxed);
-                                        let target_y = ((cursor_y_ratio * h as f32) as i32)
-                                            .clamp(0, h - 1);
-                                        let (entry_x, entry_y) = match switch_edge {
-                                            SwitchEdge::Left => (24.min(w - 1), target_y),
-                                            SwitchEdge::Right => ((w - 24).max(0), target_y),
-                                            SwitchEdge::Top => (w / 2, 24.min(h - 1)),
-                                            SwitchEdge::Bottom => (w / 2, (h - 24).max(0)),
-                                        };
-                                        unsafe {
-                                            SetCursorPos(entry_x, entry_y);
-                                        }
-                                        if prev != NodeId::Windows as u8 {
-                                            println!(
-                                                "[Windows] --> Focus switched to WINDOWS (entry cursor: {}, {})",
-                                                entry_x, entry_y
-                                            );
-                                        }
-                                    } else if prev != NodeId::Debian as u8 {
-                                        println!("[Windows] <-- Focus switched to DEBIAN");
-                                    }
-
-                                    send_udp_payload(Payload::FocusAck {
-                                        active_node: target_node,
-                                        seq_ref: pkt.seq,
-                                    });
-                                    send_udp_payload(Payload::PeerDisplayInfo {
-                                        width: SCREEN_WIDTH.load(Ordering::Relaxed),
-                                        height: SCREEN_HEIGHT.load(Ordering::Relaxed),
-                                    });
-                                }
-                                Payload::Heartbeat => {
-                                    send_udp_payload(Payload::PeerDisplayInfo {
-                                        width: SCREEN_WIDTH.load(Ordering::Relaxed),
-                                        height: SCREEN_HEIGHT.load(Ordering::Relaxed),
-                                    });
-                                }
-                                Payload::PanicRelease => {
-                                    PANIC_MODE.store(true, Ordering::SeqCst);
-                                    ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
-                                    println!(
-                                        "[PANIC] Received PanicRelease from Debian! Local keyboard unlocked."
-                                    );
-                                }
-                                _ => {}
                             }
+                            Payload::MouseButton { button, pressed } => {
+                                route(Event::PeerButton { button, pressed });
+                            }
+                            Payload::MouseWheel { delta_x, delta_y } => {
+                                route(Event::PeerWheel { dx: delta_x, dy: delta_y });
+                            }
+                            Payload::KeyEvent { scancode, pressed } => {
+                                route(Event::PeerKey { scancode, pressed });
+                            }
+                            Payload::FocusSwitchAt { target_node, x, y } => {
+                                if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
+                                    route(Event::PeerFocus {
+                                        target: target_node as DeviceId,
+                                        x,
+                                        y,
+                                    });
+                                }
+                            }
+                            Payload::ActiveView { active_node } => {
+                                route(Event::PeerActiveView { active: active_node as DeviceId });
+                            }
+                            Payload::GameLock { locked } => {
+                                route(Event::PeerGameLock(locked));
+                            }
+                            Payload::EdgeMap { edge, start, end, resistance } => {
+                                let mut state = edge_state();
+                                state.span = Some(EdgeSpan { edge, start, end });
+                                state.tracker.set_resistance(resistance);
+                            }
+                            Payload::Heartbeat => {
+                                send_udp_payload(Payload::PeerDisplayInfo { width, height });
+                            }
+                            Payload::PanicRelease => {
+                                println!(
+                                    "[PANIC] Received PanicRelease from Debian! Local keyboard unlocked."
+                                );
+                                route(Event::PeerPanic);
+                            }
+                            _ => {}
                         }
                     }
                     Err(_) => {
-                        std::thread::sleep(Duration::from_millis(1));
+                        let linked = router().online();
+                        std::thread::sleep(if linked { RX_IDLE_LINKED } else { RX_IDLE_ALONE });
                     }
                 }
             }
         })
         .map_err(|e| format!("Failed to spawn UDP thread: {}", e))?;
 
-    // Install WH_KEYBOARD_LL hook on main thread and run Win32 message loop
-    let hook = unsafe {
+    // Install both low-level hooks on this thread and run the Win32 message loop
+    let keyboard_hook = unsafe {
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
             Some(keyboard_hook_proc),
@@ -794,10 +972,20 @@ pub fn run_windows_node(
             0,
         )
     };
-    if hook.is_null() {
+    if keyboard_hook.is_null() {
         return Err("SetWindowsHookExW(WH_KEYBOARD_LL) failed".to_string());
     }
     println!("[Windows] Installed WH_KEYBOARD_LL low-level keyboard hook.");
+
+    let mouse_hook =
+        unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), ptr::null_mut(), 0) };
+    if mouse_hook.is_null() {
+        unsafe {
+            UnhookWindowsHookEx(keyboard_hook);
+        }
+        return Err("SetWindowsHookExW(WH_MOUSE_LL) failed".to_string());
+    }
+    println!("[Windows] Installed WH_MOUSE_LL low-level mouse hook.");
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     unsafe {
@@ -805,7 +993,8 @@ pub fn run_windows_node(
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        UnhookWindowsHookEx(hook);
+        UnhookWindowsHookEx(mouse_hook);
+        UnhookWindowsHookEx(keyboard_hook);
     }
 
     Ok(())
