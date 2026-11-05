@@ -92,6 +92,10 @@ pub enum Payload {
     PanicRelease,
     Heartbeat,
     PeerDisplayInfo { width: i32, height: i32 },
+    /// Debian to laptop with each heartbeat: which laptop edge touches Debian, and where.
+    EdgeMap { edge: SwitchEdge, start: i32, end: i32, resistance: i32 },
+    /// Replaces `FocusSwitch` for all new sends; `x`, `y` are laptop-local.
+    FocusSwitchAt { target_node: NodeId, x: i32, y: i32 },
 }
 
 impl Packet {
@@ -124,3 +128,40 @@ pub const MOUSE_BTN_RIGHT: u8 = 2;
 pub const MOUSE_BTN_MIDDLE: u8 = 3;
 pub const MOUSE_BTN_SIDE: u8 = 4;
 pub const MOUSE_BTN_EXTRA: u8 = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(payload: Payload) -> Payload {
+        let bytes = Packet::new(1, NodeId::Debian, payload).encode().unwrap();
+        Packet::decode(&bytes).unwrap().payload
+    }
+
+    #[test]
+    fn new_payloads_round_trip() {
+        match round_trip(Payload::EdgeMap { edge: SwitchEdge::Bottom, start: -5, end: 900, resistance: 55 }) {
+            Payload::EdgeMap { edge, start, end, resistance } => {
+                assert_eq!((edge, start, end, resistance), (SwitchEdge::Bottom, -5, 900, 55));
+            }
+            other => panic!("wrong payload: {other:?}"),
+        }
+        match round_trip(Payload::FocusSwitchAt { target_node: NodeId::Windows, x: 12, y: -34 }) {
+            Payload::FocusSwitchAt { target_node, x, y } => {
+                assert_eq!((target_node, x, y), (NodeId::Windows, 12, -34));
+            }
+            other => panic!("wrong payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_indexes_unchanged() {
+        // Header: magic(4) + seq(8) + source NodeId(4) = 16 bytes, then the variant index.
+        let index = |p: Payload| {
+            let bytes = Packet::new(0, NodeId::Debian, p).encode().unwrap();
+            bytes[16..20].to_vec()
+        };
+        assert_eq!(index(Payload::Heartbeat), 7u32.to_le_bytes());
+        assert_eq!(index(Payload::PeerDisplayInfo { width: 1, height: 1 }), 8u32.to_le_bytes());
+    }
+}
