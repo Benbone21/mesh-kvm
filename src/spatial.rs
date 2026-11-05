@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Command;
-use std::sync::atomic::Ordering;
-#[allow(unused_imports)]
-use std::sync::atomic::AtomicBool as _AtomicBoolUnused;
 use std::sync::{Arc, RwLock};
 
 const LAYOUT_FILE: &str = "/home/bread/mesh-kvm/layout.json";
@@ -605,5 +602,4 @@ fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val:
         }
         _ => {}
     }
-    let _ = Ordering::Relaxed;
 }

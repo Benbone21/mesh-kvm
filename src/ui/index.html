@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mesh-kvm Studio</title>
+<style>
+  /* Served from the daemon with no network dependency, so only system fonts. */
+  :root {
+    --deep: #15242a;
+    --panel: #20353c;
+    --raised: #2b464e;
+    --edge: #41636c;
+    --ink: #eee9da;
+    --dim: #a5bcbc;
+    --amber: #ffb22e;
+    --green: #63e08e;
+    --red: #ff7a66;
+    --debian: #3f8c8c;
+    --font: Bahnschrift, "DIN Alternate", "Barlow", "Noto Sans", "DejaVu Sans", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--deep); }
+  body { margin: 0; color: var(--ink); font: 15px/1.45 var(--font); background: var(--deep); }
+  h1, h2, h3, p { margin: 0; }
+  h2 { font-size: 17px; font-weight: 600; }
+  button, select, input { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  .bar {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 24px;
+    padding: 18px 24px; background: var(--panel); border-bottom: 2px solid var(--edge);
+  }
+  .bay { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .bay.right { justify-content: flex-end; text-align: right; }
+  .bay strong { display: block; font-size: 19px; font-weight: 600; line-height: 1.2; }
+  .bay small { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
+  .led { flex: none; width: 14px; height: 14px; border-radius: 50%; background: #0e181c; box-shadow: inset 0 0 0 2px var(--edge); }
+  .led.on { background: var(--green); box-shadow: 0 0 10px var(--green); }
+  .led.active { background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+
+  /* The one physical object on the panel: a slide switch that shows who owns the keyboard. */
+  .switch {
+    position: relative; width: 196px; height: 58px; padding: 0; border: 2px solid var(--edge);
+    border-radius: 6px; background: var(--deep); cursor: pointer;
+    box-shadow: inset 0 3px 8px rgba(0, 0, 0, .55);
+  }
+  .switch:disabled { cursor: not-allowed; opacity: .55; }
+  .switch .knob {
+    position: absolute; top: 4px; left: 4px; width: 92px; height: 46px; border-radius: 3px;
+    display: grid; place-items: center; color: var(--deep); font-weight: 700;
+    background: repeating-linear-gradient(90deg, var(--amber) 0 5px, #e79b1c 5px 7px);
+    transition: transform .16s cubic-bezier(.3, 1.5, .6, 1);
+  }
+  .switch[data-node="Windows"] .knob { transform: translateX(94px); }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 2px; background: var(--edge); }
+  section { background: var(--panel); padding: 20px 24px; min-width: 0; }
+  .map-wrap { background: var(--deep); padding: 20px 24px; display: flex; flex-direction: column; gap: 12px; }
+  .map-head { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  .map-head span { color: var(--dim); font-size: 14px; }
+  #map { position: relative; flex: 1; min-height: 340px; overflow: hidden; touch-action: none; }
+  .screen {
+    position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 4px; text-align: center; overflow: hidden; font-size: 14px; line-height: 1.25;
+    background: color-mix(in srgb, var(--debian) 28%, var(--deep)); border: 2px solid var(--debian); border-radius: 4px;
+  }
+  .screen small { color: var(--dim); font-size: 12px; }
+  .screen.laptop {
+    background: color-mix(in srgb, var(--amber) 16%, var(--deep)); border-color: var(--amber);
+    cursor: grab; z-index: 1;
+  }
+  .screen.laptop.dragging { cursor: grabbing; }
+  .screen.owner { box-shadow: 0 0 0 2px var(--ink); }
+  #cursor { position: absolute; z-index: 2; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: var(--red); pointer-events: none; }
+
+  .side { display: flex; flex-direction: column; gap: 18px; }
+  .field { display: grid; gap: 4px; }
+  .field > label, .line > label { font-size: 14px; }
+  .line { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .value { color: var(--amber); font-variant-numeric: tabular-nums; }
+  .hint { color: var(--dim); font-size: 13px; }
+  select, .btn {
+    min-height: 38px; padding: 6px 12px; border: 1px solid var(--edge); border-radius: 4px;
+    background: var(--raised); width: 100%;
+  }
+  .btn { cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--ink); }
+  .btn:disabled, select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.stop { color: var(--deep); background: var(--red); border-color: var(--red); font-weight: 600; }
+  input[type=range] { width: 100%; accent-color: var(--amber); }
+  input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--amber); }
+
+  .devices { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; grid-column: 1 / -1; background: var(--edge); }
+  .device { display: flex; flex-direction: column; gap: 14px; }
+  .device-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .device-body { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 24px; }
+  .device-body h3 { font-size: 14px; font-weight: 600; color: var(--dim); }
+  .col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .meter { height: 8px; background: var(--deep); border-radius: 2px; overflow: hidden; }
+  .meter div { height: 100%; width: 0; background: var(--green); }
+  .notice { padding: 10px 24px; color: var(--deep); background: var(--amber); font-weight: 600; }
+  .notice.bad { background: var(--red); }
+  .offline { color: var(--dim); }
+  [hidden] { display: none !important; }
+
+  @media (max-width: 960px) {
+    main, .devices { grid-template-columns: minmax(0, 1fr); }
+    .bar { grid-template-columns: 1fr 1fr; padding: 14px 16px; }
+    .bar .switch { grid-row: 2; grid-column: 1 / -1; justify-self: center; }
+    section, .map-wrap { padding: 16px; }
+    #map { min-height: 260px; }
+  }
+  @media (max-width: 520px) { .device-body { grid-template-columns: minmax(0, 1fr); } }
+  @media (prefers-reduced-motion: reduce) { .switch .knob { transition: none; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="bay">
+    <span class="led" id="led-debian"></span>
+    <div><strong>Debian desktop</strong><small id="sub-debian">Connecting</small></div>
+  </div>
+  <button class="switch" id="switch" type="button" data-node="Debian" aria-label="Switch keyboard and mouse to the other device">
+    <span class="knob" id="knob">Debian</span>
+  </button>
+  <div class="bay right">
+    <div><strong>Windows laptop</strong><small id="sub-windows">Connecting</small></div>
+    <span class="led" id="led-windows"></span>
+  </div>
+</header>
+<div class="notice" id="notice" hidden></div>
+
+<main>
+  <div class="map-wrap">
+    <div class="map-head">
+      <h2>Screens</h2>
+      <span id="map-hint">Drag the laptop to where it sits on your desk.</span>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <section class="side" aria-label="Layout and pointer">
+    <div class="field">
+      <label for="place">Laptop position</label>
+      <select id="place"></select>
+    </div>
+    <div class="field">
+      <label for="res">Laptop resolution</label>
+      <select id="res">
+        <option value="native">Native</option>
+        <option>1920x1080</option><option>1920x1200</option><option>2560x1440</option>
+        <option>2560x1600</option><option>2880x1800</option><option>3840x2160</option>
+      </select>
+    </div>
+    <div class="field">
+      <div class="line"><label for="speed">Pointer speed on the laptop</label><span class="value" id="speed-v"></span></div>
+      <input type="range" id="speed" min="0.05" max="1.5" step="0.05">
+    </div>
+    <div class="field">
+      <div class="line"><label for="edge">Push needed to cross a screen edge</label><span class="value" id="edge-v"></span></div>
+      <input type="range" id="edge" min="10" max="180" step="5">
+    </div>
+    <div class="line"><label for="auto-lock">Keep the mouse on the screen while a game runs</label><input type="checkbox" id="auto-lock"></div>
+    <div class="line"><label for="man-lock">Lock the mouse to this screen now</label><input type="checkbox" id="man-lock"></div>
+    <p class="hint" id="lock-state"></p>
+    <button class="btn" id="native" type="button">Reset to native resolutions</button>
+    <button class="btn stop" id="panic" type="button">Release all input</button>
+  </section>
+
+  <div class="devices" id="devices"></div>
+</main>
+
+<template id="device-tpl">
+  <section class="device">
+    <div class="device-head">
+      <h2 data-f="title"></h2>
+      <span class="hint" data-f="meta"></span>
+    </div>
+    <p class="offline" data-f="offline" hidden></p>
+    <div class="device-body" data-f="body">
+      <div class="col">
+        <h3 data-f="tx-title"></h3>
+        <div class="line"><label data-for="tx">Share audio</label><input type="checkbox" data-c="tx"></div>
+        <div class="meter"><div data-f="tx-peak"></div></div>
+        <div class="field" data-f="source-wrap">
+          <label data-for="source">Audio to share</label>
+          <select data-c="source"><option value="0">System sound</option><option value="1">Microphone</option></select>
+        </div>
+        <div class="field">
+          <div class="line"><label data-for="txv">Share volume</label><span class="value" data-f="txv-v"></span></div>
+          <input type="range" min="0" max="150" step="5" data-c="txv">
+        </div>
+      </div>
+      <div class="col">
+        <h3 data-f="rx-title"></h3>
+        <div class="line"><label data-for="mute">Mute incoming audio</label><input type="checkbox" data-c="mute"></div>
+        <div class="meter"><div data-f="rx-peak"></div></div>
+        <div class="field">
+          <div class="line"><label data-for="rxv">Incoming volume</label><span class="value" data-f="rxv-v"></span></div>
+          <input type="range" min="0" max="150" step="5" data-c="rxv">
+        </div>
+        <button class="btn" type="button" data-c="chime"></button>
+      </div>
+    </div>
+    <div class="line" data-f="auto-wrap"><label data-for="autostart">Start mesh-kvm when this device boots</label><input type="checkbox" data-c="autostart"></div>
+  </section>
+</template>
+
+<script>
+const $ = id => document.getElementById(id);
+const NODES = {
+  debian: { title: 'Debian desktop', other: 'Windows laptop', key: 'Debian' },
+  windows: { title: 'Windows laptop', other: 'Debian desktop', key: 'Windows' },
+};
+let local = null;              // this device's /api/local
+const dev = { debian: null, windows: null };
+let master = null;             // { config, telemetry } from the Debian node
+let dragging = null;
+let view = { s: 0.1, ox: 0, oy: 0 };
+const controls = {};
+
+async function getJson(path) {
+  const r = await fetch(path, { cache: 'no-store' });
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return r.json();
+}
+const post = (path, body) => fetch(path, { method: 'POST', body: JSON.stringify(body) }).catch(() => {});
+const baseOf = node => (local && local.node === node ? '' : '/api/peer');
+const masterAction = action => post(baseOf('debian') + '/api/action', { action });
+const deviceAction = (node, action, extra) => post(baseOf(node) + '/api/local/action', { action, ...extra });
+
+function throttle(fn, ms) {
+  let timer = null, last = null;
+  return (...a) => {
+    last = a;
+    if (timer) return;
+    timer = setTimeout(() => { timer = null; fn(...last); }, ms);
+  };
+}
+const saveLayout = throttle(() => { if (master) post(baseOf('debian') + '/api/layout', master.config); }, 150);
+
+// Don't overwrite a control the person is using with a poll result.
+const touched = el => { el.dataset.t = Date.now(); };
+const busy = el => Date.now() - (+el.dataset.t || 0) < 1200;
+function setVal(el, v) { if (!busy(el)) el.value = v; }
+function setChk(el, v) { if (!busy(el)) el.checked = v; }
+
+function buildDevice(node) {
+  const n = NODES[node];
+  const root = $('device-tpl').content.firstElementChild.cloneNode(true);
+  const f = {}, c = {};
+  root.querySelectorAll('[data-f]').forEach(e => { f[e.dataset.f] = e; });
+  root.querySelectorAll('[data-c]').forEach(e => { c[e.dataset.c] = e; e.id = node + '-' + e.dataset.c; });
+  root.querySelectorAll('[data-for]').forEach(e => { e.htmlFor = node + '-' + e.dataset.for; });
+  f.title.textContent = n.title;
+  f['tx-title'].textContent = 'Send to ' + n.other;
+  f['rx-title'].textContent = 'Hear from ' + n.other;
+  c.chime.textContent = 'Play a test sound on ' + n.other;
+
+  c.tx.onchange = () => { touched(c.tx); deviceAction(node, 'set_audio_tx', { enabled: c.tx.checked }); };
+  c.mute.onchange = () => { touched(c.mute); deviceAction(node, 'set_audio_rx_muted', { muted: c.mute.checked }); };
+  c.source.onchange = () => { touched(c.source); deviceAction(node, 'set_audio_tx_source', { mode: +c.source.value }); };
+  const txv = throttle(v => deviceAction(node, 'set_audio_tx_volume', { volume: v }), 120);
+  const rxv = throttle(v => deviceAction(node, 'set_audio_rx_volume', { volume: v }), 120);
+  c.txv.oninput = () => { touched(c.txv); f['txv-v'].textContent = c.txv.value + '%'; txv(+c.txv.value); };
+  c.rxv.oninput = () => { touched(c.rxv); f['rxv-v'].textContent = c.rxv.value + '%'; rxv(+c.rxv.value); };
+  c.chime.onclick = () => deviceAction(node, 'test_audio_chime', { target: 'peer' });
+  c.autostart.onchange = () => { touched(c.autostart); deviceAction(node, 'set_autostart', { enabled: c.autostart.checked }); };
+
+  $('devices').append(root);
+  controls[node] = { f, c };
+}
+
+function renderDevice(node) {
+  const { f, c } = controls[node];
+  const d = dev[node], n = NODES[node];
+  const here = local && local.node === node;
+  f.body.hidden = f['auto-wrap'].hidden = !d;
+  f.offline.hidden = !!d;
+  if (!d) {
+    f.meta.textContent = 'Not connected';
+    f.offline.textContent = local
+      ? `${n.title} isn't answering. Check that mesh-kvm is running there and that TCP port 24880 is allowed through its firewall.`
+      : 'mesh-kvm is not responding on this device.';
+    return;
+  }
+  f.meta.textContent = `${here ? 'This device, ' : ''}${d.hostname}, ${d.ip}`;
+  const a = d.audio;
+  setChk(c.tx, a.tx_enabled);
+  setChk(c.mute, a.rx_muted);
+  setVal(c.txv, a.tx_volume);
+  setVal(c.rxv, a.rx_volume);
+  f['txv-v'].textContent = c.txv.value + '%';
+  f['rxv-v'].textContent = c.rxv.value + '%';
+  f['tx-peak'].style.width = (a.tx_peak || 0) + '%';
+  f['rx-peak'].style.width = (a.rx_peak || 0) + '%';
+  f['source-wrap'].hidden = a.tx_source === null;
+  if (a.tx_source !== null) setVal(c.source, a.tx_source);
+  setChk(c.autostart, d.autostart);
+}
+
+function renderBar() {
+  const t = master && master.telemetry;
+  const active = t ? t.active_node : local && local.active_node;
+  const linked = !!(dev.debian && dev.windows && (t ? t.peer_online : local && local.peer_online));
+  const sw = $('switch');
+  sw.disabled = !linked;
+  if (active) { sw.dataset.node = active; $('knob').textContent = active; }
+  for (const node of ['debian', 'windows']) {
+    const owner = active === NODES[node].key && (linked || (local && local.node === node));
+    $('led-' + node).className = 'led' + (owner ? ' active' : dev[node] ? ' on' : '');
+    $('sub-' + node).textContent = !dev[node] ? 'Not connected' : owner ? 'Has keyboard and mouse' : 'Connected';
+  }
+  const notice = $('notice');
+  let msg = '', bad = false;
+  if (!local) { msg = 'mesh-kvm is not responding on this device. Start the daemon, then this page reconnects by itself.'; bad = true; }
+  else if (t && t.panic_mode) { msg = 'All input is released, and each device is using its own keyboard and mouse. Use the switch to reconnect.'; }
+  else if (!linked) { msg = `${local.node === 'debian' ? 'The laptop' : 'The desktop'} is out of reach, so each device is working on its own.`; }
+  notice.textContent = msg; notice.hidden = !msg; notice.classList.toggle('bad', bad);
+}
+
+function placements(c) {
+  const out = [], W = c.win_w, H = c.win_h;
+  for (const m of c.debian_monitors) {
+    const label = m.name.split(' ')[0];
+    const cx = Math.round(m.x + (m.w - W) / 2), cy = Math.round(m.y + (m.h - H) / 2);
+    out.push({ label: 'Below ' + label, x: cx, y: m.y + m.h, side: 'Bottom' });
+    out.push({ label: 'Above ' + label, x: cx, y: m.y - H, side: 'Top' });
+    if (m.x <= 0) out.push({ label: 'Left of ' + label, x: m.x - W, y: cy, side: 'Left' });
+    if (m.x + m.w >= c.deb_total_w) out.push({ label: 'Right of ' + label, x: m.x + m.w, y: cy, side: 'Right' });
+  }
+  return out;
+}
+
+function snap(c, wx, wy) {
+  const W = c.win_w, H = c.win_h;
+  let best = null, bestD = Infinity;
+  const consider = (x, y, side) => {
+    const d = Math.hypot(wx - x, wy - y);
+    if (d < bestD) { bestD = d; best = { x: Math.round(x), y: Math.round(y), side }; }
+  };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(v, hi));
+  for (const m of c.debian_monitors) {
+    const cy = clamp(wy, m.y - H + 240, m.y + m.h - 240);
+    const cx = clamp(wx, m.x - W + 280, m.x + m.w - 280);
+    if (m.x + m.w >= c.deb_total_w) consider(m.x + m.w, cy, 'Right');
+    if (m.x <= 0) consider(m.x - W, cy, 'Left');
+    consider(cx, m.y + m.h, 'Bottom');
+    consider(cx, m.y - H, 'Top');
+  }
+  return best;
+}
+
+function fit(c) {
+  const map = $('map'), pad = 16;
+  let x0 = c.win_x, y0 = c.win_y, x1 = c.win_x + c.win_w, y1 = c.win_y + c.win_h;
+  for (const m of c.debian_monitors) {
+    x0 = Math.min(x0, m.x); y0 = Math.min(y0, m.y);
+    x1 = Math.max(x1, m.x + m.w); y1 = Math.max(y1, m.y + m.h);
+  }
+  const w = map.clientWidth - pad * 2, h = map.clientHeight - pad * 2;
+  const s = Math.min(w / (x1 - x0), h / (y1 - y0));
+  view = { s, ox: pad + (w - (x1 - x0) * s) / 2 - x0 * s, oy: pad + (h - (y1 - y0) * s) / 2 - y0 * s };
+}
+
+function place(el, x, y, w, h) {
+  el.style.left = view.ox + x * view.s + 'px';
+  el.style.top = view.oy + y * view.s + 'px';
+  el.style.width = w * view.s + 'px';
+  el.style.height = h * view.s + 'px';
+}
+
+function renderMap() {
+  const map = $('map');
+  if (!master) { map.replaceChildren(); return; }
+  const { config: c, telemetry: t } = master;
+  if (!dragging) fit(c);
+  const screens = [...c.debian_monitors.map(m => ({ ...m, laptop: false })),
+    { name: 'Windows laptop', x: c.win_x, y: c.win_y, w: c.win_w, h: c.win_h, laptop: true }];
+  while (map.children.length > screens.length + 1) map.lastChild.remove();
+  screens.forEach((s, i) => {
+    let el = map.children[i];
+    if (!el || el.id === 'cursor') {
+      el = document.createElement('div');
+      el.innerHTML = '<span></span><small></small>';
+      map.insertBefore(el, map.children[i] || null);
+    }
+    el.className = 'screen' + (s.laptop ? ' laptop' : '') + (dragging && s.laptop ? ' dragging' : '')
+      + ((s.laptop ? t.active_node === 'Windows' : t.active_node === 'Debian') ? ' owner' : '');
+    el.dataset.laptop = s.laptop ? '1' : '';
+    el.firstChild.textContent = s.name;
+    el.lastChild.textContent = `${s.w} × ${s.h}`;
+    place(el, s.x, s.y, s.w, s.h);
+  });
+  let cur = $('cursor');
+  if (!cur) { cur = document.createElement('div'); cur.id = 'cursor'; map.append(cur); }
+  const onWin = t.active_node === 'Windows';
+  cur.style.left = view.ox + (onWin ? c.win_x + t.win_cursor_x : t.deb_cursor_x) * view.s + 'px';
+  cur.style.top = view.oy + (onWin ? c.win_y + t.win_cursor_y : t.deb_cursor_y) * view.s + 'px';
+}
+
+function renderSide() {
+  const has = !!master;
+  for (const id of ['place', 'res', 'speed', 'edge', 'auto-lock', 'man-lock', 'native']) $(id).disabled = !has;
+  $('panic').disabled = !local;
+  $('map-hint').textContent = has
+    ? 'Drag the laptop to where it sits on your desk.'
+    : 'The layout is stored on the Debian desktop and needs it to be connected.';
+  if (!has) return;
+  const { config: c, telemetry: t } = master;
+  const opts = placements(c), sel = $('place');
+  if (!busy(sel) && document.activeElement !== sel) {
+    const cur = opts.findIndex(o => o.x === c.win_x && o.y === c.win_y);
+    sel.replaceChildren(...[...(cur < 0 ? [{ label: `Custom (${c.attach_side.toLowerCase()} edge)` }] : []), ...opts].map(o => new Option(o.label)));
+    sel.selectedIndex = cur < 0 ? 0 : cur;
+  }
+  setVal($('res'), c.resolution_mode === 'native' ? 'native' : `${c.win_w}x${c.win_h}`);
+  setVal($('speed'), c.mouse_speed);
+  setVal($('edge'), c.edge_resistance);
+  $('speed-v').textContent = (+$('speed').value).toFixed(2) + '×';
+  $('edge-v').textContent = $('edge').value;
+  setChk($('auto-lock'), c.auto_game_lock);
+  setChk($('man-lock'), c.manual_game_lock);
+  $('lock-state').textContent = t.game_captive_active
+    ? `Mouse is held on this screen${t.game_reason ? ': ' + t.game_reason : ''}.` : '';
+}
+
+function render() { renderBar(); renderMap(); renderSide(); renderDevice('debian'); renderDevice('windows'); }
+
+async function poll() {
+  const opt = p => getJson(p).catch(() => null);
+  local = await opt('/api/local');
+  if (local) {
+    const other = local.node === 'debian' ? 'windows' : 'debian';
+    const [peer, state] = await Promise.all([
+      opt('/api/peer/api/local'),
+      opt(baseOf('debian') + '/api/state'),
+    ]);
+    dev[local.node] = local; dev[other] = peer;
+    if (!dragging) master = state;
+  } else {
+    dev.debian = dev.windows = null; master = null;
+  }
+  render();
+  setTimeout(poll, 200);
+}
+
+$('switch').onclick = () => masterAction('toggle_focus');
+$('panic').onclick = () => (master ? masterAction('panic') : deviceAction(local.node, 'panic'));
+$('native').onclick = () => masterAction('reset_native_resolutions');
+$('auto-lock').onchange = e => { touched(e.target); masterAction('toggle_auto_game_lock'); };
+$('man-lock').onchange = e => { touched(e.target); masterAction('toggle_game_lock'); };
+
+$('place').onchange = e => {
+  touched(e.target);
+  const c = master.config, o = placements(c).find(p => p.label === e.target.value);
+  if (!o) return;
+  Object.assign(c, { win_x: o.x, win_y: o.y, attach_side: o.side });
+  saveLayout(); render();
+  e.target.blur();
+};
+$('res').onchange = e => {
+  touched(e.target);
+  const c = master.config, v = e.target.value;
+  if (v === 'native') {
+    c.resolution_mode = 'native'; c.win_w = c.win_native_w; c.win_h = c.win_native_h;
+  } else {
+    c.resolution_mode = 'custom'; [c.win_w, c.win_h] = v.split('x').map(Number);
+  }
+  const s = snap(c, c.win_x, c.win_y);
+  if (s) Object.assign(c, { win_x: s.x, win_y: s.y, attach_side: s.side });
+  saveLayout(); render();
+};
+$('speed').oninput = e => { touched(e.target); master.config.mouse_speed = +e.target.value; $('speed-v').textContent = (+e.target.value).toFixed(2) + '×'; saveLayout(); };
+$('edge').oninput = e => { touched(e.target); master.config.edge_resistance = +e.target.value; $('edge-v').textContent = e.target.value; saveLayout(); };
+
+const toWorld = e => {
+  const r = $('map').getBoundingClientRect();
+  return [(e.clientX - r.left - view.ox) / view.s, (e.clientY - r.top - view.oy) / view.s];
+};
+$('map').addEventListener('pointerdown', e => {
+  const el = e.target.closest('.screen');
+  if (!master || !el || !el.dataset.laptop) return;
+  const c = master.config, [wx, wy] = toWorld(e);
+  dragging = { dx: wx - c.win_x, dy: wy - c.win_y };
+  $('map').setPointerCapture(e.pointerId);
+});
+$('map').addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const c = master.config, [wx, wy] = toWorld(e);
+  const s = snap(c, wx - dragging.dx, wy - dragging.dy);
+  if (s) { Object.assign(c, { win_x: s.x, win_y: s.y, attach_side: s.side }); renderMap(); }
+});
+const endDrag = () => { if (dragging) { dragging = null; saveLayout(); } };
+$('map').addEventListener('pointerup', endDrag);
+$('map').addEventListener('pointercancel', endDrag);
+window.addEventListener('resize', () => { if (master) renderMap(); });
+
+buildDevice('debian');
+buildDevice('windows');
+poll();
+</script>
+</body>
+</html>

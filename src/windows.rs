@@ -10,7 +10,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -44,15 +44,16 @@ static PANIC_MODE: AtomicBool = AtomicBool::new(false);
 static MANUAL_GAME_LOCK: AtomicBool = AtomicBool::new(false);
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static LAST_PEER_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
 static SCREEN_WIDTH: AtomicI32 = AtomicI32::new(1920);
 static SCREEN_HEIGHT: AtomicI32 = AtomicI32::new(1080);
 
+/// Monotonic on purpose: with the wall clock, a backwards jump (NTP resync after waking away
+/// from home) makes the peer look online until the clock catches up, swallowing the keyboard.
 #[inline]
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 /// Returns true only if the Debian desktop has sent a UDP packet within the last 1,350 ms.
@@ -99,6 +100,121 @@ fn send_udp_payload(payload: Payload) {
     }
 }
 
+fn startup_vbs_path() -> Option<PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    Some(
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join("mesh-kvm-autostart.vbs"),
+    )
+}
+
+/// Present when the user turned auto-boot off in the Studio, so startup doesn't reinstall it.
+fn autostart_disabled_marker() -> PathBuf {
+    crate::settings::config_dir().join("autostart-disabled")
+}
+
+fn set_windows_autostart(enabled: bool, peer_addr: SocketAddr, switch_edge: SwitchEdge) {
+    let marker = autostart_disabled_marker();
+    if enabled {
+        let _ = fs::remove_file(&marker);
+        ensure_windows_autorun_installed(peer_addr, switch_edge);
+    } else {
+        let _ = fs::create_dir_all(crate::settings::config_dir());
+        let _ = fs::write(&marker, "");
+        if let Some(vbs) = startup_vbs_path() {
+            let _ = fs::remove_file(vbs);
+        }
+    }
+}
+
+/// Builds the Windows node's Studio API handler (plugged into the shared `webui` server).
+/// Layout and focus live on the Debian master; the UI reaches them through the peer proxy.
+fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webui::Handler {
+    let peer_ip = peer_addr.ip().to_string();
+    Arc::new(move |req: &crate::webui::HttpRequest| -> Option<String> {
+        let path = req.path.split('?').next().unwrap_or("");
+        match (req.method.as_str(), path) {
+            ("GET", "/api/local") => {
+                let mut pt = POINT { x: 0, y: 0 };
+                unsafe {
+                    GetCursorPos(&mut pt);
+                }
+                let active = if ACTIVE_NODE.load(Ordering::Relaxed) == NodeId::Debian as u8 {
+                    "Debian"
+                } else {
+                    "Windows"
+                };
+                let manual = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
+                let captive = is_windows_game_captive();
+                let reason = if manual {
+                    "Manual lock"
+                } else if captive {
+                    "Game is holding the cursor"
+                } else {
+                    ""
+                };
+                let (w, h) = (
+                    SCREEN_WIDTH.load(Ordering::Relaxed),
+                    SCREEN_HEIGHT.load(Ordering::Relaxed),
+                );
+                Some(
+                    serde_json::json!({
+                        "node": "windows",
+                        "label": "Windows Laptop",
+                        "hostname": crate::webui::hostname(),
+                        "ip": crate::webui::local_ip_toward(&peer_ip),
+                        "peer_ip": peer_ip,
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "os": "Windows 11",
+                        "peer_online": is_debian_peer_online(),
+                        "active_node": active,
+                        "panic_mode": PANIC_MODE.load(Ordering::Relaxed),
+                        "game_lock": captive,
+                        "game_reason": reason,
+                        "displays": [{ "name": "Laptop display", "x": 0, "y": 0, "w": w, "h": h }],
+                        "cursor": [pt.x, pt.y],
+                        "autostart": startup_vbs_path().is_some_and(|p| p.exists()),
+                        "input_devices": ["Laptop keyboard", "Laptop trackpad"],
+                        "audio": crate::settings::audio_status_json(false),
+                    })
+                    .to_string(),
+                )
+            }
+            ("POST", "/api/local/action") => {
+                let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
+                let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if !crate::settings::handle_common_action(act, &val) {
+                    match act {
+                        "set_autostart" => set_windows_autostart(
+                            val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                            peer_addr,
+                            switch_edge,
+                        ),
+                        "panic" => {
+                            PANIC_MODE.store(true, Ordering::SeqCst);
+                            ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
+                            for _ in 0..3 {
+                                send_udp_payload(Payload::PanicRelease);
+                            }
+                        }
+                        "toggle_game_lock" => {
+                            MANUAL_GAME_LOCK.fetch_xor(true, Ordering::SeqCst);
+                        }
+                        _ => return Some(r#"{"ok":false,"error":"unknown action"}"#.to_string()),
+                    }
+                }
+                Some(r#"{"ok":true}"#.to_string())
+            }
+            _ => None,
+        }
+    })
+}
+
 /// Installs `mesh-kvm.exe` into `%LOCALAPPDATA%\mesh-kvm\mesh-kvm.exe` and creates a silent
 /// windowless Startup launcher in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
 /// so the Windows 11 laptop automatically starts `mesh-kvm` in the background on every boot/login.
@@ -125,13 +241,27 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
         return;
     };
 
-    let startup_dir = PathBuf::from(&appdata)
+    let programs_dir = PathBuf::from(&appdata)
         .join("Microsoft")
         .join("Windows")
         .join("Start Menu")
-        .join("Programs")
-        .join("Startup");
+        .join("Programs");
 
+    // Start Menu entry for the Studio UI (the daemon itself runs windowless)
+    let _ = fs::write(
+        programs_dir.join("mesh-kvm Studio.vbs"),
+        format!(
+            "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
+             WshShell.Run \"\"\"{}\"\" --studio\", 0, False\r\n",
+            exe_to_run.to_string_lossy()
+        ),
+    );
+
+    if autostart_disabled_marker().exists() {
+        return;
+    }
+
+    let startup_dir = programs_dir.join("Startup");
     if startup_dir.exists() {
         let vbs_path = startup_dir.join("mesh-kvm-autostart.vbs");
         let peer_ip = peer_addr.ip();
@@ -424,6 +554,11 @@ pub fn run_windows_node(
         peer_addr,
     });
 
+    crate::webui::start(
+        peer_addr.ip().to_string(),
+        studio_handler(peer_addr, switch_edge),
+    )?;
+
     // Report true native Windows display resolution to Debian peer immediately
     for _ in 0..3 {
         send_udp_payload(Payload::PeerDisplayInfo { width, height });
@@ -448,6 +583,11 @@ pub fn run_windows_node(
                 if !online && was_online {
                     was_online = false;
                     ACTIVE_NODE.store(NodeId::Windows as u8, Ordering::SeqCst);
+                    // Debian can no longer send the button-up for anything it was holding
+                    let held = BUTTONS_HELD_MASK.swap(0, Ordering::SeqCst);
+                    for bit in (0..8u8).filter(|b| held & (1 << b) != 0) {
+                        inject_mouse_button(bit + 1, false);
+                    }
                     println!(
                         "[Windows] Debian peer disconnected/out-of-range -> Switched to Standalone Laptop Mode."
                     );
@@ -471,11 +611,13 @@ pub fn run_windows_node(
             let mut buf = [0u8; 512];
             let mut last_switch_instant = Instant::now() - Duration::from_secs(1);
             let mut last_rx_focus_seq = 0u64;
-            let mut buttons_held_mask: u8 = 0;
 
             loop {
                 match rx_socket.recv_from(&mut buf) {
-                    Ok((len, _src_addr)) => {
+                    Ok((len, src_addr)) => {
+                        if src_addr.ip() != peer_addr.ip() {
+                            continue;
+                        }
                         if let Ok(pkt) = Packet::decode(&buf[..len]) {
                             LAST_PEER_SEEN_MS.store(now_ms(), Ordering::Relaxed);
                             match pkt.payload {
@@ -501,7 +643,7 @@ pub fn run_windows_node(
 
                                             if hit_edge
                                                 && !is_windows_game_captive()
-                                                && buttons_held_mask == 0
+                                                && BUTTONS_HELD_MASK.load(Ordering::Relaxed) == 0
                                                 && last_switch_instant.elapsed()
                                                     >= Duration::from_millis(150)
                                             {
@@ -551,9 +693,9 @@ pub fn run_windows_node(
                                 Payload::MouseButton { button, pressed } => {
                                     let bit = button.saturating_sub(1).min(7);
                                     if pressed {
-                                        buttons_held_mask |= 1 << bit;
+                                        BUTTONS_HELD_MASK.fetch_or(1 << bit, Ordering::SeqCst);
                                     } else {
-                                        buttons_held_mask &= !(1 << bit);
+                                        BUTTONS_HELD_MASK.fetch_and(!(1 << bit), Ordering::SeqCst);
                                     }
 
                                     if !PANIC_MODE.load(Ordering::Relaxed)

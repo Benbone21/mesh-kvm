@@ -4,8 +4,10 @@ mod keymap;
 #[cfg(target_os = "linux")]
 mod linux;
 mod protocol;
+mod settings;
 #[cfg(target_os = "linux")]
 mod spatial;
+mod webui;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -84,6 +86,10 @@ struct Cli {
     /// Phase 3: TCP port for clipboard sync (default: 24852)
     #[arg(long, default_value_t = DEFAULT_CLIPBOARD_PORT)]
     clipboard_port: u16,
+
+    /// Open the Studio UI window for the daemon already running on this device, then exit
+    #[arg(long)]
+    studio: bool,
 }
 
 fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, SocketAddr), String> {
@@ -101,6 +107,14 @@ fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, Sock
 fn main() {
     let cli = Cli::parse();
 
+    if cli.studio {
+        if let Err(e) = webui::http_call("127.0.0.1", "GET", "/api/local", "") {
+            eprintln!("[Studio] Warning: mesh-kvm daemon is not responding: {}", e);
+        }
+        webui::open_app_window();
+        return;
+    }
+
     let (peer_ip, peer_addr) = match parse_peer_socket_addr(&cli.peer, cli.port) {
         Ok(v) => v,
         Err(e) => {
@@ -116,6 +130,8 @@ fn main() {
         peer_addr,
         cli.switch_edge
     );
+
+    settings::load_and_apply();
 
     // Phase 2: Bidirectional Audio Bus (UDP 24851)
     if cli.audio_listen {

@@ -7,7 +7,7 @@ use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
-use crate::spatial::{start_web_ui_server, SharedSpatialState, TouchSide};
+use crate::spatial::{studio_handler, SharedSpatialState, TouchSide};
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -663,7 +663,10 @@ pub fn run_debian_node(
     let spatial_state = Arc::new(RwLock::new(SharedSpatialState::load_or_default(
         peer_addr.to_string(),
     )));
-    start_web_ui_server(Arc::clone(&spatial_state))?;
+    crate::webui::start(
+        peer_addr.ip().to_string(),
+        studio_handler(Arc::clone(&spatial_state)),
+    )?;
 
     let mut vkbd = VirtualKeyboard::new()?;
     let vmouse = VirtualMouse::new(width, height)?;
@@ -700,6 +703,7 @@ pub fn run_debian_node(
         .as_micros() as u64;
     let seq_counter = Arc::new(AtomicU64::new(init_seq));
 
+    let mut was_peer_online = false;
     let mut win_cursor_x: i32 = 960;
     let mut win_cursor_y: i32 = 540;
     let mut frac_dx: f32 = 0.0;
@@ -1055,6 +1059,12 @@ pub fn run_debian_node(
         let peer_online = last_peer_seen
             .map(|t| t.elapsed() <= Duration::from_millis(1600))
             .unwrap_or(false);
+
+        // The laptop keyboard can vanish mid-keypress; don't leave those keys held on Debian
+        if was_peer_online && !peer_online {
+            vkbd.release_all_keys();
+        }
+        was_peer_online = peer_online;
 
         // On-The-Go Watchdog: If Windows was active and its heartbeat dropped for >1.6s, auto-restore Debian!
         if active_node.load(Ordering::Relaxed) == NodeId::Windows as u8
