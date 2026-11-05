@@ -216,8 +216,14 @@ fn is_windows_game_captive() -> bool {
 }
 
 /// Safe from a hook: the socket is non-blocking, and a failed send is dropped.
+///
+/// Every packet leaves through here. A poisoned router sends nothing, heartbeats included, so
+/// that Debian's link timeout takes its input back rather than forwarding to a frozen laptop.
 #[inline]
 fn send_udp_payload(payload: Payload) {
+    if router_lock().is_poisoned() {
+        return;
+    }
     if let Some(net) = NET_STATE.get() {
         let pkt = Packet::new(
             SEQ_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -260,7 +266,7 @@ fn remember_cursor(pt: (i32, i32)) {
     LAST_Y.store(y, Ordering::Relaxed);
 }
 
-/// A handle only: the hook, UDP and watchdog threads all use it, so its state is in statics.
+/// A handle only: the hook, UDP, watchdog and webui threads all use it, so its state is in statics.
 struct WindowsBackend;
 
 impl InputBackend for WindowsBackend {

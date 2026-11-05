@@ -280,7 +280,14 @@ impl Router {
             Event::PeerGameLock(locked) => self.peer_game_lock = locked,
             Event::PeerFocus { target, x, y } => {
                 let known = target == me || target == peer;
-                if self.online && known && !(self.conflicts(target) && me == self.cfg.main) {
+                // A startup burst is sent whether or not main hears us, so it proves nothing:
+                // handing control to main still takes a view.
+                let unproven = me != self.cfg.main && target == peer && self.view_heard.is_none();
+                if self.online
+                    && known
+                    && !unproven
+                    && !(self.conflicts(target) && me == self.cfg.main)
+                {
                     self.panicked = false;
                     self.last_switch = None;
                     // Main only claims focus while it hears us, so this counts like a view.
@@ -398,11 +405,18 @@ impl Router {
                 .is_some_and(|heard| self.now.saturating_sub(heard) <= VIEW_TIMEOUT_MS)
     }
 
-    /// Main has gone quiet: control comes back here, though the link stays up.
+    /// Main has gone quiet: control comes back here, though the link stays up. The peer may
+    /// still hear us, so what it holds for us is released before the sets are cleared.
     fn control_lost(&mut self, actions: &mut Vec<Action>) {
         self.active = self.cfg.me;
         self.last_switch = None;
         self.view_heard = None;
+        for &scancode in &self.fwd_keys {
+            actions.push(Action::ForwardKey { scancode, pressed: false });
+        }
+        for &button in &self.fwd_buttons {
+            actions.push(Action::ForwardButton { button, pressed: false });
+        }
         self.reset_held();
         actions.push(Action::ReleaseHeld);
     }
@@ -686,13 +700,77 @@ mod tests {
     fn peer_focus_counts_as_hearing_main() {
         let mut r = router(1);
         online(&mut r);
+        r.handle(Event::PeerActiveView { active: 1 });
+        r.handle(Event::PeerAlive { now_ms: 2000 });
         r.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
         assert_eq!(r.active(), 0);
-        alive_to_3000(&mut r);
-        r.handle(Event::Tick { now_ms: 3500 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerAlive { now_ms: 4000 });
+        r.handle(Event::Tick { now_ms: 4500 });
         assert_eq!(r.active(), 0);
+        r.handle(Event::Tick { now_ms: 4501 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn startup_burst_does_not_adopt_before_first_view() {
+        let mut r = router(1);
+        online(&mut r);
+        let burst = Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR };
+        for _ in 0..3 {
+            assert!(r.handle(burst).actions.is_empty());
+        }
+        assert_eq!(r.active(), 1);
+        assert!(!key(&mut r, 30, true).swallow);
+        // The view that follows is what hands control over.
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn focus_for_this_device_needs_no_view() {
+        let mut r = router(1);
+        online(&mut r);
+        let out = r.handle(Event::PeerFocus { target: 1, x: 4, y: 5 });
+        assert!(out.actions.contains(&Action::WarpCursor { x: 4, y: 5 }));
+    }
+
+    #[test]
+    fn peer_focus_does_not_end_a_fallback() {
+        let mut r = adopted_router(cfg(1));
+        alive_to_3000(&mut r);
         r.handle(Event::Tick { now_ms: 3501 });
         assert_eq!(r.active(), 1);
+        r.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn fallback_forwards_held_releases() {
+        let mut r = adopted_router(cfg(1));
+        assert!(key(&mut r, 30, true).swallow);
+        assert!(key(&mut r, 31, true).swallow);
+        assert!(r.handle(Event::LocalButton { button: 1, pressed: true }).swallow);
+        alive_to_3000(&mut r);
+        let out = r.handle(Event::Tick { now_ms: 3501 });
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: false }));
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 31, pressed: false }));
+        assert!(out.actions.contains(&Action::ForwardButton { button: 1, pressed: false }));
+        // Already released for the peer, so the physical release stays local and sends nothing.
+        let up = key(&mut r, 30, false);
+        assert!(!up.swallow);
+        assert!(up.actions.is_empty());
+        let up = r.handle(Event::LocalButton { button: 1, pressed: false });
+        assert!(!up.swallow);
+        assert!(up.actions.is_empty());
+    }
+
+    #[test]
+    fn link_loss_forwards_nothing() {
+        let mut r = adopted_router(cfg(1));
+        key(&mut r, 30, true);
+        let out = r.handle(Event::Tick { now_ms: 1000 + LINK_TIMEOUT_MS + 1 });
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::ForwardKey { .. })));
     }
 
     #[test]
