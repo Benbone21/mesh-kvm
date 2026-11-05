@@ -4,6 +4,7 @@ mod keymap;
 #[cfg(target_os = "linux")]
 mod linux;
 mod protocol;
+mod router;
 mod settings;
 #[cfg(target_os = "linux")]
 mod spatial;
