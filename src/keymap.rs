@@ -272,6 +272,43 @@ pub fn win_vk_scan_to_evdev(vk: u32, scan: u32, extended: bool) -> Option<u16> {
     None
 }
 
+/// Translate a Linux `evdev` key into the PS/2 set-1 make scancode and whether Windows needs
+/// `KEYEVENTF_EXTENDEDKEY` for it. Returns `None` for keys with no stable set-1 code
+/// (F13 to F24, Pause) or unknown keys.
+pub fn evdev_to_win_scan(evdev: u16) -> Option<(u16, bool)> {
+    let extended = |scan: u16| Some((scan, true));
+    match evdev {
+        // Evdev 1..=88 equals the set-1 make code for the non-extended block.
+        1..=83 | 86..=88 => Some((evdev, false)),
+        KEY_KPENTER => extended(0x1C),
+        KEY_RIGHTCTRL => extended(0x1D),
+        KEY_KPSLASH => extended(0x35),
+        KEY_SYSRQ => extended(0x37),
+        KEY_RIGHTALT => extended(0x38),
+        KEY_HOME => extended(0x47),
+        KEY_UP => extended(0x48),
+        KEY_PAGEUP => extended(0x49),
+        KEY_LEFT => extended(0x4B),
+        KEY_RIGHT => extended(0x4D),
+        KEY_END => extended(0x4F),
+        KEY_DOWN => extended(0x50),
+        KEY_PAGEDOWN => extended(0x51),
+        KEY_INSERT => extended(0x52),
+        KEY_DELETE => extended(0x53),
+        KEY_MUTE => extended(0x20),
+        KEY_VOLUMEDOWN => extended(0x2E),
+        KEY_VOLUMEUP => extended(0x30),
+        KEY_LEFTMETA => extended(0x5B),
+        KEY_RIGHTMETA => extended(0x5C),
+        KEY_COMPOSE => extended(0x5D),
+        KEY_NEXTSONG => extended(0x19),
+        KEY_PLAYPAUSE => extended(0x22),
+        KEY_PREVIOUSSONG => extended(0x10),
+        KEY_STOPCD => extended(0x24),
+        _ => None,
+    }
+}
+
 /// Returns true if an evdev scancode is a modifier key (`Ctrl`, `Shift`, `Alt`, `Meta`).
 pub fn is_modifier_evdev(scancode: u16) -> bool {
     matches!(
@@ -285,4 +322,82 @@ pub fn is_modifier_evdev(scancode: u16) -> bool {
             | KEY_LEFTMETA
             | KEY_RIGHTMETA
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test-only evdev -> Windows VK table, used to drive the round trip through
+    /// `win_vk_scan_to_evdev`.
+    const VK_TABLE: &[(u16, u32)] = &[
+        (KEY_ESC, 0x1B), (KEY_1, 0x31), (KEY_2, 0x32), (KEY_3, 0x33), (KEY_4, 0x34),
+        (KEY_5, 0x35), (KEY_6, 0x36), (KEY_7, 0x37), (KEY_8, 0x38), (KEY_9, 0x39),
+        (KEY_0, 0x30), (KEY_MINUS, 0xBD), (KEY_EQUAL, 0xBB), (KEY_BACKSPACE, 0x08),
+        (KEY_TAB, 0x09), (KEY_Q, 0x51), (KEY_W, 0x57), (KEY_E, 0x45), (KEY_R, 0x52),
+        (KEY_T, 0x54), (KEY_Y, 0x59), (KEY_U, 0x55), (KEY_I, 0x49), (KEY_O, 0x4F),
+        (KEY_P, 0x50), (KEY_LEFTBRACE, 0xDB), (KEY_RIGHTBRACE, 0xDD), (KEY_ENTER, 0x0D),
+        (KEY_LEFTCTRL, 0xA2), (KEY_A, 0x41), (KEY_S, 0x53), (KEY_D, 0x44), (KEY_F, 0x46),
+        (KEY_G, 0x47), (KEY_H, 0x48), (KEY_J, 0x4A), (KEY_K, 0x4B), (KEY_L, 0x4C),
+        (KEY_SEMICOLON, 0xBA), (KEY_APOSTROPHE, 0xDE), (KEY_GRAVE, 0xC0),
+        (KEY_LEFTSHIFT, 0xA0), (KEY_BACKSLASH, 0xDC), (KEY_Z, 0x5A), (KEY_X, 0x58),
+        (KEY_C, 0x43), (KEY_V, 0x56), (KEY_B, 0x42), (KEY_N, 0x4E), (KEY_M, 0x4D),
+        (KEY_COMMA, 0xBC), (KEY_DOT, 0xBE), (KEY_SLASH, 0xBF), (KEY_RIGHTSHIFT, 0xA1),
+        (KEY_KPASTERISK, 0x6A), (KEY_LEFTALT, 0xA4), (KEY_SPACE, 0x20), (KEY_CAPSLOCK, 0x14),
+        (KEY_F1, 0x70), (KEY_F2, 0x71), (KEY_F3, 0x72), (KEY_F4, 0x73), (KEY_F5, 0x74),
+        (KEY_F6, 0x75), (KEY_F7, 0x76), (KEY_F8, 0x77), (KEY_F9, 0x78), (KEY_F10, 0x79),
+        (KEY_NUMLOCK, 0x90), (KEY_SCROLLLOCK, 0x91), (KEY_KP7, 0x67), (KEY_KP8, 0x68),
+        (KEY_KP9, 0x69), (KEY_KPMINUS, 0x6D), (KEY_KP4, 0x64), (KEY_KP5, 0x65),
+        (KEY_KP6, 0x66), (KEY_KPPLUS, 0x6B), (KEY_KP1, 0x61), (KEY_KP2, 0x62),
+        (KEY_KP3, 0x63), (KEY_KP0, 0x60), (KEY_KPDOT, 0x6E), (86, 0xE2),
+        (KEY_F11, 0x7A), (KEY_F12, 0x7B), (KEY_KPENTER, 0x0D), (KEY_RIGHTCTRL, 0xA3),
+        (KEY_KPSLASH, 0x6F), (KEY_SYSRQ, 0x2C), (KEY_RIGHTALT, 0xA5), (KEY_HOME, 0x24),
+        (KEY_UP, 0x26), (KEY_PAGEUP, 0x21), (KEY_LEFT, 0x25), (KEY_RIGHT, 0x27),
+        (KEY_END, 0x23), (KEY_DOWN, 0x28), (KEY_PAGEDOWN, 0x22), (KEY_INSERT, 0x2D),
+        (KEY_DELETE, 0x2E), (KEY_MUTE, 0xAD), (KEY_VOLUMEDOWN, 0xAE), (KEY_VOLUMEUP, 0xAF),
+        (KEY_LEFTMETA, 0x5B), (KEY_RIGHTMETA, 0x5C), (KEY_COMPOSE, 0x5D),
+        (KEY_NEXTSONG, 0xB0), (KEY_PLAYPAUSE, 0xB3), (KEY_PREVIOUSSONG, 0xB1),
+        (KEY_STOPCD, 0xB2),
+    ];
+
+    fn vk_for(key: u16) -> Option<u32> {
+        VK_TABLE.iter().find(|(k, _)| *k == key).map(|(_, vk)| *vk)
+    }
+
+    #[test]
+    fn letters_map_to_scancodes() {
+        assert_eq!(evdev_to_win_scan(KEY_A), Some((0x1E, false)));
+        assert_eq!(evdev_to_win_scan(KEY_ENTER), Some((0x1C, false)));
+    }
+
+    #[test]
+    fn extended_keys_are_flagged() {
+        assert_eq!(evdev_to_win_scan(KEY_RIGHTCTRL), Some((0x1D, true)));
+        assert_eq!(evdev_to_win_scan(KEY_LEFT), Some((0x4B, true)));
+        assert_eq!(evdev_to_win_scan(KEY_LEFTMETA), Some((0x5B, true)));
+        assert_eq!(evdev_to_win_scan(KEY_KPENTER), Some((0x1C, true)));
+    }
+
+    #[test]
+    fn every_key_round_trips() {
+        let mut mapped = 0;
+        for key in 0..=u16::MAX {
+            let Some((scan, ext)) = evdev_to_win_scan(key) else { continue };
+            let vk = vk_for(key).unwrap_or_else(|| panic!("no test VK for evdev {key}"));
+            assert_eq!(
+                win_vk_scan_to_evdev(vk, scan as u32, ext),
+                Some(key),
+                "evdev {key} vk {vk:#x} scan {scan:#x} ext {ext}"
+            );
+            mapped += 1;
+        }
+        // Every entry in the test table is actually mapped (no stale rows).
+        assert_eq!(mapped, VK_TABLE.len());
+    }
+
+    #[test]
+    fn unknown_key_is_none() {
+        assert_eq!(evdev_to_win_scan(0xFFFF), None);
+        assert_eq!(evdev_to_win_scan(KEY_F13), None);
+    }
 }
