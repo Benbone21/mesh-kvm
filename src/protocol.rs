@@ -108,6 +108,10 @@ pub enum Payload {
     EdgeMap { edge: SwitchEdge, start: i32, end: i32, resistance: i32 },
     /// Replaces `FocusSwitch` for all new sends; `x`, `y` are laptop-local.
     FocusSwitchAt { target_node: NodeId, x: i32, y: i32 },
+    /// Debian to laptop with each heartbeat: the manual game lock forbids leaving the active device.
+    GameLock { locked: bool },
+    /// Main device to the other, about once a second: which device main believes is active.
+    ActiveView { active_node: NodeId },
 }
 
 impl Packet {
@@ -164,6 +168,14 @@ mod tests {
             }
             other => panic!("wrong payload: {other:?}"),
         }
+        match round_trip(Payload::GameLock { locked: true }) {
+            Payload::GameLock { locked } => assert!(locked),
+            other => panic!("wrong payload: {other:?}"),
+        }
+        match round_trip(Payload::ActiveView { active_node: NodeId::Windows }) {
+            Payload::ActiveView { active_node } => assert_eq!(active_node, NodeId::Windows),
+            other => panic!("wrong payload: {other:?}"),
+        }
     }
 
     #[test]
@@ -175,5 +187,7 @@ mod tests {
         };
         assert_eq!(index(Payload::Heartbeat), 7u32.to_le_bytes());
         assert_eq!(index(Payload::PeerDisplayInfo { width: 1, height: 1 }), 8u32.to_le_bytes());
+        assert_eq!(index(Payload::GameLock { locked: true }), 11u32.to_le_bytes());
+        assert_eq!(index(Payload::ActiveView { active_node: NodeId::Windows }), 12u32.to_le_bytes());
     }
 }

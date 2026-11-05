@@ -9,7 +9,7 @@ use crate::protocol::{
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
-use crate::spatial::{studio_handler, SharedSpatialState, SpatialConfig};
+use crate::spatial::{studio_handler, take_studio_requests, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -549,6 +549,8 @@ pub struct EvdevDevice {
     pub grabbed: bool,
     /// Keys and buttons physically down on this device.
     pub held: HashSet<u16>,
+    /// The last `EVIOCGRAB` failed and was logged; sync retries it every loop.
+    pub grab_failed: bool,
 }
 
 /// Updates `held` from one event read off a device.
@@ -573,6 +575,13 @@ fn should_grab(wanted: bool, grabbed: bool, idle: bool) -> bool {
     wanted && (grabbed || idle)
 }
 
+/// Whether a local event belongs to the router. While a wanted grab is still waiting the desktop
+/// receives everything, so new input stays there alone. Releases always go through: only they
+/// clear a key or button forwarded earlier.
+fn reaches_router(blocking: bool, grabbed: bool, release: bool) -> bool {
+    release || !blocking || grabbed
+}
+
 impl EvdevDevice {
     /// Reads pending events into `buf` and returns how many; 0 when there are none.
     fn read_events(&self, buf: &mut [InputEvent]) -> usize {
@@ -594,11 +603,21 @@ impl EvdevDevice {
         let res = unsafe { libc::ioctl(self.fd, EVIOCGRAB, arg) };
         if res == 0 {
             self.grabbed = enable;
+            self.grab_failed = false;
             println!(
                 "[Debian] EVIOCGRAB {} on '{}' ({})",
                 if enable { "ENABLED" } else { "RELEASED" },
                 self.name,
                 self.path
+            );
+        } else if !self.grab_failed {
+            self.grab_failed = true;
+            eprintln!(
+                "[Debian] EVIOCGRAB {} failed on '{}' ({}): {}",
+                if enable { "grab" } else { "release" },
+                self.name,
+                self.path,
+                std::io::Error::last_os_error()
             );
         }
     }
@@ -615,13 +634,17 @@ impl Drop for EvdevDevice {
     }
 }
 
+/// `O_CLOEXEC` because a grab lives as long as its file description: a long-running child such
+/// as dbus-monitor would otherwise keep the keyboard grabbed after this process died.
+const EVDEV_OPEN_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+
 fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<EvdevDevice>) {
     let mut mice = Vec::new();
     let mut keyboards = Vec::new();
 
     if let Some(mouse_path) = explicit_mouse {
         if let Ok(cpath) = CString::new(mouse_path) {
-            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            let fd = unsafe { libc::open(cpath.as_ptr(), EVDEV_OPEN_FLAGS) };
             if fd >= 0 {
                 let name = get_device_name(fd);
                 mice.push(EvdevDevice {
@@ -630,6 +653,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                     fd,
                     grabbed: false,
                     held: HashSet::new(),
+                    grab_failed: false,
                 });
             }
         }
@@ -655,7 +679,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
             Ok(c) => c,
             Err(_) => continue,
         };
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(cpath.as_ptr(), EVDEV_OPEN_FLAGS) };
         if fd < 0 {
             continue;
         }
@@ -692,6 +716,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                 fd,
                 grabbed: false,
                 held: HashSet::new(),
+                grab_failed: false,
             });
         } else if has_kbd_keys {
             keyboards.push(EvdevDevice {
@@ -700,6 +725,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
                 fd,
                 grabbed: false,
                 held: HashSet::new(),
+                grab_failed: false,
             });
         } else {
             unsafe { libc::close(fd) };
@@ -953,16 +979,21 @@ struct LinuxBackend {
 }
 
 impl LinuxBackend {
-    /// Moves every device toward the wanted grab state. Runs each loop, so a grab put off by a
-    /// held key lands once the key is up, and a failed `EVIOCGRAB` is retried.
+    /// Moves every device toward the wanted grab state, and retries any failed `EVIOCGRAB`. Must
+    /// run straight after the devices are read: a new grab trusts `held`, and a key pressed since
+    /// the last read would end up stuck.
     fn sync_grabs(&mut self) {
+        self.update_grabs(true);
+    }
+
+    fn update_grabs(&mut self, may_start: bool) {
         for (devices, wanted) in [
             (&mut self.mice, self.block_mice),
             (&mut self.keyboards, self.block_keyboards),
         ] {
             for device in devices {
-                let grab = should_grab(wanted, device.grabbed, device.held.is_empty());
-                device.set_grab(grab);
+                let idle = may_start && device.held.is_empty();
+                device.set_grab(should_grab(wanted, device.grabbed, idle));
             }
         }
     }
@@ -976,7 +1007,8 @@ impl InputBackend for LinuxBackend {
     fn set_blocking(&mut self, mouse: bool, keyboard: bool) {
         self.block_mice = mouse;
         self.block_keyboards = keyboard;
-        self.sync_grabs();
+        // Letting go is immediate. New grabs wait for `sync_grabs`, as `held` may be stale here.
+        self.update_grabs(false);
     }
 
     fn inject_move(&mut self, dx: i32, dy: i32) {
@@ -1121,9 +1153,9 @@ pub fn run_debian_node(
         .unwrap_or_default()
         .as_micros() as u64;
 
-    let initial_speed = spatial_state
+    let mut cfg_snapshot = spatial_state
         .read()
-        .map(|guard| guard.config.mouse_speed)
+        .map(|guard| guard.config.clone())
         .map_err(|_| "Spatial state lock poisoned".to_string())?;
     let mut core = Core {
         router: Router::new(RouterConfig {
@@ -1131,7 +1163,7 @@ pub fn run_debian_node(
             peer: WINDOWS,
             main: DEBIAN,
             sharing: Sharing { mouse: true, keyboard: true },
-            pointer_speed: initial_speed,
+            pointer_speed: cfg_snapshot.mouse_speed,
         }),
         backend: LinuxBackend {
             vkbd,
@@ -1200,16 +1232,15 @@ pub fn run_debian_node(
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
 
-        // Check WebUI actions (manual toggle / panic)
-        let (manual_toggle, web_panic, cfg_snapshot) = if let Ok(mut guard) = spatial_state.write()
-        {
-            let mt = guard.pending_manual_switch.take().is_some();
-            let wp = guard.pending_panic;
-            guard.pending_panic = false;
-            (mt, wp, guard.config.clone())
-        } else {
-            (false, false, Default::default())
-        };
+        // Check WebUI actions (manual toggle / panic). If the lock is busy they wait for the next
+        // iteration and the last config stands.
+        let mut manual_toggle = false;
+        let mut web_panic = false;
+        if let Some(requests) = take_studio_requests(&spatial_state) {
+            manual_toggle = requests.manual_switch;
+            web_panic = requests.panic;
+            cfg_snapshot = requests.config;
+        }
 
         core.router.set_pointer_speed(cfg_snapshot.mouse_speed);
         let is_game_captive = cfg_snapshot.manual_game_lock
@@ -1253,16 +1284,6 @@ pub fn run_debian_node(
                     if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
                         let (x, y) = cfg_snapshot.laptop_to_debian(x, y);
                         core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
-                    }
-                }
-                // A laptop still on the previous build: no position, so the cursor stays put.
-                Payload::FocusSwitch { target_node, .. } => {
-                    if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
-                        core.route(Event::PeerFocus {
-                            target: target_node as DeviceId,
-                            x: KEEP_CURSOR,
-                            y: KEEP_CURSOR,
-                        });
                     }
                 }
                 Payload::PanicRelease => {
@@ -1316,7 +1337,11 @@ pub fn run_debian_node(
                     }
                     match hotkeys.feed(ev.code, ev.value) {
                         KeyRoute::Forward { scancode, pressed } => {
-                            core.route(Event::LocalKey { scancode, pressed });
+                            let keyboard = &core.backend.keyboards[i];
+                            let blocking = core.backend.block_keyboards;
+                            if reaches_router(blocking, keyboard.grabbed, !pressed) {
+                                core.route(Event::LocalKey { scancode, pressed });
+                            }
                         }
                         KeyRoute::Consumed => {}
                         KeyRoute::Hotkey(Hotkey::Panic) => {
@@ -1367,21 +1392,31 @@ pub fn run_debian_node(
                         },
                         EV_KEY => {
                             if let Some(button) = button_id(ev.code) {
-                                core.route(Event::LocalButton {
-                                    button,
-                                    pressed: ev.value != 0,
-                                });
+                                let pressed = ev.value != 0;
+                                let grabbed = core.backend.mice[i].grabbed;
+                                if reaches_router(core.backend.block_mice, grabbed, !pressed) {
+                                    core.route(Event::LocalButton { button, pressed });
+                                }
                             }
                         }
                         EV_SYN if ev.code == SYN_REPORT => {
+                            let grabbed = core.backend.mice[i].grabbed;
+                            let to_router = reaches_router(core.backend.block_mice, grabbed, false);
                             if acc_dx != 0 || acc_dy != 0 {
-                                core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
+                                if to_router {
+                                    core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
+                                }
                                 core.push_edge(&cfg_snapshot, acc_dx, acc_dy);
                                 acc_dx = 0;
                                 acc_dy = 0;
                             }
                             if acc_wheel_x != 0 || acc_wheel_y != 0 {
-                                core.route(Event::LocalWheel { dx: acc_wheel_x, dy: acc_wheel_y });
+                                if to_router {
+                                    core.route(Event::LocalWheel {
+                                        dx: acc_wheel_x,
+                                        dy: acc_wheel_y,
+                                    });
+                                }
                                 acc_wheel_x = 0;
                                 acc_wheel_y = 0;
                             }
@@ -1392,6 +1427,7 @@ pub fn run_debian_node(
             }
         }
 
+        // Straight after the reads, so held state is as fresh as it can be.
         core.backend.sync_grabs();
 
         // Update live WebUI telemetry every 40ms
@@ -1436,7 +1472,7 @@ pub fn run_debian_node(
             }
         }
 
-        // Heartbeat, with the edge map the laptop needs to check its own edges (every 400ms)
+        // Heartbeat, with what the laptop needs to check its own edges (every 400ms)
         if last_heartbeat.elapsed() >= Duration::from_millis(400) {
             last_heartbeat = Instant::now();
             core.peer.send(Payload::Heartbeat);
@@ -1447,6 +1483,7 @@ pub fn run_debian_node(
                 end: span.end,
                 resistance: cfg_snapshot.edge_resistance,
             });
+            core.peer.send(Payload::GameLock { locked: cfg_snapshot.manual_game_lock });
         }
 
         std::thread::sleep(Duration::from_micros(500));
@@ -1586,6 +1623,41 @@ mod tests {
         assert!(!should_grab(false, true, false));
         assert!(!should_grab(false, true, true));
         assert!(!should_grab(false, false, true));
+    }
+
+    #[test]
+    fn input_goes_to_the_router_when_nothing_blocks_or_the_grab_holds() {
+        assert!(reaches_router(false, false, false));
+        assert!(reaches_router(true, true, false));
+    }
+
+    #[test]
+    fn desktop_keeps_new_input_while_a_grab_waits() {
+        // It already has the event, so forwarding it too would give it two destinations.
+        assert!(!reaches_router(true, false, false));
+    }
+
+    #[test]
+    fn releases_always_reach_the_router() {
+        // A key forwarded earlier is only cleared, here and on the peer, by its release.
+        assert!(reaches_router(true, false, true));
+        assert!(reaches_router(true, true, true));
+        assert!(reaches_router(false, false, true));
+    }
+
+    #[test]
+    fn grab_failure_is_recorded_until_a_grab_succeeds() {
+        let mut device = EvdevDevice {
+            path: "test".to_string(),
+            name: "test".to_string(),
+            fd: -1, // EBADF: the ioctl fails without touching any device
+            grabbed: false,
+            held: HashSet::new(),
+            grab_failed: false,
+        };
+        device.set_grab(true);
+        assert!(!device.grabbed);
+        assert!(device.grab_failed);
     }
 
     #[test]

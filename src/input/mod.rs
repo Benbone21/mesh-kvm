@@ -62,6 +62,11 @@ pub fn apply(actions: &[Action], backend: &mut dyn InputBackend, peer: &mut dyn 
                     peer.send(Payload::PanicRelease);
                 }
             }
+            Action::SendActiveView { active } => {
+                if let Ok(active_node) = NodeId::try_from(active) {
+                    peer.send(Payload::ActiveView { active_node });
+                }
+            }
             Action::WarpCursor { x, y } => backend.warp_cursor(x, y),
             Action::ReleaseHeld => backend.release_held(),
             Action::SetBlocking { mouse, keyboard } => backend.set_blocking(mouse, keyboard),
@@ -121,6 +126,7 @@ mod tests {
             Action::InjectKey { scancode: 31, pressed: true },
             Action::SendFocus { target: 1, x: 10, y: KEEP_CURSOR },
             Action::SendPanic,
+            Action::SendActiveView { active: 1 },
             Action::WarpCursor { x: 11, y: 12 },
             Action::ReleaseHeld,
             Action::SetBlocking { mouse: true, keyboard: false },
@@ -152,6 +158,8 @@ mod tests {
         ];
         want.extend(std::iter::repeat_with(|| focus.clone()).take(3));
         want.extend(std::iter::repeat_with(|| Payload::PanicRelease).take(3));
+        // Repeated every second by the router, so one copy is enough.
+        want.push(Payload::ActiveView { active_node: NodeId::Windows });
         assert_eq!(format!("{:?}", p.0), format!("{:?}", want));
     }
 }

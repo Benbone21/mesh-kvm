@@ -265,11 +265,56 @@ pub struct LiveTelemetry {
     pub peer_online: bool,
 }
 
+impl LiveTelemetry {
+    fn new(peer_addr: String) -> Self {
+        Self {
+            active_node: "Debian".to_string(),
+            panic_mode: false,
+            deb_cursor_x: 3200,
+            deb_cursor_y: 720,
+            win_cursor_x: 960,
+            win_cursor_y: 540,
+            peer_addr,
+            game_captive_active: false,
+            game_reason: String::new(),
+            audio_rx_packets: 0,
+            audio_rx_peak: 0,
+            audio_muted: false,
+            audio_volume: 100,
+            audio_tx_enabled: false,
+            audio_tx_packets: 0,
+            audio_tx_peak: 0,
+            audio_tx_volume: 100,
+            audio_tx_source_mode: 0,
+            win_peer_reported_res: false,
+            peer_online: false,
+        }
+    }
+}
+
 pub struct SharedSpatialState {
     pub config: SpatialConfig,
     pub telemetry: LiveTelemetry,
     pub pending_manual_switch: Option<String>,
     pub pending_panic: bool,
+}
+
+/// What the input loop picks up from the Studio.
+pub struct StudioRequests {
+    pub manual_switch: bool,
+    pub panic: bool,
+    pub config: SpatialConfig,
+}
+
+/// Takes pending Studio requests with a config snapshot, or `None` if the lock is busy. The
+/// input loop must never wait here: it runs the link timeout and the failsafe hotkeys.
+pub fn take_studio_requests(state: &RwLock<SharedSpatialState>) -> Option<StudioRequests> {
+    let mut guard = state.try_write().ok()?;
+    Some(StudioRequests {
+        manual_switch: guard.pending_manual_switch.take().is_some(),
+        panic: std::mem::take(&mut guard.pending_panic),
+        config: guard.config.clone(),
+    })
 }
 
 impl SharedSpatialState {
@@ -296,28 +341,7 @@ impl SharedSpatialState {
 
         let state = Self {
             config,
-            telemetry: LiveTelemetry {
-                active_node: "Debian".to_string(),
-                panic_mode: false,
-                deb_cursor_x: 3200,
-                deb_cursor_y: 720,
-                win_cursor_x: 960,
-                win_cursor_y: 540,
-                peer_addr,
-                game_captive_active: false,
-                game_reason: String::new(),
-                audio_rx_packets: 0,
-                audio_rx_peak: 0,
-                audio_muted: false,
-                audio_volume: 100,
-                audio_tx_enabled: false,
-                audio_tx_packets: 0,
-                audio_tx_peak: 0,
-                audio_tx_volume: 100,
-                audio_tx_source_mode: 0,
-                win_peer_reported_res: false,
-                peer_online: false,
-            },
+            telemetry: LiveTelemetry::new(peer_addr),
             pending_manual_switch: None,
             pending_panic: false,
         };
@@ -563,9 +587,10 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
                         return Some(serde_json::json!({ "ok": false, "error": e.to_string() }).to_string())
                     }
                 };
-                let mut g = state.write().ok()?;
-                // Debian monitors always come from live hardware
+                // Debian monitors always come from live hardware. xrandr can hang, so it runs
+                // before the lock.
                 let (deb_mons, total_w, total_h) = detect_debian_monitors_native();
+                let mut g = state.write().ok()?;
                 new_cfg.debian_monitors = deb_mons;
                 new_cfg.deb_total_w = total_w;
                 new_cfg.deb_total_h = total_h;
@@ -620,7 +645,20 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
 }
 
 fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val: &serde_json::Value) {
+    // xrandr can hang, so it runs before the lock.
+    let detected = (act == "reset_native_resolutions").then(detect_debian_monitors_native);
     let Ok(mut g) = state.write() else { return };
+    if let Some((deb_mons, total_w, total_h)) = detected {
+        g.config.debian_monitors = deb_mons;
+        g.config.deb_total_w = total_w;
+        g.config.deb_total_h = total_h;
+        g.config.resolution_mode = "native".to_string();
+        g.config.win_w = g.config.win_native_w.max(640);
+        g.config.win_h = g.config.win_native_h.max(480);
+        g.config.resnap_after_resize();
+        g.save();
+        return;
+    }
     match act {
         "toggle_focus" => g.pending_manual_switch = Some("toggle".to_string()),
         "panic" => g.pending_panic = true,
@@ -630,17 +668,6 @@ fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val:
         }
         "toggle_auto_game_lock" => {
             g.config.auto_game_lock = !g.config.auto_game_lock;
-            g.save();
-        }
-        "reset_native_resolutions" => {
-            let (deb_mons, total_w, total_h) = detect_debian_monitors_native();
-            g.config.debian_monitors = deb_mons;
-            g.config.deb_total_w = total_w;
-            g.config.deb_total_h = total_h;
-            g.config.resolution_mode = "native".to_string();
-            g.config.win_w = g.config.win_native_w.max(640);
-            g.config.win_h = g.config.win_native_h.max(480);
-            g.config.resnap_after_resize();
             g.save();
         }
         _ => {}
@@ -776,6 +803,36 @@ mod tests {
         let mut c = layout(TouchSide::Bottom, 2240, 1440);
         c.debian_monitors.clear();
         assert_eq!(c.laptop_to_debian(100, 40), (2340, 1439));
+    }
+
+    fn shared_state() -> RwLock<SharedSpatialState> {
+        RwLock::new(SharedSpatialState {
+            config: layout(TouchSide::Bottom, 2240, 1440),
+            telemetry: LiveTelemetry::new(String::new()),
+            pending_manual_switch: Some("toggle".to_string()),
+            pending_panic: true,
+        })
+    }
+
+    #[test]
+    fn studio_requests_are_taken_once() {
+        let state = shared_state();
+        let first = take_studio_requests(&state).unwrap();
+        assert!(first.manual_switch && first.panic);
+        assert_eq!(first.config.win_x, 2240);
+        let second = take_studio_requests(&state).unwrap();
+        assert!(!second.manual_switch && !second.panic);
+    }
+
+    #[test]
+    fn busy_lock_skips_the_sync_and_keeps_requests() {
+        let state = shared_state();
+        {
+            let _studio = state.read().unwrap();
+            assert!(take_studio_requests(&state).is_none());
+        }
+        let taken = take_studio_requests(&state).unwrap();
+        assert!(taken.manual_switch && taken.panic);
     }
 
     #[test]
