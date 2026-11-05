@@ -11,6 +11,8 @@
 
 use std::collections::HashSet;
 
+use crate::protocol::SwitchEdge;
+
 pub type DeviceId = u8;
 pub const LINK_TIMEOUT_MS: u64 = 1350;
 pub const SWITCH_RACE_MS: u64 = 200;
@@ -354,6 +356,68 @@ impl Router {
             self.blocking = want;
             actions.push(Action::SetBlocking { mouse: want.0, keyboard: want.1 });
         }
+    }
+}
+
+/// A stretch of one screen edge, in laptop-local pixels along that edge (`start..=end`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeSpan {
+    pub edge: SwitchEdge,
+    pub start: i32,
+    pub end: i32,
+}
+
+/// Accumulates outward pointer push against an edge until it exceeds the resistance.
+pub struct EdgeTracker {
+    resistance: i32,
+    pushed: i32,
+}
+
+impl EdgeTracker {
+    pub fn new(resistance: i32) -> Self {
+        Self { resistance, pushed: 0 }
+    }
+
+    pub fn set_resistance(&mut self, resistance: i32) {
+        self.resistance = resistance;
+    }
+
+    /// True when this movement completes a push across `span`.
+    ///
+    /// Only outward movement while the pointer sits on the edge pixel inside the span
+    /// accumulates. Moving away, leaving the span, or holding a button clears it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(
+        &mut self,
+        span: EdgeSpan,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        dx: i32,
+        dy: i32,
+        buttons_held: bool,
+    ) -> bool {
+        if buttons_held {
+            self.pushed = 0;
+            return false;
+        }
+        let (on_edge, along, outward) = match span.edge {
+            SwitchEdge::Left => (x <= 0, y, -dx),
+            SwitchEdge::Right => (x >= w - 1, y, dx),
+            SwitchEdge::Top => (y <= 0, x, -dy),
+            SwitchEdge::Bottom => (y >= h - 1, x, dy),
+        };
+        if !on_edge || along < span.start || along > span.end || outward < 0 {
+            self.pushed = 0;
+            return false;
+        }
+        self.pushed = self.pushed.saturating_add(outward);
+        if self.pushed >= self.resistance {
+            self.pushed = 0;
+            return true;
+        }
+        false
     }
 }
 
@@ -821,5 +885,54 @@ mod tests {
         assert!(up.swallow);
         assert_eq!(up.actions, vec![Action::ForwardKey { scancode: 30, pressed: false }]);
         assert!(!key(&mut r, 30, true).swallow);
+    }
+
+    fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {
+        EdgeSpan { edge, start, end }
+    }
+
+    #[test]
+    fn crosses_after_resistance() {
+        let mut t = EdgeTracker::new(55);
+        let s = span(SwitchEdge::Left, 0, 1079);
+        assert!(!t.push(s, 0, 500, 1920, 1080, -30, 0, false));
+        assert!(t.push(s, 0, 500, 1920, 1080, -30, 0, false));
+    }
+
+    #[test]
+    fn moving_away_resets_push() {
+        let mut t = EdgeTracker::new(55);
+        let s = span(SwitchEdge::Left, 0, 1079);
+        assert!(!t.push(s, 0, 500, 1920, 1080, -30, 0, false));
+        assert!(!t.push(s, 0, 500, 1920, 1080, 5, 0, false));
+        assert!(!t.push(s, 0, 500, 1920, 1080, -30, 0, false));
+    }
+
+    #[test]
+    fn no_cross_outside_span() {
+        let mut t = EdgeTracker::new(55);
+        let s = span(SwitchEdge::Bottom, 0, 500);
+        for _ in 0..10 {
+            assert!(!t.push(s, 900, 1079, 1920, 1080, 0, 30, false));
+        }
+    }
+
+    #[test]
+    fn no_cross_with_button_held() {
+        let mut t = EdgeTracker::new(55);
+        let s = span(SwitchEdge::Left, 0, 1079);
+        for _ in 0..10 {
+            assert!(!t.push(s, 0, 500, 1920, 1080, -30, 0, true));
+        }
+    }
+
+    #[test]
+    fn releasing_drag_needs_fresh_push() {
+        let mut t = EdgeTracker::new(55);
+        let s = span(SwitchEdge::Left, 0, 1079);
+        for _ in 0..10 {
+            assert!(!t.push(s, 0, 500, 1920, 1080, -30, 0, true));
+        }
+        assert!(!t.push(s, 0, 500, 1920, 1080, -1, 0, false));
     }
 }
