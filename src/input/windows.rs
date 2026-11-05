@@ -185,14 +185,15 @@ fn route_local(event: Event) -> Routed {
 /// and a stale `SetBlocking` would leave the pin wrong. Whoever applies last corrects it here
 /// against the router, and the watchdog does so every tick. A poisoned router counts as neither.
 fn settle_races() {
-    let (remote, injecting) = match win_logic::lock_live(router_lock()) {
+    let (remote, pin_mouse, injecting) = match win_logic::lock_live(router_lock()) {
         Some(router) => {
             let live = router.online() && !router.panicked();
-            (live && router.active() != ME, live && router.active() == ME)
+            let remote = live && router.active() != ME;
+            (remote, remote && router.shares_mouse(), live && router.active() == ME)
         }
-        None => (false, false),
+        None => (false, false, false),
     };
-    WindowsBackend.set_blocking(remote, remote);
+    WindowsBackend.set_blocking(pin_mouse, remote);
     if !injecting {
         WindowsBackend.release_held();
     }
@@ -292,7 +293,12 @@ impl InputBackend for WindowsBackend {
     fn inject_button(&mut self, button: u8, pressed: bool) {
         // Recorded first, so a release racing this call can always see it.
         let update = |mask| Some(win_logic::button_mask(mask, button, pressed));
-        let _ = BUTTONS_HELD_MASK.try_update(Ordering::SeqCst, Ordering::SeqCst, update);
+        if let Ok(prev) = BUTTONS_HELD_MASK.try_update(Ordering::SeqCst, Ordering::SeqCst, update) {
+            // A repeated release changes nothing, so it sends nothing.
+            if !pressed && win_logic::button_mask(prev, button, false) == prev {
+                return;
+            }
+        }
         inject_mouse_button(button, pressed);
     }
 
@@ -306,7 +312,10 @@ impl InputBackend for WindowsBackend {
         };
         // Recorded first, so a release racing this call can always see it.
         if let Some(held) = KEYS_HELD.get(scancode as usize) {
-            held.store(pressed, Ordering::SeqCst);
+            // A repeated release changes nothing, so it sends nothing.
+            if !held.swap(pressed, Ordering::SeqCst) && !pressed {
+                return;
+            }
         }
         send_key(scan, extended, pressed);
     }

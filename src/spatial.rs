@@ -5,6 +5,8 @@ use std::fs;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 
+/// How far in from a screen edge a cursor enters, on both machines.
+const ENTRY_INSET: i32 = 28;
 const LAYOUT_FILE: &str = "/home/bread/mesh-kvm/layout.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,7 +485,38 @@ impl SpatialConfig {
         if x == KEEP_CURSOR || y == KEEP_CURSOR {
             return (KEEP_CURSOR, KEEP_CURSOR);
         }
-        self.clamp_to_debian(x.saturating_add(self.win_x), y.saturating_add(self.win_y))
+        let p = self.clamp_to_debian(x.saturating_add(self.win_x), y.saturating_add(self.win_y));
+        self.inset_on_monitor(p)
+    }
+
+    /// Pulls a point `ENTRY_INSET` pixels in from any monitor edge it sits on, so entry does not
+    /// land on the boundary pixel. Stays inside the monitor.
+    fn inset_on_monitor(&self, p: (i32, i32)) -> (i32, i32) {
+        let inset = |v: i32, lo: i32, size: i32| {
+            let hi = lo + (size - 1).max(0);
+            let (lo_i, hi_i) = (lo + ENTRY_INSET, hi - ENTRY_INSET);
+            if lo_i > hi_i {
+                // Too small to inset on both sides: use the middle.
+                return lo + (hi - lo) / 2;
+            }
+            if v == lo {
+                lo_i
+            } else if v == hi {
+                hi_i
+            } else {
+                v
+            }
+        };
+        let m = self.debian_monitors.iter().find(|m| {
+            m.w > 0 && m.h > 0 && (m.x..m.x + m.w).contains(&p.0) && (m.y..m.y + m.h).contains(&p.1)
+        });
+        match m {
+            Some(m) => (inset(p.0, m.x, m.w), inset(p.1, m.y, m.h)),
+            None if self.debian_monitors.is_empty() => {
+                (inset(p.0, 0, self.deb_total_w), inset(p.1, 0, self.deb_total_h))
+            }
+            None => p,
+        }
     }
 
     /// The closest pixel to `(x, y)` on any Debian monitor.
@@ -766,20 +799,20 @@ mod tests {
     fn laptop_point_converts_to_debian_coordinates() {
         // Laptop right of DP-2: (-1, 300) is just outside, so it lands on DP-2's last column.
         let c = layout(TouchSide::Right, 4480, 200);
-        assert_eq!(c.laptop_to_debian(-1, 300), (4479, 500));
+        assert_eq!(c.laptop_to_debian(-1, 300), (4451, 500));
     }
 
     #[test]
     fn laptop_point_clamps_to_nearest_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_to_debian(100, -1), (2340, 1439));
-        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1439));
+        assert_eq!(c.laptop_to_debian(100, -1), (2340, 1411));
+        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1411));
         // Left of the laptop's origin and below DP-3.
-        assert_eq!(c.laptop_to_debian(-1000, 0), (1240, 1439));
+        assert_eq!(c.laptop_to_debian(-1000, 0), (1240, 1411));
         // The empty corner above DP-3 goes to the closer of the two monitors.
         let c = layout(TouchSide::Top, 0, 0);
-        assert_eq!(c.laptop_to_debian(1900, 100), (1920, 100));
-        assert_eq!(c.laptop_to_debian(100, 340), (100, 360));
+        assert_eq!(c.laptop_to_debian(1900, 100), (1948, 100));
+        assert_eq!(c.laptop_to_debian(100, 340), (100, 388));
     }
 
     #[test]
@@ -794,15 +827,32 @@ mod tests {
     #[test]
     fn hostile_laptop_coordinates_stay_on_a_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_to_debian(i32::MAX, i32::MAX), (4479, 1439));
-        assert_eq!(c.laptop_to_debian(i32::MIN + 1, i32::MIN + 1), (0, 360));
+        assert_eq!(c.laptop_to_debian(i32::MAX, i32::MAX), (4451, 1411));
+        assert_eq!(c.laptop_to_debian(i32::MIN + 1, i32::MIN + 1), (28, 388));
     }
 
     #[test]
     fn laptop_point_without_monitors_uses_the_desktop_box() {
         let mut c = layout(TouchSide::Bottom, 2240, 1440);
         c.debian_monitors.clear();
-        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1439));
+        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1411));
+    }
+
+    #[test]
+    fn entry_is_inset_from_the_edge_it_lands_on_only() {
+        let c = layout(TouchSide::Right, 4480, 200);
+        // Interior points on the free axis keep their coordinate.
+        assert_eq!(c.laptop_to_debian(-1, 700), (4451, 900));
+        // An interior point is untouched.
+        assert_eq!(c.laptop_to_debian(-500, 300), (3980, 500));
+    }
+
+    #[test]
+    fn inset_stays_inside_a_tiny_monitor() {
+        let mut c = layout(TouchSide::Right, 4480, 200);
+        c.debian_monitors = vec![MonitorRect { name: "T".into(), x: 0, y: 0, w: 40, h: 40 }];
+        let (x, y) = c.laptop_to_debian(-4480, -200);
+        assert!((0..40).contains(&x) && (0..40).contains(&y));
     }
 
     fn shared_state() -> RwLock<SharedSpatialState> {

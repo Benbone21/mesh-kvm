@@ -155,7 +155,7 @@ pub struct VirtualKeyboard {
 impl VirtualKeyboard {
     pub fn new() -> Result<Self, String> {
         let path = CString::new("/dev/uinput").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(format!(
                 "Failed to open /dev/uinput (errno {}).",
@@ -206,6 +206,10 @@ impl VirtualKeyboard {
                 1
             }
         } else {
+            if !self.held_keys[idx] {
+                // A repeated release: nothing to do.
+                return;
+            }
             self.held_keys[idx] = false;
             0
         };
@@ -266,7 +270,7 @@ pub struct VirtualMouse {
 impl VirtualMouse {
     pub fn new(width: i32, height: i32) -> Result<Self, String> {
         let path = CString::new("/dev/uinput").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err("Failed to open /dev/uinput for Virtual Mouse".to_string());
         }
@@ -409,7 +413,7 @@ pub struct VirtualRelMouse {
 impl VirtualRelMouse {
     pub fn new() -> Result<Self, String> {
         let path = CString::new("/dev/uinput").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err("Failed to open /dev/uinput for Virtual Relative Mouse".to_string());
         }
@@ -470,8 +474,9 @@ impl VirtualRelMouse {
         };
         if pressed {
             self.held_buttons.insert(code);
-        } else {
-            self.held_buttons.remove(&code);
+        } else if !self.held_buttons.remove(&code) {
+            // A repeated release: nothing to do.
+            return;
         }
         self.write_event(EV_KEY, code, pressed as i32);
         self.write_event(EV_SYN, SYN_REPORT, 0);

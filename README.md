@@ -21,9 +21,11 @@ On Debian, run `mesh-kvm` with `--peer` set to the laptop's IP address. On Windo
 
 ## Update the laptop
 
+Update the laptop first. A new laptop with an old Debian stays local and safe. A new Debian with an old laptop forwards input into nothing until you press Ctrl+Alt+F11.
+
 1. Quit the running `mesh-kvm.exe` (Task Manager, Details tab). Windows won't let the installed copy be replaced while it runs.
-2. Copy the new `mesh-kvm.exe` to the laptop and run it once with the same `--peer` as before.
-3. Update and restart Debian at the same time.
+2. Copy the new `mesh-kvm.exe` to the laptop and run it once with the same `--peer` as before. The new exe keeps running from the folder you downloaded it to. The installed copy takes effect at the next login.
+3. Update and restart Debian.
 
 ## Hotkeys
 
@@ -32,8 +34,10 @@ These work on both devices.
 | Keys | What it does |
 | --- | --- |
 | Ctrl+Alt+F11 | Switch input to the other device |
-| Ctrl+Alt+F12 or ScrollLock | Release: hand input back to the device you are sitting at |
+| Ctrl+Alt+F12 or Ctrl+Alt+ScrollLock | Release: hand input back to the device you are sitting at |
 | Ctrl+Alt+G | Game lock: keep the pointer on the current device |
+
+Ctrl+Alt+F11 and Ctrl+Alt+G need the link to the laptop to be up. Ctrl+Alt+F12 and Ctrl+Alt+ScrollLock always work.
 
 If input seems stuck on the wrong device, press Ctrl+Alt+F12.
 
@@ -54,4 +58,4 @@ The Studio shows both devices and lets you arrange their screens. Open http://lo
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
 ```
 
-The exe path can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`.
+The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`.

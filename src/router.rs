@@ -149,6 +149,10 @@ impl Router {
     pub fn panicked(&self) -> bool {
         self.panicked
     }
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn shares_mouse(&self) -> bool {
+        self.cfg.sharing.mouse
+    }
     pub fn captive(&self) -> bool {
         self.captive
     }

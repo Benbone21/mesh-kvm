@@ -396,8 +396,14 @@ function renderMap() {
   let cur = $('cursor');
   if (!cur) { cur = document.createElement('div'); cur.id = 'cursor'; map.append(cur); }
   const onWin = t.active_node === 'Windows';
-  cur.style.left = view.ox + (onWin ? c.win_x + t.win_cursor_x : t.deb_cursor_x) * view.s + 'px';
-  cur.style.top = view.oy + (onWin ? c.win_y + t.win_cursor_y : t.deb_cursor_y) * view.s + 'px';
+  // The laptop's own position comes from its polled state; telemetry no longer carries it.
+  const winCur = dev.windows && dev.windows.cursor;
+  const pos = onWin ? (winCur ? [c.win_x + winCur[0], c.win_y + winCur[1]] : null) : [t.deb_cursor_x, t.deb_cursor_y];
+  cur.hidden = !pos;
+  if (pos) {
+    cur.style.left = view.ox + pos[0] * view.s + 'px';
+    cur.style.top = view.oy + pos[1] * view.s + 'px';
+  }
 }
 
 function renderSide() {

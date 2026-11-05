@@ -50,14 +50,22 @@ pub fn apply(actions: &[Action], backend: &mut dyn InputBackend, peer: &mut dyn 
         match *action {
             Action::ForwardMove { dx, dy } => peer.send(Payload::MouseMoveDelta { dx, dy }),
             Action::ForwardButton { button, pressed } => {
-                peer.send(Payload::MouseButton { button, pressed })
+                // A lost release would stick the button, so releases are repeated.
+                let copies = if pressed { 1 } else { REPEAT_CRITICAL };
+                for _ in 0..copies {
+                    peer.send(Payload::MouseButton { button, pressed });
+                }
             }
             Action::ForwardWheel { dx, dy } => peer.send(Payload::MouseWheel {
                 delta_x: dx,
                 delta_y: dy,
             }),
             Action::ForwardKey { scancode, pressed } => {
-                peer.send(Payload::KeyEvent { scancode, pressed })
+                // A lost release would stick the key, so releases are repeated.
+                let copies = if pressed { 1 } else { REPEAT_CRITICAL };
+                for _ in 0..copies {
+                    peer.send(Payload::KeyEvent { scancode, pressed });
+                }
             }
             Action::InjectMove { dx, dy } => backend.inject_move(dx, dy),
             Action::InjectButton { button, pressed } => backend.inject_button(button, pressed),
@@ -150,6 +158,7 @@ mod tests {
         let actions = [
             Action::ForwardMove { dx: 1, dy: -2 },
             Action::ForwardButton { button: 3, pressed: true },
+            Action::ForwardButton { button: 2, pressed: false },
             Action::ForwardWheel { dx: 4, dy: 5 },
             Action::ForwardKey { scancode: 30, pressed: false },
             Action::InjectMove { dx: 6, dy: 7 },
@@ -185,7 +194,12 @@ mod tests {
         let mut want = vec![
             Payload::MouseMoveDelta { dx: 1, dy: -2 },
             Payload::MouseButton { button: 3, pressed: true },
+            Payload::MouseButton { button: 2, pressed: false },
+            Payload::MouseButton { button: 2, pressed: false },
+            Payload::MouseButton { button: 2, pressed: false },
             Payload::MouseWheel { delta_x: 4, delta_y: 5 },
+            Payload::KeyEvent { scancode: 30, pressed: false },
+            Payload::KeyEvent { scancode: 30, pressed: false },
             Payload::KeyEvent { scancode: 30, pressed: false },
         ];
         want.extend(std::iter::repeat_with(|| focus.clone()).take(3));
