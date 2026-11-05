@@ -13,6 +13,18 @@ pub enum NodeId {
     Windows = 1,
 }
 
+impl TryFrom<u8> for NodeId {
+    type Error = u8;
+
+    fn try_from(v: u8) -> Result<Self, u8> {
+        match v {
+            0 => Ok(NodeId::Debian),
+            1 => Ok(NodeId::Windows),
+            other => Err(other),
+        }
+    }
+}
+
 impl FromStr for NodeId {
     type Err = String;
 

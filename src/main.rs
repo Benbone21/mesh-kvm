@@ -1,16 +1,13 @@
 mod audio;
 mod clipboard;
 mod keymap;
-#[cfg(target_os = "linux")]
-mod linux;
+mod input;
 mod protocol;
 mod router;
 mod settings;
 #[cfg(target_os = "linux")]
 mod spatial;
 mod webui;
-#[cfg(target_os = "windows")]
-mod windows;
 
 use clap::Parser;
 use protocol::{
@@ -169,7 +166,7 @@ fn main() {
                 cli.role
             );
         }
-        if let Err(e) = linux::run_debian_node(
+        if let Err(e) = input::linux::run_debian_node(
             peer_addr,
             cli.port,
             cli.switch_edge,
@@ -191,7 +188,7 @@ fn main() {
                 cli.role
             );
         }
-        if let Err(e) = windows::run_windows_node(
+        if let Err(e) = input::windows::run_windows_node(
             peer_addr,
             cli.port,
             cli.switch_edge,
