@@ -7,13 +7,15 @@
 //! Coordinates (`x`, `y` in `PeerFocus`, `EdgeCrossed`, `SendFocus`, `WarpCursor`) are
 //! opaque to the router: they are passed through unchanged. The caller owns any
 //! coordinate conversion. `ManualSwitch` has no coordinates, so its `SendFocus`
-//! carries `x: 0, y: 0`.
+//! carries `KEEP_CURSOR` for both, and a `PeerFocus` with `KEEP_CURSOR` emits no warp.
 
 use std::collections::HashSet;
 
 pub type DeviceId = u8;
 pub const LINK_TIMEOUT_MS: u64 = 1350;
 pub const SWITCH_RACE_MS: u64 = 200;
+/// Coordinate sentinel in `SendFocus`/`PeerFocus`: the receiver must not move its cursor.
+pub const KEEP_CURSOR: i32 = i32::MIN;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sharing {
@@ -88,6 +90,8 @@ pub struct Router {
     /// Last `SetBlocking` state emitted.
     blocking: (bool, bool),
     fwd_keys: HashSet<u16>,
+    /// Keys pressed while input was local; their repeats and release stay local.
+    local_keys: HashSet<u16>,
     fwd_buttons: HashSet<u8>,
     carry_x: f64,
     carry_y: f64,
@@ -107,6 +111,7 @@ impl Router {
             last_switch: None,
             blocking: (false, false),
             fwd_keys: HashSet::new(),
+            local_keys: HashSet::new(),
             fwd_buttons: HashSet::new(),
             carry_x: 0.0,
             carry_y: 0.0,
@@ -166,13 +171,22 @@ impl Router {
             }
             Event::LocalKey { scancode, pressed } => {
                 let route = if pressed {
-                    let f = self.forwarding(self.cfg.sharing.keyboard);
-                    if f {
+                    if self.fwd_keys.contains(&scancode) {
+                        true // repeat of a forwarded key
+                    } else if self.local_keys.contains(&scancode) {
+                        false // repeat of a locally held key
+                    } else if self.forwarding(self.cfg.sharing.keyboard) {
                         self.fwd_keys.insert(scancode);
+                        true
+                    } else {
+                        self.local_keys.insert(scancode);
+                        false
                     }
-                    f
+                } else if self.fwd_keys.remove(&scancode) {
+                    true
                 } else {
-                    self.fwd_keys.remove(&scancode)
+                    self.local_keys.remove(&scancode);
+                    false
                 };
                 if route {
                     out.swallow = true;
@@ -180,22 +194,22 @@ impl Router {
                 }
             }
             Event::PeerMove { dx, dy } => {
-                if self.injecting(self.cfg.sharing.mouse) {
+                if self.injecting() {
                     out.actions.push(Action::InjectMove { dx, dy });
                 }
             }
             Event::PeerWheel { dx, dy } => {
-                if self.injecting(self.cfg.sharing.mouse) {
+                if self.injecting() {
                     out.actions.push(Action::InjectWheel { dx, dy });
                 }
             }
             Event::PeerButton { button, pressed } => {
-                if self.injecting(self.cfg.sharing.mouse) {
+                if self.injecting() {
                     out.actions.push(Action::InjectButton { button, pressed });
                 }
             }
             Event::PeerKey { scancode, pressed } => {
-                if self.injecting(self.cfg.sharing.keyboard) {
+                if self.injecting() {
                     out.actions.push(Action::InjectKey { scancode, pressed });
                 }
             }
@@ -226,7 +240,7 @@ impl Router {
                     self.panicked = false;
                     self.last_switch = None;
                     self.set_active(target, &mut out.actions);
-                    if target == me {
+                    if target == me && !(x == KEEP_CURSOR && y == KEEP_CURSOR) {
                         out.actions.push(Action::WarpCursor { x, y });
                     }
                 }
@@ -245,7 +259,7 @@ impl Router {
                 self.panicked = false;
                 if self.online {
                     let target = if self.active == me { peer } else { me };
-                    self.own_switch(target, 0, 0, &mut out.actions);
+                    self.own_switch(target, KEEP_CURSOR, KEEP_CURSOR, &mut out.actions);
                 }
             }
             Event::SetCaptive(c) => self.captive = c,
@@ -264,9 +278,10 @@ impl Router {
         shared && self.online && !self.panicked && self.active != self.cfg.me
     }
 
-    /// Peer input of this kind is injected here.
-    fn injecting(&self, shared: bool) -> bool {
-        shared && self.online && !self.panicked && self.active == self.cfg.me
+    /// Peer input is injected here. The peer decides what to forward, so this device's
+    /// own sharing flags play no part.
+    fn injecting(&self) -> bool {
+        self.online && !self.panicked && self.active == self.cfg.me
     }
 
     fn scale(&mut self, dx: i32, dy: i32) -> (i32, i32) {
@@ -608,7 +623,7 @@ mod tests {
         assert!(!r.panicked());
         // Online: switches as normal.
         assert_eq!(r.active(), 1);
-        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: 0, y: 0 }));
+        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: KEEP_CURSOR, y: KEEP_CURSOR }));
     }
 
     #[test]
@@ -675,7 +690,7 @@ mod tests {
         assert_eq!(r.active(), 0);
         let out = r.handle(Event::ManualSwitch);
         assert_eq!(r.active(), 1);
-        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: 0, y: 0 }));
+        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: KEEP_CURSOR, y: KEEP_CURSOR }));
         assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
     }
 
@@ -745,5 +760,66 @@ mod tests {
         r.set_pointer_speed(2.0);
         let out = r.handle(Event::LocalMove { dx: 1, dy: 1 });
         assert_eq!(out.actions, vec![Action::ForwardMove { dx: 2, dy: 2 }]);
+    }
+
+    #[test]
+    fn peer_input_injects_even_if_local_sharing_is_off() {
+        let mut c = cfg(0);
+        c.sharing = Sharing { mouse: false, keyboard: false };
+        let mut r = Router::new(c);
+        online(&mut r);
+        assert_eq!(
+            r.handle(Event::PeerKey { scancode: 30, pressed: true }).actions,
+            vec![Action::InjectKey { scancode: 30, pressed: true }]
+        );
+        assert_eq!(
+            r.handle(Event::PeerMove { dx: 1, dy: 2 }).actions,
+            vec![Action::InjectMove { dx: 1, dy: 2 }]
+        );
+    }
+
+    #[test]
+    fn manual_switch_keeps_receiver_cursor() {
+        let mut r = router(1);
+        online(&mut r);
+        let out = r.handle(Event::ManualSwitch);
+        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: KEEP_CURSOR, y: KEEP_CURSOR }));
+        let mut m = router(0);
+        online(&mut m);
+        let out = m.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+        assert_eq!(m.active(), 0);
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::WarpCursor { .. })));
+    }
+
+    #[test]
+    fn key_repeat_of_locally_held_key_stays_local() {
+        let mut r = router(0);
+        online(&mut r);
+        assert!(!key(&mut r, 30, true).swallow);
+        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        assert_eq!(r.active(), 1);
+        let rep = key(&mut r, 30, true);
+        assert!(!rep.swallow);
+        assert!(rep.actions.is_empty());
+        let up = key(&mut r, 30, false);
+        assert!(!up.swallow);
+        assert!(up.actions.is_empty());
+        // After release, a fresh press forwards normally.
+        assert!(key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn key_repeat_of_forwarded_key_stays_forwarded() {
+        let mut r = forwarding_router();
+        assert!(key(&mut r, 30, true).swallow);
+        r.handle(Event::PeerFocus { target: 0, x: 0, y: 0 });
+        assert_eq!(r.active(), 0);
+        let rep = key(&mut r, 30, true);
+        assert!(rep.swallow);
+        assert_eq!(rep.actions, vec![Action::ForwardKey { scancode: 30, pressed: true }]);
+        let up = key(&mut r, 30, false);
+        assert!(up.swallow);
+        assert_eq!(up.actions, vec![Action::ForwardKey { scancode: 30, pressed: false }]);
+        assert!(!key(&mut r, 30, true).swallow);
     }
 }
