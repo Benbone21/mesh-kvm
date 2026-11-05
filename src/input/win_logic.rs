@@ -8,6 +8,7 @@ use crate::keymap::{
 use crate::protocol::{
     MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
+use std::sync::{Mutex, MutexGuard};
 
 // Win32 values, restated so this file builds on Linux. `windows.rs` asserts they match.
 pub const WM_MOUSEMOVE: u32 = 0x0200;
@@ -29,6 +30,28 @@ pub const KEYEVENTF_SCANCODE: u32 = 0x8;
 
 /// Held-key table size: every evdev key that `evdev_to_win_scan` maps is below this.
 pub const KEY_SLOTS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HookGate {
+    Route,
+    /// Hand the event to the OS untouched and drop the pin.
+    PassToOs,
+}
+
+/// What a hook does first. A poisoned router may be half-updated, so input fails open: it must
+/// never be swallowed on the word of state nobody can trust.
+pub fn hook_gate(router_poisoned: bool) -> HookGate {
+    if router_poisoned {
+        HookGate::PassToOs
+    } else {
+        HookGate::Route
+    }
+}
+
+/// Locks `mutex`, or `None` once a panic has poisoned it.
+pub fn lock_live<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    mutex.lock().ok()
+}
 
 /// Movement carried by one mouse-hook event at `pt`, or `None` for an event that is only our
 /// own pin coming back.
@@ -141,38 +164,83 @@ enum HotkeyKeyState {
     ToOs,
 }
 
+/// What the OS believes about Ctrl and Alt, from `GetAsyncKeyState`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OsModifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ModifierState {
+    Up,
+    /// Down, and the OS saw the press, so it can confirm this.
+    SeenByOs,
+    /// Down, but the hook swallowed the press: the OS will report it as up.
+    Swallowed,
+}
+
+/// Whether a side of this modifier is really down. A press the OS saw but no longer reports
+/// lost its key-up on the secure desktop, where hooks see nothing, so it is cleared.
+fn confirm_modifier(sides: &mut [ModifierState; 2], os_down: bool) -> bool {
+    let down = sides.iter().any(|&side| side != ModifierState::Up);
+    if down && !os_down && !sides.contains(&ModifierState::Swallowed) {
+        *sides = [ModifierState::Up; 2];
+        return false;
+    }
+    down
+}
+
 const HOTKEY_KEYS: [u16; 4] = [KEY_F11, KEY_F12, KEY_SCROLLLOCK, KEY_G];
 
 /// Finds hotkeys in the physical key stream, so a hotkey's own key never reaches the router.
 /// Ctrl and Alt are ordinary keys here: they are tracked and passed on.
 pub struct HotkeyFilter {
-    ctrl_l: bool,
-    ctrl_r: bool,
-    alt_l: bool,
-    alt_r: bool,
+    /// Left, then right.
+    ctrl: [ModifierState; 2],
+    alt: [ModifierState; 2],
     keys: [HotkeyKeyState; HOTKEY_KEYS.len()],
 }
 
 impl HotkeyFilter {
     pub const fn new() -> Self {
         Self {
-            ctrl_l: false,
-            ctrl_r: false,
-            alt_l: false,
-            alt_r: false,
+            ctrl: [ModifierState::Up; 2],
+            alt: [ModifierState::Up; 2],
             keys: [HotkeyKeyState::Up; HOTKEY_KEYS.len()],
         }
     }
 
-    /// Classifies one physical key event. Windows reports an auto-repeat as another press.
-    /// Panic needs no link; the other hotkeys are ordinary keys while `link_up` is false.
-    pub fn feed(&mut self, code: u16, pressed: bool, link_up: bool) -> KeyRoute {
+    fn modifier(&mut self, code: u16) -> Option<&mut ModifierState> {
         match code {
-            KEY_LEFTCTRL => self.ctrl_l = pressed,
-            KEY_RIGHTCTRL => self.ctrl_r = pressed,
-            KEY_LEFTALT => self.alt_l = pressed,
-            KEY_RIGHTALT => self.alt_r = pressed,
-            _ => {}
+            KEY_LEFTCTRL => Some(&mut self.ctrl[0]),
+            KEY_RIGHTCTRL => Some(&mut self.ctrl[1]),
+            KEY_LEFTALT => Some(&mut self.alt[0]),
+            KEY_RIGHTALT => Some(&mut self.alt[1]),
+            _ => None,
+        }
+    }
+
+    /// Records that the hook kept this key's press from the OS. Without this, the panic
+    /// hotkey would fail while forwarding, which is when it matters.
+    pub fn note_swallowed(&mut self, code: u16) {
+        if let Some(state) = self.modifier(code) {
+            if *state != ModifierState::Up {
+                *state = ModifierState::Swallowed;
+            }
+        }
+    }
+
+    /// Classifies one physical key event. Windows reports an auto-repeat as another press.
+    /// Panic needs no link and fires whatever the key did before, as it is the way out. The
+    /// other hotkeys are ordinary keys while `link_up` is false.
+    pub fn feed(&mut self, code: u16, pressed: bool, link_up: bool, os: OsModifiers) -> KeyRoute {
+        if let Some(state) = self.modifier(code) {
+            *state = match (pressed, *state) {
+                (false, _) => ModifierState::Up,
+                (true, ModifierState::Up) => ModifierState::SeenByOs,
+                (true, held) => held,
+            };
         }
         let Some(slot) = HOTKEY_KEYS.iter().position(|&key| key == code) else {
             return KeyRoute::Route;
@@ -180,23 +248,31 @@ impl HotkeyFilter {
         let state = self.keys[slot];
         if !pressed {
             self.keys[slot] = HotkeyKeyState::Up;
+            return match state {
+                HotkeyKeyState::Swallowed => KeyRoute::ConsumedSwallowed,
+                HotkeyKeyState::ToOs => KeyRoute::ConsumedToOs,
+                HotkeyKeyState::Up | HotkeyKeyState::Ordinary => KeyRoute::Route,
+            };
+        }
+
+        let ctrl = confirm_modifier(&mut self.ctrl, os.ctrl);
+        let alt = confirm_modifier(&mut self.alt, os.alt);
+        let chord = ctrl && alt;
+        if chord && matches!(code, KEY_F12 | KEY_SCROLLLOCK) {
+            self.keys[slot] = HotkeyKeyState::ToOs;
+            return KeyRoute::Hotkey(Hotkey::Panic);
         }
         match state {
             HotkeyKeyState::Swallowed => KeyRoute::ConsumedSwallowed,
             HotkeyKeyState::ToOs => KeyRoute::ConsumedToOs,
             HotkeyKeyState::Ordinary => KeyRoute::Route,
-            HotkeyKeyState::Up if !pressed => KeyRoute::Route,
             HotkeyKeyState::Up => {
-                let chord = (self.ctrl_l || self.ctrl_r) && (self.alt_l || self.alt_r);
                 let hotkey = match code {
-                    _ if !chord => None,
-                    KEY_F12 | KEY_SCROLLLOCK => Some(Hotkey::Panic),
-                    KEY_F11 if link_up => Some(Hotkey::ManualSwitch),
-                    KEY_G if link_up => Some(Hotkey::GameLock),
+                    KEY_F11 if chord && link_up => Some(Hotkey::ManualSwitch),
+                    KEY_G if chord && link_up => Some(Hotkey::GameLock),
                     _ => None,
                 };
                 self.keys[slot] = match hotkey {
-                    Some(Hotkey::Panic) => HotkeyKeyState::ToOs,
                     Some(_) => HotkeyKeyState::Swallowed,
                     None => HotkeyKeyState::Ordinary,
                 };
@@ -216,6 +292,8 @@ mod tests {
     };
 
     const PIN: (i32, i32) = (960, 540);
+    const OS_DOWN: OsModifiers = OsModifiers { ctrl: true, alt: true };
+    const OS_UP: OsModifiers = OsModifiers { ctrl: false, alt: false };
 
     #[test]
     fn offset_while_local_is_from_the_last_position() {
@@ -341,8 +419,8 @@ mod tests {
     }
 
     fn ctrl_alt(f: &mut HotkeyFilter) {
-        assert_eq!(f.feed(KEY_LEFTCTRL, true, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_LEFTALT, true, true), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_LEFTCTRL, true, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_LEFTALT, true, true, OS_DOWN), KeyRoute::Route);
     }
 
     #[test]
@@ -355,56 +433,55 @@ mod tests {
         ] {
             let mut f = HotkeyFilter::new();
             ctrl_alt(&mut f);
-            assert_eq!(f.feed(key, true, true), KeyRoute::Hotkey(hotkey));
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::Hotkey(hotkey));
         }
     }
 
     #[test]
     fn either_side_modifier_counts() {
         let mut f = HotkeyFilter::new();
-        f.feed(KEY_RIGHTCTRL, true, true);
-        f.feed(KEY_RIGHTALT, true, true);
-        assert_eq!(f.feed(KEY_F12, true, true), KeyRoute::Hotkey(Hotkey::Panic));
+        f.feed(KEY_RIGHTCTRL, true, true, OS_DOWN);
+        f.feed(KEY_RIGHTALT, true, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_DOWN), KeyRoute::Hotkey(Hotkey::Panic));
     }
 
     #[test]
     fn releasing_one_side_keeps_the_other() {
         let mut f = HotkeyFilter::new();
-        f.feed(KEY_LEFTCTRL, true, true);
-        f.feed(KEY_RIGHTCTRL, true, true);
-        f.feed(KEY_LEFTCTRL, false, true);
-        f.feed(KEY_LEFTALT, true, true);
-        assert_eq!(f.feed(KEY_G, true, true), KeyRoute::Hotkey(Hotkey::GameLock));
+        f.feed(KEY_LEFTCTRL, true, true, OS_DOWN);
+        f.feed(KEY_RIGHTCTRL, true, true, OS_DOWN);
+        f.feed(KEY_LEFTCTRL, false, true, OS_DOWN);
+        f.feed(KEY_LEFTALT, true, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_G, true, true, OS_DOWN), KeyRoute::Hotkey(Hotkey::GameLock));
     }
 
     #[test]
     fn hotkey_keys_without_both_modifiers_route_normally() {
         let mut f = HotkeyFilter::new();
-        assert_eq!(f.feed(KEY_G, true, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_G, false, true), KeyRoute::Route);
-        f.feed(KEY_LEFTCTRL, true, true);
-        assert_eq!(f.feed(KEY_F12, true, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_F12, false, true), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_G, true, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_G, false, true, OS_DOWN), KeyRoute::Route);
+        f.feed(KEY_LEFTCTRL, true, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_F12, false, true, OS_DOWN), KeyRoute::Route);
     }
 
     #[test]
     fn other_keys_route_with_modifiers_held() {
         let mut f = HotkeyFilter::new();
         ctrl_alt(&mut f);
-        assert_eq!(f.feed(KEY_A, true, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_A, false, true), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_A, true, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_A, false, true, OS_DOWN), KeyRoute::Route);
     }
 
     #[test]
     fn panic_works_with_no_link_and_stays_with_the_os() {
         for key in [KEY_F12, KEY_SCROLLLOCK] {
             let mut f = HotkeyFilter::new();
-            f.feed(KEY_LEFTCTRL, true, false);
-            f.feed(KEY_LEFTALT, true, false);
-            assert_eq!(f.feed(key, true, false), KeyRoute::Hotkey(Hotkey::Panic));
-            assert_eq!(f.feed(key, true, false), KeyRoute::ConsumedToOs);
-            assert_eq!(f.feed(key, false, false), KeyRoute::ConsumedToOs);
-            assert_eq!(f.feed(key, true, false), KeyRoute::Hotkey(Hotkey::Panic));
+            f.feed(KEY_LEFTCTRL, true, false, OS_DOWN);
+            f.feed(KEY_LEFTALT, true, false, OS_DOWN);
+            assert_eq!(f.feed(key, true, false, OS_DOWN), KeyRoute::Hotkey(Hotkey::Panic));
+            assert_eq!(f.feed(key, false, false, OS_DOWN), KeyRoute::ConsumedToOs);
+            assert_eq!(f.feed(key, true, false, OS_DOWN), KeyRoute::Hotkey(Hotkey::Panic));
         }
     }
 
@@ -412,10 +489,10 @@ mod tests {
     fn switch_and_game_lock_need_the_link() {
         for key in [KEY_F11, KEY_G] {
             let mut f = HotkeyFilter::new();
-            f.feed(KEY_LEFTCTRL, true, false);
-            f.feed(KEY_LEFTALT, true, false);
-            assert_eq!(f.feed(key, true, false), KeyRoute::Route);
-            assert_eq!(f.feed(key, false, false), KeyRoute::Route);
+            f.feed(KEY_LEFTCTRL, true, false, OS_DOWN);
+            f.feed(KEY_LEFTALT, true, false, OS_DOWN);
+            assert_eq!(f.feed(key, true, false, OS_DOWN), KeyRoute::Route);
+            assert_eq!(f.feed(key, false, false, OS_DOWN), KeyRoute::Route);
         }
     }
 
@@ -424,9 +501,9 @@ mod tests {
         for key in [KEY_F11, KEY_G] {
             let mut f = HotkeyFilter::new();
             ctrl_alt(&mut f);
-            assert!(matches!(f.feed(key, true, true), KeyRoute::Hotkey(_)));
-            assert_eq!(f.feed(key, true, true), KeyRoute::ConsumedSwallowed);
-            assert_eq!(f.feed(key, false, true), KeyRoute::ConsumedSwallowed);
+            assert!(matches!(f.feed(key, true, true, OS_DOWN), KeyRoute::Hotkey(_)));
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::ConsumedSwallowed);
+            assert_eq!(f.feed(key, false, true, OS_DOWN), KeyRoute::ConsumedSwallowed);
         }
     }
 
@@ -434,11 +511,123 @@ mod tests {
     fn hotkey_release_stays_consumed_after_ctrl_and_alt_go_up() {
         let mut f = HotkeyFilter::new();
         ctrl_alt(&mut f);
-        f.feed(KEY_F11, true, true);
-        assert_eq!(f.feed(KEY_LEFTCTRL, false, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_LEFTALT, false, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_F11, false, true), KeyRoute::ConsumedSwallowed);
-        assert_eq!(f.feed(KEY_F11, true, true), KeyRoute::Route);
+        f.feed(KEY_F11, true, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_LEFTCTRL, false, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_LEFTALT, false, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_F11, false, true, OS_DOWN), KeyRoute::ConsumedSwallowed);
+        assert_eq!(f.feed(KEY_F11, true, true, OS_DOWN), KeyRoute::Route);
+    }
+
+    #[test]
+    fn panic_fires_from_any_key_history() {
+        for key in [KEY_F12, KEY_SCROLLLOCK] {
+            // Held as an ordinary key before Ctrl+Alt went down.
+            let mut f = HotkeyFilter::new();
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::Route);
+            ctrl_alt(&mut f);
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::Hotkey(Hotkey::Panic));
+            // Auto-repeat of a panic that already fired.
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::Hotkey(Hotkey::Panic));
+            assert_eq!(f.feed(key, false, true, OS_DOWN), KeyRoute::ConsumedToOs);
+        }
+    }
+
+    #[test]
+    fn panic_repeat_without_the_chord_stays_with_the_os() {
+        let mut f = HotkeyFilter::new();
+        ctrl_alt(&mut f);
+        f.feed(KEY_F12, true, true, OS_DOWN);
+        f.feed(KEY_LEFTCTRL, false, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_DOWN), KeyRoute::ConsumedToOs);
+        assert_eq!(f.feed(KEY_F12, false, true, OS_DOWN), KeyRoute::ConsumedToOs);
+    }
+
+    #[test]
+    fn stale_modifiers_are_cleared_when_the_os_disagrees() {
+        // Ctrl+Alt+Del: the key-ups happened on the secure desktop, where hooks see nothing.
+        for key in [KEY_F11, KEY_F12, KEY_SCROLLLOCK, KEY_G] {
+            let mut f = HotkeyFilter::new();
+            ctrl_alt(&mut f);
+            assert_eq!(f.feed(key, true, true, OS_UP), KeyRoute::Route);
+            assert_eq!(f.feed(key, false, true, OS_UP), KeyRoute::Route);
+            // Cleared for good: a later agreeing OS state does not revive them.
+            assert_eq!(f.feed(key, true, true, OS_DOWN), KeyRoute::Route);
+        }
+    }
+
+    #[test]
+    fn only_the_disagreeing_modifier_is_cleared() {
+        let mut f = HotkeyFilter::new();
+        ctrl_alt(&mut f);
+        let ctrl_only = OsModifiers { ctrl: true, alt: false };
+        assert_eq!(f.feed(KEY_G, true, true, ctrl_only), KeyRoute::Route);
+        f.feed(KEY_G, false, true, ctrl_only);
+        // Ctrl survived, so a fresh Alt completes the chord.
+        f.feed(KEY_LEFTALT, true, true, OS_DOWN);
+        assert_eq!(f.feed(KEY_G, true, true, OS_DOWN), KeyRoute::Hotkey(Hotkey::GameLock));
+    }
+
+    #[test]
+    fn swallowed_modifiers_need_no_os_confirmation() {
+        // While forwarding the hook swallows Ctrl and Alt, so the OS never records them as
+        // down. This is the panic that gets the user out, so it must still fire.
+        for (key, hotkey) in [
+            (KEY_F12, Hotkey::Panic),
+            (KEY_SCROLLLOCK, Hotkey::Panic),
+            (KEY_F11, Hotkey::ManualSwitch),
+            (KEY_G, Hotkey::GameLock),
+        ] {
+            let mut f = HotkeyFilter::new();
+            ctrl_alt(&mut f);
+            f.note_swallowed(KEY_LEFTCTRL);
+            f.note_swallowed(KEY_LEFTALT);
+            assert_eq!(f.feed(key, true, true, OS_UP), KeyRoute::Hotkey(hotkey));
+        }
+    }
+
+    #[test]
+    fn swallowed_state_survives_auto_repeat_and_ends_on_release() {
+        let mut f = HotkeyFilter::new();
+        ctrl_alt(&mut f);
+        f.note_swallowed(KEY_LEFTCTRL);
+        f.note_swallowed(KEY_LEFTALT);
+        f.feed(KEY_LEFTCTRL, true, true, OS_UP);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_UP), KeyRoute::Hotkey(Hotkey::Panic));
+        f.feed(KEY_F12, false, true, OS_UP);
+        f.feed(KEY_LEFTCTRL, false, true, OS_UP);
+        f.feed(KEY_LEFTCTRL, true, true, OS_UP);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_UP), KeyRoute::Route);
+    }
+
+    #[test]
+    fn noting_a_key_that_is_up_changes_nothing() {
+        let mut f = HotkeyFilter::new();
+        f.note_swallowed(KEY_LEFTCTRL);
+        f.note_swallowed(KEY_A);
+        f.feed(KEY_LEFTALT, true, true, OS_UP);
+        assert_eq!(f.feed(KEY_F12, true, true, OS_UP), KeyRoute::Route);
+    }
+
+    #[test]
+    fn a_poisoned_router_sends_hooks_straight_to_the_os() {
+        assert_eq!(hook_gate(false), HookGate::Route);
+        assert_eq!(hook_gate(true), HookGate::PassToOs);
+    }
+
+    #[test]
+    fn a_poisoned_lock_gives_no_guard() {
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(1));
+        assert_eq!(lock_live(&lock).as_deref(), Some(&1));
+        let held = lock.clone();
+        let _ = std::thread::Builder::new()
+            .spawn(move || {
+                let _guard = held.lock().unwrap();
+                std::panic::resume_unwind(Box::new("poison"));
+            })
+            .unwrap()
+            .join();
+        assert!(lock.is_poisoned());
+        assert!(lock_live(&lock).is_none());
     }
 
     #[test]
@@ -446,9 +635,9 @@ mod tests {
         // G was forwarded before Ctrl+Alt went down. Firing here would lose G's release
         // and leave it stuck on the peer.
         let mut f = HotkeyFilter::new();
-        assert_eq!(f.feed(KEY_G, true, true), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_G, true, true, OS_DOWN), KeyRoute::Route);
         ctrl_alt(&mut f);
-        assert_eq!(f.feed(KEY_G, true, true), KeyRoute::Route);
-        assert_eq!(f.feed(KEY_G, false, true), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_G, true, true, OS_DOWN), KeyRoute::Route);
+        assert_eq!(f.feed(KEY_G, false, true, OS_DOWN), KeyRoute::Route);
     }
 }

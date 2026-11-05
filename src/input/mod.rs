@@ -10,6 +10,7 @@ pub mod windows;
 
 use crate::protocol::{NodeId, Payload};
 use crate::router::Action;
+use std::net::SocketAddr;
 
 /// Times focus and panic packets are sent, because the UDP link is lossy.
 const REPEAT_CRITICAL: usize = 3;
@@ -26,6 +27,11 @@ pub trait InputBackend {
 
 pub trait PeerSender {
     fn send(&mut self, payload: Payload);
+}
+
+/// True for a packet from the configured peer's IP. Its source port may vary.
+pub fn from_peer(src: SocketAddr, peer: SocketAddr) -> bool {
+    src.ip() == peer.ip()
 }
 
 /// False for a focus packet older than one already handled. UDP can reorder a burst.
@@ -119,6 +125,14 @@ mod tests {
         fn send(&mut self, payload: Payload) {
             self.0.push(payload);
         }
+    }
+
+    #[test]
+    fn only_the_configured_peer_ip_is_heard() {
+        let peer: SocketAddr = "192.168.8.210:24850".parse().unwrap();
+        assert!(from_peer("192.168.8.210:24850".parse().unwrap(), peer));
+        assert!(from_peer("192.168.8.210:50000".parse().unwrap(), peer));
+        assert!(!from_peer("192.168.8.211:24850".parse().unwrap(), peer));
     }
 
     #[test]

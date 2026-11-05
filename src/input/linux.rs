@@ -3,7 +3,7 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::{apply, fresh_focus_seq, InputBackend, PeerSender};
+use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
@@ -1250,7 +1250,10 @@ pub fn run_debian_node(
         }
 
         // 1. Drain incoming UDP packets on port 24850
-        while let Ok((len, _)) = socket.recv_from(&mut udp_buf) {
+        while let Ok((len, src_addr)) = socket.recv_from(&mut udp_buf) {
+            if !from_peer(src_addr, peer_addr) {
+                continue;
+            }
             let Ok(pkt) = Packet::decode(&udp_buf[..len]) else {
                 continue;
             };

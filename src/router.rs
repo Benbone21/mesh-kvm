@@ -17,6 +17,9 @@ pub const LINK_TIMEOUT_MS: u64 = 1350;
 pub const SWITCH_RACE_MS: u64 = 200;
 /// How often the main device repeats its view of the active device.
 pub const ACTIVE_VIEW_INTERVAL_MS: u64 = 1000;
+/// How long a non-main device keeps control with main after main's last view. Main sends one
+/// a second and only while it hears this device, so silence means forwarding may reach nobody.
+pub const VIEW_TIMEOUT_MS: u64 = 2500;
 /// Coordinate sentinel in `SendFocus`/`PeerFocus`: the receiver must not move its cursor.
 pub const KEEP_CURSOR: i32 = i32::MIN;
 
@@ -98,6 +101,9 @@ pub struct Router {
     last_alive: u64,
     /// When this device last sent `SendActiveView`.
     last_view: u64,
+    /// When a non-main device last heard from main that it hears us. `None` until the first
+    /// view, and after a fallback.
+    view_heard: Option<u64>,
     /// Our own most recent switch: (time, target we claimed).
     last_switch: Option<(u64, DeviceId)>,
     /// Last `SetBlocking` state emitted.
@@ -123,6 +129,7 @@ impl Router {
             now: 0,
             last_alive: 0,
             last_view: 0,
+            view_heard: None,
             last_switch: None,
             blocking: (false, false),
             fwd_keys: HashSet::new(),
@@ -238,9 +245,9 @@ impl Router {
                 self.last_alive = self.last_alive.max(now_ms);
                 if !self.online {
                     self.online = true;
+                    // A non-main device stays active for itself until main's first view
+                    // proves main hears it.
                     if !self.panicked {
-                        let main = self.cfg.main;
-                        self.set_active(main, &mut out.actions);
                         self.send_view(&mut out.actions);
                     }
                 }
@@ -249,6 +256,9 @@ impl Router {
                 self.now = self.now.max(now_ms);
                 if self.online && self.now.saturating_sub(self.last_alive) > LINK_TIMEOUT_MS {
                     self.link_lost(&mut out.actions);
+                }
+                if self.active != me && !self.view_fresh() {
+                    self.control_lost(&mut out.actions);
                 }
                 if self.online
                     && !self.panicked
@@ -259,14 +269,12 @@ impl Router {
             }
             Event::PeerActiveView { active } => {
                 let known = active == me || active == peer;
-                // A view that crossed our own fresh switch on the wire is stale, not a desync.
-                if me != self.cfg.main
-                    && self.online
-                    && !self.panicked
-                    && known
-                    && !self.conflicts(active)
-                {
-                    self.set_active(active, &mut out.actions);
+                if me != self.cfg.main && self.online && known {
+                    self.view_heard = Some(self.now);
+                    // A view that crossed our own fresh switch on the wire is stale, not a desync.
+                    if !self.panicked && !self.conflicts(active) {
+                        self.set_active(active, &mut out.actions);
+                    }
                 }
             }
             Event::PeerGameLock(locked) => self.peer_game_lock = locked,
@@ -275,6 +283,8 @@ impl Router {
                 if self.online && known && !(self.conflicts(target) && me == self.cfg.main) {
                     self.panicked = false;
                     self.last_switch = None;
+                    // Main only claims focus while it hears us, so this counts like a view.
+                    self.view_heard = Some(self.now);
                     self.set_active(target, &mut out.actions);
                     if target == me && !(x == KEEP_CURSOR && y == KEEP_CURSOR) {
                         out.actions.push(Action::WarpCursor { x, y });
@@ -288,6 +298,7 @@ impl Router {
                     && !self.peer_game_lock
                     && self.cfg.sharing.mouse
                     && self.active == me
+                    && self.view_fresh()
                 {
                     self.own_switch(peer, x, y, &mut out.actions);
                 }
@@ -296,7 +307,17 @@ impl Router {
                 self.panicked = false;
                 if self.online {
                     let target = if self.active == me { peer } else { me };
-                    self.own_switch(target, KEEP_CURSOR, KEEP_CURSOR, &mut out.actions);
+                    if target == me || self.view_fresh() {
+                        self.own_switch(target, KEEP_CURSOR, KEEP_CURSOR, &mut out.actions);
+                    } else {
+                        // Only ask: control moves on main's next view, which proves it heard.
+                        // Panic silences views, so this is also how a panic ends from here.
+                        out.actions.push(Action::SendFocus {
+                            target,
+                            x: KEEP_CURSOR,
+                            y: KEEP_CURSOR,
+                        });
+                    }
                 }
             }
             Event::SetCaptive(c) => self.captive = c,
@@ -369,10 +390,28 @@ impl Router {
         }
     }
 
+    /// Main counts as hearing this device. Always true on main itself.
+    fn view_fresh(&self) -> bool {
+        self.cfg.me == self.cfg.main
+            || self
+                .view_heard
+                .is_some_and(|heard| self.now.saturating_sub(heard) <= VIEW_TIMEOUT_MS)
+    }
+
+    /// Main has gone quiet: control comes back here, though the link stays up.
+    fn control_lost(&mut self, actions: &mut Vec<Action>) {
+        self.active = self.cfg.me;
+        self.last_switch = None;
+        self.view_heard = None;
+        self.reset_held();
+        actions.push(Action::ReleaseHeld);
+    }
+
     fn link_lost(&mut self, actions: &mut Vec<Action>) {
         self.online = false;
         self.active = self.cfg.me;
         self.last_switch = None;
+        self.view_heard = None;
         self.peer_game_lock = false;
         self.reset_held();
         actions.push(Action::ReleaseHeld);
@@ -487,6 +526,19 @@ mod tests {
     fn online(r: &mut Router) -> Routed {
         r.handle(Event::PeerAlive { now_ms: 1000 })
     }
+    /// Router 1 online, with main's first view adopted: device 0 is active.
+    fn adopted_router(c: RouterConfig) -> Router {
+        let mut r = Router::new(c);
+        online(&mut r);
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+        r
+    }
+    /// Heartbeats after `online`, close enough together that the link stays up.
+    fn alive_to_3000(r: &mut Router) {
+        r.handle(Event::PeerAlive { now_ms: 2000 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+    }
     fn key(r: &mut Router, scancode: u16, pressed: bool) -> Routed {
         r.handle(Event::LocalKey { scancode, pressed })
     }
@@ -514,10 +566,143 @@ mod tests {
     #[test]
     fn link_up_makes_main_device_active() {
         let mut r = router(1);
-        let out = online(&mut r);
+        online(&mut r);
         assert!(r.online());
+        let out = r.handle(Event::PeerActiveView { active: 0 });
         assert_eq!(r.active(), 0);
         assert!(out.actions.contains(&Action::SetBlocking { mouse: true, keyboard: true }));
+    }
+
+    #[test]
+    fn non_main_waits_for_first_view() {
+        let mut r = router(1);
+        let out = online(&mut r);
+        assert!(r.online());
+        assert_eq!(r.active(), 1);
+        assert!(out.actions.is_empty());
+        assert!(!key(&mut r, 30, true).swallow);
+        assert!(!r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+    }
+
+    #[test]
+    fn one_way_link_falls_back_to_local() {
+        let mut r = adopted_router(cfg(1));
+        assert!(key(&mut r, 30, true).swallow);
+        // Heartbeats keep arriving, but main has stopped sending views.
+        alive_to_3000(&mut r);
+        let out = r.handle(Event::Tick { now_ms: 1000 + VIEW_TIMEOUT_MS + 1 });
+        assert!(r.online());
+        assert_eq!(r.active(), 1);
+        assert!(out.actions.contains(&Action::ReleaseHeld));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(!key(&mut r, 31, true).swallow);
+        assert!(!r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+        // A key forwarded before the fallback is local now too.
+        assert!(!key(&mut r, 30, false).swallow);
+        // More heartbeats alone change nothing.
+        r.handle(Event::PeerAlive { now_ms: 4000 });
+        r.handle(Event::Tick { now_ms: 4000 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn view_timeout_boundary() {
+        let mut r = adopted_router(cfg(1));
+        alive_to_3000(&mut r);
+        let out = r.handle(Event::Tick { now_ms: 1000 + 2500 });
+        assert_eq!(r.active(), 0);
+        assert!(out.actions.is_empty());
+        r.handle(Event::Tick { now_ms: 1000 + 2501 });
+        assert_eq!(r.active(), 1);
+        assert_eq!(VIEW_TIMEOUT_MS, 2500);
+    }
+
+    #[test]
+    fn views_keep_control_with_the_peer() {
+        let mut r = adopted_router(cfg(1));
+        for now_ms in [2000, 3000, 4000, 5000] {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(Event::PeerActiveView { active: 0 });
+            r.handle(Event::Tick { now_ms });
+        }
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn view_resumes_after_fallback() {
+        let mut r = adopted_router(cfg(1));
+        alive_to_3000(&mut r);
+        r.handle(Event::Tick { now_ms: 3501 });
+        assert_eq!(r.active(), 1);
+        r.handle(Event::PeerAlive { now_ms: 3600 });
+        let out = r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: true, keyboard: true }));
+        assert!(key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn fallback_stays_until_the_next_view() {
+        let mut r = adopted_router(cfg(1));
+        alive_to_3000(&mut r);
+        r.handle(Event::Tick { now_ms: 3501 });
+        // Neither a push on the edge nor a manual switch hands control to a silent main.
+        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        assert!(out.actions.is_empty());
+        assert_eq!(r.active(), 1);
+        let out = r.handle(Event::ManualSwitch);
+        assert_eq!(r.active(), 1);
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::SetBlocking { .. })));
+    }
+
+    #[test]
+    fn manual_switch_with_no_view_still_asks_main() {
+        // Panic silences main's views, so this is how the laptop ends a panic on both devices.
+        let mut r = router(1);
+        online(&mut r);
+        r.handle(Event::Panic);
+        let out = r.handle(Event::ManualSwitch);
+        assert!(!r.panicked());
+        assert_eq!(r.active(), 1);
+        assert!(out.actions.contains(&Action::SendFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR }));
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn edge_crossing_needs_a_recent_view_on_non_main() {
+        let mut r = router(1);
+        online(&mut r);
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert_eq!(r.active(), 1);
+        r.handle(Event::PeerActiveView { active: 1 });
+        alive_to_3000(&mut r);
+        r.handle(Event::Tick { now_ms: 3501 });
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn peer_focus_counts_as_hearing_main() {
+        let mut r = router(1);
+        online(&mut r);
+        r.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+        assert_eq!(r.active(), 0);
+        alive_to_3000(&mut r);
+        r.handle(Event::Tick { now_ms: 3500 });
+        assert_eq!(r.active(), 0);
+        r.handle(Event::Tick { now_ms: 3501 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn main_never_falls_back_on_views() {
+        let mut r = forwarding_router();
+        alive_to_3000(&mut r);
+        r.handle(Event::PeerAlive { now_ms: 4000 });
+        r.handle(Event::Tick { now_ms: 4000 });
+        assert!(r.online());
+        assert_eq!(r.active(), 1);
     }
 
     #[test]
@@ -530,8 +715,7 @@ mod tests {
 
     #[test]
     fn shared_input_forwards_to_remote_active() {
-        let mut r = router(1);
-        online(&mut r);
+        let mut r = adopted_router(cfg(1));
         let k = key(&mut r, 30, true);
         assert!(k.swallow);
         assert_eq!(k.actions, vec![Action::ForwardKey { scancode: 30, pressed: true }]);
@@ -547,8 +731,7 @@ mod tests {
     fn unshared_input_stays_local() {
         let mut c = cfg(1);
         c.sharing = Sharing { mouse: true, keyboard: false };
-        let mut r = Router::new(c);
-        online(&mut r);
+        let mut r = adopted_router(c);
         let k = key(&mut r, 30, true);
         assert!(!k.swallow);
         assert!(k.actions.is_empty());
@@ -558,7 +741,8 @@ mod tests {
         let mut c = cfg(1);
         c.sharing = Sharing { mouse: false, keyboard: true };
         let mut r = Router::new(c);
-        let out = online(&mut r);
+        online(&mut r);
+        let out = r.handle(Event::PeerActiveView { active: 0 });
         assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: true }));
         let m = r.handle(Event::LocalMove { dx: 1, dy: 1 });
         assert!(!m.swallow);
@@ -690,8 +874,7 @@ mod tests {
 
     #[test]
     fn link_loss_on_non_main_becomes_active_for_itself() {
-        let mut r = router(1);
-        online(&mut r);
+        let mut r = adopted_router(cfg(1));
         r.handle(Event::Tick { now_ms: 1000 + 1351 });
         assert_eq!(r.active(), 1);
         assert!(!key(&mut r, 30, true).swallow);
@@ -796,9 +979,7 @@ mod tests {
 
     #[test]
     fn manual_switch_toggles_when_online() {
-        let mut r = router(1);
-        online(&mut r);
-        assert_eq!(r.active(), 0);
+        let mut r = adopted_router(cfg(1));
         let out = r.handle(Event::ManualSwitch);
         assert_eq!(r.active(), 1);
         assert!(out.actions.contains(&Action::SendFocus { target: 1, x: KEEP_CURSOR, y: KEEP_CURSOR }));
@@ -818,6 +999,7 @@ mod tests {
         let mut other = router(1);
         online(&mut main);
         online(&mut other);
+        other.handle(Event::PeerActiveView { active: 0 });
         // Views disagree: `other` earlier accepted a claim for device 1 that `main` never saw.
         other.handle(Event::PeerFocus { target: 1, x: 0, y: 0 });
         assert_eq!((main.active(), other.active()), (0, 1));
@@ -855,8 +1037,7 @@ mod tests {
     fn pointer_speed_scales_with_carry() {
         let mut c = cfg(1);
         c.pointer_speed = 0.5;
-        let mut r = Router::new(c);
-        online(&mut r);
+        let mut r = adopted_router(c);
         let mut total = 0;
         for _ in 0..2 {
             let out = r.handle(Event::LocalMove { dx: 1, dy: 0 });
@@ -891,8 +1072,7 @@ mod tests {
 
     #[test]
     fn manual_switch_keeps_receiver_cursor() {
-        let mut r = router(1);
-        online(&mut r);
+        let mut r = adopted_router(cfg(1));
         let out = r.handle(Event::ManualSwitch);
         assert!(out.actions.contains(&Action::SendFocus { target: 1, x: KEEP_CURSOR, y: KEEP_CURSOR }));
         let mut m = router(0);
@@ -945,10 +1125,10 @@ mod tests {
     fn desync_recovers_when_laptop_restarts() {
         let mut debian = forwarding_router();
         assert_eq!(debian.active(), 1);
-        // The laptop's fresh router comes up on main while Debian still forwards to it.
+        // The laptop's fresh router comes up for itself while Debian still forwards to it.
         let mut laptop = router(1);
         online(&mut laptop);
-        assert_eq!(laptop.active(), 0);
+        assert_eq!(laptop.active(), 1);
         let now = 1000 + ACTIVE_VIEW_INTERVAL_MS;
         debian.handle(Event::PeerAlive { now_ms: now });
         laptop.handle(Event::PeerAlive { now_ms: now });
@@ -956,7 +1136,7 @@ mod tests {
         let out = laptop.handle(view);
         laptop.handle(Event::Tick { now_ms: now });
         assert_eq!((debian.active(), laptop.active()), (1, 1));
-        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(out.actions.is_empty());
     }
 
     #[test]
@@ -1000,7 +1180,7 @@ mod tests {
         assert_eq!(laptop.active(), 1);
         online(&mut laptop);
         laptop.handle(Event::PeerActiveView { active: 7 });
-        assert_eq!(laptop.active(), 0);
+        assert_eq!(laptop.active(), 1);
     }
 
     #[test]

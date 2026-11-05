@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
 
-use super::win_logic::{self, Hotkey, HotkeyFilter, KeyRoute, KEY_SLOTS};
-use super::{apply, fresh_focus_seq, InputBackend, PeerSender};
+use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
+use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
@@ -24,10 +24,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     GetDC, GetDeviceCaps, ReleaseDC, DESKTOPHORZRES, DESKTOPVERTRES,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorInfo, GetCursorPos, GetMessageW, GetSystemMetrics,
@@ -111,22 +111,26 @@ fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// The shared router. Hold the guard only to call it: never across `SendInput`, `SetCursorPos`,
-/// a socket send or `println!`. `SendInput` waits for the hook thread, and the hook thread may be
-/// waiting for this lock.
+fn router_lock() -> &'static Mutex<Router> {
+    ROUTER.get_or_init(|| {
+        Mutex::new(Router::new(RouterConfig {
+            me: ME,
+            peer: PEER,
+            main: PEER,
+            sharing: Sharing { mouse: true, keyboard: true },
+            pointer_speed: 1.0,
+        }))
+    })
+}
+
+/// The shared router, for reading its state. Anything that decides what happens to input uses
+/// `win_logic::lock_live` instead, so that a poisoned router fails open.
+///
+/// Hold either guard only to call the router: never across `SendInput`, `SetCursorPos`, a socket
+/// send or `println!`. `SendInput` waits for the hook thread, and the hook thread may be waiting
+/// for this lock.
 fn router() -> MutexGuard<'static, Router> {
-    ROUTER
-        .get_or_init(|| {
-            Mutex::new(Router::new(RouterConfig {
-                me: ME,
-                peer: PEER,
-                main: PEER,
-                sharing: Sharing { mouse: true, keyboard: true },
-                pointer_speed: 1.0,
-            }))
-        })
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    router_lock().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn edge_state() -> MutexGuard<'static, EdgeState> {
@@ -134,11 +138,13 @@ fn edge_state() -> MutexGuard<'static, EdgeState> {
 }
 
 /// Feeds events to the router, then carries out their actions outside the lock. Returns the
-/// actions, and the last event's `swallow`.
+/// actions, and the last event's `swallow`. A poisoned router swallows nothing and does nothing.
 fn route_events(events: &[Event]) -> Routed {
     let mut routed = Routed::default();
     {
-        let mut router = router();
+        let Some(mut router) = win_logic::lock_live(router_lock()) else {
+            return Routed::default();
+        };
         let before = router.active();
         for &event in events {
             let step = router.handle(event);
@@ -174,14 +180,17 @@ fn route_local(event: Event) -> Routed {
     route_events(&[Event::Tick { now_ms: now_ms() }, event])
 }
 
-/// Three threads apply actions outside the lock, so they can land out of order: a key press
-/// injected just after another thread's `ReleaseHeld` would stick, and a stale `SetBlocking`
-/// would leave the pin wrong. Whoever applies last corrects it here against the router.
+/// The hook, UDP, watchdog and webui threads all apply actions outside the lock, so actions can
+/// land out of order: a key press injected just after another thread's `ReleaseHeld` would stick,
+/// and a stale `SetBlocking` would leave the pin wrong. Whoever applies last corrects it here
+/// against the router, and the watchdog does so every tick. A poisoned router counts as neither.
 fn settle_races() {
-    let (remote, injecting) = {
-        let router = router();
-        let live = router.online() && !router.panicked();
-        (live && router.active() != ME, live && router.active() == ME)
+    let (remote, injecting) = match win_logic::lock_live(router_lock()) {
+        Some(router) => {
+            let live = router.online() && !router.panicked();
+            (live && router.active() != ME, live && router.active() == ME)
+        }
+        None => (false, false),
     };
     WindowsBackend.set_blocking(remote, remote);
     if !injecting {
@@ -496,13 +505,28 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
     }
 }
 
+fn hotkeys() -> MutexGuard<'static, HotkeyFilter> {
+    HOTKEYS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn os_key_down(vk: u16) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+/// True if the hook must hand this event straight to the OS, because the router is poisoned.
+fn hook_fails_open() -> bool {
+    let open = win_logic::hook_gate(router_lock().is_poisoned()) == HookGate::PassToOs;
+    if open {
+        MOUSE_PINNED.store(false, Ordering::SeqCst);
+    }
+    open
+}
+
 /// Handles one physical key. Returns true to keep it from the OS.
 fn local_key(code: u16, pressed: bool) -> bool {
     let link_up = router().online();
-    let key_route = HOTKEYS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .feed(code, pressed, link_up);
+    let os = OsModifiers { ctrl: os_key_down(VK_CONTROL), alt: os_key_down(VK_MENU) };
+    let key_route = hotkeys().feed(code, pressed, link_up, os);
     match key_route {
         // Panic stays with the OS: restoring the keyboard must not depend on anything else.
         KeyRoute::Hotkey(Hotkey::Panic) => {
@@ -510,7 +534,7 @@ fn local_key(code: u16, pressed: bool) -> bool {
             false
         }
         KeyRoute::Hotkey(Hotkey::ManualSwitch) => {
-            route(Event::ManualSwitch);
+            route_local(Event::ManualSwitch);
             true
         }
         KeyRoute::Hotkey(Hotkey::GameLock) => {
@@ -519,7 +543,13 @@ fn local_key(code: u16, pressed: bool) -> bool {
         }
         KeyRoute::ConsumedSwallowed => true,
         KeyRoute::ConsumedToOs => false,
-        KeyRoute::Route => route_local(Event::LocalKey { scancode: code, pressed }).swallow,
+        KeyRoute::Route => {
+            let swallow = route_local(Event::LocalKey { scancode: code, pressed }).swallow;
+            if swallow {
+                hotkeys().note_swallowed(code);
+            }
+            swallow
+        }
     }
 }
 
@@ -528,6 +558,10 @@ unsafe extern "system" fn keyboard_hook_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
+    if hook_fails_open() {
+        return CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param);
+    }
+
     if n_code == HC_ACTION as i32 && l_param != 0 {
         let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
         let msg = w_param as u32;
@@ -629,6 +663,10 @@ unsafe extern "system" fn mouse_hook_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
+    if hook_fails_open() {
+        return CallNextHookEx(ptr::null_mut(), n_code, w_param, l_param);
+    }
+
     if n_code == HC_ACTION as i32 && l_param != 0 {
         let ms = &*(l_param as *const MSLLHOOKSTRUCT);
         let pt = (ms.pt.x, ms.pt.y);
@@ -850,6 +888,7 @@ pub fn run_windows_node(
             loop {
                 std::thread::sleep(TICK_INTERVAL);
                 route(Event::Tick { now_ms: now_ms() });
+                settle_races();
 
                 let now_captive = is_windows_game_captive();
                 if now_captive != captive {
@@ -893,7 +932,7 @@ pub fn run_windows_node(
             loop {
                 match rx_socket.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
-                        if src_addr.ip() != peer_addr.ip() {
+                        if !from_peer(src_addr, peer_addr) {
                             continue;
                         }
                         let Ok(pkt) = Packet::decode(&buf[..len]) else {
