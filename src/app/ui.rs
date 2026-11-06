@@ -550,6 +550,9 @@ impl DevicePanel<'_> {
             section(ui, "Clipboard");
             self.toggle(ui, Control::ClipboardSend, &format!("Send clipboard to {other}"));
             self.toggle(ui, Control::ClipboardReceive, &format!("Receive clipboard from {other}"));
+            if !self.status.clipboard.note.is_empty() {
+                ui.small(&self.status.clipboard.note);
+            }
         });
 
         ui.add_space(6.0);

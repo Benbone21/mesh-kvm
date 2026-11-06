@@ -5,7 +5,7 @@ use crate::audio::{
     AUDIO_TX_ENABLED, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOURCE_MODE,
     AUDIO_TX_VOLUME_PCT,
 };
-use crate::clipboard::{CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
+use crate::clipboard::{clipboard_note, CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
 use crate::protocol::NodeId;
 use crate::router::{DeviceId, Event, Sharing};
 use serde::{Deserialize, Serialize};
@@ -267,6 +267,7 @@ pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32, mai
     status["clipboard"] = serde_json::json!({
         "send": CLIPBOARD_SEND.load(Ordering::SeqCst),
         "receive": CLIPBOARD_RECEIVE.load(Ordering::SeqCst),
+        "note": clipboard_note(),
     });
     status["pointer_speed"] = serde_json::json!(pointer_speed);
     status["main_device"] = serde_json::json!(main_device());

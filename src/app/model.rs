@@ -121,11 +121,13 @@ impl Default for Sharing {
 pub struct ClipboardSharing {
     pub send: bool,
     pub receive: bool,
+    /// What the clipboard last did on that device.
+    pub note: String,
 }
 
 impl Default for ClipboardSharing {
     fn default() -> Self {
-        Self { send: true, receive: true }
+        Self { send: true, receive: true, note: String::new() }
     }
 }
 
