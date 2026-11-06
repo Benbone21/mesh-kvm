@@ -704,11 +704,12 @@ mod tests {
         ))
         .unwrap();
         d.sharing = Some(Default::default());
-        d.audio.tx_source = tx_source;
+        d.audio.output = if tx_source.is_some() { "speakers".into() } else { String::new() };
+        d.audio.outputs = vec![crate::app::model::AudioDevice { id: "speakers".into(), name: "Speakers".into() }];
         d.audio.tx_volume = 100;
         d.audio.rx_volume = 100;
         d.audio.tx_peak = 60;
-        d.audio.mute_while_sending = Some(true);
+        d.audio.play_only_on_other = Some(true);
         d
     }
 
@@ -731,7 +732,7 @@ mod tests {
         split.local.as_mut().unwrap().main_conflict = true;
         let mut older = linked();
         older.peer.as_mut().unwrap().sharing = None;
-        older.peer.as_mut().unwrap().audio.mute_while_sending = None;
+        older.peer.as_mut().unwrap().audio.play_only_on_other = None;
         let mut with_modes = linked();
         with_modes.local_displays = vec![display("DP-3"), display("DP-2")];
         with_modes.peer_displays = vec![display("Display 1")];

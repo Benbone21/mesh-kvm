@@ -127,15 +127,112 @@ impl Default for ClipboardSharing {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct AudioStatus {
+    /// Something is chosen to send.
     pub tx_enabled: bool,
+    /// What's chosen: a device id, `default`, or empty for nothing.
+    pub input: String,
+    pub output: String,
+    pub play: String,
+    pub inputs: Vec<AudioDevice>,
+    pub outputs: Vec<AudioDevice>,
+    /// Anything the person should know about these choices right now.
+    pub notes: Vec<String>,
+    /// What this device plays stays out of what it sends. Older services have no way to do that.
+    pub echo_safe: bool,
+    /// In kbit/s, with zero meaning uncompressed.
+    pub bitrate: u32,
     pub tx_volume: u32,
     pub tx_peak: u32,
-    pub tx_source: Option<u32>,
-    /// Missing from an older service, which can't mute itself.
-    pub mute_while_sending: Option<bool>,
+    pub tx_reaching: bool,
+    /// Percent of what's sent that the other device says isn't arriving.
+    pub tx_loss: u32,
+    /// Missing from an older service.
+    pub play_only_on_other: Option<bool>,
     pub rx_muted: bool,
     pub rx_volume: u32,
     pub rx_peak: u32,
+    pub rx_packets: u64,
+    /// Percent of what's sent here that isn't arriving in time, and what couldn't be rebuilt.
+    pub rx_loss: f32,
+    pub rx_unrepaired: f32,
+    pub rx_buffer_ms: u32,
+    /// Audio is arriving from a mesh-kvm of another version, and being ignored.
+    pub rx_other_version: bool,
+}
+
+/// A microphone, line-in or output, by the id it's saved under and the name it's shown by.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// What a device dropdown chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeviceRole {
+    Input,
+    Output,
+    Play,
+}
+
+const SYSTEM_DEFAULT: (&str, &str) = ("default", "System default");
+const NOTHING: (&str, &str) = ("", "None");
+
+impl DeviceRole {
+    /// The name the service knows it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            DeviceRole::Input => "input",
+            DeviceRole::Output => "output",
+            DeviceRole::Play => "play",
+        }
+    }
+
+    /// What's on offer ahead of the real devices. Received audio always plays somewhere.
+    pub fn fixed_options(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            DeviceRole::Input | DeviceRole::Output => &[NOTHING, SYSTEM_DEFAULT],
+            DeviceRole::Play => &[SYSTEM_DEFAULT],
+        }
+    }
+}
+
+/// How a chosen device shows in its dropdown.
+pub fn device_label(id: &str, devices: &[AudioDevice]) -> String {
+    if id == NOTHING.0 {
+        return NOTHING.1.into();
+    }
+    if id == SYSTEM_DEFAULT.0 {
+        return SYSTEM_DEFAULT.1.into();
+    }
+    devices.iter().find(|device| device.id == id).map_or("Not connected".into(), |device| device.name.clone())
+}
+
+pub fn bitrate_label(kbps: u32) -> String {
+    match kbps {
+        0 => "Uncompressed".into(),
+        kbps => format!("{kbps} kbit/s"),
+    }
+}
+
+/// How what's being sent is getting on.
+pub fn sending_quality(audio: &AudioStatus, other: &str) -> String {
+    if audio.tx_reaching {
+        format!("Playing on {other}, {}% lost on the way.", audio.tx_loss)
+    } else {
+        format!("Not playing on {other} yet.")
+    }
+}
+
+/// How what's arriving is getting on, once anything has.
+pub fn receiving_quality(audio: &AudioStatus) -> Option<String> {
+    (audio.rx_packets > 0).then(|| {
+        format!(
+            "Received: {:.1}% lost, {:.1}% couldn't be repaired, {} ms held back to smooth it out.",
+            audio.rx_loss, audio.rx_unrepaired, audio.rx_buffer_ms
+        )
+    })
 }
 
 /// One device's `/api/local`.
@@ -592,9 +689,8 @@ pub enum Control {
     MouseSharing,
     KeyboardSharing,
     PointerSpeed,
-    AudioSend,
-    AudioSource,
-    MuteWhileSending,
+    PlayOnlyOnOther,
+    AudioBitrate,
     SendVolume,
     AudioPlay,
     PlayVolume,
@@ -614,9 +710,8 @@ impl Control {
             Control::MouseSharing => flag(d.sharing.as_ref().is_none_or(|s| s.mouse)),
             Control::KeyboardSharing => flag(d.sharing.as_ref().is_none_or(|s| s.keyboard)),
             Control::PointerSpeed => d.pointer_speed as f64,
-            Control::AudioSend => flag(d.audio.tx_enabled),
-            Control::AudioSource => d.audio.tx_source.unwrap_or(0) as f64,
-            Control::MuteWhileSending => flag(d.audio.mute_while_sending.unwrap_or(false)),
+            Control::PlayOnlyOnOther => flag(d.audio.play_only_on_other.unwrap_or(false)),
+            Control::AudioBitrate => d.audio.bitrate as f64,
             Control::SendVolume => d.audio.tx_volume as f64,
             Control::AudioPlay => flag(!d.audio.rx_muted),
             Control::PlayVolume => d.audio.rx_volume as f64,
@@ -635,9 +730,8 @@ impl Control {
             Control::PointerSpeed => {
                 json!({ "action": "set_pointer_speed", "speed": (value * 100.0).round() / 100.0 })
             }
-            Control::AudioSend => json!({ "action": "set_audio_tx", "enabled": on }),
-            Control::AudioSource => json!({ "action": "set_audio_tx_source", "mode": value as u32 }),
-            Control::MuteWhileSending => json!({ "action": "set_mute_while_sending", "enabled": on }),
+            Control::PlayOnlyOnOther => json!({ "action": "set_play_only_on_other", "enabled": on }),
+            Control::AudioBitrate => json!({ "action": "set_audio_bitrate", "kbps": value as u32 }),
             Control::SendVolume => json!({ "action": "set_audio_tx_volume", "volume": value as u32 }),
             Control::AudioPlay => json!({ "action": "set_audio_rx_muted", "muted": !on }),
             Control::PlayVolume => json!({ "action": "set_audio_rx_volume", "volume": value as u32 }),
@@ -1159,12 +1253,17 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
                 .into(),
         );
     }
-    if local.audio.tx_enabled && snapshot.peer.as_ref().is_some_and(|peer| peer.audio.tx_enabled) {
-        return Some(
-            "Both devices are sending audio, which causes an echo. Turn off Send on one of them.".into(),
-        );
-    }
-    None
+    snapshot.peer.as_ref().and_then(|peer| echo_message(local, peer))
+}
+
+/// Both devices sending output sound only echoes if one can't keep what it plays out of what it
+/// sends. A microphone can't be helped from here: that's a room, not a loop in the software.
+fn echo_message(local: &DeviceStatus, peer: &DeviceStatus) -> Option<String> {
+    let sends_output = |d: &DeviceStatus| !d.audio.output.is_empty();
+    (sends_output(local) && sends_output(peer) && !(local.audio.echo_safe && peer.audio.echo_safe)).then(|| {
+        "Both devices are sending output sound, and one can't leave out what it plays, so you may hear an echo. Choose None under Output to send on one of them."
+            .into()
+    })
 }
 
 /// Explains two devices that disagree about the main device. Only Main device ends this: the
@@ -1933,36 +2032,90 @@ mod tests {
     }
 
     #[test]
-    fn both_devices_sending_is_called_out() {
+    fn both_devices_sending_is_called_out_only_when_an_echo_could_happen() {
         let linked = || {
             let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
             let peer = DeviceStatus { node: "windows".into(), ..local.clone() };
             Snapshot { local: Some(local), peer: Some(peer), layout: LayoutState::parse(STATE_JSON), ..Default::default() }
         };
+        const WARNING: &str = "Both devices are sending output sound, and one can't leave out what it plays, so you may hear an echo. Choose None under Output to send on one of them.";
         let mut snap = linked();
-        snap.local.as_mut().unwrap().audio.tx_enabled = true;
+        snap.local.as_mut().unwrap().audio.output = "default".into();
         assert_eq!(status_message(&snap), None, "one device sending is the normal case");
-        snap.peer.as_mut().unwrap().audio.tx_enabled = true;
-        assert_eq!(
-            status_message(&snap).as_deref(),
-            Some("Both devices are sending audio, which causes an echo. Turn off Send on one of them.")
-        );
+        snap.peer.as_mut().unwrap().audio.output = "speakers".into();
+        assert_eq!(status_message(&snap).as_deref(), Some(WARNING), "an older service can't leave it out");
+        snap.local.as_mut().unwrap().audio.echo_safe = true;
+        assert_eq!(status_message(&snap).as_deref(), Some(WARNING), "both have to");
+        snap.peer.as_mut().unwrap().audio.echo_safe = true;
+        assert_eq!(status_message(&snap), None);
+        snap.peer.as_mut().unwrap().audio.echo_safe = false;
+        snap.peer.as_mut().unwrap().audio.output.clear();
+        snap.peer.as_mut().unwrap().audio.input = "mic".into();
+        assert_eq!(status_message(&snap), None, "a microphone isn't a loop");
     }
 
     #[test]
-    fn mute_while_sending_reads_and_writes_the_service_field() {
+    fn play_only_on_the_other_device_reads_and_writes_the_service_field() {
         let mut d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
-        assert_eq!(d.audio.mute_while_sending, None, "an older service has no such field");
-        assert_eq!(Control::MuteWhileSending.read(&d), 0.0);
-        d.audio.mute_while_sending = Some(true);
-        assert_eq!(Control::MuteWhileSending.read(&d), 1.0);
+        assert_eq!(d.audio.play_only_on_other, None, "an older service has no such field");
+        assert_eq!(Control::PlayOnlyOnOther.read(&d), 0.0);
+        d.audio.play_only_on_other = Some(true);
+        assert_eq!(Control::PlayOnlyOnOther.read(&d), 1.0);
         assert_eq!(
-            Control::MuteWhileSending.action(0.0),
-            json!({"action": "set_mute_while_sending", "enabled": false})
+            Control::PlayOnlyOnOther.action(0.0),
+            json!({"action": "set_play_only_on_other", "enabled": false})
         );
-        let newer = LOCAL_JSON.replace(r#""tx_source":0,"#, r#""tx_source":0,"mute_while_sending":false,"#);
+        let newer = LOCAL_JSON.replace(r#""tx_source":0,"#, r#""play_only_on_other":false,"#);
         let d: DeviceStatus = serde_json::from_str(&newer).unwrap();
-        assert_eq!(d.audio.mute_while_sending, Some(false));
+        assert_eq!(d.audio.play_only_on_other, Some(false));
+    }
+
+    #[test]
+    fn the_bitrate_reads_and_writes_the_service_field() {
+        let mut d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
+        d.audio.bitrate = 128;
+        assert_eq!(Control::AudioBitrate.read(&d), 128.0);
+        assert_eq!(Control::AudioBitrate.action(0.0), json!({"action": "set_audio_bitrate", "kbps": 0}));
+        assert_eq!(bitrate_label(64), "64 kbit/s");
+        assert_eq!(bitrate_label(0), "Uncompressed");
+    }
+
+    #[test]
+    fn device_lists_come_from_the_status_with_readable_names() {
+        let text = LOCAL_JSON.replace(
+            r#""tx_source":0,"#,
+            r#""output":"usb-1","outputs":[{"id":"usb-1","name":"USB speakers"}],"inputs":[],"notes":["Hello"],"#,
+        );
+        let d: DeviceStatus = serde_json::from_str(&text).unwrap();
+        assert_eq!(device_label(&d.audio.output, &d.audio.outputs), "USB speakers");
+        assert_eq!(d.audio.notes, ["Hello"]);
+        assert_eq!(device_label("", &d.audio.outputs), "None");
+        assert_eq!(device_label("default", &d.audio.outputs), "System default");
+        assert_eq!(device_label("usb-2", &d.audio.outputs), "Not connected");
+    }
+
+    #[test]
+    fn received_audio_can_t_be_set_to_nowhere() {
+        assert!(DeviceRole::Input.fixed_options().iter().any(|(id, _)| id.is_empty()));
+        assert!(DeviceRole::Output.fixed_options().iter().any(|(id, _)| id.is_empty()));
+        assert!(!DeviceRole::Play.fixed_options().iter().any(|(id, _)| id.is_empty()));
+    }
+
+    #[test]
+    fn quality_lines_read_plainly() {
+        let mut audio = AudioStatus { tx_loss: 3, ..Default::default() };
+        assert_eq!(sending_quality(&audio, "Laptop"), "Not playing on Laptop yet.");
+        audio.tx_reaching = true;
+        assert_eq!(sending_quality(&audio, "Laptop"), "Playing on Laptop, 3% lost on the way.");
+        assert_eq!(receiving_quality(&audio), None, "nothing has arrived");
+        audio.rx_packets = 10;
+        audio.rx_loss = 2.5;
+        audio.rx_unrepaired = 0.4;
+        audio.rx_buffer_ms = 30;
+        assert_eq!(
+            receiving_quality(&audio).unwrap(),
+            "Received: 2.5% lost, 0.4% couldn't be repaired, 30 ms held back to smooth it out."
+        );
     }
 
     const KEY: (Device, Control) = (Device::Windows, Control::SendVolume);

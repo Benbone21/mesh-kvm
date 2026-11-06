@@ -1,9 +1,10 @@
 //! The controls beside the arrangement: one column of sections for each device.
 
 use super::canvas::{Canvas, MonitorKey};
-use super::model::{self, Control, ControlsEnabled, Device, DeviceStatus, Display, Edits, LayoutDraft, Snapshot};
+use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutDraft, Snapshot};
 use super::theme::{self, line, AMBER, DEEP, DIM, EDGE, INK};
 use super::widgets::{meter, slider_row, small, toggle_row, wide_button};
+use crate::audio::BITRATES;
 use crate::platform::{DisplayInfo, DisplayMode};
 use crate::settings::MAX_DEVICE_NAME;
 use crate::webui::UNKNOWN_ADDRESS;
@@ -19,6 +20,8 @@ const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 /// How long a new name stays on show before the polled one takes over.
 const NAME_HOLD: Duration = Duration::from_secs(3);
 const NAME_BOX_ROOM: f32 = 2.0;
+/// How long a picked device stays on show before the polled choice takes over.
+const PICK_HOLD: Duration = Duration::from_secs(1);
 
 const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 
@@ -34,6 +37,7 @@ struct NameEdit {
 #[derive(Default)]
 pub struct Panels {
     names: HashMap<Device, NameEdit>,
+    picks: HashMap<(Device, DeviceRole), (String, Instant)>,
 }
 
 /// What the person asked for in one device's section, for the window to send.
@@ -75,7 +79,7 @@ impl Panels {
             ui.label(small(text));
             return;
         };
-        let mut panel = DevicePanel { device, status, shared, requests };
+        let mut panel = DevicePanel { device, status, shared, requests, picks: &mut self.picks };
         panel.screens(ui);
         panel.input(ui);
         panel.clipboard(ui);
@@ -146,6 +150,7 @@ struct DevicePanel<'a, 'b> {
     status: &'a DeviceStatus,
     shared: &'a mut Shared<'b>,
     requests: &'a mut Requests,
+    picks: &'a mut HashMap<(Device, DeviceRole), (String, Instant)>,
 }
 
 impl DevicePanel<'_, '_> {
@@ -308,9 +313,17 @@ impl DevicePanel<'_, '_> {
 
     fn audio(&mut self, ui: &mut Ui) {
         subheading(ui, "Audio");
-        self.audio_sent(ui);
-        ui.add_space(theme::HEADING_GAP);
-        self.audio_received(ui);
+        ui.add_enabled_ui(self.status.audio.play_only_on_other.is_some(), |ui| {
+            self.audio_sent(ui);
+            ui.add_space(theme::HEADING_GAP);
+            self.audio_received(ui);
+        });
+        for note in &self.status.audio.notes {
+            ui.label(small(note));
+        }
+        if self.status.audio.rx_other_version {
+            ui.label(small("Audio from the other device is being ignored. Update both devices to the same version."));
+        }
         let label = format!("Play a test sound on {}", self.other_name());
         let can_test = self.shared.on.test_sound;
         if ui.add_enabled_ui(can_test, |ui| wide_button(ui, egui::Button::new(label)).clicked()).inner {
@@ -319,42 +332,73 @@ impl DevicePanel<'_, '_> {
     }
 
     fn audio_sent(&mut self, ui: &mut Ui) {
-        let other = self.other_name();
-        self.toggle(ui, Control::AudioSend, &format!("Send audio to {other}"));
+        let audio = &self.status.audio;
+        let (inputs, outputs) = (audio.inputs.clone(), audio.outputs.clone());
+        let (input, output) = (audio.input.clone(), audio.output.clone());
+        self.device_picker(ui, DeviceRole::Input, "Microphone or line-in to send", &inputs, &input);
+        self.device_picker(ui, DeviceRole::Output, "Output to send", &outputs, &output);
         meter(ui, self.status.audio.tx_peak);
-        if self.status.audio.tx_source.is_some() {
-            self.source_picker(ui);
-        }
-        ui.add_enabled_ui(self.status.audio.mute_while_sending.is_some(), |ui| {
-            self.toggle(ui, Control::MuteWhileSending, "Mute this device while sending");
-        });
+        self.toggle(ui, Control::PlayOnlyOnOther, "Play only on the other device");
+        self.bitrate_picker(ui);
         self.slider(ui, Control::SendVolume, "Send volume", |v| format!("{v:.0}%"), VOLUME_RANGE, 5.0);
+        if self.status.audio.tx_enabled {
+            ui.label(small(&model::sending_quality(&self.status.audio, &self.other_name())));
+        }
     }
 
     fn audio_received(&mut self, ui: &mut Ui) {
         let other = self.other_name();
         self.toggle(ui, Control::AudioPlay, &format!("Play audio from {other}"));
+        let (outputs, play) = (self.status.audio.outputs.clone(), self.status.audio.play.clone());
+        self.device_picker(ui, DeviceRole::Play, "Play received audio on", &outputs, &play);
         meter(ui, self.status.audio.rx_peak);
         self.slider(ui, Control::PlayVolume, "Playback volume", |v| format!("{v:.0}%"), VOLUME_RANGE, 5.0);
+        if let Some(quality) = model::receiving_quality(&self.status.audio) {
+            ui.label(small(&quality));
+        }
     }
 
-    fn source_picker(&mut self, ui: &mut Ui) {
-        const SOURCES: [&str; 2] = ["System sound", "Microphone"];
-        let current = self.value(Control::AudioSource) as usize;
-        ui.label("Audio to send");
+    /// A dropdown of real devices. A new pick shows at once, ahead of the next status.
+    fn device_picker(&mut self, ui: &mut Ui, role: DeviceRole, label: &str, devices: &[AudioDevice], polled: &str) {
+        let key = (self.device, role);
+        let held = self.picks.get(&key).filter(|(_, at)| self.shared.now.duration_since(*at) < PICK_HOLD);
+        let current = held.map_or(polled.to_string(), |(id, _)| id.clone());
+        ui.label(label);
         let mut chosen = None;
-        egui::ComboBox::from_id_salt((self.device, "audio source"))
-            .selected_text(SOURCES[current.min(1)])
+        egui::ComboBox::from_id_salt((self.device, label))
+            .selected_text(model::device_label(&current, devices))
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for (mode, name) in SOURCES.iter().enumerate() {
-                    if ui.selectable_label(mode == current, *name).clicked() {
-                        chosen = Some(mode);
+                let options = role.fixed_options().iter().map(|(id, name)| (*id, *name));
+                let options = options.chain(devices.iter().map(|d| (d.id.as_str(), d.name.as_str())));
+                for (id, name) in options {
+                    if ui.selectable_label(id == current, name).clicked() {
+                        chosen = Some(id.to_string());
                     }
                 }
             });
-        if let Some(mode) = chosen {
-            self.set(Control::AudioSource, mode as f64);
+        if let Some(id) = chosen {
+            self.requests.actions.push((self.device, json!({ "action": "set_audio_device", "role": role.name(), "id": id })));
+            self.picks.insert(key, (id, self.shared.now));
+        }
+    }
+
+    fn bitrate_picker(&mut self, ui: &mut Ui) {
+        let current = self.value(Control::AudioBitrate) as u32;
+        ui.label("Audio quality");
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt((self.device, "audio quality"))
+            .selected_text(model::bitrate_label(current))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for kbps in BITRATES {
+                    if ui.selectable_label(kbps == current, model::bitrate_label(kbps)).clicked() {
+                        chosen = Some(kbps);
+                    }
+                }
+            });
+        if let Some(kbps) = chosen {
+            self.set(Control::AudioBitrate, f64::from(kbps));
         }
     }
 

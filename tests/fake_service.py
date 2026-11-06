@@ -105,7 +105,10 @@ def default_settings():
         "sharing": {"mouse": True, "keyboard": True},
         "clipboard": {"send": True, "receive": True, "note": "Copied 12 characters from the other device."},
         "pointer_speed": 0.75,
-        "audio": {"tx_enabled": False, "tx_volume": 100, "tx_peak": 0, "tx_source": 0, "mute_while_sending": True,
+        "audio": {"tx_enabled": False, "tx_volume": 100, "tx_peak": 0, "play_only_on_other": True,
+                  "input": "", "output": "", "play": "default", "bitrate": 96, "echo_safe": True, "notes": [],
+                  "inputs": [{"id": "usb-mic", "name": "USB microphone"}],
+                  "outputs": [{"id": "speakers", "name": "Speakers"}, {"id": "headset", "name": "Headset"}],
                   "rx_muted": False, "rx_volume": 100, "rx_peak": 45},
     }
 
