@@ -86,12 +86,22 @@ pub fn log_fatal(message: &str) {
     append_fatal(&config_dir(), message);
 }
 
+/// Writes a plain note to `mesh-kvm.log`, for things worth knowing that aren't fatal.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn log_note(message: &str) {
+    append_line(&config_dir(), &format!("Note: {}", message));
+}
+
 fn append_fatal(dir: &Path, message: &str) {
+    append_line(dir, &format!("Fatal error: {}", message));
+}
+
+fn append_line(dir: &Path, line: &str) {
     let _ = std::fs::create_dir_all(dir);
     if let Ok(mut file) =
         std::fs::OpenOptions::new().create(true).append(true).open(dir.join("mesh-kvm.log"))
     {
-        let _ = writeln!(file, "Fatal error: {}", message);
+        let _ = writeln!(file, "{}", line);
     }
 }
 

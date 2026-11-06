@@ -455,17 +455,27 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
 /// windowless Startup launcher (service and tray) in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
 /// so the Windows 11 laptop automatically starts `mesh-kvm` in the background on every boot/login.
 fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
+    // The shortcut comes from PowerShell, which takes a moment: keep it off the caller's thread.
+    let _ = std::thread::Builder::new()
+        .name("mesh-kvm-install".into())
+        .spawn(move || install_launchers(peer_addr, switch_edge));
+}
+
+fn install_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
+    use crate::app::install;
     let Ok(appdata) = std::env::var("APPDATA") else {
         return;
     };
-    let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| appdata.clone());
-    let install_dir = PathBuf::from(&local_appdata).join("mesh-kvm");
-    let _ = fs::create_dir_all(&install_dir);
-    let installed_exe = install_dir.join("mesh-kvm.exe");
+    let Some(installed_exe) = install::installed_exe() else {
+        return;
+    };
 
+    install::clear_stale(&installed_exe);
     if let Ok(cur_exe) = std::env::current_exe() {
-        if cur_exe != installed_exe {
-            let _ = fs::copy(&cur_exe, &installed_exe);
+        if install::needs_install(&cur_exe, &installed_exe) {
+            if let Err(e) = install::replace_exe(&cur_exe, &installed_exe) {
+                crate::settings::log_fatal(&e);
+            }
         }
     }
 
@@ -490,6 +500,7 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
         &peer_addr.ip().to_string(),
         &switch_edge.to_string(),
         !autostart_disabled_marker().exists(),
+        &crate::app::launch::make_shortcut,
     );
     if let Some(vbs_path) = login_script {
         println!(
@@ -825,9 +836,6 @@ pub fn run_windows_node(
         remember_cursor(pt);
     }
 
-    // Ensure auto-boot on Windows login is installed
-    ensure_windows_autorun_installed(peer_addr, switch_edge);
-
     let init_seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -858,6 +866,10 @@ pub fn run_windows_node(
         peer_addr.ip().to_string(),
         studio_handler(peer_addr, switch_edge),
     )?;
+
+    // Ensure auto-boot on Windows login is installed. This waits until the web server has the
+    // port, so a process that loses the race to another service doesn't rewrite the launchers.
+    ensure_windows_autorun_installed(peer_addr, switch_edge);
 
     // Report true native Windows display resolution to Debian peer immediately
     for _ in 0..3 {

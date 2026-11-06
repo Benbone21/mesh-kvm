@@ -1,5 +1,6 @@
 pub mod client;
 mod icon;
+pub mod install;
 pub mod launch;
 pub mod model;
 pub mod single;

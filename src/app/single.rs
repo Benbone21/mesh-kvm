@@ -18,13 +18,21 @@ pub enum Instance {
     /// Nobody else holds the port. Keep this alive for as long as the process should own it.
     First(TcpListener),
     AlreadyRunning,
+    /// The port couldn't be taken for some other reason (the message says why).
+    Failed(String),
 }
 
 /// Takes `port` on 127.0.0.1.
 pub fn claim(port: u16) -> Instance {
-    match TcpListener::bind(("127.0.0.1", port)) {
+    classify(TcpListener::bind(("127.0.0.1", port)))
+}
+
+/// A taken port means another instance holds it. Any other error is a real failure.
+fn classify(bound: std::io::Result<TcpListener>) -> Instance {
+    match bound {
         Ok(listener) => Instance::First(listener),
-        Err(_) => Instance::AlreadyRunning,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Instance::AlreadyRunning,
+        Err(e) => Instance::Failed(format!("mesh-kvm couldn't reserve its local port: {e}")),
     }
 }
 
@@ -68,6 +76,10 @@ pub fn serve_focus(ctx: eframe::egui::Context) {
         listen(listener, move || {
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
+            // Wayland refuses a plain focus request. This one goes through xdg-activation.
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::RequestUserAttention(
+                eframe::egui::UserAttentionType::Informational,
+            ));
             ctx.request_repaint();
         });
     }
@@ -81,6 +93,14 @@ mod tests {
     /// A port nobody holds right now.
     fn free_port() -> u16 {
         TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn only_a_taken_port_means_already_running() {
+        let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        assert!(matches!(classify(Err(taken)), Instance::AlreadyRunning));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(classify(Err(denied)), Instance::Failed(_)));
     }
 
     #[test]

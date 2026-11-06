@@ -44,8 +44,8 @@ Changes take effect straight away and are kept when mesh-kvm restarts.
 
 Update the laptop first. A new laptop with an old Debian stays local and safe. A new Debian with an old laptop forwards input into nothing until you press Ctrl+Alt+F11.
 
-1. Quit the running `mesh-kvm.exe` (Task Manager, Details tab). Windows won't let the installed copy be replaced while it runs.
-2. Copy the new `mesh-kvm.exe` to the laptop and run it once with the same `--peer` as before. The new exe keeps running from the folder you downloaded it to. The installed copy takes effect at the next login.
+1. End every `mesh-kvm.exe` in Task Manager (Details tab). The service, the tray icon and the window are separate processes, so there are several.
+2. Copy the new `mesh-kvm.exe` to the laptop and run it once with the same `--peer` as before. It installs itself over the old copy (the old one is moved aside and deleted later), and the installed copy takes effect at the next login. Double-clicking a newer download while mesh-kvm runs also installs it, but the running processes keep the old version until you end them.
 3. Update and restart Debian.
 
 ## Hotkeys

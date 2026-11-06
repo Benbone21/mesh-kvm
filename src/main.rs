@@ -120,6 +120,23 @@ fn is_bare_launch(arg_count: usize) -> bool {
     arg_count <= 1
 }
 
+/// What a bare Windows launch does.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct BarePlan {
+    /// Install this exe over the installed one now (a running service won't do it).
+    install_exe: bool,
+    /// This process turns into the service.
+    become_service: bool,
+}
+
+/// A bare launch always opens the tray and window. With no service it becomes one (which installs
+/// itself); with a service already running it installs only if it is a different, newer download.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn bare_launch_plan(service_running: bool, exe_differs: bool) -> BarePlan {
+    BarePlan { install_exe: service_running && exe_differs, become_service: !service_running }
+}
+
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
 fn run_app_window() {
     match app::single::claim(app::single::WINDOW_PORT) {
@@ -128,6 +145,11 @@ fn run_app_window() {
             return;
         }
         app::single::Instance::First(listener) => app::single::keep_for_window(listener),
+        app::single::Instance::Failed(e) => {
+            eprintln!("Error: {}", e);
+            settings::log_fatal(&e);
+            std::process::exit(1);
+        }
     }
     if let Err(e) = app::ui::run_window() {
         eprintln!("Error: {}", e);
@@ -153,12 +175,30 @@ fn main() {
     #[cfg(target_os = "windows")]
     if is_bare_launch(std::env::args_os().len()) {
         let service_running = webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok();
+        let installed = app::install::installed_exe();
+        let exe_differs = match (std::env::current_exe(), &installed) {
+            (Ok(current), Some(installed)) => app::install::needs_install(&current, installed),
+            _ => false,
+        };
+        let plan = bare_launch_plan(service_running, exe_differs);
+        if plan.install_exe {
+            if let (Ok(current), Some(installed)) = (std::env::current_exe(), &installed) {
+                // A newer download was double-clicked while an older copy runs: install it now.
+                match app::install::replace_exe(&current, installed) {
+                    Ok(()) => settings::log_note(&format!(
+                        "Installed the newer {} over the running copy; it takes effect once every mesh-kvm.exe is ended and started again.",
+                        current.display()
+                    )),
+                    Err(e) => settings::log_fatal(&e),
+                }
+            }
+        }
         for flag in ["--tray", "--app"] {
             if let Err(e) = app::launch::spawn_self(flag) {
                 settings::log_fatal(&format!("Couldn't start mesh-kvm {flag}: {e}"));
             }
         }
-        if service_running {
+        if !plan.become_service {
             return;
         }
     }
@@ -284,6 +324,28 @@ mod tests {
         assert!(Cli::try_parse_from(["mesh-kvm", "--app"]).unwrap().app);
         assert!(Cli::try_parse_from(["mesh-kvm", "--studio"]).unwrap().app);
         assert!(!Cli::try_parse_from(["mesh-kvm"]).unwrap().app);
+    }
+
+    #[test]
+    fn bare_launch_plan_covers_every_case() {
+        use super::{bare_launch_plan, BarePlan};
+        assert_eq!(
+            bare_launch_plan(false, false),
+            BarePlan { install_exe: false, become_service: true }
+        );
+        assert_eq!(
+            bare_launch_plan(false, true),
+            BarePlan { install_exe: false, become_service: true },
+            "a starting service installs the exe itself"
+        );
+        assert_eq!(
+            bare_launch_plan(true, false),
+            BarePlan { install_exe: false, become_service: false }
+        );
+        assert_eq!(
+            bare_launch_plan(true, true),
+            BarePlan { install_exe: true, become_service: false }
+        );
     }
 
     #[test]
