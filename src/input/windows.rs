@@ -383,9 +383,9 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                 unsafe {
                     GetCursorPos(&mut pt);
                 }
-                let (peer_online, active_node, panic_mode) = {
+                let (peer_online, active_node, panic_mode, main_conflict) = {
                     let router = router();
-                    (router.online(), router.active(), router.panicked())
+                    (router.online(), router.active(), router.panicked(), router.main_conflict())
                 };
                 let active = if active_node == PEER { "Debian" } else { "Windows" };
                 let manual = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
@@ -417,12 +417,17 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                     "input_devices": ["Laptop keyboard", "Laptop trackpad"],
                     "audio": crate::settings::audio_status_json(false),
                 });
-                crate::settings::add_toggle_status(&mut status, crate::settings::pointer_speed());
+                let speed = crate::settings::pointer_speed();
+                crate::settings::add_toggle_status(&mut status, speed, main_conflict);
                 Some(status.to_string())
             }
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
                 let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if act == "set_main_device" {
+                    let link_up = router().online();
+                    return Some(crate::settings::set_main_device(&val, link_up));
+                }
                 if !crate::settings::handle_common_action(act, &val) {
                     match act {
                         "set_autostart" => set_windows_autostart(
@@ -591,8 +596,9 @@ unsafe extern "system" fn keyboard_hook_proc(
 }
 
 /// Counts a cursor at `(x, y)` that just moved by `(dx, dy)` against the edge touching Debian,
-/// and crosses when the push completes. Returns true if focus left this laptop.
-fn push_edge(x: i32, y: i32, dx: i32, dy: i32) -> bool {
+/// and crosses when the push completes. Returns true if focus left this laptop. `from_peer` says
+/// Debian's input moved the cursor.
+fn push_edge(x: i32, y: i32, dx: i32, dy: i32, from_peer: bool) -> bool {
     let may_cross = {
         let router = router();
         router.online() && !router.panicked() && !router.captive() && router.active() == ME
@@ -613,7 +619,7 @@ fn push_edge(x: i32, y: i32, dx: i32, dy: i32) -> bool {
         }
     };
     pushed_through
-        && route(Event::EdgeCrossed { x, y })
+        && route(Event::EdgeCrossed { x, y, from_peer })
             .actions
             .iter()
             .any(|a| matches!(a, Action::SendFocus { .. }))
@@ -647,7 +653,7 @@ fn local_move(pt: (i32, i32)) -> bool {
     let (w, h) = screen_size();
     let (x, y) = win_logic::clamp_to_screen(pt, w, h);
     // On a crossing the event must not reach the OS, or it would drag the cursor off the pin.
-    push_edge(x, y, dx, dy)
+    push_edge(x, y, dx, dy, false)
 }
 
 /// Handles one physical mouse event. Returns true to keep it from the OS.
@@ -964,7 +970,7 @@ pub fn run_windows_node(
                                     .any(|a| matches!(a, Action::InjectMove { .. }));
                                 if injected {
                                     if let Some((x, y)) = cursor_pos() {
-                                        push_edge(x, y, dx, dy);
+                                        push_edge(x, y, dx, dy, true);
                                     }
                                 }
                             }

@@ -70,7 +70,7 @@ pub fn settled_input(router: &Router, me: DeviceId) -> SettledInput {
     SettledInput {
         block_mouse: remote && sharing.mouse,
         block_keyboard: remote && sharing.keyboard,
-        injecting: live && router.active() == me,
+        injecting: live && !router.main_conflict() && router.active() == me,
     }
 }
 
@@ -669,6 +669,23 @@ mod tests {
         router.handle(Event::PeerFocus { target: 1, x: 0, y: 0 });
         let want = SettledInput { block_mouse: false, block_keyboard: false, injecting: true };
         assert_eq!(settled_input(&router, 1), want);
+    }
+
+    #[test]
+    fn settling_neither_blocks_nor_injects_during_a_main_conflict() {
+        let mut router = Router::new(RouterConfig {
+            me: 1,
+            peer: 0,
+            main: 1,
+            sharing: Sharing { mouse: true, keyboard: true },
+            pointer_speed: 1.0,
+        });
+        for now_ms in [1000, 2000, 3000, 4000, 5000] {
+            router.handle(Event::PeerAlive { now_ms });
+            router.handle(Event::PeerActiveView { active: 0 });
+        }
+        assert!(router.main_conflict());
+        assert_eq!(settled_input(&router, 1), SettledInput::default());
     }
 
     #[test]

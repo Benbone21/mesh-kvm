@@ -9,13 +9,16 @@ use crate::clipboard::{CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
 use crate::protocol::NodeId;
 use crate::router::{DeviceId, Event, Sharing};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 const MIN_POINTER_SPEED: f64 = 0.05;
 const MAX_POINTER_SPEED: f64 = 2.0;
 const DEFAULT_POINTER_SPEED: f32 = 1.0;
 const DEFAULT_MAIN_DEVICE: DeviceId = NodeId::Debian as DeviceId;
+pub const OK_RESPONSE: &str = r#"{"ok":true}"#;
 
 static MOUSE_SHARING: AtomicBool = AtomicBool::new(true);
 static KEYBOARD_SHARING: AtomicBool = AtomicBool::new(true);
@@ -25,6 +28,8 @@ static MAIN_DEVICE: AtomicU8 = AtomicU8::new(DEFAULT_MAIN_DEVICE);
 /// Set after the values above change, for the input loop to feed its router.
 static SHARING_PENDING: AtomicBool = AtomicBool::new(false);
 static MAIN_PENDING: AtomicBool = AtomicBool::new(false);
+/// One save at a time: they share a temp file, and the last to finish must have the newest values.
+static SAVING: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -154,8 +159,8 @@ pub fn load_and_apply() {
     MAIN_DEVICE.store(s.main_device, Ordering::SeqCst);
 }
 
-pub fn save_current() {
-    let s = LocalSettings {
+fn current_settings() -> LocalSettings {
+    LocalSettings {
         audio_tx_enabled: AUDIO_TX_ENABLED.load(Ordering::Relaxed),
         audio_tx_volume: AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed),
         audio_tx_source: AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed),
@@ -167,10 +172,30 @@ pub fn save_current() {
         clipboard_receive: CLIPBOARD_RECEIVE.load(Ordering::SeqCst),
         pointer_speed: f32::from_bits(POINTER_SPEED_BITS.load(Ordering::SeqCst)),
         main_device: main_device(),
-    };
+    }
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    path.with_extension("json.tmp")
+}
+
+/// Replaces `path` in one step, so that a crash leaves the old file or the new one, never half.
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let temp = temp_path(path);
+    let mut file = std::fs::File::create(&temp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+pub fn save_current() {
+    let _saving = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
     let _ = std::fs::create_dir_all(config_dir());
-    if let Ok(json) = serde_json::to_string_pretty(&s) {
-        let _ = std::fs::write(settings_path(), json);
+    if let Ok(json) = serde_json::to_string_pretty(&current_settings()) {
+        let _ = write_atomically(&settings_path(), &json);
     }
 }
 
@@ -193,8 +218,8 @@ pub fn audio_status_json(supports_source_select: bool) -> serde_json::Value {
 }
 
 /// Adds the toggles to a `/api/local` status. Debian's pointer speed lives in its layout, so each
-/// node passes its own.
-pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32) {
+/// node passes its own, along with whether its router has a main conflict.
+pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32, main_conflict: bool) {
     let sharing = sharing();
     status["sharing"] = serde_json::json!({ "mouse": sharing.mouse, "keyboard": sharing.keyboard });
     status["clipboard"] = serde_json::json!({
@@ -203,6 +228,7 @@ pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32) {
     });
     status["pointer_speed"] = serde_json::json!(pointer_speed);
     status["main_device"] = serde_json::json!(main_device());
+    status["main_conflict"] = serde_json::json!(main_conflict);
 }
 
 /// Applies a toggle action to the live atomics, without saving. A field left out keeps its value,
@@ -229,15 +255,29 @@ fn apply_toggle(act: &str, val: &serde_json::Value) -> bool {
                 POINTER_SPEED_BITS.store(speed.to_bits(), Ordering::SeqCst);
             }
         }
-        "set_main_device" => {
-            if let Some(device) = requested_main_device(val) {
-                MAIN_DEVICE.store(device, Ordering::SeqCst);
-                MAIN_PENDING.store(true, Ordering::SeqCst);
-            }
-        }
         _ => return false,
     }
     true
+}
+
+/// Handles `set_main_device` and returns the response body. Not a common action, as each node
+/// must say whether its link is up: changing one device alone leaves two mains or none.
+pub fn set_main_device(val: &serde_json::Value, link_up: bool) -> String {
+    change_main_device(val, link_up, save_current)
+}
+
+fn change_main_device(val: &serde_json::Value, link_up: bool, save: impl FnOnce()) -> String {
+    let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
+    let Some(device) = requested_main_device(val) else {
+        return refuse("Unknown device. Choose 0 for Debian or 1 for the laptop.");
+    };
+    if !link_up {
+        return refuse("The devices aren't linked. Reconnect them, then change the main device.");
+    }
+    MAIN_DEVICE.store(device, Ordering::SeqCst);
+    MAIN_PENDING.store(true, Ordering::SeqCst);
+    save();
+    OK_RESPONSE.to_string()
 }
 
 /// Handles actions common to both nodes. Returns true if the action was recognised.
@@ -395,17 +435,94 @@ mod tests {
     fn unknown_main_device_is_ignored() {
         let _guard = live_toggles();
         take_router_events();
-        assert!(apply_toggle("set_main_device", &json!({ "device": 1 })));
+        assert_eq!(change_main_device(&json!({ "device": 1 }), true, || ()), OK_RESPONSE);
         assert_eq!(take_router_events(), vec![Event::SetMain(1)]);
         // 256 and 257 must not wrap round to a real device.
         for device in [json!(7), json!(256), json!(257), json!(-1), json!(0.5), json!("0")] {
-            assert!(apply_toggle("set_main_device", &json!({ "device": device })));
+            let response = change_main_device(&json!({ "device": device }), true, || ());
+            assert_refused(&response);
             assert_eq!(main_device(), 1);
             assert!(take_router_events().is_empty());
         }
-        apply_toggle("set_main_device", &json!({ "device": 0 }));
+        change_main_device(&json!({ "device": 0 }), true, || ());
         assert_eq!(take_router_events(), vec![Event::SetMain(0)]);
         assert_eq!(main_device(), 0);
+    }
+
+    fn assert_refused(response: &str) {
+        let body: serde_json::Value = serde_json::from_str(response).unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(!body["error"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn refused_main_change_is_not_saved() {
+        let _guard = live_toggles();
+        take_router_events();
+        let before = main_device();
+        let saves = std::cell::Cell::new(0);
+        let save = || saves.set(saves.get() + 1);
+
+        // Link down, with a device that would otherwise be fine.
+        assert_refused(&change_main_device(&json!({ "device": 1 - before }), false, save));
+        // Link up, with an unknown device.
+        assert_refused(&change_main_device(&json!({ "device": 7 }), true, save));
+        assert_eq!(saves.get(), 0);
+        assert_eq!(main_device(), before);
+        assert_eq!(current_settings().main_device, before);
+        assert!(take_router_events().is_empty());
+
+        assert_eq!(change_main_device(&json!({ "device": before }), true, save), OK_RESPONSE);
+        assert_eq!(saves.get(), 1);
+        take_router_events();
+    }
+
+    #[test]
+    fn set_main_device_is_not_a_plain_toggle() {
+        assert!(!apply_toggle("set_main_device", &json!({ "device": 1 })));
+    }
+
+    /// A fresh directory for a test of real file writes, away from the real settings.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mesh-kvm-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saving_replaces_the_file_and_leaves_nothing_behind() {
+        let dir = test_dir("save");
+        let path = dir.join("local-settings.json");
+        std::fs::write(&path, "old").unwrap();
+        write_atomically(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_old_file() {
+        let dir = test_dir("failed-save");
+        let path = dir.join("local-settings.json");
+        std::fs::write(&path, "old").unwrap();
+        // Something in the temp file's place stops the write before the real file is touched.
+        std::fs::create_dir(temp_path(&path)).unwrap();
+        assert!(write_atomically(&path, "new").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_rename_cleans_up_the_temp_file() {
+        let dir = test_dir("failed-rename");
+        // A directory cannot be replaced by a file.
+        let path = dir.join("local-settings.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "").unwrap();
+        assert!(write_atomically(&path, "new").is_err());
+        assert!(!temp_path(&path).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -449,7 +566,7 @@ mod tests {
     fn status_reports_every_toggle() {
         let _guard = live_toggles();
         let mut status = json!({ "node": "debian" });
-        add_toggle_status(&mut status, 0.5);
+        add_toggle_status(&mut status, 0.5, true);
         assert_eq!(status["node"], "debian");
         assert_eq!(status["sharing"]["mouse"], true);
         assert_eq!(status["sharing"]["keyboard"], true);
@@ -457,5 +574,6 @@ mod tests {
         assert_eq!(status["clipboard"]["receive"], true);
         assert_eq!(status["pointer_speed"], 0.5);
         assert_eq!(status["main_device"], 0);
+        assert_eq!(status["main_conflict"], true);
     }
 }

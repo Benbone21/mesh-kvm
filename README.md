@@ -41,6 +41,8 @@ Ctrl+Alt+F11 and Ctrl+Alt+G need the link to the laptop to be up. Ctrl+Alt+F12 a
 
 If input seems stuck on the wrong device, press Ctrl+Alt+F12.
 
+Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it is the way out if turning sharing off leaves the other device with focus.
+
 ## Studio
 
 The Studio shows both devices and lets you arrange their screens. Open http://localhost:24880 in a browser, or run `mesh-kvm --studio`.

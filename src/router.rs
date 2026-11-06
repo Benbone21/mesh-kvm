@@ -20,6 +20,9 @@ pub const ACTIVE_VIEW_INTERVAL_MS: u64 = 1000;
 /// How long a non-main device keeps control with main after main's last view. Main sends one
 /// a second and only while it hears this device, so silence means forwarding may reach nobody.
 pub const VIEW_TIMEOUT_MS: u64 = 2500;
+/// How long a main device tolerates views from a peer that also claims main. A handover applied
+/// to one device before the other looks like this for a moment. Past it, the two have a split.
+pub const SPLIT_GRACE_MS: u64 = 3000;
 /// Coordinate sentinel in `SendFocus`/`PeerFocus`: the receiver must not move its cursor.
 pub const KEEP_CURSOR: i32 = i32::MIN;
 
@@ -60,11 +63,14 @@ pub enum Event {
     ManualSwitch,
     Panic,
     SetCaptive(bool),
-    EdgeCrossed { x: i32, y: i32 },
+    /// The cursor went through the shared edge. `from_peer` means the peer's input drove it
+    /// there, so this device's own mouse sharing has no say: refusing would trap the peer's mouse.
+    EdgeCrossed { x: i32, y: i32, from_peer: bool },
     /// Live change of what this device shares. Focus stays put, and panic and link rules still
     /// win. Input of a kind turned off is let go on the peer and stays local from then on.
     SetSharing(Sharing),
-    /// Live change of the main device. An unknown device is ignored.
+    /// Live change of the main device. An unknown device is ignored. Any real change ends a
+    /// main conflict.
     SetMain(DeviceId),
 }
 
@@ -108,6 +114,12 @@ pub struct Router {
     /// When a non-main device last heard from main that it hears us. `None` until the first
     /// view, and after a fallback.
     view_heard: Option<u64>,
+    /// While this device is main: the first and latest of an unbroken run of peer views.
+    peer_views: Option<(u64, u64)>,
+    /// Both devices claim main, past the grace period. Views no longer settle who is active, so
+    /// this device stays local, refuses focus both ways and injects nothing until that ends.
+    /// Only ever true on a device that is main, and `active` stays `me` throughout.
+    main_conflict: bool,
     /// Our own most recent switch: (time, target we claimed).
     last_switch: Option<(u64, DeviceId)>,
     /// Last `SetBlocking` state emitted.
@@ -134,6 +146,8 @@ impl Router {
             last_alive: 0,
             last_view: 0,
             view_heard: None,
+            peer_views: None,
+            main_conflict: false,
             last_switch: None,
             blocking: (false, false),
             fwd_keys: HashSet::new(),
@@ -159,6 +173,9 @@ impl Router {
     }
     pub fn main(&self) -> DeviceId {
         self.cfg.main
+    }
+    pub fn main_conflict(&self) -> bool {
+        self.main_conflict
     }
     pub fn captive(&self) -> bool {
         self.captive
@@ -270,6 +287,13 @@ impl Router {
                 if self.active != me && !self.view_fresh() {
                     self.control_lost(&mut out.actions);
                 }
+                // Longer than a link timeout, so that one lost view does not end the conflict.
+                let stopped = self.peer_views.is_none_or(|(_, last)| {
+                    self.now.saturating_sub(last) > VIEW_TIMEOUT_MS
+                });
+                if self.main_conflict && stopped {
+                    self.end_main_conflict();
+                }
                 if self.online
                     && !self.panicked
                     && self.now.saturating_sub(self.last_view) >= ACTIVE_VIEW_INTERVAL_MS
@@ -279,7 +303,9 @@ impl Router {
             }
             Event::PeerActiveView { active } => {
                 let known = active == me || active == peer;
-                if me != self.cfg.main && self.online && known {
+                if self.online && known && me == self.cfg.main {
+                    self.peer_view_heard(&mut out.actions);
+                } else if self.online && known {
                     self.view_heard = Some(self.now);
                     // A view that crossed our own fresh switch on the wire is stale, not a desync.
                     if !self.panicked && !self.conflicts(active) {
@@ -296,6 +322,7 @@ impl Router {
                 if self.online
                     && known
                     && !unproven
+                    && !self.main_conflict
                     && !(self.conflicts(target) && me == self.cfg.main)
                 {
                     self.panicked = false;
@@ -308,12 +335,13 @@ impl Router {
                     }
                 }
             }
-            Event::EdgeCrossed { x, y } => {
+            Event::EdgeCrossed { x, y, from_peer } => {
                 if self.online
                     && !self.panicked
+                    && !self.main_conflict
                     && !self.captive
                     && !self.peer_game_lock
-                    && self.cfg.sharing.mouse
+                    && (from_peer || self.cfg.sharing.mouse)
                     && self.active == me
                     && self.view_fresh()
                 {
@@ -322,7 +350,7 @@ impl Router {
             }
             Event::ManualSwitch => {
                 self.panicked = false;
-                if self.online {
+                if self.online && !self.main_conflict {
                     let target = if self.active == me { peer } else { me };
                     if target == me || self.view_fresh() {
                         self.own_switch(target, KEEP_CURSOR, KEEP_CURSOR, &mut out.actions);
@@ -359,6 +387,7 @@ impl Router {
                     self.cfg.main = device;
                     // That the old main heard us says nothing about the new one.
                     self.view_heard = None;
+                    self.end_main_conflict();
                 }
             }
         }
@@ -374,7 +403,7 @@ impl Router {
     /// Peer input is injected here. The peer decides what to forward, so this device's
     /// own sharing flags play no part.
     fn injecting(&self) -> bool {
-        self.online && !self.panicked && self.active == self.cfg.me
+        self.online && !self.panicked && !self.main_conflict && self.active == self.cfg.me
     }
 
     fn scale(&mut self, dx: i32, dy: i32) -> (i32, i32) {
@@ -425,6 +454,27 @@ impl Router {
         }
     }
 
+    /// The peer sent a view, so it claims main too. Inside the grace period that may be a handover
+    /// in progress. Past it, views can no longer repair a desync, which could leave both devices
+    /// forwarding at each other, so control is lost here as with no main at all. Views keep going
+    /// out regardless: they are how the peer finds the split too, and stays in it.
+    fn peer_view_heard(&mut self, actions: &mut Vec<Action>) {
+        let since = match self.peer_views {
+            Some((since, last)) if self.now.saturating_sub(last) <= LINK_TIMEOUT_MS => since,
+            _ => self.now,
+        };
+        self.peer_views = Some((since, self.now));
+        if !self.main_conflict && self.now.saturating_sub(since) > SPLIT_GRACE_MS {
+            self.main_conflict = true;
+            self.control_lost(actions);
+        }
+    }
+
+    fn end_main_conflict(&mut self) {
+        self.main_conflict = false;
+        self.peer_views = None;
+    }
+
     /// Main counts as hearing this device. Always true on main itself.
     fn view_fresh(&self) -> bool {
         self.cfg.me == self.cfg.main
@@ -461,6 +511,7 @@ impl Router {
 
     fn link_lost(&mut self, actions: &mut Vec<Action>) {
         self.online = false;
+        self.end_main_conflict();
         self.active = self.cfg.me;
         self.last_switch = None;
         self.view_heard = None;
@@ -598,7 +649,7 @@ mod tests {
     fn forwarding_router() -> Router {
         let mut r = router(0);
         online(&mut r);
-        r.handle(Event::EdgeCrossed { x: 5, y: 6 });
+        r.handle(Event::EdgeCrossed { x: 5, y: 6, from_peer: false });
         assert_eq!(r.active(), 1);
         // Move past the race window so later peer claims are not treated as conflicts.
         r.handle(Event::Tick { now_ms: 1000 + SWITCH_RACE_MS + 1 });
@@ -699,7 +750,7 @@ mod tests {
         alive_to_3000(&mut r);
         r.handle(Event::Tick { now_ms: 3501 });
         // Neither a push on the edge nor a manual switch hands control to a silent main.
-        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert!(out.actions.is_empty());
         assert_eq!(r.active(), 1);
         let out = r.handle(Event::ManualSwitch);
@@ -725,12 +776,12 @@ mod tests {
     fn edge_crossing_needs_a_recent_view_on_non_main() {
         let mut r = router(1);
         online(&mut r);
-        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false }).actions.is_empty());
         assert_eq!(r.active(), 1);
         r.handle(Event::PeerActiveView { active: 1 });
         alive_to_3000(&mut r);
         r.handle(Event::Tick { now_ms: 3501 });
-        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false }).actions.is_empty());
         assert_eq!(r.active(), 1);
     }
 
@@ -904,7 +955,7 @@ mod tests {
             r.handle(Event::PeerWheel { dx: 0, dy: 1 }).actions,
             vec![Action::InjectWheel { dx: 0, dy: 1 }]
         );
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert!(r.handle(Event::PeerKey { scancode: 30, pressed: false }).actions.is_empty());
         assert!(r.handle(Event::PeerMove { dx: 1, dy: 1 }).actions.is_empty());
     }
@@ -925,7 +976,7 @@ mod tests {
         let mut r = router(0);
         online(&mut r);
         assert!(!key(&mut r, 30, true).swallow);
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 1);
         let up = key(&mut r, 30, false);
         assert!(!up.swallow);
@@ -945,7 +996,7 @@ mod tests {
         let mut r = router(0);
         online(&mut r);
         assert!(!r.handle(Event::LocalButton { button: 1, pressed: true }).swallow);
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         let up = r.handle(Event::LocalButton { button: 1, pressed: false });
         assert!(!up.swallow);
         assert!(up.actions.is_empty());
@@ -955,7 +1006,7 @@ mod tests {
     fn switch_releases_held_on_losing_device() {
         let mut r = router(0);
         online(&mut r);
-        let out = r.handle(Event::EdgeCrossed { x: 7, y: 9 });
+        let out = r.handle(Event::EdgeCrossed { x: 7, y: 9, from_peer: false });
         assert!(out.actions.contains(&Action::ReleaseHeld));
         assert!(out.actions.contains(&Action::SendFocus { target: 1, x: 7, y: 9 }));
         assert!(out.actions.contains(&Action::SetBlocking { mouse: true, keyboard: true }));
@@ -1027,7 +1078,7 @@ mod tests {
         assert_eq!(r.active(), 0);
         assert!(!key(&mut r, 30, true).swallow);
         // Edge crossing and peer injection are ignored while panicked.
-        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false }).actions.is_empty());
         assert!(r.handle(Event::PeerKey { scancode: 1, pressed: true }).actions.is_empty());
         let out = r.handle(Event::ManualSwitch);
         assert!(!r.panicked());
@@ -1077,11 +1128,11 @@ mod tests {
         online(&mut r);
         r.handle(Event::SetCaptive(true));
         assert!(r.captive());
-        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert!(!out.actions.iter().any(|a| matches!(a, Action::SendFocus { .. })));
         assert_eq!(r.active(), 0);
         r.handle(Event::SetCaptive(false));
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 1);
     }
 
@@ -1120,7 +1171,7 @@ mod tests {
         other.handle(Event::PeerFocus { target: 1, x: 0, y: 0 });
         assert_eq!((main.active(), other.active()), (0, 1));
         // Both switch within the race window with opposite targets.
-        let from_main = main.handle(Event::EdgeCrossed { x: 1, y: 2 });
+        let from_main = main.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
         let from_other = other.handle(Event::ManualSwitch);
         assert_eq!((main.active(), other.active()), (1, 0));
         main.handle(focus_of(&from_other).unwrap());
@@ -1133,7 +1184,7 @@ mod tests {
     fn claim_outside_race_window_is_accepted_by_main() {
         let mut main = router(0);
         online(&mut main);
-        main.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        main.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         main.handle(Event::Tick { now_ms: 1000 + SWITCH_RACE_MS + 1 });
         main.handle(Event::PeerFocus { target: 0, x: 0, y: 0 });
         assert_eq!(main.active(), 0);
@@ -1143,7 +1194,7 @@ mod tests {
     fn claim_at_race_boundary_still_conflicts() {
         let mut main = router(0);
         online(&mut main);
-        main.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        main.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         main.handle(Event::Tick { now_ms: 1000 + SWITCH_RACE_MS });
         main.handle(Event::PeerFocus { target: 0, x: 0, y: 0 });
         assert_eq!(main.active(), 1);
@@ -1203,7 +1254,7 @@ mod tests {
         let mut r = router(0);
         online(&mut r);
         assert!(!key(&mut r, 30, true).swallow);
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 1);
         let rep = key(&mut r, 30, true);
         assert!(!rep.swallow);
@@ -1305,7 +1356,7 @@ mod tests {
         let mut laptop = router(1);
         online(&mut laptop);
         laptop.handle(Event::PeerActiveView { active: 1 });
-        laptop.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        laptop.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(laptop.active(), 0);
         laptop.handle(Event::PeerActiveView { active: 1 });
         assert_eq!(laptop.active(), 0);
@@ -1357,16 +1408,16 @@ mod tests {
         online(&mut r);
         r.handle(Event::PeerActiveView { active: 1 });
         r.handle(Event::PeerGameLock(true));
-        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert!(!out.actions.iter().any(|a| matches!(a, Action::SendFocus { .. })));
         assert_eq!(r.active(), 1);
         // The local game lock is a separate flag: clearing it leaves the peer's in force.
         r.handle(Event::SetCaptive(true));
         r.handle(Event::SetCaptive(false));
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 1);
         r.handle(Event::PeerGameLock(false));
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 0);
     }
 
@@ -1379,7 +1430,7 @@ mod tests {
         r.handle(Event::Tick { now_ms: 1000 + LINK_TIMEOUT_MS + 1 });
         r.handle(Event::PeerAlive { now_ms: 5000 });
         r.handle(Event::PeerActiveView { active: 1 });
-        r.handle(Event::EdgeCrossed { x: 0, y: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
         assert_eq!(r.active(), 0);
     }
 
@@ -1517,7 +1568,7 @@ mod tests {
         let mut r = Router::new(cfg(0));
         online(&mut r);
         r.handle(Event::SetSharing(Sharing { mouse: false, keyboard: true }));
-        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false }).actions.is_empty());
         assert_eq!(r.active(), 0);
     }
 
@@ -1633,7 +1684,7 @@ mod tests {
 
         // The laptop holds control when it becomes main.
         let (mut debian, mut laptop) = linked_pair();
-        let out = debian.handle(Event::EdgeCrossed { x: 1, y: 2 });
+        let out = debian.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
         assert!(out.actions.contains(&Action::SendFocus { target: 1, x: 1, y: 2 }));
         laptop.handle(Event::PeerFocus { target: 1, x: 1, y: 2 });
         assert_eq!((debian.active(), laptop.active()), (1, 1));
@@ -1652,6 +1703,285 @@ mod tests {
             exchange(&mut debian, &mut laptop, now_ms);
         }
         assert_eq!(debian.active(), laptop.active());
+    }
+
+    /// Debian and the laptop with the link up, each with its own idea of the main device.
+    fn pair_with_mains(debian_main: DeviceId, laptop_main: DeviceId) -> (Router, Router) {
+        let mut debian = Router::new(RouterConfig { main: debian_main, ..cfg(0) });
+        let mut laptop = Router::new(RouterConfig { main: laptop_main, ..cfg(1) });
+        online(&mut debian);
+        online(&mut laptop);
+        (debian, laptop)
+    }
+
+    fn exchange_until(a: &mut Router, b: &mut Router, times: &[u64]) {
+        for &now_ms in times {
+            exchange(a, b, now_ms);
+        }
+    }
+
+    fn assert_both_local(debian: &mut Router, laptop: &mut Router) {
+        assert_eq!((debian.active(), laptop.active()), (0, 1));
+        for r in [debian, laptop] {
+            assert_eq!(r.blocking, (false, false));
+            assert!(!key(r, 40, true).swallow);
+            assert!(!r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+            key(r, 40, false);
+        }
+    }
+
+    /// Two routers that have settled into a split, each local.
+    fn split_pair() -> (Router, Router) {
+        let (mut debian, mut laptop) = pair_with_mains(0, 1);
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000, 5000, 6000]);
+        assert!(debian.main_conflict());
+        assert!(laptop.main_conflict());
+        (debian, laptop)
+    }
+
+    #[test]
+    fn only_the_laptop_applied_the_change_so_both_fall_back_then_heal() {
+        // Debian forwards, then the laptop alone takes up main: two mains.
+        let (mut debian, mut laptop) = linked_pair();
+        debian.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
+        laptop.handle(Event::PeerFocus { target: 1, x: 1, y: 2 });
+        assert!(key(&mut debian, 30, true).swallow);
+        laptop.handle(Event::SetMain(1));
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000, 5000]);
+        assert_eq!(debian.active(), 1);
+
+        // The view that crosses the grace period ends it, with the held key let go.
+        debian.handle(Event::PeerAlive { now_ms: 6000 });
+        laptop.handle(Event::PeerAlive { now_ms: 6000 });
+        let from_debian = view_of(&debian.handle(Event::Tick { now_ms: 6000 })).unwrap();
+        let from_laptop = view_of(&laptop.handle(Event::Tick { now_ms: 6000 })).unwrap();
+        laptop.handle(from_debian);
+        let out = debian.handle(from_laptop);
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: false }));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        exchange_until(&mut debian, &mut laptop, &[7000]);
+        assert!(debian.main_conflict() && laptop.main_conflict());
+        assert_both_local(&mut debian, &mut laptop);
+
+        // Debian catches up: one main again, on both.
+        debian.handle(Event::SetMain(1));
+        assert!(!debian.main_conflict());
+        exchange_until(&mut debian, &mut laptop, &[8000, 9000, 10_000, 11_000]);
+        assert!(!laptop.main_conflict());
+        assert_eq!((debian.active(), laptop.active()), (1, 1));
+        assert!(key(&mut debian, 30, true).swallow);
+        let out = laptop.handle(Event::PeerKey { scancode: 30, pressed: true });
+        assert_eq!(out.actions, vec![Action::InjectKey { scancode: 30, pressed: true }]);
+    }
+
+    #[test]
+    fn only_debian_applied_the_change_so_both_fall_back_then_heal() {
+        // The laptop forwards, then Debian alone gives up main: no main, and no views.
+        let (mut debian, mut laptop) = linked_pair();
+        assert!(key(&mut laptop, 30, true).swallow);
+        debian.handle(Event::SetMain(1));
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000]);
+        assert!(!debian.main_conflict() && !laptop.main_conflict());
+        assert_both_local(&mut debian, &mut laptop);
+
+        // The laptop catches up, and its views bring both together.
+        laptop.handle(Event::SetMain(1));
+        exchange_until(&mut debian, &mut laptop, &[5000, 6000]);
+        assert_eq!(debian.active(), laptop.active());
+        assert!(!debian.main_conflict() && !laptop.main_conflict());
+    }
+
+    #[test]
+    fn two_mains_forwarding_at_each_other_both_end_up_local() {
+        let (mut debian, mut laptop) = pair_with_mains(0, 1);
+        // The laptop forwards to Debian.
+        laptop.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
+        debian.handle(Event::PeerFocus { target: 0, x: 1, y: 2 });
+        assert_eq!((debian.active(), laptop.active()), (0, 0));
+        // Debian crosses and every focus packet is lost: each forwards to the other.
+        debian.handle(Event::Tick { now_ms: 1000 + SWITCH_RACE_MS + 1 });
+        debian.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
+        assert_eq!((debian.active(), laptop.active()), (1, 0));
+        assert!(key(&mut debian, 30, true).swallow);
+        assert!(key(&mut laptop, 31, true).swallow);
+        let peer_key = Event::PeerKey { scancode: 32, pressed: true };
+        assert!(debian.handle(peer_key).actions.is_empty());
+        assert!(laptop.handle(peer_key).actions.is_empty());
+
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000, 5000, 6000, 7000]);
+        assert!(!key(&mut debian, 30, false).swallow);
+        assert!(!key(&mut laptop, 31, false).swallow);
+        assert_both_local(&mut debian, &mut laptop);
+    }
+
+    #[test]
+    fn startup_burst_cannot_capture_a_main_laptop_for_long() {
+        // Debian restarts on a corrupt file, so it thinks it is main, and its burst reaches a
+        // laptop that really is main.
+        let (mut debian, mut laptop) = pair_with_mains(0, 1);
+        laptop.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+        assert_eq!(laptop.active(), 0);
+        assert!(key(&mut laptop, 30, true).swallow);
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000, 5000, 6000, 7000]);
+        assert!(!key(&mut laptop, 30, false).swallow);
+        assert_both_local(&mut debian, &mut laptop);
+    }
+
+    #[test]
+    fn handover_inside_the_grace_period_is_not_a_split() {
+        let (mut debian, mut laptop) = linked_pair();
+        debian.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
+        laptop.handle(Event::PeerFocus { target: 1, x: 1, y: 2 });
+        laptop.handle(Event::SetMain(1));
+        // Debian keeps forwarding through views right up to the limit.
+        exchange_until(&mut debian, &mut laptop, &[2000, 3000, 4000, 5000]);
+        assert!(!debian.main_conflict());
+        assert!(key(&mut debian, 30, true).swallow);
+        debian.handle(Event::SetMain(1));
+        exchange_until(&mut debian, &mut laptop, &[6000, 7000, 8000, 9000, 10_000]);
+        assert!(!debian.main_conflict() && !laptop.main_conflict());
+        assert_eq!((debian.active(), laptop.active()), (1, 1));
+    }
+
+    #[test]
+    fn split_starts_only_past_the_grace_period() {
+        assert_eq!(SPLIT_GRACE_MS, 3000);
+        let mut r = forwarding_router();
+        let view = Event::PeerActiveView { active: 1 };
+        let at = |r: &mut Router, now_ms| {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(view)
+        };
+        at(&mut r, 2000);
+        at(&mut r, 3000);
+        at(&mut r, 4000);
+        at(&mut r, 2000 + SPLIT_GRACE_MS);
+        assert!(!r.main_conflict());
+        assert_eq!(r.active(), 1);
+        let out = at(&mut r, 2000 + SPLIT_GRACE_MS + 1);
+        assert!(r.main_conflict());
+        assert_eq!(r.active(), 0);
+        assert!(out.actions.contains(&Action::ReleaseHeld));
+    }
+
+    #[test]
+    fn a_gap_in_peer_views_restarts_the_grace_period() {
+        let mut r = forwarding_router();
+        let view = Event::PeerActiveView { active: 1 };
+        for now_ms in [2000, 3000, 4000] {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(view);
+        }
+        // Heartbeats carry on, but no view comes for longer than a link timeout.
+        r.handle(Event::PeerAlive { now_ms: 5000 });
+        r.handle(Event::PeerAlive { now_ms: 4000 + LINK_TIMEOUT_MS + 1 });
+        r.handle(view);
+        // Past the grace period from the first view, but not from the one after the gap.
+        r.handle(Event::PeerAlive { now_ms: 6000 });
+        r.handle(view);
+        assert!(!r.main_conflict());
+    }
+
+    #[test]
+    fn split_refuses_focus_both_ways() {
+        let (mut debian, mut laptop) = split_pair();
+        let claim = Event::PeerFocus { target: 0, x: 1, y: 2 };
+        assert!(laptop.handle(claim).actions.is_empty());
+        assert_eq!(laptop.active(), 1);
+        for ev in [Event::EdgeCrossed { x: 1, y: 2, from_peer: false }, Event::ManualSwitch] {
+            assert!(debian.handle(ev).actions.is_empty());
+            assert!(laptop.handle(ev).actions.is_empty());
+        }
+        let crossing = Event::EdgeCrossed { x: 1, y: 2, from_peer: true };
+        assert!(laptop.handle(crossing).actions.is_empty());
+        assert_both_local(&mut debian, &mut laptop);
+    }
+
+    #[test]
+    fn split_injects_nothing_from_the_peer() {
+        let (mut debian, _) = split_pair();
+        let out = debian.handle(Event::PeerKey { scancode: 30, pressed: true });
+        assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn split_keeps_sending_views_so_the_peer_stays_split_too() {
+        let (mut debian, _) = split_pair();
+        debian.handle(Event::PeerAlive { now_ms: 7000 });
+        assert!(view_of(&debian.handle(Event::Tick { now_ms: 7000 })).is_some());
+    }
+
+    #[test]
+    fn split_survives_one_lost_view() {
+        let (mut debian, mut laptop) = split_pair();
+        // 7000's view is lost.
+        debian.handle(Event::PeerAlive { now_ms: 7000 });
+        debian.handle(Event::Tick { now_ms: 7000 });
+        debian.handle(Event::PeerAlive { now_ms: 7900 });
+        debian.handle(Event::Tick { now_ms: 7900 });
+        assert!(debian.main_conflict());
+        exchange_until(&mut debian, &mut laptop, &[8000]);
+        assert!(debian.main_conflict());
+    }
+
+    #[test]
+    fn split_ends_when_the_views_stop() {
+        let (mut debian, _) = split_pair();
+        for now_ms in [7000, 8000] {
+            debian.handle(Event::PeerAlive { now_ms });
+            debian.handle(Event::Tick { now_ms });
+        }
+        assert!(debian.main_conflict());
+        debian.handle(Event::PeerAlive { now_ms: 6000 + VIEW_TIMEOUT_MS + 1 });
+        debian.handle(Event::Tick { now_ms: 6000 + VIEW_TIMEOUT_MS + 1 });
+        assert!(!debian.main_conflict());
+        // Local, and free to cross again.
+        debian.handle(Event::EdgeCrossed { x: 1, y: 2, from_peer: false });
+        assert_eq!(debian.active(), 1);
+    }
+
+    #[test]
+    fn split_ends_when_main_changes_or_the_link_drops() {
+        let (mut debian, _) = split_pair();
+        debian.handle(Event::SetMain(0));
+        assert!(debian.main_conflict());
+        debian.handle(Event::SetMain(1));
+        assert!(!debian.main_conflict());
+
+        let (mut debian, _) = split_pair();
+        debian.handle(Event::Tick { now_ms: 6000 + LINK_TIMEOUT_MS + 1 });
+        assert!(!debian.online());
+        assert!(!debian.main_conflict());
+    }
+
+    #[test]
+    fn panic_still_works_during_a_split() {
+        let (mut debian, _) = split_pair();
+        let out = debian.handle(Event::Panic);
+        assert!(debian.panicked());
+        assert!(out.actions.contains(&Action::SendPanic));
+    }
+
+    #[test]
+    fn peer_driven_crossing_ignores_this_devices_mouse_sharing() {
+        // Debian's mouse is on the laptop, whose own mouse is not shared.
+        let mut laptop = Router::new(RouterConfig {
+            sharing: Sharing { mouse: false, keyboard: true },
+            ..cfg(1)
+        });
+        online(&mut laptop);
+        laptop.handle(Event::PeerActiveView { active: 1 });
+        let moved = laptop.handle(Event::PeerMove { dx: -5, dy: 0 });
+        assert_eq!(moved.actions, vec![Action::InjectMove { dx: -5, dy: 0 }]);
+
+        // The laptop's own trackpad on that edge stays put.
+        let own = laptop.handle(Event::EdgeCrossed { x: 0, y: 9, from_peer: false });
+        assert!(own.actions.is_empty());
+        assert_eq!(laptop.active(), 1);
+
+        let out = laptop.handle(Event::EdgeCrossed { x: 0, y: 9, from_peer: true });
+        assert!(out.actions.contains(&Action::SendFocus { target: 0, x: 0, y: 9 }));
+        assert_eq!(laptop.active(), 0);
     }
 
     fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {

@@ -1078,7 +1078,7 @@ impl Core<'_> {
 
     /// Counts movement of the Debian cursor by `(dx, dy)` against the shared edge, from either
     /// device's mouse, and crosses to the laptop when the push completes.
-    fn push_edge(&mut self, cfg: &SpatialConfig, dx: i32, dy: i32) {
+    fn push_edge(&mut self, cfg: &SpatialConfig, dx: i32, dy: i32, from_peer: bool) {
         let can_cross = self.router.online()
             && !self.router.panicked()
             && !self.router.captive()
@@ -1091,7 +1091,7 @@ impl Core<'_> {
         let cx = self.backend.kwin_x.load(Ordering::Relaxed);
         let cy = self.backend.kwin_y.load(Ordering::Relaxed);
         if let Some((x, y)) = cfg.push_debian_edge(cx, cy, dx, dy, &mut self.edge_pushed) {
-            self.route(Event::EdgeCrossed { x, y });
+            self.route(Event::EdgeCrossed { x, y, from_peer });
         }
     }
 }
@@ -1278,7 +1278,7 @@ pub fn run_debian_node(
                 Payload::MouseMoveDelta { dx, dy } => {
                     let actions = core.route(Event::PeerMove { dx, dy });
                     if actions.iter().any(|a| matches!(a, Action::InjectMove { .. })) {
-                        core.push_edge(&cfg_snapshot, dx, dy);
+                        core.push_edge(&cfg_snapshot, dx, dy, true);
                     }
                 }
                 Payload::MouseButton { button, pressed } => {
@@ -1416,7 +1416,7 @@ pub fn run_debian_node(
                                 if to_router {
                                     core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
                                 }
-                                core.push_edge(&cfg_snapshot, acc_dx, acc_dy);
+                                core.push_edge(&cfg_snapshot, acc_dx, acc_dy, false);
                                 acc_dx = 0;
                                 acc_dy = 0;
                             }
@@ -1479,6 +1479,7 @@ pub fn run_debian_node(
                 guard.telemetry.audio_tx_source_mode =
                     crate::audio::AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed);
                 guard.telemetry.peer_online = core.router.online();
+                guard.telemetry.main_conflict = core.router.main_conflict();
             }
         }
 

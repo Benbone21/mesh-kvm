@@ -265,6 +265,7 @@ pub struct LiveTelemetry {
     pub win_peer_reported_res: bool,
     #[serde(default)]
     pub peer_online: bool,
+    pub main_conflict: bool,
 }
 
 impl LiveTelemetry {
@@ -290,6 +291,7 @@ impl LiveTelemetry {
             audio_tx_source_mode: 0,
             win_peer_reported_res: false,
             peer_online: false,
+            main_conflict: false,
         }
     }
 }
@@ -592,12 +594,16 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
                     "input_devices": ["Physical mouse (evdev)", "Desk keyboard (evdev)"],
                     "audio": crate::settings::audio_status_json(true),
                 });
-                crate::settings::add_toggle_status(&mut status, g.config.mouse_speed);
+                let conflict = g.telemetry.main_conflict;
+                crate::settings::add_toggle_status(&mut status, g.config.mouse_speed, conflict);
                 Some(status.to_string())
             }
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
                 let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                if act == "set_main_device" {
+                    return Some(set_main_device(&state, &val));
+                }
                 if !handle_local_action(&state, act, &val) {
                     match act {
                         "set_autostart" => set_debian_autostart(
@@ -652,6 +658,9 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
             ("POST", "/api/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
                 let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if act == "set_main_device" {
+                    return Some(set_main_device(&state, &val));
+                }
                 // Legacy audio action names from older UIs
                 let handled_audio = match act.as_str() {
                     "toggle_audio_mute" => crate::settings::handle_common_action(
@@ -674,6 +683,11 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
             _ => None,
         }
     })
+}
+
+fn set_main_device(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value) -> String {
+    let link_up = state.read().is_ok_and(|g| g.telemetry.peer_online);
+    crate::settings::set_main_device(val, link_up)
 }
 
 /// `settings::handle_common_action`, except that Debian's pointer speed is the layout's
