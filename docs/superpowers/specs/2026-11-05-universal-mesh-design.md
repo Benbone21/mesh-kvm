@@ -41,7 +41,7 @@ is entered by hand), macOS, and control of the Windows lock screen or UAC prompt
 One `mesh-kvm` program per device, run in two modes:
 
 - `mesh-kvm`: background service. Owns input, audio, clipboard, and the link.
-- `mesh-kvm --app`: window and tray icon. Holds no state of its own.
+- `mesh-kvm --app` and `mesh-kvm --tray`: window and tray icon. They hold no state of their own.
 
 | Module | Responsibility | Depends on |
 |---|---|---|
@@ -179,9 +179,12 @@ libraries, and `tray-icon` on Windows. Its menu has Open, Switch device, Release
 all input, and Quit. Closing the window leaves the tray running, and sharing runs
 in the service either way. Quit closes the app but not the service.
 
-The app starts at login with the tray only. A Start Menu entry and a Linux
-`.desktop` file open the window. Opening the app while it is already running
-focuses the existing window.
+The app runs as two small processes. `mesh-kvm --tray` stays running, and
+`mesh-kvm --app` is the window. Closing the window ends that process, and the tray
+opens a new one on demand, so no hidden window has to be kept alive.
+
+The tray starts at login. A Start Menu entry and a Linux `.desktop` file open the
+window. Opening the app while it is already running focuses the existing window.
 
 ## Failure handling
 
@@ -224,11 +227,16 @@ On real hardware, by the user:
 
 ## Build stages
 
-Each stage is shipped and working before the next starts.
+Each stage is shipped and working before the next starts. The native app was moved
+ahead of encryption at the user's request on 2026-11-05.
 
 1. **Two-way input.** Add `router.rs` and the input backends, on the existing
-   protocol and web UI. Toggles use config defaults. This fixes the stuck laptop mouse.
-2. **Secure link and settings.** Add `link.rs`, `config.rs`, and `api.rs`, with
-   pairing done from a temporary `--pair` command. Both devices update together.
-3. **Native app.** Add `app/` and the tray, move pairing into the app, then remove
-   the web UI, its port, and `mesh-kvm-ui.py`.
+   protocol and web UI. Done.
+2. **Native app and toggles.** Add `app/`, the tray, and every toggle above, then
+   remove the web UI page and `mesh-kvm-ui.py`. The app uses the existing API on
+   port 24880 and its peer proxy, so that port and its unauthenticated access stay
+   until stage 3. The main device toggle sets who gets control on link-up. Layout
+   stays stored on Debian until stage 3.
+3. **Secure link and settings.** Add `link.rs`, `config.rs`, and `api.rs`, with
+   pairing in the app. Move shared settings to the main device, and close port
+   24880 to the network. Both devices update together.

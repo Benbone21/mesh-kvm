@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
+
 mod audio;
 mod clipboard;
 mod keymap;
@@ -102,8 +104,53 @@ fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, Sock
     Ok((addr.ip().to_string(), addr))
 }
 
+/// True when the program was started with no arguments.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn should_open_studio(arg_count: usize) -> bool {
+    arg_count <= 1
+}
+
+/// Opens the Studio once this process's web server is answering.
+#[cfg(target_os = "windows")]
+fn open_studio_when_ready() {
+    std::thread::spawn(|| {
+        for _ in 0..40 {
+            if webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok() {
+                webui::open_app_window();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
+/// The Windows build has no console, so a fatal error would otherwise vanish.
+#[cfg(target_os = "windows")]
+fn log_fatal(message: &str) {
+    use std::io::Write;
+    let dir = settings::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("mesh-kvm.log"))
+    {
+        let _ = writeln!(file, "Fatal error: {}", message);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    // Double-clicking the Windows exe passes no arguments; the login launcher always does.
+    #[cfg(target_os = "windows")]
+    if should_open_studio(std::env::args_os().len()) {
+        if webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok() {
+            webui::open_app_window();
+            return;
+        }
+        open_studio_when_ready();
+    }
 
     if cli.studio {
         if let Err(e) = webui::http_call("127.0.0.1", "GET", "/api/local", "") {
@@ -196,7 +243,23 @@ fn main() {
             cli.height,
         ) {
             eprintln!("[Windows] Fatal error: {}", e);
+            log_fatal(&e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_open_studio;
+
+    #[test]
+    fn bare_launch_opens_the_studio() {
+        assert!(should_open_studio(1));
+    }
+
+    #[test]
+    fn login_launcher_stays_silent() {
+        assert!(!should_open_studio(7));
     }
 }
