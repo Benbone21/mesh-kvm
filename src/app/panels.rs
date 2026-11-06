@@ -285,6 +285,16 @@ impl DevicePanel<'_, '_> {
         if self.shared.snapshot.is_here(self.device) {
             self.game_locks(ui);
         }
+        self.link(ui);
+    }
+
+    /// How the link looks from this device. A device with only a line to give leaves out the rest.
+    fn link(&self, ui: &mut Ui) {
+        let Some((text, poor)) = model::link_line(self.status, &self.other_name()) else { return };
+        let label = ui.label(if poor { small(text).color(AMBER) } else { small(text) });
+        if let Some(link) = self.status.link.as_ref().filter(|l| l.measured && self.status.peer_online) {
+            label.on_hover_text(model::link_detail(link));
+        }
     }
 
     /// Only for the device the app is on: the locks are its own, and don't travel.
@@ -305,8 +315,9 @@ impl DevicePanel<'_, '_> {
         ui.add_enabled_ui(!self.status.is_older(), |ui| {
             self.toggle(ui, Control::ClipboardSend, &format!("Send clipboard to {other}"));
             self.toggle(ui, Control::ClipboardReceive, &format!("Receive clipboard from {other}"));
-            if !self.status.clipboard.note.is_empty() {
-                ui.label(small(&self.status.clipboard.note));
+            let clipboard = &self.status.clipboard;
+            if !clipboard.note.is_empty() {
+                ui.label(if clipboard.note_failed { small(&clipboard.note).color(AMBER) } else { small(&clipboard.note) });
             }
         });
     }

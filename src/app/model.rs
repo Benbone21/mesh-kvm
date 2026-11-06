@@ -116,11 +116,13 @@ pub struct ClipboardSharing {
     pub receive: bool,
     /// What the clipboard last did on that device.
     pub note: String,
+    /// That note says something went wrong.
+    pub note_failed: bool,
 }
 
 impl Default for ClipboardSharing {
     fn default() -> Self {
-        Self { send: true, receive: true, note: String::new() }
+        Self { send: true, receive: true, note: String::new(), note_failed: false }
     }
 }
 
@@ -241,6 +243,43 @@ pub fn receiving_quality(audio: &AudioStatus) -> Option<String> {
     })
 }
 
+/// The line about the link in a device's section, and whether it should stand out. Never a figure
+/// from before the link went down.
+pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
+    let link = status.link.as_ref()?;
+    if !status.peer_online {
+        let text = if link.returning {
+            format!("Link is down. Control goes back to {other} when it returns.")
+        } else {
+            "Link is down, so each device is using its own keyboard and mouse.".to_string()
+        };
+        return Some((text, true));
+    }
+    if link.returning {
+        return Some((format!("Link is back. Control is on its way to {other}."), false));
+    }
+    if !link.measured {
+        return Some(("Link is up, and being measured.".to_string(), false));
+    }
+    let loss = link.loss();
+    let poor = loss >= POOR_LOSS_PERCENT || link.round_trip_ms.is_some_and(|ms| ms >= POOR_ROUND_TRIP_MS);
+    let text = match link.round_trip_ms {
+        Some(ms) => format!("Link: {loss:.1}% lost, {ms} ms round trip."),
+        None => format!("Link: {loss:.1}% lost."),
+    };
+    Some((text, poor))
+}
+
+/// What's behind the figure in the link line.
+pub fn link_detail(link: &LinkStatus) -> String {
+    let mut detail = format!("Input: {:.1}% lost on the way here, {:.1}% on the way there.", link.loss_in, link.loss_out);
+    if link.audio_loss_in.is_some() || link.audio_loss_out.is_some() {
+        let (here, there) = (link.audio_loss_in.unwrap_or(0.0), link.audio_loss_out.unwrap_or(0.0));
+        detail.push_str(&format!("\nAudio: {here:.1}% lost on the way here, {there:.1}% on the way there."));
+    }
+    detail
+}
+
 /// One device's `/api/local`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -279,6 +318,38 @@ pub struct DeviceStatus {
     /// What the person calls this device: its given name, or else its hostname.
     pub device_name: String,
     pub display_change: DisplayChanges,
+    /// Missing from a service that doesn't measure the link.
+    pub link: Option<LinkStatus>,
+}
+
+/// `link` in `/api/local`: how the link looks from one device.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LinkStatus {
+    /// False until there is a figure to show, and whenever the link is down.
+    pub measured: bool,
+    pub loss_in: f32,
+    pub loss_out: f32,
+    pub audio_loss_in: Option<f32>,
+    pub audio_loss_out: Option<f32>,
+    pub round_trip_ms: Option<u32>,
+    /// A dropout took control from the other device, and it's waiting to go back.
+    pub returning: bool,
+    /// "same", "older", "other", or "unknown" while it can't tell.
+    pub peer_version: String,
+}
+
+/// From this much on, the link line stands out.
+const POOR_LOSS_PERCENT: f32 = 5.0;
+const POOR_ROUND_TRIP_MS: u32 = 150;
+
+impl LinkStatus {
+    /// The worst loss either way, from the link's own packets and from audio, which sends far more
+    /// of them and also counts what came too late to play.
+    fn loss(&self) -> f32 {
+        let audio = [self.audio_loss_in, self.audio_loss_out].into_iter().flatten();
+        audio.fold(self.loss_in.max(self.loss_out), f32::max)
+    }
 }
 
 /// A monitor's mode change that is waiting for an answer.
@@ -620,8 +691,11 @@ pub fn device_badge(snapshot: &Snapshot, device: Device) -> (Light, &'static str
         && (snapshot.linked() || snapshot.this_device() == Some(device));
     if has_control {
         (Light::Active, "Has keyboard and mouse")
-    } else {
+    } else if snapshot.linked() || snapshot.this_device() == Some(device) {
         (Light::Connected, "Connected")
+    } else {
+        // Its service may still answer the app, but no input can reach it.
+        (Light::Off, "Link down")
     }
 }
 
@@ -1233,6 +1307,12 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
         return Some("mesh-kvm needs the other device's address before it can share anything.".into());
     }
     let other = snapshot.title(snapshot.in_order()[1]);
+    let link = local.link.as_ref();
+    if link.is_some_and(|l| l.returning) {
+        return Some(format!(
+            "The link to {other} dropped, so each device is using its own keyboard and mouse for now. Control goes back to {other} once the link is back."
+        ));
+    }
     if snapshot.peer.is_none() {
         return Some(format!(
             "{other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
@@ -1246,6 +1326,17 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
         return Some(format!(
             "{other} is found but not linked yet, so each device is working on its own. Wait a few seconds, or restart mesh-kvm on both devices."
         ));
+    }
+    match link.map(|l| l.peer_version.as_str()) {
+        Some("older") => {
+            return Some(format!(
+                "{other} is running an older mesh-kvm, so a lost key press isn't corrected and control won't come back after a dropout. Update both devices together."
+            ));
+        }
+        Some("other") => {
+            return Some("The two devices are running different versions of mesh-kvm and can't read all of each other's packets. Update both devices together.".into());
+        }
+        _ => {}
     }
     if let Some(message) = snapshot.peer.as_ref().and_then(|peer| split_message(local, peer)) {
         return Some(message);
@@ -1989,12 +2080,20 @@ mod tests {
     }
 
     #[test]
+    fn a_device_the_link_cannot_reach_is_not_shown_as_connected() {
+        // Its service still answers the app, but no input can get to it.
+        let snap = link_snapshot(false, LinkStatus::default(), true);
+        assert_eq!(device_badge(&snap, Device::Windows), (Light::Off, "Link down"));
+        assert_eq!(device_badge(&snap, Device::Debian), (Light::Active, "Has keyboard and mouse"));
+    }
+
+    #[test]
     fn an_unlinked_peer_never_claims_the_keyboard() {
         let mut snap = pair(0, 0);
         let layout = snap.layout.as_mut().unwrap();
         layout.telemetry.peer_online = false;
         layout.telemetry.active_node = "Windows".into();
-        assert_eq!(device_badge(&snap, Device::Windows).0, Light::Connected);
+        assert_eq!(device_badge(&snap, Device::Windows).0, Light::Off);
     }
 
     #[test]
@@ -2126,6 +2225,109 @@ mod tests {
         );
         audio.rx_live = false;
         assert_eq!(receiving_quality(&audio), None, "the stream ended, so its figures are gone");
+    }
+
+    fn linked_status(link: LinkStatus) -> DeviceStatus {
+        DeviceStatus { peer_online: true, link: Some(link), ..DeviceStatus::default() }
+    }
+
+    #[test]
+    fn the_link_line_gives_the_worst_loss_and_the_round_trip() {
+        let link = LinkStatus { measured: true, loss_in: 1.2, loss_out: 0.4, round_trip_ms: Some(23), ..LinkStatus::default() };
+        assert_eq!(link_line(&linked_status(link), "Laptop"), Some(("Link: 1.2% lost, 23 ms round trip.".to_string(), false)));
+    }
+
+    #[test]
+    fn audio_loss_counts_towards_the_link_line() {
+        let link = LinkStatus { measured: true, loss_in: 0.5, audio_loss_in: Some(2.5), audio_loss_out: Some(7.0), round_trip_ms: Some(40), ..LinkStatus::default() };
+        assert_eq!(link_line(&linked_status(link.clone()), "Laptop"), Some(("Link: 7.0% lost, 40 ms round trip.".to_string(), true)));
+        let detail = link_detail(&link);
+        assert!(detail.contains("Audio: 2.5% lost on the way here, 7.0% on the way there."), "{detail}");
+    }
+
+    #[test]
+    fn a_slow_link_stands_out_too() {
+        let link = LinkStatus { measured: true, round_trip_ms: Some(POOR_ROUND_TRIP_MS), ..LinkStatus::default() };
+        assert!(link_line(&linked_status(link), "Laptop").unwrap().1);
+    }
+
+    #[test]
+    fn the_link_line_says_when_it_has_nothing_to_go_on() {
+        let line = link_line(&linked_status(LinkStatus::default()), "Laptop");
+        assert_eq!(line, Some(("Link is up, and being measured.".to_string(), false)));
+        let link = LinkStatus { measured: true, loss_in: 1.0, ..LinkStatus::default() };
+        assert_eq!(link_line(&linked_status(link), "Laptop"), Some(("Link: 1.0% lost.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_link_that_is_down_shows_no_figures() {
+        let link = LinkStatus { measured: true, loss_in: 3.0, round_trip_ms: Some(23), ..LinkStatus::default() };
+        let status = DeviceStatus { peer_online: false, link: Some(link), ..DeviceStatus::default() };
+        assert_eq!(link_line(&status, "Laptop"), Some(("Link is down, so each device is using its own keyboard and mouse.".to_string(), true)));
+    }
+
+    #[test]
+    fn a_dropout_says_where_control_is_going() {
+        let link = LinkStatus { returning: true, ..LinkStatus::default() };
+        let status = DeviceStatus { peer_online: false, link: Some(link.clone()), ..DeviceStatus::default() };
+        assert_eq!(link_line(&status, "Laptop").unwrap().0, "Link is down. Control goes back to Laptop when it returns.");
+        assert_eq!(link_line(&linked_status(link), "Laptop").unwrap().0, "Link is back. Control is on its way to Laptop.");
+    }
+
+    #[test]
+    fn a_service_that_does_not_measure_the_link_gets_no_line() {
+        assert_eq!(link_line(&DeviceStatus::default(), "Laptop"), None);
+    }
+
+    fn link_snapshot(online: bool, link: LinkStatus, peer: bool) -> Snapshot {
+        let mut snap = pair(0, 0);
+        let local = snap.local.as_mut().unwrap();
+        local.peer_online = online;
+        local.link = Some(link);
+        if !peer {
+            snap.peer = None;
+        }
+        if let Some(layout) = snap.layout.as_mut() {
+            layout.telemetry.peer_online = online;
+        }
+        snap
+    }
+
+    #[test]
+    fn a_dropout_is_explained_even_with_the_other_device_out_of_reach() {
+        let link = LinkStatus { returning: true, ..LinkStatus::default() };
+        let message = status_message(&link_snapshot(false, link, false)).unwrap();
+        assert!(message.contains("dropped"), "{message}");
+        assert!(message.contains("Control goes back"), "{message}");
+    }
+
+    #[test]
+    fn an_older_device_on_the_link_is_named() {
+        let link = LinkStatus { peer_version: "older".into(), ..LinkStatus::default() };
+        let message = status_message(&link_snapshot(true, link, true)).unwrap();
+        assert!(message.contains("older mesh-kvm"), "{message}");
+        assert!(message.contains("Update both devices together"), "{message}");
+    }
+
+    #[test]
+    fn a_device_on_another_version_is_said_plainly() {
+        let link = LinkStatus { peer_version: "other".into(), ..LinkStatus::default() };
+        let message = status_message(&link_snapshot(true, link, true)).unwrap();
+        assert!(message.contains("different versions"), "{message}");
+    }
+
+    #[test]
+    fn devices_on_one_version_have_nothing_to_say() {
+        let link = LinkStatus { peer_version: "same".into(), ..LinkStatus::default() };
+        assert_eq!(status_message(&link_snapshot(true, link, true)), None);
+    }
+
+    #[test]
+    fn link_status_reads_from_the_service() {
+        let d: DeviceStatus = serde_json::from_str(r#"{"link":{"measured":true,"loss_in":1.5,"loss_out":0.5,"round_trip_ms":12,"returning":false,"peer_version":"same","audio_loss_in":null,"audio_loss_out":2.0}}"#).unwrap();
+        let link = d.link.unwrap();
+        assert_eq!((link.loss_in, link.round_trip_ms, link.audio_loss_in, link.audio_loss_out), (1.5, Some(12), None, Some(2.0)));
+        assert_eq!(link.peer_version, "same");
     }
 
     const KEY: (Device, Control) = (Device::Windows, Control::SendVolume);

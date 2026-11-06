@@ -9,7 +9,8 @@ the mode change countdown the way the real service does. Run it where that port 
 
 --name-style long tries names that don't fit. --audio picks how the audio section starts: idle,
 sending, failure, echo, missing or old. POST {"state": ...} to /fake/audio to change it while running,
-and GET /fake/requests for the audio actions the app has sent.
+and GET /fake/requests for the audio actions the app has sent. --link picks how the link looks: good,
+poor, measuring, returning, down or older. POST {"state": ...} to /fake/link to change that too.
 """
 
 import argparse
@@ -82,7 +83,7 @@ class World:
                     "monitors": self.rects(n), "custom_size": None} for n in ("Debian", "Windows")]
         config = {"revision": self.revision, "editor": "Debian", "devices": devices, "attach_side": self.attach_side,
                   "edge_resistance": self.resistance, "auto_game_lock": True, "manual_game_lock": False}
-        telemetry = {"active_node": self.active, "peer_online": True, "panic_mode": False, "cursor_x": 2600, "cursor_y": 700,
+        telemetry = {"active_node": self.active, "peer_online": self.online, "panic_mode": False, "cursor_x": 2600, "cursor_y": 700,
                      "peer_addr": "192.168.8.241:24850", "game_captive_active": False, "game_reason": "", "main_conflict": False}
         return {"config": config, "telemetry": telemetry}
 
@@ -91,16 +92,34 @@ class World:
         status = {
             "node": node.lower(), "device_name": self.names[node], "hostname": "bread" if node == "Debian" else "THINKPAD",
             "ip": "192.168.8.210" if node == "Debian" else "192.168.8.241", "peer_ip": "192.168.8.241", "paired": True,
-            "version": "0.3.0", "os": "", "label": "", "peer_online": True, "active_node": self.active, "panic_mode": False,
+            "version": "0.3.0", "os": "", "label": "", "peer_online": self.online, "active_node": self.active, "panic_mode": False,
             "game_lock": False, "game_reason": "", "displays": self.rects(node), "cursor": [2600, 700], "autostart": True,
             "peer_pinned": False, "main_device": 0, "main_conflict": False,
             "display_change": {"change": None, "note": self.note[node]},
+            "link": self.link,
         }
         status.update(self.settings[node])
         if change:
             left = max(0, int((change["until"] - time.time()) * 1000))
             status["display_change"]["change"] = {k: change[k] for k in ("id", "output", "name", "from", "to")} | {"stage": "waiting", "ms_left": left}
         return status
+
+
+def link_states():
+    figures = {"measured": True, "peer_version": "same", "returning": False}
+    nothing = {"measured": False, "loss_in": 0, "loss_out": 0, "round_trip_ms": None, "audio_loss_in": None, "audio_loss_out": None}
+    return {
+        "good": (True, figures | {"loss_in": 0.2, "loss_out": 0.4, "round_trip_ms": 4, "audio_loss_in": None, "audio_loss_out": None}),
+        "poor": (True, figures | {"loss_in": 3.5, "loss_out": 6.2, "round_trip_ms": 188, "audio_loss_in": 8.4, "audio_loss_out": 7.0}),
+        "measuring": (True, nothing | {"peer_version": "unknown", "returning": False}),
+        "returning": (False, nothing | {"peer_version": "unknown", "returning": True}),
+        "down": (False, nothing | {"peer_version": "unknown", "returning": False}),
+        "older": (True, figures | {"loss_in": 0.2, "loss_out": 0, "round_trip_ms": None, "peer_version": "older"}),
+    }
+
+
+def set_link_state(world, name):
+    world.online, world.link = link_states()[name]
 
 
 def default_settings():
@@ -209,6 +228,8 @@ def serve(world):
                     world.active = "Windows" if world.active == "Debian" else "Debian"
                 elif self.path == "/fake/audio":
                     set_audio_state(world, body["state"])
+                elif self.path == "/fake/link":
+                    set_link_state(world, body["state"])
                 elif self.path.endswith("/api/local/action"):
                     if "audio" in body.get("action", "") or "play_only" in body.get("action", ""):
                         world.requests.append({"device": self.node()} | body)
@@ -280,7 +301,9 @@ if __name__ == "__main__":
     parser.add_argument("--name-style", default="short")
     parser.add_argument("--no-modes", action="store_true", help="this device's desktop isn't answering about modes")
     parser.add_argument("--audio", default="idle", choices=list(audio_states()))
+    parser.add_argument("--link", default="good", choices=list(link_states()))
     options = parser.parse_args()
     world = World(options.monitors, options.name_style == "long", options.no_modes)
     set_audio_state(world, options.audio)
+    set_link_state(world, options.link)
     serve(world)
