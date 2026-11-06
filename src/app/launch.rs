@@ -171,7 +171,26 @@ pub fn install_linux_launchers() -> Result<(), String> {
     for path in written {
         println!("Wrote {}", path.display());
     }
+    match refresh_menu(|tool| run_quietly(tool)) {
+        Some(tool) => println!("Refreshed the app menu with {tool}"),
+        None => println!("Log out and back in if mesh-kvm doesn't appear in your app menu."),
+    }
     Ok(())
+}
+
+/// KDE reads its app menu from a cache, so a new entry stays hidden until the cache is rebuilt.
+#[cfg(any(target_os = "linux", test))]
+fn refresh_menu(run: impl Fn(&str) -> bool) -> Option<&'static str> {
+    ["kbuildsycoca6", "kbuildsycoca5"].into_iter().find(|tool| run(tool))
+}
+
+#[cfg(target_os = "linux")]
+fn run_quietly(tool: &str) -> bool {
+    std::process::Command::new(tool)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Linux reports `current_exe` with " (deleted)" on the end once a rebuild has replaced the file.
@@ -204,6 +223,21 @@ pub fn spawn_self(arg: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn menu_refresh_prefers_the_current_kde_tool() {
+        assert_eq!(refresh_menu(|_| true), Some("kbuildsycoca6"));
+    }
+
+    #[test]
+    fn menu_refresh_falls_back_to_the_older_tool() {
+        assert_eq!(refresh_menu(|tool| tool == "kbuildsycoca5"), Some("kbuildsycoca5"));
+    }
+
+    #[test]
+    fn menu_refresh_is_optional_off_kde() {
+        assert_eq!(refresh_menu(|_| false), None);
+    }
+
     use super::*;
     use std::path::Path;
 
