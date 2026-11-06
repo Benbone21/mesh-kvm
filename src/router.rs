@@ -294,8 +294,10 @@ impl Router {
                 if self.main_conflict && stopped {
                     self.end_main_conflict();
                 }
+                // A conflict ends when views stop, so a panic must not silence them: it would end
+                // the peer's conflict but not this one, and only one side would be free to cross.
                 if self.online
-                    && !self.panicked
+                    && (!self.panicked || self.main_conflict)
                     && self.now.saturating_sub(self.last_view) >= ACTIVE_VIEW_INTERVAL_MS
                 {
                     self.send_view(&mut out.actions);
@@ -457,7 +459,8 @@ impl Router {
     /// The peer sent a view, so it claims main too. Inside the grace period that may be a handover
     /// in progress. Past it, views can no longer repair a desync, which could leave both devices
     /// forwarding at each other, so control is lost here as with no main at all. Views keep going
-    /// out regardless: they are how the peer finds the split too, and stays in it.
+    /// out regardless, even through a panic: they are how the peer finds the split too, and stays
+    /// in it.
     fn peer_view_heard(&mut self, actions: &mut Vec<Action>) {
         let since = match self.peer_views {
             Some((since, last)) if self.now.saturating_sub(last) <= LINK_TIMEOUT_MS => since,
@@ -1960,6 +1963,43 @@ mod tests {
         let out = debian.handle(Event::Panic);
         assert!(debian.panicked());
         assert!(out.actions.contains(&Action::SendPanic));
+    }
+
+    #[test]
+    fn panic_during_a_split_cannot_end_it_on_one_side_only() {
+        let (mut a, mut b) = split_pair();
+        // F12 on A reaches B, so both are panicked.
+        a.handle(Event::Panic);
+        b.handle(Event::PeerPanic);
+        assert!(a.panicked() && b.panicked());
+        // F11 on A, inside B's last view's timeout, ends A's panic and tells B nothing.
+        exchange(&mut a, &mut b, 7000);
+        assert!(a.handle(Event::ManualSwitch).actions.is_empty());
+        assert!(!a.panicked() && b.panicked());
+
+        for now_ms in (8000..=60_000).step_by(1000) {
+            exchange(&mut a, &mut b, now_ms);
+            // A pushes on the edge at every step, and neither device gets anywhere.
+            let crossing = Event::EdgeCrossed { x: 1, y: 2, from_peer: false };
+            assert!(a.handle(crossing).actions.is_empty());
+            assert!(a.main_conflict() && b.main_conflict());
+            assert_eq!((a.active(), b.active()), (0, 1));
+            assert_eq!(a.blocking, (false, false));
+            assert_eq!(b.blocking, (false, false));
+        }
+        assert!(!key(&mut a, 30, true).swallow);
+        assert!(!key(&mut b, 30, true).swallow);
+    }
+
+    #[test]
+    fn panicked_main_outside_a_conflict_stays_silent() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::Panic);
+        for now_ms in [2000, 3000, 4000] {
+            r.handle(Event::PeerAlive { now_ms });
+            assert_eq!(view_of(&r.handle(Event::Tick { now_ms })), None);
+        }
     }
 
     #[test]
