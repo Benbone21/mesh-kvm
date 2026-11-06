@@ -1,5 +1,7 @@
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
+#[allow(dead_code)] // Until the window lands.
+mod app;
 mod audio;
 mod clipboard;
 mod keymap;
