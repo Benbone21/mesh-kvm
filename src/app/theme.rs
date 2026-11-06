@@ -14,21 +14,38 @@ pub const DIM: Color32 = Color32::from_rgb(0xa5, 0xbc, 0xbc);
 pub const AMBER: Color32 = Color32::from_rgb(0xff, 0xb2, 0x2e);
 pub const GREEN: Color32 = Color32::from_rgb(0x63, 0xe0, 0x8e);
 pub const RED: Color32 = Color32::from_rgb(0xff, 0x7a, 0x66);
-pub const DEBIAN: Color32 = Color32::from_rgb(0x3f, 0x8c, 0x8c);
 /// The grooves in the slide switch's knob.
 pub const AMBER_GROOVE: Color32 = Color32::from_rgb(0xe7, 0x9b, 0x1c);
 /// A status light that is off.
 pub const UNLIT: Color32 = Color32::from_rgb(0x0e, 0x18, 0x1c);
 
+/// The felt mat the monitors stand on, which is the largest thing in the window.
+pub const MAT: Color32 = Color32::from_rgb(0x1b, 0x3d, 0x3a);
+/// The casing around a screen.
+pub const BEZEL: Color32 = Color32::from_rgb(0x0b, 0x12, 0x15);
+/// A screen with nothing to show: its device isn't connected.
+pub const GLASS: Color32 = Color32::from_rgb(0x16, 0x20, 0x24);
+/// Dark text on a lit screen.
+pub const ON_SCREEN: Color32 = Color32::from_rgb(0x10, 0x20, 0x24);
+/// What each device's screens look like lit. Amber is kept for what can be acted on and for the
+/// place the devices meet, so neither device is amber.
+pub const SCREEN_FIRST: Color32 = Color32::from_rgb(0xb9, 0xea, 0xdd);
+pub const SCREEN_SECOND: Color32 = Color32::from_rgb(0xc8, 0xd2, 0xff);
+
 pub const RADIUS: u8 = 6;
 pub const SMALL_RADIUS: u8 = 4;
-pub const CARD_PADDING: i8 = 16;
-pub const CARD_GAP: f32 = 12.0;
-pub const ROW_HEIGHT: f32 = 32.0;
-pub const BUTTON_HEIGHT: f32 = 38.0;
-pub const TITLE_SIZE: f32 = 19.0;
-pub const HEADING_SIZE: f32 = 17.0;
+/// The space around the window's parts.
+pub const MARGIN: i8 = 16;
+pub const ROW_HEIGHT: f32 = 30.0;
+pub const BUTTON_HEIGHT: f32 = 34.0;
+/// The type scale, each step about a quarter up from the last.
 pub const SMALL_SIZE: f32 = 13.0;
+pub const BODY_SIZE: f32 = 15.0;
+pub const HEADING_SIZE: f32 = 18.0;
+pub const TITLE_SIZE: f32 = 22.0;
+/// The space above a section, and below its heading.
+pub const SECTION_GAP: f32 = 20.0;
+pub const HEADING_GAP: f32 = 6.0;
 
 pub fn line(width: f32, colour: Color32) -> Stroke {
     Stroke { width, color: colour }
@@ -40,22 +57,33 @@ pub fn mix(a: Color32, b: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(channel(a.r(), b.r()), channel(a.g(), b.g()), channel(a.b(), b.b()))
 }
 
+/// The colour of `device`'s lit screens.
+pub fn screen_colour(first_device: bool) -> Color32 {
+    if first_device {
+        SCREEN_FIRST
+    } else {
+        SCREEN_SECOND
+    }
+}
+
 pub fn apply(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Dark, visuals());
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(|style| {
         style.text_styles = [
             (TextStyle::Small, FontId::new(SMALL_SIZE, FontFamily::Proportional)),
-            (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(BODY_SIZE, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(BODY_SIZE, FontFamily::Proportional)),
             (TextStyle::Heading, FontId::new(HEADING_SIZE, FontFamily::Proportional)),
             (TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace)),
         ]
         .into();
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
-        style.spacing.interact_size.y = 24.0;
+        style.spacing.interact_size.y = 26.0;
         style.spacing.combo_height = 320.0;
+        // Always there rather than floating, so it's plain that the controls go on below.
+        style.spacing.scroll = egui::style::ScrollStyle::thin();
         style.spacing.menu_margin = Margin::same(6);
         style.animation_time = 0.12;
     });

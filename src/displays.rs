@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// How long the person has to keep a new mode before it undoes itself.
 pub const REVERT_AFTER: Duration = Duration::from_secs(15);
 /// How often to look at the monitors again. They rarely change, and the look isn't free.
-const LOOK_EVERY: Duration = Duration::from_secs(10);
+const LOOK_EVERY: Duration = Duration::from_secs(30);
 /// How long a note about what happened stays in the status.
 const NOTE_FOR: Duration = Duration::from_secs(10);
 const PENDING_FILE: &str = "display-change.json";

@@ -1,21 +1,18 @@
 //! The app window. It draws what the `Client` last polled and sends what the person changes. The
-//! decisions live in `model`; this file is layout and painting.
+//! decisions live in `model`; the arrangement is in `canvas`, and the device controls in `panels`.
 
+use super::canvas::Canvas;
 use super::client::Client;
 use super::launch::ServiceStarter;
-use super::model::{
-    self, Control, ControlsEnabled, Device, DeviceStatus, Edits, LayoutDraft, Light, MapView,
-    ServiceStart, Snapshot,
-};
-use super::theme::{
-    self, line, AMBER, AMBER_GROOVE, DEBIAN, DEEP, DIM, EDGE, GREEN, INK, PANEL, RAISED, RED, UNLIT,
-};
+use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, Light, ModeChange, ServiceStart, Snapshot};
+use super::panels::{self, Panels, Requests, Shared};
+use super::theme::{self, AMBER, DEEP, INK, PANEL, RED};
+use super::widgets::{paint_light, paint_name_and_state, segment, slide_switch, slider_row, small};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
-    self, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Margin, Painter, Pos2, Rect,
-    Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextStyle, Ui,
+    self, vec2, Align2, Color32, Frame, Key, Margin, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
+    ViewportCommand,
 };
-use serde_json::json;
 use std::ops::RangeInclusive;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -23,25 +20,33 @@ use std::time::{Duration, Instant};
 
 const WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
-const SWITCH_SIZE: [f32; 2] = [196.0, 58.0];
-const SIDE_WIDTH: f32 = 300.0;
-const MIN_MAP_HEIGHT: f32 = 300.0;
-/// Below this content width, the two device panels stack.
-const TWO_DEVICE_COLUMNS: f32 = 1060.0;
-const PILL_SIZE: [f32; 2] = [40.0, 22.0];
-const METER_HEIGHT: f32 = 8.0;
-const SWITCH_TRAVEL_SECONDS: f32 = 0.16;
-const DISABLED_SWITCH: f32 = 0.55;
+const SWITCH_SIZE: [f32; 2] = [176.0, 44.0];
+const HEADER_HEIGHT: f32 = 46.0;
+const BAY_GAP: f32 = 16.0;
+/// Below this width a device's place in the header says it has control in fewer words.
+const ROOM_FOR_FULL_STATE: f32 = 190.0;
+/// Below this width the arrangement's settings take two rows.
+const THREE_SETTINGS_FROM: f32 = 620.0;
 
-const MIN_POINTER_SPEED: f64 = 0.05;
-const MAX_POINTER_SPEED: f64 = 2.0;
-const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 const EDGE_PUSH_RANGE: RangeInclusive<f64> = 10.0..=180.0;
 /// How often to look at how starting the service is going.
 const START_CHECK: Duration = Duration::from_millis(250);
 const PEER_PROMPT_WIDTH: f32 = 380.0;
+const MODE_PROMPT_WIDTH: f32 = 420.0;
+const MODE_PROMPT_SECONDS: f32 = crate::displays::REVERT_AFTER.as_secs() as f32;
+
+/// The app size a person can choose, on top of what the window's size does by itself.
+const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.5];
+const UI_SCALE_KEY: &str = "ui_scale";
+const DEFAULT_UI_SCALE: f32 = 1.0;
+/// How far the window's own zoom has to move before it changes, so a resize doesn't flicker.
+const ZOOM_SLACK: f32 = 0.04;
 
 /// Opens the window and returns when it closes. `starter` is getting the service running.
+///
+/// eframe remembers the window's size, and its place where the desktop allows that: Windows and
+/// X11 do, and Wayland leaves it to the compositor. It also keeps egui's zoom, without which the
+/// remembered size would come back divided by the zoom.
 pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -50,6 +55,7 @@ pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE)
             .with_icon(super::icon::egui_icon()),
+        persist_window: true,
         ..Default::default()
     };
     eframe::run_native(
@@ -57,22 +63,29 @@ pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             super::single::serve_focus(cc.egui_ctx.clone());
             let ctx = cc.egui_ctx.clone();
-            let client = Client::start(super::client::WINDOW_POLL, Box::new(move || ctx.request_repaint()));
-            Ok(Box::new(Window::new(client, starter)))
+            let client = Client::start_with_displays(super::client::WINDOW_POLL, Box::new(move || ctx.request_repaint()));
+            let mut window = Window::new(client, starter);
+            let saved = cc.storage.and_then(|s| eframe::get_value::<f32>(s, UI_SCALE_KEY));
+            window.ui_scale = saved.map_or(DEFAULT_UI_SCALE, nearest_ui_scale);
+            Ok(Box::new(window))
         }),
     )
     .map_err(|e| format!("The mesh-kvm window couldn't start: {e}"))
 }
 
-/// A laptop being dragged on the map. The view stays as it was when the drag began, so the map
-/// doesn't rescale under the pointer.
-struct MapDrag {
-    view: MapView,
-    /// Where the laptop was grabbed, from its corner, in layout units.
-    grab: (f32, f32),
-    from: (i32, i32),
+fn nearest_ui_scale(scale: f32) -> f32 {
+    let distance = |s: &&f32| ((**s - scale).abs() * 1000.0) as u32;
+    UI_SCALES.iter().min_by_key(distance).copied().unwrap_or(DEFAULT_UI_SCALE)
+}
+
+/// The next app size up or down from `scale`, stopping at the ends.
+fn stepped_ui_scale(scale: f32, up: bool) -> f32 {
+    let at = UI_SCALES.iter().position(|s| *s == nearest_ui_scale(scale)).unwrap_or(2);
+    let to = if up { (at + 1).min(UI_SCALES.len() - 1) } else { at.saturating_sub(1) };
+    UI_SCALES[to]
 }
 
 /// The box that asks for the other device's address.
@@ -93,21 +106,33 @@ struct Window {
     peer_prompt: PeerPrompt,
     edits: Edits,
     layout: LayoutDraft,
-    drag: Option<MapDrag>,
+    canvas: Canvas,
+    panels: Panels,
     main_change: Option<Receiver<Result<(), String>>>,
     main_error: Option<String>,
     /// The device the failed change was for, and whether the link has been seen down since.
     main_choice: Option<Device>,
     main_link_was_down: bool,
-    /// Last frame's heights, so that cards in a row can match the tallest.
-    side_height: f32,
-    device_height: f32,
+    /// The person's choice of app size, and what the window's size adds to it.
+    ui_scale: f32,
+    window_zoom: f32,
+    /// The zoom the window's smallest size was last worked out for.
+    min_size_zoom: f32,
+    settings_height: f32,
 }
 
 impl eframe::App for Window {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let snapshot = self.client.snapshot();
         self.show(ctx, &snapshot, Instant::now());
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, UI_SCALE_KEY, &self.ui_scale);
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        DEEP.to_normalized_gamma_f32()
     }
 }
 
@@ -119,31 +144,69 @@ impl Window {
             peer_prompt: PeerPrompt::default(),
             edits: Edits::default(),
             layout: LayoutDraft::default(),
-            drag: None,
+            canvas: Canvas::default(),
+            panels: Panels::default(),
             main_change: None,
             main_error: None,
             main_choice: None,
             main_link_was_down: false,
-            side_height: 0.0,
-            device_height: 0.0,
+            ui_scale: DEFAULT_UI_SCALE,
+            window_zoom: 1.0,
+            min_size_zoom: 0.0,
+            settings_height: 0.0,
+        }
+    }
+
+    /// Sizes everything from the window and the person's choice. The smallest window grows with
+    /// their choice, so nothing has to fit in less room than the layout was made for.
+    fn apply_scale(&mut self, ctx: &egui::Context) {
+        let keys = ctx.input_mut(|i| {
+            let plus = i.consume_key(Modifiers::COMMAND, Key::Plus) || i.consume_key(Modifiers::COMMAND, Key::Equals);
+            let minus = i.consume_key(Modifiers::COMMAND, Key::Minus);
+            (plus, minus, i.consume_key(Modifiers::COMMAND, Key::Num0))
+        });
+        match keys {
+            (true, ..) => self.ui_scale = stepped_ui_scale(self.ui_scale, true),
+            (_, true, _) => self.ui_scale = stepped_ui_scale(self.ui_scale, false),
+            (.., true) => self.ui_scale = DEFAULT_UI_SCALE,
+            _ => {}
+        }
+        let window = ctx.screen_rect().size() * ctx.zoom_factor();
+        let wanted = model::window_zoom(window.x, window.y);
+        if (wanted - self.window_zoom).abs() > ZOOM_SLACK {
+            self.window_zoom = wanted;
+        }
+        let zoom = self.ui_scale * self.window_zoom;
+        ctx.set_zoom_factor(zoom);
+        if zoom != self.min_size_zoom {
+            self.min_size_zoom = zoom;
+            let smallest = vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]) * self.ui_scale / zoom;
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(smallest));
         }
     }
 
     fn show(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) {
+        self.apply_scale(ctx);
         let on = model::enabled(snapshot);
         self.collect_main_change();
         self.collect_peer_change();
         self.clear_stale_main_error(snapshot, &on);
         let start = self.starter.state();
-        self.layout.follow(snapshot.layout.clone(), self.drag.is_some(), now);
+        self.layout.follow(snapshot.layout.clone(), self.canvas.is_dragging(), now);
 
-        egui::TopBottomPanel::top("top bar")
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(24, 14)))
-            .show(ctx, |ui| self.top_bar(ui, snapshot, &on));
+        egui::TopBottomPanel::top("header")
+            .show_separator_line(false)
+            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(theme::MARGIN, 10)))
+            .show(ctx, |ui| self.header(ui, snapshot, &on));
         if let Some(message) = model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)) {
             let fill = if model::notice_is_serious(snapshot, &start) { RED } else { AMBER };
             notice_strip(ctx, "notice", fill, |ui| {
                 ui.label(RichText::new(message).color(DEEP));
+            });
+        }
+        for (index, note) in Device::BOTH.into_iter().filter_map(|d| snapshot.device(d)?.display_change.note.as_ref()).enumerate() {
+            notice_strip(ctx, if index == 0 { "first screen note" } else { "second screen note" }, AMBER, |ui| {
+                ui.label(RichText::new(note).color(DEEP));
             });
         }
         if let Some(message) = self.client.last_error() {
@@ -161,20 +224,37 @@ impl Window {
                 });
             });
         }
-        egui::CentralPanel::default().frame(Frame::new().fill(DEEP)).show(ctx, |ui| {
-            ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
-                Frame::new().inner_margin(Margin::same(theme::CARD_PADDING)).show(ui, |ui| {
-                    self.content(ui, snapshot, &on, now);
-                });
-            });
-        });
+
+        let body = model::body_layout(ctx.screen_rect().width());
+        egui::SidePanel::right("controls")
+            .exact_width(body.rail)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(PANEL))
+            .show(ctx, |ui| self.controls(ui, snapshot, &on, body.columns, now));
+        let settings = egui::TopBottomPanel::bottom("arrangement settings")
+            .show_separator_line(false)
+            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::MARGIN, right: theme::MARGIN, top: 0, bottom: 12 }))
+            .show(ctx, |ui| self.arrangement_settings(ui, snapshot, &on, now));
+        // A panel takes the height it had last frame, so a reflow needs one more frame to settle.
+        let settings_height = settings.response.rect.height();
+        if settings_height != self.settings_height {
+            self.settings_height = settings_height;
+            ctx.request_repaint();
+        }
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::MARGIN, right: theme::MARGIN, top: theme::MARGIN, bottom: 10 }))
+            .show(ctx, |ui| self.canvas.show(ui, &mut self.layout, snapshot, now));
 
         let first_run = model::needs_peer(snapshot);
         if first_run || self.peer_prompt.open {
             self.peer_window(ctx, snapshot, first_run);
         }
+        if let Some((device, change)) = snapshot.mode_change() {
+            self.mode_prompt(ctx, snapshot, device, change);
+        }
 
-        self.end_lost_drag(ctx, now);
+        self.canvas.end_lost_drag(ctx, &mut self.layout, now);
         self.send_changes(now);
         let wake = [self.edits.next_wake(now), self.layout.next_wake(now)].into_iter().flatten().min();
         if let Some(wake) = wake {
@@ -182,6 +262,52 @@ impl Window {
         }
         if start == ServiceStart::Starting {
             ctx.request_repaint_after(START_CHECK);
+        }
+    }
+
+    /// Asks whether to keep a new mode. It works from either device, and the service undoes the
+    /// change by itself if nobody answers, so closing this window can't leave a blank screen.
+    fn mode_prompt(&mut self, ctx: &egui::Context, snapshot: &Snapshot, device: Device, change: &ModeChange) {
+        let (mut keep, mut undo) = (false, false);
+        let waiting = change.is_waiting();
+        let seconds = (change.ms_left as f32 / 1000.0).ceil() as u32;
+        let target = change.to.as_ref().map_or_else(String::new, |m| m.label());
+        let going_back = change.from.as_ref().map_or_else(String::new, |m| m.label());
+        let screen = format!("{} on {}", change.name, snapshot.name(device));
+        let frame = Frame::popup(&ctx.style()).inner_margin(Margin::same(18));
+        egui::Window::new("Keep these screen settings?")
+            .id(egui::Id::new("mode prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .frame(frame)
+            .min_width(MODE_PROMPT_WIDTH)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| match change.stage.as_str() {
+                "applying" => {
+                    ui.label(format!("Changing {screen} to {target}."));
+                }
+                "going_back" => {
+                    ui.label(format!("Putting {screen} back to {going_back}."));
+                }
+                _ => {
+                    ui.label(format!("{screen} is now {target}."));
+                    ui.label(small(format!("It goes back to {going_back} in {seconds} seconds unless you keep it.")));
+                    let share = change.ms_left as f32 / 1000.0 / MODE_PROMPT_SECONDS;
+                    let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+                    ui.painter().rect_filled(bar, 2.0, DEEP);
+                    let left = Rect::from_min_size(bar.min, vec2(bar.width() * share.clamp(0.0, 1.0), bar.height()));
+                    ui.painter().rect_filled(left, 2.0, AMBER);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let text = RichText::new("Keep this").color(DEEP);
+                        keep = ui.add(egui::Button::new(text).fill(AMBER).stroke(Stroke::NONE)).clicked();
+                        undo = ui.button("Go back now").clicked();
+                    });
+                }
+            });
+        if waiting && (keep || undo) {
+            let action = if keep { "keep_display_mode" } else { "undo_display_mode" };
+            self.client.local_action(device, serde_json::json!({ "action": action }));
         }
     }
 
@@ -309,277 +435,161 @@ impl Window {
         self.main_change = Some(change);
     }
 
-    fn top_bar(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
-        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), SWITCH_SIZE[1]), Sense::hover());
-        let switch_rect = Rect::from_center_size(bar.center(), SWITCH_SIZE.into());
-        let gap = 24.0;
-        let left = Rect::from_min_max(bar.min, Pos2::new(switch_rect.left() - gap, bar.bottom()));
-        let right = Rect::from_min_max(Pos2::new(switch_rect.right() + gap, bar.top()), bar.max);
-        device_bay(ui, left, Device::Debian, snapshot, Align2::LEFT_CENTER);
-        device_bay(ui, right, Device::Windows, snapshot, Align2::RIGHT_CENTER);
-        if slide_switch(ui, switch_rect, snapshot.active(), on.switch).clicked() {
+    fn header(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
+        let [left, right] = snapshot.in_order();
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_HEIGHT), Sense::hover());
+        // The two buttons sit at the end, and the devices and their switch share the rest.
+        let buttons = ui.painter().layout_no_wrap("Release all input".into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x
+            + ui.painter().layout_no_wrap("Settings".into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x
+            + 4.0 * ui.spacing().button_padding.x
+            + ui.spacing().item_spacing.x;
+        let room = Rect::from_min_max(bar.min, Pos2::new(bar.right() - buttons - BAY_GAP, bar.bottom()));
+        let switch_rect = Rect::from_center_size(room.center(), SWITCH_SIZE.into());
+        let left_bay = Rect::from_min_max(room.min, Pos2::new(switch_rect.left() - BAY_GAP, room.bottom()));
+        let right_bay = Rect::from_min_max(Pos2::new(switch_rect.right() + BAY_GAP, room.top()), room.max);
+        for (device, bay, side) in [(left, left_bay, Align2::LEFT_CENTER), (right, right_bay, Align2::RIGHT_CENTER)] {
+            device_bay(ui, bay, device, snapshot, side);
+        }
+        let active = snapshot.active();
+        let side = active.map_or(0.5, |d| if d == left { 0.0 } else { 1.0 });
+        let knob = active.map(|d| snapshot.title(d));
+        let hint = match (on.switch, active) {
+            (true, Some(device)) => format!("Switch keyboard and mouse to {}", snapshot.name(device.other())),
+            _ => "The switch works while the devices are linked and agree on a main device.".to_string(),
+        };
+        if slide_switch(ui, switch_rect, side, knob.as_deref(), on.switch, hint).clicked() {
             self.client.master_action("toggle_focus");
+        }
+        let buttons = Rect::from_min_max(Pos2::new(bar.right() - buttons, bar.top()), bar.max);
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(buttons), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("Settings", |ui| self.settings_menu(ui, snapshot));
+                ui.add_enabled_ui(on.release, |ui| {
+                    let text = RichText::new("Release all input").color(DEEP);
+                    let button = egui::Button::new(text).fill(RED).stroke(Stroke::NONE);
+                    if ui.add(button).on_hover_text("Gives each device back its own keyboard and mouse.").clicked() {
+                        self.client.release_all_input();
+                    }
+                });
+            });
+        });
+    }
+
+    fn settings_menu(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
+        ui.set_min_width(260.0);
+        ui.label("App size");
+        ui.horizontal_wrapped(|ui| {
+            for scale in UI_SCALES {
+                let text = format!("{:.0}%", scale * 100.0);
+                if ui.selectable_label(self.ui_scale == scale, text).clicked() {
+                    self.ui_scale = scale;
+                }
+            }
+        });
+        ui.label(small("Ctrl and plus or minus do the same."));
+        if let Some(local) = snapshot.local.as_ref().filter(|l| l.paired == Some(true)) {
+            ui.add_space(8.0);
+            ui.label(format!("{}'s address", snapshot.title(snapshot.in_order()[1])));
+            ui.label(small(&local.peer_ip));
+            ui.add_enabled_ui(!local.peer_pinned, |ui| {
+                if ui.button("Change address").clicked() {
+                    self.peer_prompt.open = true;
+                    ui.close_menu();
+                }
+            });
+            if local.peer_pinned {
+                ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
+            }
         }
     }
 
-    fn content(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
+    /// Where the devices sit and which leads, under the map they belong to.
+    fn arrangement_settings(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
+        let gap = theme::MARGIN as f32;
         let width = ui.available_width();
-        let border = 2.0 * (theme::CARD_PADDING as f32 + 1.0);
-        ui.horizontal_top(|ui| {
-            let map_width = (width - SIDE_WIDTH - theme::CARD_GAP - border).max(0.0);
-            card(ui, map_width, |ui| self.map(ui, snapshot, now));
-            ui.add_space(theme::CARD_GAP - ui.spacing().item_spacing.x);
-            card(ui, SIDE_WIDTH - border, |ui| {
-                let height = measured_height(ui, |ui| self.side_panel(ui, snapshot, on, now));
-                if height != self.side_height {
-                    self.side_height = height;
-                    ui.ctx().request_repaint();
-                }
-            });
-        });
-        ui.add_space(theme::CARD_GAP - ui.spacing().item_spacing.y);
-
-        let mut tallest: f32 = 0.0;
-        let two_columns = width >= TWO_DEVICE_COLUMNS;
-        if two_columns {
-            let card_width = (width - theme::CARD_GAP) / 2.0 - border;
+        let three = width >= THREE_SETTINGS_FROM;
+        let column = if three { (width - 2.0 * gap) / 3.0 } else { (width - gap) / 2.0 };
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
             ui.horizontal_top(|ui| {
-                for (i, device) in Device::BOTH.into_iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(theme::CARD_GAP - ui.spacing().item_spacing.x);
-                    }
-                    card(ui, card_width, |ui| {
-                        let height = measured_height(ui, |ui| self.device_panel(ui, device, snapshot, on, now));
-                        tallest = tallest.max(height);
-                        ui.add_space((self.device_height - height).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(column);
+                    self.position_control(ui, snapshot, on, now);
+                });
+                ui.vertical(|ui| {
+                    ui.set_width(column);
+                    self.edge_push_control(ui, on, now);
+                });
+                if three {
+                    ui.vertical(|ui| {
+                        ui.set_width(column);
+                        self.main_device_controls(ui, snapshot, on);
                     });
                 }
             });
-        } else {
-            for device in Device::BOTH {
-                card(ui, width - border, |ui| self.device_panel(ui, device, snapshot, on, now));
-                ui.add_space(theme::CARD_GAP - ui.spacing().item_spacing.y);
-            }
-        }
-        if tallest != self.device_height {
-            self.device_height = tallest;
-            ui.ctx().request_repaint();
-        }
-    }
-
-    fn map(&mut self, ui: &mut Ui, snapshot: &Snapshot, now: Instant) {
-        let has_layout = self.layout.state.is_some();
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Screens");
-            if has_layout {
-                ui.label(small("Drag the laptop to where it sits on your desk."));
-            }
         });
-        let height = (self.side_height - ui.min_rect().height() - ui.spacing().item_spacing.y).max(MIN_MAP_HEIGHT);
-        let (well, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-        paint_map_well(ui.painter(), well);
-
-        let Some(state) = &self.layout.state else {
-            let text = "The layout shows up here once mesh-kvm is running on this device.";
-            let galley = ui.painter().layout(text.into(), body_font(ui), DIM, well.width() - 48.0);
-            let at = well.center() - galley.size() / 2.0;
-            ui.painter().galley(at, galley, DIM);
-            return;
-        };
-        let cfg = state.config.clone();
-        let view = self.drag.as_ref().map_or_else(|| model::fit(&cfg, well.width(), well.height()), |d| d.view);
-        let to_rect = |x: i32, y: i32, w: i32, h: i32| {
-            let (sx, sy) = view.to_screen(x as f32, y as f32);
-            Rect::from_min_size(well.min + vec2(sx, sy), vec2(w as f32, h as f32) * view.scale)
-        };
-        let painter = ui.painter().with_clip_rect(well);
-        let active = snapshot.active();
-
-        for m in cfg.rects(Device::Debian) {
-            let colours = (theme::mix(DEEP, DEBIAN, 0.28), DEBIAN);
-            paint_screen(&painter, to_rect(m.x, m.y, m.w, m.h), &m.name, (m.w, m.h), colours, active == Some(Device::Debian));
-        }
-        let (win_x, win_y, win_w, win_h) = cfg.laptop_box();
-        let laptop = to_rect(win_x, win_y, win_w, win_h);
-        let colours = (theme::mix(DEEP, AMBER, 0.16), AMBER);
-        let screens = cfg.rects(Device::Windows);
-        for m in &screens {
-            let name = if screens.len() == 1 { Device::Windows.title() } else { m.name.as_str() };
-            paint_screen(&painter, to_rect(m.x, m.y, m.w, m.h), name, (m.w, m.h), colours, active == Some(Device::Windows));
-        }
-        if self.drag.is_some() {
-            paint_attached_edge(&painter, laptop, &cfg.attach_side);
-        }
-        if let Some((x, y)) = model::cursor_position(snapshot, &cfg) {
-            let (sx, sy) = view.to_screen(x as f32, y as f32);
-            painter.circle_filled(well.min + vec2(sx, sy), 5.0, RED);
-        }
-
-        let grab = ui.interact(laptop, laptop_id(), Sense::drag());
-        let grab = grab.on_hover_cursor(if self.drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::Grab });
-        let in_map = |p: Pos2| (p.x - well.min.x, p.y - well.min.y);
-        if grab.drag_started() {
-            let pressed = ui.input(|i| i.pointer.press_origin()).or(grab.interact_pointer_pos());
-            if let Some(pressed) = pressed {
-                let (px, py) = in_map(pressed);
-                let (wx, wy) = view.to_world(px, py);
-                let offset = (wx - win_x as f32, wy - win_y as f32);
-                self.drag = Some(MapDrag { view, grab: offset, from: (win_x, win_y) });
-            }
-        }
-        if let (true, Some(drag), Some(pointer)) = (grab.dragged(), &self.drag, grab.interact_pointer_pos()) {
-            let (x, y) = model::drag_target(&drag.view, in_map(pointer), drag.grab);
-            if let (Some(place), Some(state)) = (model::snap(&cfg, x, y), &mut self.layout.state) {
-                model::apply_placement(&mut state.config, &place);
-            }
-        }
-        if grab.drag_stopped() {
-            self.finish_drag(now);
+        if !three {
+            self.main_device_controls(ui, snapshot, on);
         }
     }
 
-    fn finish_drag(&mut self, now: Instant) {
-        let Some(drag) = self.drag.take() else { return };
-        let moved = self.layout.state.as_ref().is_some_and(|s| {
-            let (x, y, ..) = s.config.laptop_box();
-            (x, y) != drag.from
-        });
-        if moved {
-            self.layout.edited(now);
-        }
-    }
-
-    /// Ends a drag whose release never reached the laptop, as when the map stops being drawn.
-    fn end_lost_drag(&mut self, ctx: &egui::Context, now: Instant) {
-        if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) {
-            self.finish_drag(now);
-        }
-    }
-
-    fn side_panel(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
-        ui.heading("Layout");
-        ui.add_enabled_ui(on.layout, |ui| self.layout_controls(ui, snapshot, now));
-        ui.add_space(10.0);
-        ui.heading("Main device");
-        self.main_device_controls(ui, snapshot, on);
-        ui.add_space(10.0);
-        self.other_device_controls(ui, snapshot);
-        ui.add_space(10.0);
-        ui.add_enabled_ui(on.release, |ui| {
-            let text = RichText::new("Release all input").color(DEEP);
-            if wide_button(ui, egui::Button::new(text).fill(RED).stroke(Stroke::NONE)).clicked() {
-                self.client.release_all_input();
-            }
-        });
-    }
-
-    /// Where the other device is, and the way to change it. A first run asks by itself.
-    fn other_device_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
-        let Some(local) = snapshot.local.as_ref().filter(|l| l.paired == Some(true)) else { return };
-        ui.heading("Other device");
-        ui.label(small(format!("Its address is {}.", local.peer_ip)));
-        ui.add_enabled_ui(!local.peer_pinned, |ui| {
-            if wide_button(ui, egui::Button::new("Change address")).clicked() {
-                self.peer_prompt.open = true;
-            }
-        });
-        if local.peer_pinned {
-            ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
-        }
-    }
-
-    fn layout_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, now: Instant) {
+    fn position_control(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
         let cfg = self.layout.state.as_ref().map(|s| s.config.clone()).unwrap_or_default();
         let has_layout = self.layout.state.is_some();
-        let placements = model::placements(&cfg);
-        let unavailable = || "Not available".to_string();
-
-        ui.label("Laptop position");
-        let selected = if has_layout { model::position_label(&cfg, &placements) } else { unavailable() };
-        let mut chosen_place = None;
-        egui::ComboBox::from_id_salt("laptop position")
-            .selected_text(selected.clone())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for place in &placements {
-                    if ui.selectable_label(place.label == selected, &place.label).clicked() {
-                        chosen_place = Some(place);
+        let placements = model::placements(&cfg, snapshot.displays(Device::Debian));
+        let selected = if has_layout { model::position_label(&cfg, &placements) } else { "Not available".to_string() };
+        let mut chosen = None;
+        ui.add_enabled_ui(on.layout, |ui| {
+            ui.add(egui::Label::new(format!("Where {} sits", snapshot.name(Device::Windows))).truncate());
+            egui::ComboBox::from_id_salt("position")
+                .selected_text(selected.clone())
+                .width(ui.available_width())
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for place in &placements {
+                        if ui.selectable_label(place.label == selected, &place.label).clicked() {
+                            chosen = Some(place);
+                        }
                     }
-                }
-            });
-
-        ui.label("Laptop resolution");
-        let selected = if has_layout { model::resolution_label(&cfg) } else { unavailable() };
-        let mut chosen_size = None;
-        egui::ComboBox::from_id_salt("laptop resolution")
-            .selected_text(selected.clone())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(selected == "Native", "Native").clicked() {
-                    chosen_size = Some(None);
-                }
-                for size in model::RESOLUTIONS {
-                    let label = model::size_label(size);
-                    if ui.selectable_label(label == selected, &label).clicked() {
-                        chosen_size = Some(Some(size));
-                    }
-                }
-            });
-
-        let mut push = cfg.edge_resistance as f64;
-        let push_text = if has_layout { format!("{push:.0}") } else { String::new() };
-        let moved = slider_row(ui, "Push needed to cross a screen edge", push_text, &mut push, EDGE_PUSH_RANGE, 5.0);
-
-        let auto_lock = toggle_row(ui, "Keep the mouse on the screen while a game runs", cfg.auto_game_lock).clicked();
-        ui.label(small("This applies to the device you're using it on."));
-        let manual_lock = toggle_row(ui, "Lock the mouse to this screen now", cfg.manual_game_lock).clicked();
-        let telemetry = snapshot.layout.as_ref().map(|l| &l.telemetry);
-        if let Some(hint) = telemetry.and_then(model::game_lock_hint) {
-            ui.label(small(hint));
-        }
-        let reset = wide_button(ui, egui::Button::new("Reset to native resolutions")).clicked();
-
-        let Some(state) = &mut self.layout.state else { return };
-        if let Some(place) = chosen_place {
+                });
+            if cfg.has_custom_size() && ui.button("Use the real screen sizes").clicked() {
+                self.client.master_action("reset_native_resolutions");
+                self.layout.let_poll_through();
+            }
+        });
+        let Some(place) = chosen else { return };
+        if let Some(state) = &mut self.layout.state {
             model::apply_placement(&mut state.config, place);
         }
-        if let Some(size) = chosen_size {
-            model::set_resolution(&mut state.config, size);
+        self.layout.edited(now);
+    }
+
+    fn edge_push_control(&mut self, ui: &mut Ui, on: &ControlsEnabled, now: Instant) {
+        let current = self.layout.state.as_ref().map(|s| s.config.edge_resistance);
+        let mut push = current.unwrap_or_default() as f64;
+        let text = current.map_or_else(String::new, |v| v.to_string());
+        let moved = ui.add_enabled_ui(on.layout, |ui| slider_row(ui, "Push needed to cross", text, &mut push, EDGE_PUSH_RANGE, 5.0)).inner;
+        if !moved {
+            return;
         }
-        if moved {
+        if let Some(state) = &mut self.layout.state {
             state.config.edge_resistance = push as i32;
         }
-        if auto_lock {
-            state.config.auto_game_lock = !state.config.auto_game_lock;
-            self.client.master_action("toggle_auto_game_lock");
-        }
-        if manual_lock {
-            state.config.manual_game_lock = !state.config.manual_game_lock;
-            self.client.master_action("toggle_game_lock");
-        }
-        if auto_lock || manual_lock {
-            self.layout.hold(now);
-        }
-        if chosen_place.is_some() || chosen_size.is_some() || moved {
-            self.layout.edited(now);
-        }
-        if reset {
-            self.client.master_action("reset_native_resolutions");
-            self.layout.let_poll_through();
-        }
+        self.layout.edited(now);
     }
 
     fn main_device_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
         let changing = self.main_change.is_some();
         let current = snapshot.main_device();
         let mut chosen = None;
+        ui.label("Main device").on_hover_text("It takes the keyboard and mouse when the devices link up.");
         ui.add_enabled_ui(on.main_device && !changing, |ui| {
             let gap = 2.0;
             let width = (ui.available_width() - gap) / 2.0;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                for device in Device::BOTH {
-                    if segment(ui, width, device.title(), current == Some(device)).clicked() && current != Some(device) {
+                for device in snapshot.in_order() {
+                    if segment(ui, width, &snapshot.title(device), current == Some(device)).clicked() && current != Some(device) {
                         chosen = Some(device);
                     }
                 }
@@ -592,439 +602,89 @@ impl Window {
             ui.label(small(error).color(RED));
         } else if changing {
             ui.label(small("Changing the main device."));
-        } else if on.main_device {
-            ui.label(small("It takes the keyboard and mouse when the devices link up."));
-        } else {
-            ui.label(small("Both devices need to be linked to change this."));
         }
     }
 
-    fn device_panel(&mut self, ui: &mut Ui, device: Device, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
-        let status = snapshot.device(device);
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(device.title());
-            let here = snapshot.local.as_ref().is_some_and(|l| l.node == device.node());
-            ui.label(small(device_details(status, here)));
-        });
-        let Some(status) = status else {
-            if let Some(message) = model::status_message(snapshot) {
-                ui.label(RichText::new(message).color(DIM));
-            }
-            return;
-        };
-        let mut panel = DevicePanel { edits: &mut self.edits, device, status, now };
-        ui.columns(2, |columns| {
-            panel.input_and_clipboard(&mut columns[0]);
-            let test_sound = panel.audio(&mut columns[1], on.test_sound);
-            if test_sound {
-                self.client.local_action(device, json!({ "action": "test_audio_chime", "target": "peer" }));
-            }
-        });
-    }
-}
-
-/// The controls of one reachable device.
-struct DevicePanel<'a> {
-    edits: &'a mut Edits,
-    device: Device,
-    status: &'a DeviceStatus,
-    now: Instant,
-}
-
-impl DevicePanel<'_> {
-    fn value(&self, control: Control) -> f64 {
-        self.edits.shown((self.device, control), control.read(self.status), self.now)
-    }
-
-    fn set(&mut self, control: Control, value: f64) {
-        self.edits.set((self.device, control), value, self.now);
-    }
-
-    fn toggle(&mut self, ui: &mut Ui, control: Control, label: &str) {
-        let on = self.value(control) != 0.0;
-        if toggle_row(ui, label, on).clicked() {
-            self.set(control, if on { 0.0 } else { 1.0 });
-        }
-    }
-
-    fn slider(
-        &mut self,
-        ui: &mut Ui,
-        control: Control,
-        label: &str,
-        format: impl Fn(f64) -> String,
-        range: RangeInclusive<f64>,
-        step: f64,
-    ) {
-        let mut value = self.value(control);
-        if slider_row(ui, label, format(value), &mut value, range, step) {
-            self.set(control, value);
-        }
-    }
-
-    fn input_and_clipboard(&mut self, ui: &mut Ui) {
-        let other = self.device.other().nickname();
-        // An older service has no actions for these, so they stay off rather than failing.
-        let newer = !self.status.is_older();
-        ui.add_enabled_ui(newer, |ui| {
-            section(ui, "Mouse and keyboard");
-            self.toggle(ui, Control::MouseSharing, "Share mouse");
-            self.toggle(ui, Control::KeyboardSharing, "Share keyboard");
-            let speed_label = format!("Pointer speed on {other}");
-            let range = MIN_POINTER_SPEED..=MAX_POINTER_SPEED;
-            self.slider(ui, Control::PointerSpeed, &speed_label, |v| format!("{v:.2}\u{d7}"), range, 0.05);
-
-            ui.add_space(6.0);
-            section(ui, "Clipboard");
-            self.toggle(ui, Control::ClipboardSend, &format!("Send clipboard to {other}"));
-            self.toggle(ui, Control::ClipboardReceive, &format!("Receive clipboard from {other}"));
-            if !self.status.clipboard.note.is_empty() {
-                ui.small(&self.status.clipboard.note);
-            }
-        });
-
-        ui.add_space(6.0);
-        section(ui, "Startup");
-        self.toggle(ui, Control::Autostart, "Start mesh-kvm when this device boots");
-    }
-
-    /// Returns true when the test sound was asked for.
-    fn audio(&mut self, ui: &mut Ui, can_test: bool) -> bool {
-        let other = self.device.other().nickname();
-        let percent = |v: f64| format!("{v:.0}%");
-        section(ui, "Audio sent");
-        self.toggle(ui, Control::AudioSend, &format!("Send audio to {other}"));
-        meter(ui, self.status.audio.tx_peak);
-        if self.status.audio.tx_source.is_some() {
-            self.source_picker(ui);
-        }
-        ui.add_enabled_ui(self.status.audio.mute_while_sending.is_some(), |ui| {
-            self.toggle(ui, Control::MuteWhileSending, "Mute this device while sending");
-        });
-        self.slider(ui, Control::SendVolume, "Send volume", percent, VOLUME_RANGE, 5.0);
-
-        ui.add_space(6.0);
-        section(ui, "Audio received");
-        self.toggle(ui, Control::AudioPlay, &format!("Play audio from {other}"));
-        meter(ui, self.status.audio.rx_peak);
-        self.slider(ui, Control::PlayVolume, "Playback volume", percent, VOLUME_RANGE, 5.0);
-
-        let label = format!("Play a test sound on {other}");
-        ui.add_enabled_ui(can_test, |ui| wide_button(ui, egui::Button::new(label)).clicked()).inner
-    }
-
-    fn source_picker(&mut self, ui: &mut Ui) {
-        const SOURCES: [&str; 2] = ["System sound", "Microphone"];
-        let current = self.value(Control::AudioSource) as usize;
-        ui.label("Audio to send");
-        let mut chosen = None;
-        egui::ComboBox::from_id_salt((self.device, "audio source"))
-            .selected_text(SOURCES[current.min(1)])
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for (mode, name) in SOURCES.iter().enumerate() {
-                    if ui.selectable_label(mode == current, *name).clicked() {
-                        chosen = Some(mode);
-                    }
+    /// Each device's sections: side by side with room for both, else one above the other.
+    fn controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, columns: usize, now: Instant) {
+        let mut requests = Requests::default();
+        let mut shared =
+            Shared { edits: &mut self.edits, layout: &self.layout, canvas: &mut self.canvas, snapshot, on, now };
+        let panels = &mut self.panels;
+        let [first, second] = snapshot.in_order();
+        ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
+            Frame::new().inner_margin(Margin::same(theme::MARGIN)).show(ui, |ui| {
+                if columns >= 2 {
+                    let gap = 2.0 * theme::MARGIN as f32;
+                    let width = (ui.available_width() - gap) / 2.0;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for device in [first, second] {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.set_width(width);
+                                panels.device(ui, device, &mut shared, &mut requests);
+                            });
+                        }
+                    });
+                } else {
+                    panels.device(ui, first, &mut shared, &mut requests);
+                    panels::device_divider(ui);
+                    panels.device(ui, second, &mut shared, &mut requests);
                 }
             });
-        if let Some(mode) = chosen {
-            self.set(Control::AudioSource, mode as f64);
-        }
-    }
-}
-
-fn laptop_id() -> egui::Id {
-    egui::Id::new("laptop on the map")
-}
-
-fn device_details(status: Option<&DeviceStatus>, here: bool) -> String {
-    match status {
-        None => "Not connected".into(),
-        Some(d) if here => format!("This device, {}, {}", d.hostname, d.ip),
-        Some(d) => format!("{}, {}", d.hostname, d.ip),
-    }
-}
-
-/// A raised panel with `contents` in a column of this width.
-fn card(ui: &mut Ui, width: f32, contents: impl FnOnce(&mut Ui)) {
-    Frame::new()
-        .fill(PANEL)
-        .stroke(line(1.0, EDGE))
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::same(theme::CARD_PADDING))
-        .show(ui, |ui| {
-            // A frame takes on its parent's layout, and cards sit in rows.
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                contents(ui);
-            });
         });
-}
+        self.send_requests(requests, now);
+    }
 
-/// How tall `contents` came out, before anything stretches the card around it.
-fn measured_height(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) -> f32 {
-    let top = ui.next_widget_position().y;
-    contents(ui);
-    ui.min_rect().bottom() - top
-}
-
-fn wide_button(ui: &mut Ui, button: egui::Button) -> Response {
-    ui.add_sized([ui.available_width(), theme::BUTTON_HEIGHT], button)
+    fn send_requests(&mut self, requests: Requests, now: Instant) {
+        for (device, action) in requests.actions {
+            self.client.local_action(device, action);
+        }
+        let (auto, manual) = (requests.toggle_auto_game_lock, requests.toggle_manual_game_lock);
+        if !auto && !manual {
+            return;
+        }
+        if let Some(state) = &mut self.layout.state {
+            state.config.auto_game_lock ^= auto;
+            state.config.manual_game_lock ^= manual;
+        }
+        if auto {
+            self.client.master_action("toggle_auto_game_lock");
+        }
+        if manual {
+            self.client.master_action("toggle_game_lock");
+        }
+        self.layout.hold(now);
+    }
 }
 
 fn notice_strip(ctx: &egui::Context, id: &'static str, fill: Color32, contents: impl FnOnce(&mut Ui)) {
     egui::TopBottomPanel::top(id)
         .show_separator_line(false)
-        .frame(Frame::new().fill(fill).inner_margin(Margin::symmetric(24, 10)))
+        .frame(Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::MARGIN, 8)))
         .show(ctx, contents);
 }
 
-fn small(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(theme::SMALL_SIZE).color(DIM)
-}
-
-fn section(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).color(DIM));
-}
-
-fn body_font(ui: &Ui) -> FontId {
-    TextStyle::Body.resolve(ui.style())
-}
-
-fn focus_ring(ui: &Ui, response: &Response, rect: Rect) {
-    if response.has_focus() {
-        let ring = line(2.0, AMBER);
-        ui.painter().rect_stroke(rect.expand(2.0), theme::RADIUS, ring, StrokeKind::Outside);
-    }
-}
-
-fn paint_light(painter: &Painter, center: Pos2, light: Light) {
-    const RADIUS: f32 = 7.0;
-    let colour = match light {
-        Light::Off => {
-            painter.circle(center, RADIUS, UNLIT, line(2.0, EDGE));
-            return;
-        }
-        Light::Connected => GREEN,
-        Light::Active => AMBER,
-    };
-    for (spread, alpha) in [(7.0, 0.05), (5.0, 0.08), (3.0, 0.14), (1.5, 0.2)] {
-        painter.circle_filled(center, RADIUS + spread, colour.gamma_multiply(alpha));
-    }
-    painter.circle_filled(center, RADIUS, colour);
-}
-
-/// A device's name and state in the top bar, against one side of `rect`.
+/// A device's name and state in the header, against one side of `rect`.
 fn device_bay(ui: &Ui, rect: Rect, device: Device, snapshot: &Snapshot, side: Align2) {
     let (light, state) = model::device_badge(snapshot, device);
+    let state = if rect.width() < ROOM_FOR_FULL_STATE && light == Light::Active { "Has control" } else { state };
     let painter = ui.painter().with_clip_rect(rect);
     let on_left = side == Align2::LEFT_CENTER;
-    let light_x = if on_left { rect.left() + 9.0 } else { rect.right() - 9.0 };
+    let light_x = if on_left { rect.left() + 8.0 } else { rect.right() - 8.0 };
     paint_light(&painter, Pos2::new(light_x, rect.center().y), light);
-    let text_x = if on_left { rect.left() + 28.0 } else { rect.right() - 28.0 };
-    let anchor = if on_left { Align2::LEFT_BOTTOM } else { Align2::RIGHT_BOTTOM };
-    let title_at = Pos2::new(text_x, rect.center().y + 3.0);
-    painter.text(title_at, anchor, device.title(), FontId::proportional(theme::TITLE_SIZE), INK);
-    let anchor = if on_left { Align2::LEFT_TOP } else { Align2::RIGHT_TOP };
-    let state_at = Pos2::new(text_x, rect.center().y + 5.0);
-    painter.text(state_at, anchor, state, FontId::proportional(theme::SMALL_SIZE), DIM);
-}
-
-/// Where the knob sits, from 0 at the Debian end to 1 at the Windows end. It waits in the middle
-/// when nothing says who has control.
-fn knob_position(active: Option<Device>) -> f32 {
-    match active {
-        Some(Device::Debian) => 0.0,
-        Some(Device::Windows) => 1.0,
-        None => 0.5,
-    }
-}
-
-/// The one physical object on the panel: a slide switch that shows who owns the keyboard.
-fn slide_switch(ui: &mut Ui, rect: Rect, active: Option<Device>, enabled: bool) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let response = ui.interact(rect, ui.id().with("slide switch"), sense);
-    let hint = match (enabled, active) {
-        (true, Some(device)) => format!("Switch keyboard and mouse to {}", device.other().name()),
-        _ => "The switch works while the devices are linked and agree on a main device.".to_string(),
-    };
-    let response = response.on_hover_text(hint);
-
-    let shade = if enabled { 1.0 } else { DISABLED_SWITCH };
-    let painter = ui.painter();
-    let radius = theme::RADIUS;
-    let border = if enabled && response.hovered() { INK } else { EDGE };
-    painter.rect_filled(rect, radius, DEEP);
-    // A shadow along the top makes the track read as a recess.
-    for (depth, alpha) in [(2.0, 0.4), (4.0, 0.25), (7.0, 0.12)] {
-        let shadow = Rect::from_min_size(rect.min, vec2(rect.width(), depth)).shrink2(vec2(2.0, 0.0));
-        painter.rect_filled(shadow, 0.0, Color32::BLACK.gamma_multiply(alpha));
-    }
-    painter.rect_stroke(rect, radius, line(2.0, border.gamma_multiply(shade)), StrokeKind::Inside);
-
-    let inset = 6.0;
-    let knob_size = vec2((rect.width() - 2.0 * inset) / 2.0 - 2.0, rect.height() - 2.0 * inset);
-    let travel = rect.width() - 2.0 * inset - knob_size.x;
-    let position = ui.ctx().animate_value_with_time(
-        response.id.with("knob"),
-        knob_position(active),
-        SWITCH_TRAVEL_SECONDS,
-    );
-    let knob = Rect::from_min_size(rect.min + vec2(inset + travel * position, inset), knob_size);
-    painter.rect_filled(knob, 3.0, AMBER.gamma_multiply(shade));
-    let grooves = painter.with_clip_rect(knob.shrink(1.0));
-    let mut x = knob.left() + 5.0;
-    while x < knob.right() {
-        let groove = Rect::from_min_size(Pos2::new(x, knob.top()), vec2(2.0, knob.height()));
-        grooves.rect_filled(groove, 0.0, AMBER_GROOVE.gamma_multiply(shade));
-        x += 7.0;
-    }
-    if let Some(device) = active {
-        let font = FontId::proportional(16.0);
-        // Painted twice, half a pixel apart, as the bundled font has no bold.
-        for nudge in [0.0, 0.5] {
-            painter.text(knob.center() + vec2(nudge, 0.0), Align2::CENTER_CENTER, device.short_name(), font.clone(), DEEP);
-        }
-    }
-    focus_ring(ui, &response, rect);
-    response
-}
-
-/// A label with an on and off switch. The whole row can be clicked.
-fn toggle_row(ui: &mut Ui, label: &str, on: bool) -> Response {
-    let width = ui.available_width();
-    let pill = vec2(PILL_SIZE[0], PILL_SIZE[1]);
-    let galley = ui.painter().layout(label.to_string(), body_font(ui), INK, width - pill.x - 12.0);
-    let height = (galley.size().y + 8.0).max(theme::ROW_HEIGHT);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-    let painter = ui.painter();
-    painter.galley(Pos2::new(rect.left(), rect.center().y - galley.size().y / 2.0), galley, INK);
-
-    let track = Rect::from_center_size(Pos2::new(rect.right() - pill.x / 2.0, rect.center().y), pill);
-    let t = ui.ctx().animate_bool(response.id, on);
-    let corner = pill.y / 2.0;
-    painter.rect_filled(track, corner, theme::mix(DEEP, AMBER, t));
-    let border = if response.hovered() { INK } else { EDGE };
-    painter.rect_stroke(track, corner, line(1.0, border), StrokeKind::Inside);
-    let travel = pill.x - pill.y;
-    let center = Pos2::new(track.left() + corner + travel * t, track.center().y);
-    painter.circle_filled(center, corner - 4.0, theme::mix(DIM, DEEP, t));
-    focus_ring(ui, &response, track);
-    response
-}
-
-/// A label, its current value, and a slider under them. Returns true when the person moved it.
-fn slider_row(
-    ui: &mut Ui,
-    label: &str,
-    value_text: String,
-    value: &mut f64,
-    range: RangeInclusive<f64>,
-    step: f64,
-) -> bool {
-    // The label wraps in the room the value leaves, so the two never touch.
-    let value_galley = ui.painter().layout_no_wrap(value_text, body_font(ui), AMBER);
-    let label_width = (ui.available_width() - value_galley.size().x - 12.0).max(40.0);
-    let label_galley = ui.painter().layout(label.to_owned(), body_font(ui), INK, label_width);
-    let height = label_galley.size().y.max(value_galley.size().y).max(20.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    let top = rect.top() + (height - label_galley.size().y) / 2.0;
-    ui.painter().galley(Pos2::new(rect.left(), top), label_galley, INK);
-    let value_pos = Pos2::new(rect.right() - value_galley.size().x, rect.center().y - value_galley.size().y / 2.0);
-    ui.painter().galley(value_pos, value_galley, AMBER);
-
-    let before = *value;
-    ui.spacing_mut().slider_width = ui.available_width();
-    // A value already outside the range stays as it is until the person moves the slider.
-    let slider = egui::Slider::new(value, range)
-        .step_by(step)
-        .show_value(false)
-        .clamping(egui::SliderClamping::Never);
-    ui.add(slider).changed() && *value != before
-}
-
-fn meter(ui: &mut Ui, percent: u32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), METER_HEIGHT), Sense::hover());
-    ui.painter().rect_filled(rect, 2.0, DEEP);
-    let level = rect.width() * percent.min(100) as f32 / 100.0;
-    let filled = Rect::from_min_size(rect.min, vec2(level, rect.height()));
-    ui.painter().rect_filled(filled, 2.0, GREEN);
-}
-
-/// One half of a two-way choice.
-fn segment(ui: &mut Ui, width: f32, label: &str, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, theme::BUTTON_HEIGHT), Sense::click());
-    let (fill, ink) = if selected { (AMBER, DEEP) } else { (RAISED, INK) };
-    let painter = ui.painter();
-    painter.rect_filled(rect, theme::SMALL_RADIUS, fill);
-    let border = if response.hovered() { INK } else if selected { AMBER } else { EDGE };
-    painter.rect_stroke(rect, theme::SMALL_RADIUS, line(1.0, border), StrokeKind::Inside);
-    painter.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(14.0), ink);
-    focus_ring(ui, &response, rect);
-    response
-}
-
-fn paint_map_well(painter: &Painter, well: Rect) {
-    const DOT_GAP: f32 = 24.0;
-    painter.rect_filled(well, theme::SMALL_RADIUS, DEEP);
-    let dot = EDGE.gamma_multiply(0.45);
-    let mut y = well.top() + DOT_GAP / 2.0;
-    while y < well.bottom() {
-        let mut x = well.left() + DOT_GAP / 2.0;
-        while x < well.right() {
-            painter.circle_filled(Pos2::new(x, y), 1.0, dot);
-            x += DOT_GAP;
-        }
-        y += DOT_GAP;
-    }
-}
-
-fn paint_screen(
-    painter: &Painter,
-    rect: Rect,
-    name: &str,
-    size: (i32, i32),
-    (fill, border): (Color32, Color32),
-    has_control: bool,
-) {
-    painter.rect_filled(rect, theme::SMALL_RADIUS, fill);
-    painter.rect_stroke(rect, theme::SMALL_RADIUS, line(2.0, border), StrokeKind::Inside);
-    if has_control {
-        painter.rect_stroke(rect, theme::SMALL_RADIUS, line(2.0, INK), StrokeKind::Outside);
-    }
-    let text = painter.with_clip_rect(rect.shrink(4.0).intersect(painter.clip_rect()));
-    let wrap = (rect.width() - 8.0).max(1.0);
-    let title = text.layout(name.to_string(), FontId::proportional(14.0), INK, wrap);
-    let detail = text.layout(model::size_label(size), FontId::proportional(12.0), DIM, wrap);
-    let height = title.size().y + detail.size().y;
-    let top = rect.center().y - height / 2.0;
-    let title_at = Pos2::new(rect.center().x - title.size().x / 2.0, top);
-    let detail_at = Pos2::new(rect.center().x - detail.size().x / 2.0, top + title.size().y);
-    text.galley(title_at, title, INK);
-    text.galley(detail_at, detail, DIM);
-}
-
-/// Marks the edge of the laptop that touches the desktop, to show where a drag will land.
-fn paint_attached_edge(painter: &Painter, laptop: Rect, side: &str) {
-    let (a, b) = match side {
-        // The side is the desktop edge the laptop sits against, so the laptop's opposite edge.
-        "Right" => (laptop.left_top(), laptop.left_bottom()),
-        "Left" => (laptop.right_top(), laptop.right_bottom()),
-        "Bottom" => (laptop.left_top(), laptop.right_top()),
-        "Top" => (laptop.left_bottom(), laptop.right_bottom()),
-        _ => return,
-    };
-    painter.line_segment([a, b], line(4.0, AMBER));
+    let text = if on_left { rect.with_min_x(rect.left() + 26.0) } else { rect.with_max_x(rect.right() - 26.0) };
+    paint_name_and_state(&painter, text, &snapshot.title(device), state, side);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::model::LayoutState;
+    use crate::app::canvas::monitor_id;
+    use crate::app::model::{Control, DeviceStatus, LayoutState};
+    use crate::app::panels::device_details;
+    use crate::platform::{DisplayInfo, DisplayMode};
     use eframe::egui::{Event, PointerButton, RawInput};
 
     const STATE: &str = r#"{"config":{"devices":[{"node":"Debian","x":0,"y":0,"monitors":[{"name":"DP-3 (240Hz Native)","x":0,"y":360,"w":1920,"h":1080},{"name":"DP-2 (360Hz Native)","x":1920,"y":0,"w":2560,"h":1440}]},{"node":"Windows","x":1920,"y":1440,"monitors":[{"name":"Display 1","x":0,"y":0,"w":2560,"h":1600}]}],"attach_side":"Bottom","edge_resistance":55,"auto_game_lock":true,"manual_game_lock":false},"telemetry":{"active_node":"Debian","peer_online":true}}"#;
@@ -1048,21 +708,47 @@ mod tests {
             local: Some(device("debian", Some(0))),
             peer: Some(device("windows", None)),
             layout: LayoutState::parse(STATE),
+            ..Default::default()
         }
     }
 
     fn states() -> Vec<Snapshot> {
         let mut no_peer = linked();
         no_peer.peer = None;
-        let laptop_alone = Snapshot { local: Some(device("windows", None)), peer: None, layout: LayoutState::parse(STATE) };
-        let no_layout = Snapshot { local: Some(device("windows", None)), peer: None, layout: None };
+        let laptop_alone = Snapshot { local: Some(device("windows", None)), layout: LayoutState::parse(STATE), ..Default::default() };
+        let no_layout = Snapshot { local: Some(device("windows", None)), ..Default::default() };
         let mut split = linked();
         split.peer.as_mut().unwrap().main_device = 1;
         split.local.as_mut().unwrap().main_conflict = true;
         let mut older = linked();
         older.peer.as_mut().unwrap().sharing = None;
         older.peer.as_mut().unwrap().audio.mute_while_sending = None;
-        vec![Snapshot::default(), linked(), no_peer, laptop_alone, no_layout, split, older]
+        let mut with_modes = linked();
+        with_modes.local_displays = vec![display("DP-3"), display("DP-2")];
+        with_modes.peer_displays = vec![display("Display 1")];
+        let mut changing = with_modes.clone();
+        changing.local.as_mut().unwrap().display_change.change = Some(waiting_change());
+        vec![Snapshot::default(), linked(), no_peer, laptop_alone, no_layout, split, older, with_modes, changing]
+    }
+
+    fn mode(width: i32, height: i32, millihertz: u32) -> DisplayMode {
+        DisplayMode { width, height, millihertz, id: String::new() }
+    }
+
+    fn display(id: &str) -> DisplayInfo {
+        let modes = vec![mode(2560, 1440, 144_000), mode(1920, 1080, 60_000)];
+        DisplayInfo { id: id.into(), name: format!("{id} model"), current: Some(modes[0].clone()), modes, can_change: true, ..Default::default() }
+    }
+
+    fn waiting_change() -> ModeChange {
+        ModeChange {
+            output: "DP-2".into(),
+            name: "Big".into(),
+            from: Some(mode(2560, 1440, 144_000)),
+            to: Some(mode(1920, 1080, 60_000)),
+            stage: "waiting".into(),
+            ms_left: 12_000,
+        }
     }
 
     fn window() -> Window {
@@ -1102,17 +788,17 @@ mod tests {
         }
     }
 
-    /// Settles the layout, then returns the laptop's rectangle on screen.
-    fn laptop_on_screen(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, now: Instant) -> Rect {
+    /// Settles the layout, then returns a monitor's rectangle on screen.
+    fn monitor_on_screen(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, device: Device, index: usize, now: Instant) -> Rect {
         for _ in 0..3 {
             frame(ctx, window, snapshot, WINDOW_SIZE, vec![], now);
         }
-        ctx.read_response(laptop_id()).unwrap().rect
+        ctx.read_response(monitor_id(device, index)).unwrap().rect
     }
 
     #[test]
-    fn draws_every_state_at_both_window_sizes() {
-        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+    fn draws_every_state_from_the_smallest_window_to_full_screen() {
+        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE, [1920.0, 1080.0], [3840.0, 2160.0]] {
             for snapshot in states() {
                 let (ctx, mut window) = (context(), window());
                 for _ in 0..3 {
@@ -1122,11 +808,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_arrangement_fills_the_height_and_stays_clear_of_the_controls() {
+        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+            let (ctx, mut window, snapshot) = (context(), window(), linked());
+            for _ in 0..4 {
+                frame(&ctx, &mut window, &snapshot, size, vec![], Instant::now());
+            }
+            let screen = ctx.screen_rect();
+            for device in Device::BOTH {
+                let rect = ctx.read_response(monitor_id(device, 0)).unwrap().rect;
+                let rail = model::body_layout(screen.width()).rail;
+                assert!(rect.right() <= screen.right() - rail, "{size:?} {rect:?}");
+                assert!(rect.left() >= 0.0 && rect.bottom() <= screen.bottom(), "{size:?} {rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_big_window_is_enlarged_on_top_of_the_persons_choice() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        assert_eq!(window.window_zoom, 1.0);
+        window.ui_scale = 1.25;
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        assert_eq!(ctx.zoom_factor(), 1.25);
+    }
+
+    #[test]
+    fn app_size_steps_stop_at_the_ends_and_a_saved_oddity_is_rounded() {
+        assert_eq!(stepped_ui_scale(1.0, true), 1.1);
+        assert_eq!(stepped_ui_scale(1.0, false), 0.9);
+        assert_eq!(stepped_ui_scale(1.5, true), 1.5);
+        assert_eq!(stepped_ui_scale(0.8, false), 0.8);
+        assert_eq!(nearest_ui_scale(1.27), 1.25);
+        assert_eq!(nearest_ui_scale(99.0), 1.5);
+    }
+
+    #[test]
+    fn a_waiting_mode_change_shows_the_prompt_on_either_devices_window() {
+        for this_device_changes in [true, false] {
+            let (ctx, mut window) = (context(), window());
+            let mut snapshot = linked();
+            let target = if this_device_changes { snapshot.local.as_mut() } else { snapshot.peer.as_mut() };
+            target.unwrap().display_change.change = Some(waiting_change());
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+            assert!(ctx.memory(|m| m.area_rect(egui::Id::new("mode prompt"))).is_some());
+        }
+    }
+
     fn unpaired() -> Snapshot {
         let mut local = device("windows", None);
         local.paired = Some(false);
         local.ip = "192.168.8.241".into();
-        Snapshot { local: Some(local), peer: None, layout: LayoutState::parse(STATE) }
+        Snapshot { local: Some(local), layout: LayoutState::parse(STATE), ..Default::default() }
     }
 
     #[test]
@@ -1205,41 +942,81 @@ mod tests {
         let (ctx, mut window) = (context(), window());
         let (snapshot, now) = (linked(), Instant::now());
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
-        let view = model::fit(&snapshot.layout.as_ref().unwrap().config, 500.0, 300.0);
-        window.drag = Some(MapDrag { view, grab: (0.0, 0.0), from: (1920, 1440) });
+        window.canvas.start_test_drag(&snapshot.layout.as_ref().unwrap().config);
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
-        assert!(window.drag.is_none());
+        assert!(!window.canvas.is_dragging());
+    }
+
+    /// Drags a monitor by `by` on screen, and returns the window still holding it.
+    fn hold_and_drag(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, rect: Rect, by: egui::Vec2, now: Instant) -> Pos2 {
+        let start = rect.center();
+        let end = start + by;
+        let mut step = |events| {
+            frame(ctx, window, snapshot, WINDOW_SIZE, events, now);
+        };
+        step(vec![Event::PointerMoved(start)]);
+        step(vec![pointer(start, true)]);
+        step(vec![Event::PointerMoved(start + by / 2.0)]);
+        step(vec![Event::PointerMoved(end)]);
+        end
+    }
+
+    fn box_of(window: &Window, device: Device) -> (i32, i32, i32, i32) {
+        window.layout.state.as_ref().unwrap().config.device_box(device)
     }
 
     #[test]
-    fn dragging_the_laptop_snaps_it_and_ignores_the_poll_until_release() {
+    fn dragging_a_monitor_snaps_its_device_and_ignores_the_poll_until_release() {
         let (ctx, mut window) = (context(), window());
         let (snapshot, now) = (linked(), Instant::now());
-        let laptop = laptop_on_screen(&ctx, &mut window, &snapshot, now);
-        let start = laptop.center();
-        let end = start + vec2(120.0, 0.0);
-        let step = |w: &mut Window, events| {
-            frame(&ctx, w, &snapshot, WINDOW_SIZE, events, now);
-        };
-        step(&mut window, vec![Event::PointerMoved(start)]);
-        step(&mut window, vec![pointer(start, true)]);
-        step(&mut window, vec![Event::PointerMoved(start + vec2(60.0, 0.0))]);
-        assert!(window.drag.is_some(), "the laptop should be held");
-        step(&mut window, vec![Event::PointerMoved(end)]);
-        let held = window.layout.state.as_ref().unwrap().config.laptop_box().0;
-        assert!(held > 1920, "the laptop should have moved, not {held}");
+        let screen = monitor_on_screen(&ctx, &mut window, &snapshot, Device::Windows, 0, now);
+        let end = hold_and_drag(&ctx, &mut window, &snapshot, screen, vec2(60.0, 0.0), now);
+        assert!(window.canvas.is_dragging(), "the device should be held");
+        let held = box_of(&window, Device::Windows).0;
+        assert!(held > 1920, "it should have moved, not {held}");
 
-        // A poll arrives saying the laptop is where it was, and the view stays frozen.
-        let view = window.drag.as_ref().unwrap().view;
-        step(&mut window, vec![]);
-        assert_eq!(window.layout.state.as_ref().unwrap().config.laptop_box().0, held);
-        assert_eq!(window.drag.as_ref().unwrap().view, view);
+        // A poll arrives saying it is where it was, and the view stays frozen.
+        let view = window.canvas.test_view();
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert_eq!(box_of(&window, Device::Windows).0, held);
+        assert_eq!(window.canvas.test_view(), view);
 
-        step(&mut window, vec![pointer(end, false)]);
-        assert!(window.drag.is_none());
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![pointer(end, false)], now);
+        assert!(!window.canvas.is_dragging());
         // Held for a moment after release, so the old poll doesn't undo the move.
-        step(&mut window, vec![]);
-        assert_eq!(window.layout.state.as_ref().unwrap().config.laptop_box().0, held);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert_eq!(box_of(&window, Device::Windows).0, held);
+    }
+
+    #[test]
+    fn every_monitor_of_both_devices_can_be_dragged() {
+        for (device, index) in [(Device::Debian, 0), (Device::Debian, 1), (Device::Windows, 0)] {
+            let (ctx, mut window) = (context(), window());
+            let (snapshot, now) = (linked(), Instant::now());
+            let gap = |w: &Window| {
+                let (a, b) = (box_of(w, Device::Debian), box_of(w, Device::Windows));
+                (b.0 - a.0, b.1 - a.1)
+            };
+            let screen = monitor_on_screen(&ctx, &mut window, &snapshot, device, index, now);
+            let before = gap(&window);
+            hold_and_drag(&ctx, &mut window, &snapshot, screen, vec2(50.0, 0.0), now);
+            assert_ne!(gap(&window), before, "{device:?} {index}");
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_monitor_selects_it_and_does_not_move_it() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (linked(), Instant::now());
+        let screen = monitor_on_screen(&ctx, &mut window, &snapshot, Device::Debian, 1, now);
+        let before = box_of(&window, Device::Windows);
+        let at = screen.center();
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert_eq!(window.canvas.selected.as_ref().map(|k| k.0), Some(Device::Debian));
+        assert_eq!(box_of(&window, Device::Windows), before);
     }
 
     #[test]
@@ -1264,7 +1041,7 @@ mod tests {
         let mut window = window();
         let (down, up) = (Snapshot::default(), linked());
         let set = |w: &mut Window| {
-            w.main_error = Some("Couldn't reach the laptop.".into());
+            w.main_error = Some("Couldn't reach it.".into());
             w.main_choice = Some(Device::Windows);
             w.main_link_was_down = false;
         };
@@ -1301,25 +1078,10 @@ mod tests {
     }
 
     #[test]
-    fn two_device_columns_need_room() {
-        // The content width at the minimum and default window sizes.
-        let content = |window: f32| window - 2.0 * theme::CARD_PADDING as f32;
-        assert!(content(MIN_WINDOW_SIZE[0]) < TWO_DEVICE_COLUMNS);
-        assert!(content(WINDOW_SIZE[0]) >= TWO_DEVICE_COLUMNS);
-    }
-
-    #[test]
     fn device_details_name_this_device() {
         let d = device("debian", None);
         assert_eq!(device_details(Some(&d), true), "This device, debian-host, 192.168.8.2");
         assert_eq!(device_details(Some(&d), false), "debian-host, 192.168.8.2");
         assert_eq!(device_details(None, false), "Not connected");
-    }
-
-    #[test]
-    fn knob_waits_in_the_middle_when_nobody_is_known_to_have_control() {
-        assert_eq!(knob_position(Some(Device::Debian)), 0.0);
-        assert_eq!(knob_position(Some(Device::Windows)), 1.0);
-        assert_eq!(knob_position(None), 0.5);
     }
 }

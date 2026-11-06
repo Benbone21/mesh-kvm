@@ -16,7 +16,7 @@ const NOTICE_FOR: Duration = Duration::from_secs(5);
 /// What the tray's tooltip says, in plain words.
 fn tooltip(snapshot: &Snapshot) -> String {
     match (&snapshot.local, snapshot.active()) {
-        (Some(_), Some(device)) => format!("mesh-kvm: {} has keyboard and mouse", device.title()),
+        (Some(_), Some(device)) => format!("mesh-kvm: {} has keyboard and mouse", snapshot.title(device)),
         _ => "mesh-kvm: not connected".to_string(),
     }
 }
@@ -324,6 +324,7 @@ mod tests {
     fn snapshot_with_active(active: &str) -> Snapshot {
         let local = DeviceStatus {
             node: "debian".into(),
+            device_name: "Desk tower".into(),
             active_node: active.into(),
             ..Default::default()
         };
@@ -334,11 +335,11 @@ mod tests {
     fn tooltip_names_the_device_with_the_keyboard_and_mouse() {
         assert_eq!(
             tooltip(&snapshot_with_active("Debian")),
-            "mesh-kvm: Debian desktop has keyboard and mouse"
+            "mesh-kvm: Desk tower has keyboard and mouse"
         );
         assert_eq!(
             tooltip(&snapshot_with_active("Windows")),
-            "mesh-kvm: Windows laptop has keyboard and mouse"
+            "mesh-kvm: The other device has keyboard and mouse"
         );
     }
 

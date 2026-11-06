@@ -1,7 +1,9 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
 use super::model::{older_message, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
+use crate::platform::DisplayInfo;
 use crate::webui::{http_call_port, UI_PORT};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -11,6 +13,9 @@ use std::time::{Duration, Instant};
 const ERROR_HOLD: Duration = Duration::from_secs(5);
 /// How often the window polls.
 pub const WINDOW_POLL: Duration = Duration::from_millis(200);
+/// How often the window asks what the monitors can do. That rarely changes, and a change made
+/// through the app is noticed from the status, so it stays out of the quick poll.
+const DISPLAYS_EVERY: Duration = Duration::from_secs(2);
 /// What a service answers for an action it doesn't have, which an older one does for newer controls.
 const UNKNOWN_ACTION: &str = "unknown action";
 const LOCALHOST: &str = "127.0.0.1";
@@ -19,7 +24,8 @@ const PEER_UNREACHABLE: u16 = 502;
 const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
 
 struct Job {
-    device: Device,
+    /// The device's name as a sentence starts it, for any error.
+    title: String,
     path: String,
     body: String,
 }
@@ -43,19 +49,26 @@ pub struct Client {
 impl Client {
     /// `on_update` runs on the poll thread after the first poll and after each change.
     pub fn start(interval: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
-        Self::start_every(UI_PORT, interval, on_update)
+        Self::start_holding(UI_PORT, interval, ERROR_HOLD, on_update, None)
+    }
+
+    /// `start`, and also keeps up with what the monitors can do, which only the window shows.
+    pub fn start_with_displays(interval: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
+        Self::start_holding(UI_PORT, interval, ERROR_HOLD, on_update, Some(DISPLAYS_EVERY))
     }
 
     #[cfg(test)]
     pub(super) fn start_on(port: u16, on_update: Box<dyn Fn() + Send>) -> Self {
-        Self::start_every(port, WINDOW_POLL, on_update)
+        Self::start_holding(port, WINDOW_POLL, ERROR_HOLD, on_update, Some(DISPLAYS_EVERY))
     }
 
-    fn start_every(port: u16, interval: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
-        Self::start_holding(port, interval, ERROR_HOLD, on_update)
-    }
-
-    fn start_holding(port: u16, interval: Duration, error_hold: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
+    fn start_holding(
+        port: u16,
+        interval: Duration,
+        error_hold: Duration,
+        on_update: Box<dyn Fn() + Send>,
+        displays_every: Option<Duration>,
+    ) -> Self {
         let shared = Arc::new(Shared {
             snapshot: Mutex::default(),
             last_error: Mutex::default(),
@@ -67,8 +80,12 @@ impl Client {
             .name("mesh-kvm-app-poll".into())
             .spawn(move || {
                 let mut last: Option<(Snapshot, Option<String>)> = None;
+                let mut displays = DisplayLook::default();
                 while !poller.stop.load(Ordering::Relaxed) {
-                    let snap = poll_once(port);
+                    let mut snap = poll_once(port);
+                    if let Some(every) = displays_every {
+                        displays.fill(&mut snap, port, every);
+                    }
                     *lock(&poller.snapshot) = snap.clone();
                     let now = (snap, lock(&poller.last_error).as_ref().map(|(m, _)| m.clone()));
                     if last.as_ref() != Some(&now) {
@@ -87,7 +104,7 @@ impl Client {
                 for job in queue {
                     let reply = http_call_port(LOCALHOST, port, "POST", &job.path, &job.body);
                     let mut error = lock(&sender.last_error);
-                    match send_problem(job.device, reply) {
+                    match send_problem(&job.title, reply) {
                         Some(message) => *error = Some((message, Instant::now())),
                         // A change that works clears an old error, but not one the person
                         // has had no time to read.
@@ -124,7 +141,8 @@ impl Client {
     fn send(&self, device: Device, path: &str, body: serde_json::Value) {
         match self.route(device, path) {
             Some(path) => {
-                let _ = self.jobs.send(Job { device, path, body: body.to_string() });
+                let title = self.snapshot().title(device);
+                let _ = self.jobs.send(Job { title, path, body: body.to_string() });
             }
             None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
         }
@@ -193,7 +211,7 @@ impl Client {
         if snapshot.peer.is_none() {
             return Err(format!(
                 "{} is out of reach, so the main device can't change. Reconnect it, then try again.",
-                capitalised(device.other().name())
+                snapshot.title(snapshot.in_order()[1])
             ));
         }
         let body = serde_json::json!({ "action": "set_main_device", "device": device.id() }).to_string();
@@ -204,21 +222,21 @@ impl Client {
                     let reply: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
                     if reply["ok"] == false {
                         if reply["error"] == UNKNOWN_ACTION {
-                            return Err(older_message(target));
+                            return Err(older_message(&snapshot.title(target)));
                         }
                         return Err(reply["error"].as_str().map_or_else(
-                            || format!("{} didn't accept the change. Try again.", capitalised(target.name())),
+                            || format!("{} didn't accept the change. Try again.", snapshot.title(target)),
                             str::to_string,
                         ));
                     }
                 }
                 Ok((PEER_UNREACHABLE, _)) | Err(_) => {
-                    return Err(format!("Couldn't reach {}. Check that mesh-kvm is running on it, then try again.", target.name()))
+                    return Err(format!("Couldn't reach {}. Check that mesh-kvm is running on it, then try again.", snapshot.name(target)))
                 }
                 Ok((status, _)) => {
                     return Err(format!(
                         "{} didn't accept the change (status {status}). Restart mesh-kvm on it, then try again.",
-                        capitalised(target.name())
+                        snapshot.title(target)
                     ))
                 }
             }
@@ -237,27 +255,20 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn capitalised(s: &str) -> String {
-    let mut c = s.chars();
-    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
-}
-
 /// What went wrong with a queued change, if anything. The service's own error text here is for
 /// developers, such as a JSON parse error, so none of it reaches the person.
-fn send_problem(device: Device, reply: Result<(u16, String), String>) -> Option<String> {
-    let refused = || {
-        format!("{} didn't accept that change. Try again, or restart mesh-kvm on it.", capitalised(device.name()))
-    };
+fn send_problem(title: &str, reply: Result<(u16, String), String>) -> Option<String> {
+    let refused = || format!("{title} didn't accept that change. Try again, or restart mesh-kvm on it.");
     match reply {
         Ok((200, body)) => {
             let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             if body["ok"] == false && body["error"] == UNKNOWN_ACTION {
-                return Some(older_message(device));
+                return Some(older_message(title));
             }
             (body["ok"] == false).then(refused)
         }
         Ok((PEER_UNREACHABLE, _)) => {
-            Some(format!("Couldn't reach {}, so that change wasn't made. Check that mesh-kvm is running on it, then try again.", device.name()))
+            Some(format!("Couldn't reach {title}, so that change wasn't made. Check that mesh-kvm is running on it, then try again."))
         }
         Ok(_) => Some(refused()),
         Err(_) => Some("mesh-kvm didn't answer on this device, so that change may not have been made. Check that it's running, then try again.".into()),
@@ -278,7 +289,48 @@ fn poll_once(port: u16) -> Snapshot {
     let peer = get(port, "/api/peer/api/local").and_then(|b| serde_json::from_str::<DeviceStatus>(&b).ok());
     // Every device keeps its own copy of the layout.
     let layout = get(port, "/api/state").and_then(|b| LayoutState::parse(&b));
-    Snapshot { local: Some(local), peer, layout }
+    Snapshot { local: Some(local), peer, layout, ..Default::default() }
+}
+
+fn displays_at(port: u16, path: &str) -> Option<Vec<DisplayInfo>> {
+    #[derive(Deserialize)]
+    struct Listing {
+        displays: Vec<DisplayInfo>,
+    }
+    let listing: Listing = serde_json::from_str(&get(port, path)?).ok()?;
+    Some(listing.displays)
+}
+
+/// The last answers from `/api/displays`, fetched every so often and at once after a mode change.
+#[derive(Default)]
+struct DisplayLook {
+    local: Vec<DisplayInfo>,
+    peer: Vec<DisplayInfo>,
+    looked_at: Option<Instant>,
+    /// The change in the last status, to notice one starting or ending.
+    change: Vec<Option<String>>,
+}
+
+impl DisplayLook {
+    fn fill(&mut self, snap: &mut Snapshot, port: u16, every: Duration) {
+        let change: Vec<Option<String>> = [&snap.local, &snap.peer]
+            .into_iter()
+            .map(|d| d.as_ref()?.display_change.change.as_ref().map(|c| c.stage.clone()))
+            .collect();
+        let due = self.looked_at.is_none_or(|at| at.elapsed() >= every);
+        if due || change != self.change {
+            self.looked_at = Some(Instant::now());
+            self.local = displays_at(port, "/api/displays").unwrap_or_default();
+            self.peer = if snap.peer.is_some() {
+                displays_at(port, "/api/peer/api/displays").unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        }
+        self.change = change;
+        snap.local_displays = self.local.clone();
+        snap.peer_displays = self.peer.clone();
+    }
 }
 
 #[cfg(test)]
@@ -342,7 +394,7 @@ mod tests {
     }
 
     fn local_json(node: &str) -> String {
-        format!(r#"{{"node":"{node}","peer_online":true}}"#)
+        format!(r#"{{"node":"{node}","device_name":"{node}-box","peer_online":true}}"#)
     }
 
     /// A service where this device is `node` and the other answers unless `peer_status` says not.
@@ -372,7 +424,7 @@ mod tests {
     }
 
     fn start_holding(port: u16, hold: Duration) -> Client {
-        Client::start_holding(port, WINDOW_POLL, hold, Box::new(|| {}))
+        Client::start_holding(port, WINDOW_POLL, hold, Box::new(|| {}), None)
     }
 
     fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -557,7 +609,7 @@ mod tests {
         let (client, _rx) = start(port);
         ready(&client);
         let err = client.set_main_device(Device::Debian).unwrap_err();
-        assert_eq!(err, "Couldn't reach the Windows laptop. Check that mesh-kvm is running on it, then try again.");
+        assert_eq!(err, "Couldn't reach windows-box. Check that mesh-kvm is running on it, then try again.");
     }
 
     #[test]
@@ -569,7 +621,7 @@ mod tests {
         client.local_action(Device::Windows, serde_json::json!({"action": "nonsense"}));
         wait_for("the error", || client.last_error().is_some());
         let err = client.last_error().unwrap();
-        assert!(err.starts_with("The Windows laptop didn't accept"), "{err}");
+        assert!(err.starts_with("windows-box didn't accept"), "{err}");
         assert!(!err.contains("bad request"), "{err}");
         rx.recv_timeout(Duration::from_secs(1)).expect("an update for the error");
     }
@@ -600,10 +652,10 @@ mod tests {
         wait_for("the error", || client.last_error().is_some());
         assert_eq!(
             client.last_error().unwrap(),
-            "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in."
+            "windows-box is running an older mesh-kvm. Update it, or sign out and back in."
         );
         let err = client.set_main_device(Device::Debian).unwrap_err();
-        assert_eq!(err, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        assert_eq!(err, "windows-box is running an older mesh-kvm. Update it, or sign out and back in.");
     }
 
     #[test]
@@ -664,14 +716,65 @@ mod tests {
         assert!(client.last_error().unwrap().contains("Start mesh-kvm"));
     }
 
+    const DISPLAYS: &str = r#"{"displays":[{"id":"DP-2","name":"Big","x":0,"y":0,"can_change":true,"current":{"width":1920,"height":1080,"millihertz":60000,"id":"1"},"modes":[{"width":1920,"height":1080,"millihertz":60000,"id":"1"}]}]}"#;
+
+    fn displays_stub(status: &'static str) -> (u16, Log) {
+        stub(move |method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, status.to_string()),
+            ("GET", "/api/peer/api/local") => (200, local_json("windows")),
+            ("GET", "/api/state") => (200, STATE.into()),
+            ("GET", "/api/displays") | ("GET", "/api/peer/api/displays") => (200, DISPLAYS.into()),
+            _ => (404, "{}".into()),
+        })
+    }
+
+    fn asks_for_displays(log: &Log) -> usize {
+        log.lock().unwrap().iter().filter(|r| r.1 == "/api/displays").count()
+    }
+
+    #[test]
+    fn monitors_are_asked_about_much_less_often_than_the_status() {
+        let (port, log) = displays_stub(r#"{"node":"debian","peer_online":true}"#);
+        let (client, _rx) = start(port);
+        wait_for("both lists", || {
+            let s = client.snapshot();
+            !s.local_displays.is_empty() && !s.peer_displays.is_empty()
+        });
+        assert_eq!(client.snapshot().displays(Device::Windows)[0].name, "Big");
+        wait_for("a few polls", || log.lock().unwrap().iter().filter(|r| r.1 == "/api/local").count() >= 4);
+        assert_eq!(asks_for_displays(&log), 1, "once up to now");
+    }
+
+    #[test]
+    fn the_tray_never_asks_about_monitors() {
+        let (port, log) = displays_stub(r#"{"node":"debian","peer_online":true}"#);
+        let client = start_holding(port, Duration::from_secs(5));
+        wait_for("the local device", || client.snapshot().local.is_some());
+        assert_eq!(asks_for_displays(&log), 0);
+    }
+
+    #[test]
+    fn a_mode_change_starting_is_a_reason_to_look_again() {
+        let (mut look, mut snap) = (DisplayLook::default(), Snapshot::default());
+        let (port, log) = displays_stub("{}");
+        look.fill(&mut snap, port, Duration::from_secs(60));
+        look.fill(&mut snap, port, Duration::from_secs(60));
+        assert_eq!(asks_for_displays(&log), 1);
+        let mut status = DeviceStatus::default();
+        status.display_change.change = Some(Default::default());
+        snap.local = Some(status);
+        look.fill(&mut snap, port, Duration::from_secs(60));
+        assert_eq!(asks_for_displays(&log), 2);
+    }
+
     #[test]
     fn send_problems_say_what_to_do_next() {
-        let problem = |reply| send_problem(Device::Windows, reply).unwrap();
-        assert!(problem(Ok((502, "{}".into()))).contains("Couldn't reach the Windows laptop"));
+        let problem = |reply| send_problem("Desk tower", reply).unwrap();
+        assert!(problem(Ok((502, "{}".into()))).contains("Couldn't reach Desk tower"));
         assert!(problem(Ok((404, "{}".into()))).contains("didn't accept"));
         let down = problem(Err("connect 127.0.0.1:24880: refused".into()));
         assert!(down.contains("Check that it's running") && !down.contains("refused"), "{down}");
-        assert_eq!(send_problem(Device::Windows, Ok((200, r#"{"ok":true}"#.into()))), None);
-        assert_eq!(send_problem(Device::Windows, Ok((200, "not json".into()))), None);
+        assert_eq!(send_problem("Desk tower", Ok((200, r#"{"ok":true}"#.into()))), None);
+        assert_eq!(send_problem("Desk tower", Ok((200, "not json".into()))), None);
     }
 }

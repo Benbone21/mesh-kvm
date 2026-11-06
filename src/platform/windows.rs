@@ -43,7 +43,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn label(&self) -> &'static str {
-        "Windows Laptop"
+        "Windows PC"
     }
 
     fn os_name(&self) -> &'static str {
@@ -89,7 +89,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn input_devices(&self) -> &'static [&'static str] {
-        &["Laptop keyboard", "Laptop trackpad"]
+        &["Keyboard", "Pointing device"]
     }
 
     fn can_pick_audio_source(&self) -> bool {

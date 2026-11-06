@@ -32,7 +32,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn label(&self) -> &'static str {
-        "Debian Desktop"
+        "Linux desktop"
     }
 
     fn os_name(&self) -> &'static str {

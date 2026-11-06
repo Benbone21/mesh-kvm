@@ -1,5 +1,6 @@
 //! What the app knows about the two devices, and the layout maths. No egui types in here.
 
+use crate::platform::{DisplayInfo, DisplayMode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,9 +13,17 @@ const SEND_GAP: Duration = Duration::from_millis(120);
 /// The shortest gap between layout saves. Each save makes the service re-read the monitors.
 const SAVE_GAP: Duration = Duration::from_millis(150);
 
-/// The laptop sizes offered besides its native one.
-pub const RESOLUTIONS: [(i32, i32); 6] =
-    [(1920, 1080), (1920, 1200), (2560, 1440), (2560, 1600), (2880, 1800), (3840, 2160)];
+/// The window size all the app's sizes are designed around, which needs no enlarging.
+const DESIGN_WINDOW: (f32, f32) = (1280.0, 800.0);
+/// How much of a window's extra size goes to enlarging the app. The rest goes to the arrangement.
+const WINDOW_GROWTH: f32 = 0.5;
+const MOST_WINDOW_ZOOM: f32 = 1.75;
+const ZOOM_STEP: f32 = 0.05;
+/// Below this width the two device columns would be too narrow.
+const TWO_COLUMNS_FROM: f32 = 1360.0;
+/// How far the snap keeps a device on the edge it's dragged along: enough of it to cross at.
+const MIN_TOUCH_ALONG_X: i32 = 280;
+const MIN_TOUCH_ALONG_Y: i32 = 240;
 
 fn yes() -> bool {
     true
@@ -60,36 +69,18 @@ impl Device {
         }
     }
 
-    /// For the middle of a sentence.
-    pub fn name(self) -> &'static str {
-        match self {
-            Device::Debian => "the Debian desktop",
-            Device::Windows => "the Windows laptop",
-        }
-    }
-
-    /// For headings and labels.
-    pub fn title(self) -> &'static str {
-        match self {
-            Device::Debian => "Debian desktop",
-            Device::Windows => "Windows laptop",
-        }
-    }
-
-    /// The everyday name, for a device already known to be the other one.
-    pub fn nickname(self) -> &'static str {
-        match self {
-            Device::Debian => "the desktop",
-            Device::Windows => "the laptop",
-        }
-    }
-
-    /// The `active_node` value, also shown on the slide switch.
-    pub fn short_name(self) -> &'static str {
+    /// How `active_node` and the layout's device list name this device. Never shown: a device is
+    /// shown by the name it reports.
+    pub fn layout_node(self) -> &'static str {
         match self {
             Device::Debian => "Debian",
             Device::Windows => "Windows",
         }
+    }
+
+    /// The device this copy of the app was built for, for when no service has said.
+    pub fn of_this_build() -> Device {
+        Device::from_node(crate::platform::ROLE).unwrap_or(Device::Debian)
     }
 }
 
@@ -180,6 +171,37 @@ pub struct DeviceStatus {
     /// 0 is Debian, 1 is the laptop.
     pub main_device: u8,
     pub main_conflict: bool,
+    /// What the person calls this device: its given name, or else its hostname.
+    pub device_name: String,
+    pub display_change: DisplayChanges,
+}
+
+/// A monitor's mode change that is waiting for an answer.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ModeChange {
+    pub output: String,
+    pub name: String,
+    pub from: Option<DisplayMode>,
+    pub to: Option<DisplayMode>,
+    /// "applying", "waiting" or "going_back".
+    pub stage: String,
+    pub ms_left: u64,
+}
+
+impl ModeChange {
+    pub fn is_waiting(&self) -> bool {
+        self.stage == "waiting"
+    }
+}
+
+/// `display_change` in `/api/local`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct DisplayChanges {
+    pub change: Option<ModeChange>,
+    /// How the last change ended, if there is anything to say.
+    pub note: Option<String>,
 }
 
 impl DeviceStatus {
@@ -195,11 +217,8 @@ impl DeviceStatus {
 }
 
 /// What to say about a device whose service is older than the app.
-pub fn older_message(device: Device) -> String {
-    let name = device.name();
-    let mut c = name.chars();
-    let name: String = c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect());
-    format!("{name} is running an older mesh-kvm. Update it, or sign out and back in.")
+pub fn older_message(title: &str) -> String {
+    format!("{title} is running an older mesh-kvm. Update it, or sign out and back in.")
 }
 
 fn default_speed() -> f32 {
@@ -255,11 +274,11 @@ pub struct LayoutConfig {
 
 impl LayoutConfig {
     pub fn device(&self, device: Device) -> Option<&LayoutDevice> {
-        self.devices.iter().find(|d| d.node == device.short_name())
+        self.devices.iter().find(|d| d.node == device.layout_node())
     }
 
     fn device_mut(&mut self, device: Device) -> Option<&mut LayoutDevice> {
-        self.devices.iter_mut().find(|d| d.node == device.short_name())
+        self.devices.iter_mut().find(|d| d.node == device.layout_node())
     }
 
     /// A device's screens in the layout.
@@ -267,10 +286,20 @@ impl LayoutConfig {
         self.device(device).map(LayoutDevice::rects).unwrap_or_default()
     }
 
-    /// The box around the laptop's screens: `(x, y, w, h)`.
-    pub fn laptop_box(&self) -> (i32, i32, i32, i32) {
-        let (left, top, right, bottom) = bounds(&self.rects(Device::Windows));
+    /// The box around a device's screens: `(x, y, w, h)`.
+    pub fn device_box(&self, device: Device) -> (i32, i32, i32, i32) {
+        let (left, top, right, bottom) = bounds(&self.rects(device));
         (left, top, right - left, bottom - top)
+    }
+
+    /// The box around the second device, which placements are worked out for.
+    pub fn laptop_box(&self) -> (i32, i32, i32, i32) {
+        self.device_box(Device::Windows)
+    }
+
+    /// True if a size stands in for a device's real monitors.
+    pub fn has_custom_size(&self) -> bool {
+        self.devices.iter().any(|d| d.custom_size.is_some())
     }
 
     /// Moves the laptop so that its box starts at `(x, y)`.
@@ -343,6 +372,9 @@ pub struct Snapshot {
     pub local: Option<DeviceStatus>,
     pub peer: Option<DeviceStatus>,
     pub layout: Option<LayoutState>,
+    /// What this device's monitors can do, from `/api/displays`.
+    pub local_displays: Vec<DisplayInfo>,
+    pub peer_displays: Vec<DisplayInfo>,
 }
 
 impl Snapshot {
@@ -353,6 +385,53 @@ impl Snapshot {
 
     pub fn this_device(&self) -> Option<Device> {
         Device::from_node(&self.local.as_ref()?.node)
+    }
+
+    /// This device first, then the other one.
+    pub fn in_order(&self) -> [Device; 2] {
+        let here = self.this_device().unwrap_or_else(Device::of_this_build);
+        [here, here.other()]
+    }
+
+    pub fn is_here(&self, device: Device) -> bool {
+        self.in_order()[0] == device
+    }
+
+    /// What `device` calls itself, from its own status or else what the layout last heard.
+    fn known_name(&self, device: Device) -> Option<String> {
+        let status = self.device(device);
+        let reported = status.map(|d| d.device_name.as_str()).filter(|n| !n.is_empty());
+        let host = status.map(|d| d.hostname.as_str()).filter(|n| !n.is_empty());
+        let layout = self.layout.as_ref().and_then(|l| l.config.device(device)).map(|d| d.name.as_str());
+        reported.or(host).or(layout.filter(|n| !n.is_empty())).map(str::to_string)
+    }
+
+    /// `device`'s name, for the middle of a sentence.
+    pub fn name(&self, device: Device) -> String {
+        self.known_name(device).unwrap_or_else(|| {
+            if self.is_here(device) { "this device" } else { "the other device" }.to_string()
+        })
+    }
+
+    /// `device`'s name, for headings and the start of a sentence.
+    pub fn title(&self, device: Device) -> String {
+        self.known_name(device).unwrap_or_else(|| {
+            if self.is_here(device) { "This device" } else { "The other device" }.to_string()
+        })
+    }
+
+    /// What `device`'s monitors can do, as far as is known.
+    pub fn displays(&self, device: Device) -> &[DisplayInfo] {
+        if self.this_device() == Some(device) {
+            &self.local_displays
+        } else {
+            &self.peer_displays
+        }
+    }
+
+    /// The mode change that wants an answer, on either device.
+    pub fn mode_change(&self) -> Option<(Device, &ModeChange)> {
+        Device::BOTH.into_iter().find_map(|d| Some((d, self.device(d)?.display_change.change.as_ref()?)))
     }
 
     /// True when both devices answer and the link between them is up.
@@ -372,7 +451,7 @@ impl Snapshot {
             (None, Some(local)) => &local.active_node,
             (None, None) => return None,
         };
-        Device::BOTH.into_iter().find(|d| d.short_name() == node)
+        Device::BOTH.into_iter().find(|d| d.layout_node() == node)
     }
 
     /// True when either reachable device runs a service older than the app.
@@ -718,18 +797,24 @@ fn js_round(v: f64) -> i32 {
     (v + 0.5).floor() as i32
 }
 
-/// The named places the laptop can go, one set per Debian monitor.
-pub fn placements(cfg: &LayoutConfig) -> Vec<Placement> {
+fn overlaps_any(rects: &[Display], (x, y, w, h): (i32, i32, i32, i32)) -> bool {
+    rects.iter().any(|m| x < m.x + m.w && m.x < x + w && y < m.y + m.h && m.y < y + h)
+}
+
+/// The named places the second device can go, one set per monitor of the first.
+pub fn placements(cfg: &LayoutConfig, displays: &[DisplayInfo]) -> Vec<Placement> {
     let (.., w, h) = cfg.laptop_box();
     let desktop = cfg.rects(Device::Debian);
     let (left, _, right, _) = bounds(&desktop);
     let mut out = Vec::new();
     for m in &desktop {
-        let label = m.name.split(' ').next().unwrap_or("");
+        let label = monitor_label(m, display_for(displays, m)).0;
         let cx = js_round(m.x as f64 + (m.w - w) as f64 / 2.0);
         let cy = js_round(m.y as f64 + (m.h - h) as f64 / 2.0);
         let mut add = |prefix: &str, x: i32, y: i32, side: &str| {
-            out.push(Placement { label: format!("{prefix} {label}"), x, y, side: side.into() });
+            if !overlaps_any(&desktop, (x, y, w, h)) {
+                out.push(Placement { label: format!("{prefix} {label}"), x, y, side: side.into() });
+            }
         };
         add("Below", cx, m.y + m.h, "Bottom");
         add("Above", cx, m.y - h, "Top");
@@ -743,33 +828,123 @@ pub fn placements(cfg: &LayoutConfig) -> Vec<Placement> {
     out
 }
 
+/// Pulls `value` onto the nearest of `lines`, if one is within `magnet`.
+fn pull_to(value: i32, lines: [i32; 3], magnet: i32) -> i32 {
+    let nearest = lines.into_iter().min_by_key(|line| (line - value).abs()).unwrap_or(value);
+    if (nearest - value).abs() <= magnet {
+        nearest
+    } else {
+        value
+    }
+}
+
 /// The closest edge placement to a dragged laptop position.
-pub fn snap(cfg: &LayoutConfig, x: i32, y: i32) -> Option<Placement> {
+///
+/// The device always lands against an edge, with enough of it alongside to cross at, and never
+/// on top of a monitor. Within `magnet` of lining up with a monitor's start, middle or end along
+/// that edge, it lines up. A device moves only as a whole, so its own monitors keep the places
+/// their operating system gave them.
+pub fn snap(cfg: &LayoutConfig, x: i32, y: i32, magnet: i32) -> Option<Placement> {
     let (.., w, h) = cfg.laptop_box();
     let desktop = cfg.rects(Device::Debian);
     let (left, _, right, _) = bounds(&desktop);
     let mut best: Option<(f64, Placement)> = None;
     let mut consider = |px: i32, py: i32, side: &str| {
         let d = ((x - px) as f64).hypot((y - py) as f64);
-        if best.as_ref().is_none_or(|(b, _)| d < *b) {
+        if !overlaps_any(&desktop, (px, py, w, h)) && best.as_ref().is_none_or(|(b, _)| d < *b) {
             best = Some((d, Placement { label: "Custom".into(), x: px, y: py, side: side.into() }));
         }
     };
     // `max` then `min`, as the page did, so an inverted range doesn't panic.
     let clamp = |v: i32, lo: i32, hi: i32| v.min(hi).max(lo);
     for m in &desktop {
-        let cy = clamp(y, m.y - h + 240, m.y + m.h - 240);
-        let cx = clamp(x, m.x - w + 280, m.x + m.w - 280);
+        let (low_y, high_y) = (m.y - h + MIN_TOUCH_ALONG_Y, m.y + m.h - MIN_TOUCH_ALONG_Y);
+        let (low_x, high_x) = (m.x - w + MIN_TOUCH_ALONG_X, m.x + m.w - MIN_TOUCH_ALONG_X);
+        let cy = pull_to(clamp(y, low_y, high_y), [m.y, m.y + (m.h - h) / 2, m.y + m.h - h], magnet);
+        let cx = pull_to(clamp(x, low_x, high_x), [m.x, m.x + (m.w - w) / 2, m.x + m.w - w], magnet);
+        let mut along_edge = |px: i32, py: i32, side: &str| {
+            consider(px, py, side);
+            // Blocked here by a monitor alongside, the nearest places clear of it are next.
+            for o in &desktop {
+                match side {
+                    "Bottom" | "Top" => {
+                        consider(clamp(o.x - w, low_x, high_x), py, side);
+                        consider(clamp(o.x + o.w, low_x, high_x), py, side);
+                    }
+                    _ => {
+                        consider(px, clamp(o.y - h, low_y, high_y), side);
+                        consider(px, clamp(o.y + o.h, low_y, high_y), side);
+                    }
+                }
+            }
+        };
         if m.x + m.w >= right {
-            consider(m.x + m.w, cy, "Right");
+            along_edge(m.x + m.w, cy, "Right");
         }
         if m.x <= left {
-            consider(m.x - w, cy, "Left");
+            along_edge(m.x - w, cy, "Left");
         }
-        consider(cx, m.y + m.h, "Bottom");
-        consider(cx, m.y - h, "Top");
+        along_edge(cx, m.y + m.h, "Bottom");
+        along_edge(cx, m.y - h, "Top");
     }
     best.map(|(_, p)| p)
+}
+
+/// Moves `device` as a whole towards `(x, y)`, the corner of its box, and snaps it. What matters
+/// is where the devices sit against each other, so the first device moving is worked out as the
+/// second moving the other way, and the second stays where it is on the map.
+pub fn drag_device(cfg: &mut LayoutConfig, device: Device, x: i32, y: i32, magnet: i32) {
+    if device == Device::Windows {
+        if let Some(place) = snap(cfg, x, y, magnet) {
+            apply_placement(cfg, &place);
+        }
+        return;
+    }
+    let (from_x, from_y, ..) = cfg.device_box(Device::Debian);
+    let (laptop_x, laptop_y, ..) = cfg.laptop_box();
+    let Some(place) = snap(cfg, laptop_x - (x - from_x), laptop_y - (y - from_y), magnet) else { return };
+    if let Some(first) = cfg.device_mut(Device::Debian) {
+        first.x += laptop_x - place.x;
+        first.y += laptop_y - place.y;
+    }
+    cfg.attach_side = place.side;
+}
+
+/// A stretch where the devices meet, as two points in layout coordinates.
+pub type Seam = ((i32, i32), (i32, i32));
+
+/// Where the mouse crosses from one device to the other: the closest monitors along the side the
+/// second device is attached to, as the service works it out.
+pub fn seams(cfg: &LayoutConfig) -> Vec<Seam> {
+    let (first, second) = (cfg.rects(Device::Debian), cfg.rects(Device::Windows));
+    let side = cfg.attach_side.as_str();
+    let mut found: Vec<(i32, Seam)> = Vec::new();
+    for m in &first {
+        for o in &second {
+            let (gap, seam) = match side {
+                "Right" | "Left" => {
+                    let (top, bottom) = (m.y.max(o.y), (m.y + m.h).min(o.y + o.h));
+                    let (mine, theirs) = if side == "Right" { (m.x + m.w, o.x) } else { (m.x, o.x + o.w) };
+                    if top >= bottom {
+                        continue;
+                    }
+                    ((mine - theirs).abs(), ((mine, top), (mine, bottom)))
+                }
+                "Bottom" | "Top" => {
+                    let (start, end) = (m.x.max(o.x), (m.x + m.w).min(o.x + o.w));
+                    let (mine, theirs) = if side == "Bottom" { (m.y + m.h, o.y) } else { (m.y, o.y + o.h) };
+                    if start >= end {
+                        continue;
+                    }
+                    ((mine - theirs).abs(), ((start, mine), (end, mine)))
+                }
+                _ => continue,
+            };
+            found.push((gap, seam));
+        }
+    }
+    let nearest = found.iter().map(|f| f.0).min().unwrap_or(0);
+    found.into_iter().filter(|f| f.0 == nearest).map(|f| f.1).collect()
 }
 
 /// Where a laptop grabbed at `grab` (its offset from the laptop's corner, in layout units) is
@@ -784,26 +959,8 @@ pub fn apply_placement(cfg: &mut LayoutConfig, placement: &Placement) {
     cfg.attach_side = placement.side.clone();
 }
 
-/// Sets the laptop's size, or its native size for `None`, and keeps it on an edge.
-pub fn set_resolution(cfg: &mut LayoutConfig, size: Option<(i32, i32)>) {
-    let (x, y, ..) = cfg.laptop_box();
-    if let Some(laptop) = cfg.device_mut(Device::Windows) {
-        laptop.custom_size = size;
-    }
-    if let Some(placement) = snap(cfg, x, y) {
-        apply_placement(cfg, &placement);
-    }
-}
-
 pub fn size_label((w, h): (i32, i32)) -> String {
     format!("{w} \u{d7} {h}")
-}
-
-pub fn resolution_label(cfg: &LayoutConfig) -> String {
-    match cfg.device(Device::Windows).and_then(|d| d.custom_size) {
-        Some(size) => size_label(size),
-        None => "Native".into(),
-    }
 }
 
 /// The name of where the laptop is now: a named place, or the edge it was dragged along.
@@ -827,6 +984,98 @@ pub fn fit(cfg: &LayoutConfig, width: f32, height: f32) -> MapView {
         scale,
         offset_x: PAD + (w - span_w * scale) / 2.0 - x0 as f32 * scale,
         offset_y: PAD + (h - span_h * scale) / 2.0 - y0 as f32 * scale,
+    }
+}
+
+/// True if a monitor in the layout, called `rect_name` there, is the one the system calls `id`.
+/// The layout's name starts with that, and may go on to say more, as in `DP-2 (360Hz Native)`.
+pub fn same_monitor(rect_name: &str, id: &str) -> bool {
+    rect_name.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// The monitor behind a screen in the layout, if `displays` has it. `own` is where the layout puts
+/// it on its device's own desktop.
+pub fn display_for<'a>(displays: &'a [DisplayInfo], rect: &Display) -> Option<&'a DisplayInfo> {
+    displays.iter().find(|d| same_monitor(&rect.name, &d.id))
+}
+
+/// How to label a monitor: its name, its size and its rate, the last if known.
+pub fn monitor_label(rect: &Display, display: Option<&DisplayInfo>) -> (String, String, Option<String>) {
+    let name = display.map_or_else(|| rect.name.split(" (").next().unwrap_or("").to_string(), |d| d.name.clone());
+    let mode = display.and_then(|d| d.current.as_ref());
+    let size = mode.map_or((rect.w, rect.h), |m| (m.width, m.height));
+    let rate = mode.filter(|m| m.millihertz > 0).map(|m| format!("{} Hz", m.whole_hertz()));
+    (name, size_label(size), rate)
+}
+
+/// The sizes a monitor offers, largest first.
+pub fn resolutions(display: &DisplayInfo) -> Vec<(i32, i32)> {
+    let mut sizes: Vec<(i32, i32)> = Vec::new();
+    for mode in &display.modes {
+        if !sizes.contains(&(mode.width, mode.height)) {
+            sizes.push((mode.width, mode.height));
+        }
+    }
+    sizes
+}
+
+/// The modes a monitor offers at one size, fastest first.
+pub fn rates(display: &DisplayInfo, (width, height): (i32, i32)) -> Vec<&DisplayMode> {
+    display.modes.iter().filter(|m| (m.width, m.height) == (width, height)).collect()
+}
+
+/// A rate as a menu shows it: whole hertz, unless two at this size would then read the same.
+pub fn rate_label(mode: &DisplayMode, among: &[&DisplayMode]) -> String {
+    let ambiguous = among.iter().filter(|m| m.whole_hertz() == mode.whole_hertz()).count() > 1;
+    if ambiguous {
+        format!("{:.2} Hz", mode.millihertz as f64 / 1000.0)
+    } else {
+        format!("{} Hz", mode.whole_hertz())
+    }
+}
+
+/// The mode to use when the person picks a size: the rate in use if it has one, else its fastest.
+pub fn mode_for_size<'a>(display: &'a DisplayInfo, size: (i32, i32)) -> Option<&'a DisplayMode> {
+    let at_size = rates(display, size);
+    let in_use = display.current.as_ref().map(DisplayMode::whole_hertz);
+    at_size.iter().find(|m| Some(m.whole_hertz()) == in_use).or(at_size.first()).copied()
+}
+
+/// The action that asks a device to switch a monitor to `mode`.
+pub fn mode_action(output: &str, mode: &DisplayMode) -> Value {
+    json!({
+        "action": "set_display_mode",
+        "output": output,
+        "width": mode.width,
+        "height": mode.height,
+        "millihertz": mode.millihertz,
+    })
+}
+
+/// How much bigger everything gets in a big window, in steps so that a resize doesn't blur the
+/// text at every pixel. `(width, height)` is the window at a zoom of one. A small window never
+/// shrinks: it reflows instead.
+pub fn window_zoom(width: f32, height: f32) -> f32 {
+    let room = (width / DESIGN_WINDOW.0).min(height / DESIGN_WINDOW.1).max(1.0);
+    let zoom = (1.0 + (room - 1.0) * WINDOW_GROWTH).min(MOST_WINDOW_ZOOM);
+    (zoom / ZOOM_STEP).round() * ZOOM_STEP
+}
+
+/// How the window's body divides up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BodyLayout {
+    /// The width of the controls beside the arrangement.
+    pub rail: f32,
+    /// How many device columns the controls have: 2 puts the devices side by side.
+    pub columns: usize,
+}
+
+/// The arrangement gets what the controls leave, and always the full height. `width` is in points.
+pub fn body_layout(width: f32) -> BodyLayout {
+    if width >= TWO_COLUMNS_FROM {
+        BodyLayout { rail: (width * 0.44).clamp(620.0, 920.0), columns: 2 }
+    } else {
+        BodyLayout { rail: (width * 0.36).clamp(300.0, 420.0), columns: 1 }
     }
 }
 
@@ -855,19 +1104,19 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     if needs_peer(snapshot) {
         return Some("mesh-kvm needs the other device's address before it can share anything.".into());
     }
-    let other = if local.node == "debian" { "laptop" } else { "desktop" };
+    let other = snapshot.title(snapshot.in_order()[1]);
     if snapshot.peer.is_none() {
         return Some(format!(
-            "The {other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
+            "{other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
         ));
     }
     let older = |d: &DeviceStatus| d.is_older() || d.has_no_shared_layout();
     if let Some(device) = Device::BOTH.into_iter().find(|d| snapshot.device(*d).is_some_and(older)) {
-        return Some(older_message(device));
+        return Some(older_message(&snapshot.title(device)));
     }
     if !local.peer_online {
         return Some(format!(
-            "The {other} is found but not linked yet, so each device is working on its own. Wait a few seconds, or restart mesh-kvm on both devices."
+            "{other} is found but not linked yet, so each device is working on its own. Wait a few seconds, or restart mesh-kvm on both devices."
         ));
     }
     if let Some(message) = snapshot.peer.as_ref().and_then(|peer| split_message(local, peer)) {
@@ -924,7 +1173,7 @@ mod tests {
 
     #[test]
     fn offers_below_each_monitor_and_outer_sides() {
-        let ps = placements(&cfg());
+        let ps = placements(&cfg(), &[]);
         assert!(has(&ps, "Below DP-2"));
         assert!(has(&ps, "Below DP-3"));
         assert!(has(&ps, "Left of DP-3"));
@@ -936,7 +1185,7 @@ mod tests {
 
     #[test]
     fn snap_lands_on_nearest_edge() {
-        let s = snap(&cfg(), 2240, 1400).unwrap();
+        let s = snap(&cfg(), 2240, 1400, 0).unwrap();
         assert_eq!(s.side, "Bottom");
         assert_eq!(s.y, 1440);
     }
@@ -992,17 +1241,17 @@ mod tests {
     #[test]
     fn peer_down_message_names_firewall_port() {
         let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
-        let snap = Snapshot { local: Some(local), peer: None, layout: None };
+        let snap = Snapshot { local: Some(local), ..Default::default() };
         let msg = status_message(&snap).unwrap();
         assert!(msg.contains("TCP port 24880"), "{msg}");
-        assert!(msg.contains("laptop"), "{msg}");
+        assert!(msg.starts_with("The other device is out of reach"), "{msg}");
     }
 
     #[test]
     fn main_conflict_message_says_how_to_fix_it() {
         let mut local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
         local.main_conflict = true;
-        let snap = Snapshot { local: Some(local.clone()), peer: Some(local), layout: None };
+        let snap = Snapshot { local: Some(local.clone()), peer: Some(local), ..Default::default() };
         let msg = status_message(&snap).unwrap();
         assert!(msg.contains("Both devices"), "{msg}");
         assert!(msg.contains("own keyboard and mouse"), "{msg}");
@@ -1012,7 +1261,7 @@ mod tests {
     #[test]
     fn healthy_link_has_no_message() {
         let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
-        let snap = Snapshot { local: Some(local.clone()), peer: Some(local), layout: None };
+        let snap = Snapshot { local: Some(local.clone()), peer: Some(local), ..Default::default() };
         assert_eq!(status_message(&snap), None);
     }
 
@@ -1097,7 +1346,7 @@ mod tests {
         let mut snap = pair(0, 0);
         snap.peer.as_mut().unwrap().paired = None;
         let msg = status_message(&snap).unwrap();
-        assert_eq!(msg, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        assert_eq!(msg, "windows-box is running an older mesh-kvm. Update it, or sign out and back in.");
         // Its own controls still work, as it does have those actions.
         assert!(!snap.peer.as_ref().unwrap().is_older());
     }
@@ -1106,7 +1355,7 @@ mod tests {
     fn with_no_address_the_app_says_so_and_nothing_else_matters_yet() {
         let mut local = device("windows", 0);
         local.paired = Some(false);
-        let snap = Snapshot { local: Some(local), peer: None, layout: LayoutState::parse(STATE_JSON) };
+        let snap = Snapshot { local: Some(local), layout: LayoutState::parse(STATE_JSON), ..Default::default() };
         assert!(needs_peer(&snap));
         assert!(status_message(&snap).unwrap().contains("the other device's address"), "not the firewall advice");
         assert!(!needs_peer(&pair(0, 0)));
@@ -1136,7 +1385,7 @@ mod tests {
     }
 
     fn place_of(c: &LayoutConfig, x: i32, y: i32) -> (i32, i32, String) {
-        let p = snap(c, x, y).unwrap();
+        let p = snap(c, x, y, 0).unwrap();
         (p.x, p.y, p.side)
     }
 
@@ -1160,15 +1409,16 @@ mod tests {
     #[test]
     fn snap_above_a_monitor() {
         assert_eq!(place_of(&cfg(), 3000, -1650), (3000, -1600, "Top".into()));
-        // Above DP-3, which starts lower than DP-2: 360 - 1600.
-        assert_eq!(place_of(&cfg(), -500, -1300), (-500, -1240, "Top".into()));
+        // Above DP-3, which starts lower than DP-2: 360 - 1600. DP-2 stands in the way at -500, so
+        // it goes as far along as clears DP-2's left edge.
+        assert_eq!(place_of(&cfg(), -500, -1300), (-640, -1240, "Top".into()));
     }
 
     #[test]
     fn placements_round_half_widths_as_javascript_does() {
         let mut c = cfg();
         let at = |c: &LayoutConfig, label: &str| {
-            let ps = placements(c);
+            let ps = placements(c, &[]);
             let p = ps.iter().find(|p| p.label == label).unwrap();
             (p.x, p.y)
         };
@@ -1201,24 +1451,214 @@ mod tests {
     }
 
     #[test]
-    fn resolution_change_keeps_the_laptop_on_an_edge() {
+    fn a_device_lines_up_with_a_monitor_when_dragged_near_to_it() {
+        // The laptop's left edge is 30 pixels off DP-2's.
+        assert_eq!(place_of(&cfg(), 1950, 1500), (1950, 1440, "Bottom".into()));
+        let lined_up = snap(&cfg(), 1950, 1500, 40).unwrap();
+        assert_eq!((lined_up.x, lined_up.y), (1920, 1440));
+        // Further off than the magnet reaches, it stays where it was put.
+        assert_eq!(snap(&cfg(), 2100, 1500, 40).unwrap().x, 2100);
+    }
+
+    #[test]
+    fn a_device_never_lands_on_a_monitor() {
+        let c = cfg();
+        let rects = c.rects(Device::Debian);
+        let (.., w, h) = c.laptop_box();
+        for x in (-4000..6000).step_by(250) {
+            for y in (-3000..3000).step_by(250) {
+                let p = snap(&c, x, y, 30).unwrap();
+                assert!(!overlaps_any(&rects, (p.x, p.y, w, h)), "{x},{y} gave {p:?}");
+            }
+        }
+        for place in placements(&c, &[]) {
+            assert!(!overlaps_any(&rects, (place.x, place.y, w, h)), "{place:?}");
+        }
+    }
+
+    #[test]
+    fn either_device_can_be_dragged_and_the_snap_is_the_same_both_ways() {
+        // The laptop dragged down and left of DP-2, and DP-2's device dragged the other way.
+        let mut by_laptop = cfg();
+        let (lx, ly, ..) = by_laptop.laptop_box();
+        drag_device(&mut by_laptop, Device::Windows, lx - 300, ly + 60, 0);
+        let mut by_desktop = cfg();
+        let (dx, dy, ..) = by_desktop.device_box(Device::Debian);
+        drag_device(&mut by_desktop, Device::Debian, dx + 300, dy - 60, 0);
+        let gap = |c: &LayoutConfig| {
+            let (a, b) = (c.device_box(Device::Debian), c.laptop_box());
+            (b.0 - a.0, b.1 - a.1)
+        };
+        assert_eq!(gap(&by_laptop), gap(&by_desktop));
+        assert_eq!(by_desktop.attach_side, by_laptop.attach_side);
+        assert_eq!(by_desktop.laptop_box().0, lx, "the other device stays put on the map");
+    }
+
+    #[test]
+    fn a_devices_own_monitors_keep_their_places_when_it_is_dragged() {
         let mut c = cfg();
-        set_resolution(&mut c, Some((1920, 1080)));
-        assert_eq!(c.laptop_box(), (2240, 1440, 1920, 1080));
-        assert_eq!(c.attach_side, "Bottom");
-        assert_eq!(resolution_label(&c), "1920 \u{d7} 1080");
-        set_resolution(&mut c, None);
-        assert_eq!((c.laptop_box().2, c.laptop_box().3), (2560, 1600));
-        assert_eq!(resolution_label(&c), "Native");
+        let own = |c: &LayoutConfig| c.device(Device::Debian).unwrap().monitors.clone();
+        let spaced = |c: &LayoutConfig| {
+            let r = c.rects(Device::Debian);
+            (r[1].x - r[0].x, r[1].y - r[0].y)
+        };
+        let (before, gap) = (own(&c), spaced(&c));
+        let (dx, dy, ..) = c.device_box(Device::Debian);
+        drag_device(&mut c, Device::Debian, dx + 500, dy - 900, 0);
+        assert_eq!(own(&c), before);
+        assert_eq!(spaced(&c), gap);
+    }
+
+    #[test]
+    fn an_edit_from_dragging_the_first_device_moves_it_in_the_save() {
+        let was = cfg();
+        let mut now = was.clone();
+        let (dx, dy, ..) = now.device_box(Device::Debian);
+        drag_device(&mut now, Device::Debian, dx + 900, dy, 0);
+        let edit = layout_edit(&was, &now).unwrap();
+        assert_ne!(edit["arrangement"]["devices"][0]["x"], 0);
+    }
+
+    #[test]
+    fn the_seam_is_where_the_two_devices_touch() {
+        let c = cfg();
+        // The laptop at x 2240..4800 under DP-2, which ends at 4480.
+        assert_eq!(seams(&c), vec![((2240, 1440), (4480, 1440))]);
+        let mut right = cfg();
+        apply_placement(&mut right, &Placement { label: "".into(), x: 4480, y: 100, side: "Right".into() });
+        assert_eq!(seams(&right), vec![((4480, 100), (4480, 1440))]);
+    }
+
+    fn display(modes: &[(i32, i32, u32)], current: usize) -> DisplayInfo {
+        let modes: Vec<DisplayMode> = modes
+            .iter()
+            .map(|&(width, height, millihertz)| DisplayMode { width, height, millihertz, id: String::new() })
+            .collect();
+        DisplayInfo { id: "DP-2".into(), name: "Big".into(), current: modes.get(current).cloned(), modes, can_change: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_monitor_is_matched_by_the_start_of_its_layout_name() {
+        assert!(same_monitor("DP-2 (360Hz Native)", "DP-2"));
+        assert!(same_monitor("Display 1", "Display 1"));
+        assert!(!same_monitor("DP-21 (60Hz Native)", "DP-2"));
+        assert!(!same_monitor("Display 12", "Display 1"));
+    }
+
+    #[test]
+    fn a_label_comes_from_the_monitor_or_failing_that_the_layout() {
+        let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
+        assert_eq!(monitor_label(&rect, None), ("DP-2".into(), "2560 \u{d7} 1440".into(), None));
+        let d = display(&[(1920, 1080, 143_912)], 0);
+        assert_eq!(monitor_label(&rect, Some(&d)), ("Big".into(), "1920 \u{d7} 1080".into(), Some("144 Hz".into())));
+    }
+
+    #[test]
+    fn menus_list_each_size_once_and_its_rates_fastest_first() {
+        let d = display(&[(2560, 1440, 144_000), (2560, 1440, 60_000), (1920, 1080, 60_000)], 0);
+        assert_eq!(resolutions(&d), [(2560, 1440), (1920, 1080)]);
+        assert_eq!(rates(&d, (2560, 1440)).len(), 2);
+        assert_eq!(rates(&d, (800, 600)).len(), 0);
+    }
+
+    #[test]
+    fn rates_that_would_read_the_same_show_their_decimals() {
+        let d = display(&[(1920, 1080, 60_000), (1920, 1080, 59_940), (1920, 1080, 50_000)], 0);
+        let all = rates(&d, (1920, 1080));
+        assert_eq!(rate_label(all[0], &all), "60.00 Hz");
+        assert_eq!(rate_label(all[1], &all), "59.94 Hz");
+        assert_eq!(rate_label(all[2], &all), "50 Hz");
+    }
+
+    #[test]
+    fn a_new_size_keeps_the_rate_if_it_can() {
+        let d = display(&[(2560, 1440, 144_000), (2560, 1440, 60_000), (1920, 1080, 144_000), (1280, 720, 60_000)], 0);
+        assert_eq!(mode_for_size(&d, (1920, 1080)).unwrap().millihertz, 144_000);
+        assert_eq!(mode_for_size(&d, (1280, 720)).unwrap().millihertz, 60_000);
+        assert_eq!(mode_for_size(&d, (800, 600)), None);
+    }
+
+    #[test]
+    fn a_mode_change_names_the_mode_by_its_numbers() {
+        let mode = DisplayMode { width: 1920, height: 1080, millihertz: 59_940, id: "9".into() };
+        assert_eq!(
+            mode_action("DP-2", &mode),
+            json!({"action": "set_display_mode", "output": "DP-2", "width": 1920, "height": 1080, "millihertz": 59940})
+        );
+    }
+
+    #[test]
+    fn a_big_window_enlarges_things_a_little_and_a_small_one_not_at_all() {
+        assert_eq!(window_zoom(760.0, 560.0), 1.0);
+        assert_eq!(window_zoom(1280.0, 800.0), 1.0);
+        let full_hd = window_zoom(1920.0, 1080.0);
+        assert!(full_hd > 1.1 && full_hd < 1.25, "{full_hd}");
+        assert!(window_zoom(7680.0, 4320.0) <= 1.75 + f32::EPSILON);
+        // Wide but short doesn't count as big.
+        assert_eq!(window_zoom(3000.0, 700.0), 1.0);
+    }
+
+    #[test]
+    fn the_devices_go_side_by_side_only_with_room_for_both() {
+        assert_eq!(body_layout(760.0), BodyLayout { rail: 300.0, columns: 1 });
+        assert_eq!(body_layout(1100.0).columns, 1);
+        let wide = body_layout(1700.0);
+        assert_eq!(wide.columns, 2);
+        assert!(1700.0 - wide.rail > 900.0, "the arrangement stays the larger part");
+    }
+
+    #[test]
+    fn names_come_from_status_then_the_layout_then_plain_words() {
+        let mut snap = pair(0, 0);
+        snap.local.as_mut().unwrap().device_name = "Desk tower".into();
+        assert_eq!(snap.name(Device::Debian), "Desk tower");
+        snap.local.as_mut().unwrap().device_name.clear();
+        snap.local.as_mut().unwrap().hostname = "bread".into();
+        assert_eq!(snap.name(Device::Debian), "bread");
+        // Out of reach, the other device goes by what the layout last heard.
+        snap.peer = None;
+        assert_eq!(snap.name(Device::Windows), "laptop");
+        snap.layout = None;
+        assert_eq!(snap.name(Device::Windows), "the other device");
+        assert_eq!(snap.title(Device::Windows), "The other device");
+    }
+
+    #[test]
+    fn with_no_service_the_devices_still_have_words_to_go_by() {
+        let snap = Snapshot::default();
+        let [here, there] = snap.in_order();
+        assert_eq!(here, Device::of_this_build());
+        assert_eq!((snap.title(here).as_str(), snap.title(there).as_str()), ("This device", "The other device"));
+    }
+
+    #[test]
+    fn a_pending_mode_change_is_found_on_either_device() {
+        let mut snap = pair(0, 0);
+        assert!(snap.mode_change().is_none());
+        snap.peer.as_mut().unwrap().display_change.change =
+            Some(ModeChange { stage: "waiting".into(), ms_left: 9000, ..Default::default() });
+        let (device, change) = snap.mode_change().unwrap();
+        assert_eq!(device, Device::Windows);
+        assert!(change.is_waiting());
+    }
+
+    #[test]
+    fn a_mode_change_parses_from_status() {
+        let text = r#"{"node":"debian","display_change":{"change":{"output":"DP-2","name":"Big","stage":"waiting","ms_left":14000,
+            "from":{"width":2560,"height":1440,"millihertz":144000,"id":"1"},"to":{"width":1920,"height":1080,"millihertz":60000,"id":"2"}},"note":null}}"#;
+        let d: DeviceStatus = serde_json::from_str(text).unwrap();
+        let change = d.display_change.change.unwrap();
+        assert_eq!(change.to.unwrap().label(), "1920 \u{d7} 1080 at 60 Hz");
+        assert_eq!(change.ms_left, 14000);
     }
 
     #[test]
     fn position_label_names_a_place_or_the_edge() {
         let mut c = cfg();
         c.move_laptop(1920, 1440);
-        assert_eq!(position_label(&c, &placements(&c)), "Below DP-2");
+        assert_eq!(position_label(&c, &placements(&c, &[])), "Below DP-2");
         c.move_laptop(2240, 1440);
-        assert_eq!(position_label(&c, &placements(&c)), "Custom (bottom edge)");
+        assert_eq!(position_label(&c, &placements(&c, &[])), "Custom (bottom edge)");
     }
 
     #[test]
@@ -1226,12 +1666,12 @@ mod tests {
         let mut snap = pair(1, 1);
         snap.peer.as_mut().unwrap().sharing = None;
         let msg = status_message(&snap).unwrap();
-        assert_eq!(msg, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        assert_eq!(msg, "windows-box is running an older mesh-kvm. Update it, or sign out and back in.");
         assert!(!enabled(&snap).main_device);
         assert!(enabled(&snap).test_sound);
         let mut snap = pair(1, 1);
         snap.local.as_mut().unwrap().sharing = None;
-        assert!(status_message(&snap).unwrap().starts_with("The Debian desktop is running an older mesh-kvm."));
+        assert!(status_message(&snap).unwrap().starts_with("debian-box is running an older mesh-kvm."));
         assert!(!enabled(&snap).main_device);
         // A current pair is unaffected.
         assert!(enabled(&pair(1, 1)).main_device);
@@ -1239,7 +1679,7 @@ mod tests {
 
     #[test]
     fn the_older_text_names_the_device() {
-        assert_eq!(older_message(Device::Windows), "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        assert_eq!(older_message("windows-box"), "windows-box is running an older mesh-kvm. Update it, or sign out and back in.");
     }
 
     #[test]
@@ -1257,6 +1697,7 @@ mod tests {
     fn device(node: &str, main_device: u8) -> DeviceStatus {
         let mut d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
         d.node = node.into();
+        d.device_name = format!("{node}-box");
         d.main_device = main_device;
         d
     }
@@ -1266,6 +1707,7 @@ mod tests {
             local: Some(device("debian", debian_main)),
             peer: Some(device("windows", windows_main)),
             layout: Some(LayoutState::parse(STATE_JSON).unwrap()),
+            ..Default::default()
         }
     }
 
@@ -1343,8 +1785,8 @@ mod tests {
         for this_device in ["debian", "windows"] {
             let snap = Snapshot {
                 local: Some(device(this_device, 0)),
-                peer: None,
                 layout: LayoutState::parse(STATE_JSON),
+                ..Default::default()
             };
             let on = enabled(&snap);
             assert!(on.layout && on.release, "{this_device}");
@@ -1373,7 +1815,7 @@ mod tests {
     fn main_device_is_named_only_when_the_devices_agree() {
         assert_eq!(pair(1, 1).main_device(), Some(Device::Windows));
         assert_eq!(pair(0, 1).main_device(), None);
-        let alone = Snapshot { local: Some(device("debian", 0)), peer: None, layout: None };
+        let alone = Snapshot { local: Some(device("debian", 0)), ..Default::default() };
         assert_eq!(alone.main_device(), Some(Device::Debian));
         assert_eq!(Snapshot::default().main_device(), None);
     }
@@ -1401,7 +1843,7 @@ mod tests {
         let mut laptop_here = pair(0, 0);
         laptop_here.local.as_mut().unwrap().node = "windows".into();
         assert_eq!(release_route(&laptop_here), Some(Release::Everywhere));
-        let alone = Snapshot { local: Some(device("windows", 0)), peer: None, layout: None };
+        let alone = Snapshot { local: Some(device("windows", 0)), ..Default::default() };
         assert_eq!(release_route(&alone), Some(Release::Only(Device::Windows)));
         assert_eq!(release_route(&Snapshot::default()), None);
     }
@@ -1440,7 +1882,7 @@ mod tests {
         let linked = || {
             let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
             let peer = DeviceStatus { node: "windows".into(), ..local.clone() };
-            Snapshot { local: Some(local), peer: Some(peer), layout: LayoutState::parse(STATE_JSON) }
+            Snapshot { local: Some(local), peer: Some(peer), layout: LayoutState::parse(STATE_JSON), ..Default::default() }
         };
         let mut snap = linked();
         snap.local.as_mut().unwrap().audio.tx_enabled = true;
