@@ -5,8 +5,8 @@
 //! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    devices, reaching_peer, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
-    AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_PACKETS,
+    devices, peer_listening, reaching_peer, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS,
 };
 use crate::settings::write_atomically;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,18 @@ const RECENT_AUDIO: Duration = Duration::from_secs(2);
 const SERVICE_SILENCE: Duration = Duration::from_secs(5);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 const SLEEP_WAIT: Duration = Duration::from_millis(1500);
+/// Once sound has been going, a silence this long keeps the output muted, so a pause between
+/// tracks doesn't bring it back and take it away again.
+const SILENCE_HOLD: Duration = Duration::from_secs(30);
+/// Sound that stops within this long of the mute may have been stopped by it: some Windows outputs
+/// could give silence to a capture once muted. So this is not yet a settled mute.
+const SETTLED_AFTER: Duration = Duration::from_secs(5);
+/// How long an unsettled mute waits out a silence. Nobody may be hearing anything, so not long.
+const UNSETTLED_HOLD: Duration = Duration::from_secs(3);
+/// Sound vanishing on a mute this many times running stops the muting for a while.
+const VANISHED_LIMIT: u32 = 2;
+const FIRST_BAR: Duration = Duration::from_secs(30);
+const LONGEST_BAR: Duration = Duration::from_secs(600);
 const FLAG_FILE: &str = "mute-state.json";
 /// A record that doesn't say which device: the default is the best guess.
 const UNNAMED_DEVICE: &str = "";
@@ -48,6 +60,14 @@ pub fn should_mute(
     setting && sending && peer_online && reaching_peer && !receiving_audio
 }
 
+/// Muting stopped because the sound stopped with it, so the app can say so.
+static BARRED: AtomicBool = AtomicBool::new(false);
+
+/// True while muting is off because sound kept vanishing when it was on.
+pub fn barred() -> bool {
+    BARRED.load(Ordering::Relaxed)
+}
+
 /// The output devices of this machine. A device is named by an identity that outlives replugging.
 pub trait MuteBackend {
     /// The output to mute, or None when it can't be found.
@@ -64,10 +84,10 @@ pub struct MuteInputs {
     /// An output is chosen to send. A microphone doesn't play through the speakers, so sending
     /// one is no reason to silence them.
     pub send_on: bool,
-    /// The capture is running and packets went out recently.
+    /// The capture is running.
     pub tx_active: bool,
     pub peer_online: bool,
-    /// The other device says the sound is arriving and playing there.
+    /// Real sound is reaching the other device's output, or was until a moment of silence.
     pub reaching_peer: bool,
     /// Sound from the other device is playing on the output that would be muted.
     pub receiving_audio: bool,
@@ -344,30 +364,141 @@ impl Recent {
     }
 }
 
+/// Decides whether sound is reaching the other device, across the gaps in it. Starting takes real
+/// sound, confirmed from the far side. Carrying on is more forgiving, as silence on the output is
+/// normal: it's what's between tracks. But silence can also mean the mute itself stopped the sound,
+/// with nobody hearing anything. See the constants above for how the two are told apart.
+#[derive(Default)]
+struct SoundHold {
+    /// When this run of muting began.
+    since: Option<Instant>,
+    last_confirmed: Option<Instant>,
+    vanished: u32,
+    barred_until: Option<Instant>,
+    next_bar: Option<Duration>,
+}
+
+impl SoundHold {
+    fn end_run(&mut self, started: Instant, last: Instant, now: Instant) {
+        self.since = None;
+        if last.duration_since(started) >= SETTLED_AFTER {
+            self.vanished = 0;
+            self.next_bar = None;
+            return;
+        }
+        self.vanished += 1;
+        if self.vanished >= VANISHED_LIMIT {
+            let bar = self.next_bar.unwrap_or(FIRST_BAR);
+            self.barred_until = Some(now + bar);
+            self.next_bar = Some((bar * 2).min(LONGEST_BAR));
+            // One more failure is enough once the bar lifts.
+            self.vanished = VANISHED_LIMIT - 1;
+        }
+    }
+
+    /// `requested`: the person wants it and the link is up. `confirmed`: real sound is going out
+    /// and the far side says it's coming out of an output. `connected`: the capture is running and
+    /// the far side has an output open, sound or no sound.
+    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, now: Instant) -> bool {
+        if !requested {
+            *self = Self::default();
+            return false;
+        }
+        if self.barred_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        self.barred_until = None;
+        let Some(started) = self.since else {
+            if confirmed {
+                self.since = Some(now);
+                self.last_confirmed = Some(now);
+            }
+            return confirmed;
+        };
+        if confirmed {
+            self.last_confirmed = Some(now);
+        }
+        if !connected {
+            self.since = None;
+            return false;
+        }
+        let last = self.last_confirmed.unwrap_or(started);
+        let settled = last.duration_since(started) >= SETTLED_AFTER;
+        let hold = if settled { SILENCE_HOLD } else { UNSETTLED_HOLD };
+        if now.duration_since(last) >= hold {
+            self.end_run(started, last, now);
+            return false;
+        }
+        true
+    }
+
+    fn barred(&self, now: Instant) -> bool {
+        self.barred_until.is_some_and(|until| now < until)
+    }
+}
+
+/// What the rest of the service says, at one moment.
+#[derive(Debug, Clone, Copy)]
+struct Readings {
+    setting: bool,
+    output_chosen: bool,
+    capture_running: bool,
+    /// Packets sent with real sound in them, however long ago.
+    sound_packets: u64,
+    peer_online: bool,
+    /// The far side has an output open.
+    peer_listening: bool,
+    /// The far side says real sound is coming out of that output.
+    peer_hearing: bool,
+    /// Sound from the far side is playing here, on the output that would be muted.
+    playing_here: bool,
+}
+
 #[derive(Default)]
 struct LiveSignals {
-    tx_packets: u64,
+    sound_packets: u64,
     tx: Recent,
     rx: Recent,
+    hold: SoundHold,
 }
 
 impl LiveSignals {
     fn read(&mut self, now: Instant) -> MuteInputs {
-        let tx_packets = AUDIO_TX_PACKETS.load(Ordering::Relaxed);
-        let tx_active = self.tx.note(tx_packets != self.tx_packets, now);
-        self.tx_packets = tx_packets;
         let in_use = devices::in_use();
         // With Play off, or playing elsewhere, muting this output silences none of it.
-        let playing = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
+        let playing_here = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
             && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0
             && in_use.play == in_use.output;
+        let inputs = self.apply(
+            Readings {
+                setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
+                output_chosen: devices::choice().output != devices::NONE,
+                capture_running: AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
+                sound_packets: AUDIO_TX_SOUND_PACKETS.load(Ordering::Relaxed),
+                peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
+                peer_listening: peer_listening(now, RECENT_AUDIO),
+                peer_hearing: reaching_peer(now, RECENT_AUDIO),
+                playing_here,
+            },
+            now,
+        );
+        BARRED.store(self.hold.barred(now), Ordering::Relaxed);
+        inputs
+    }
+
+    fn apply(&mut self, r: Readings, now: Instant) -> MuteInputs {
+        let sending_sound = self.tx.note(r.sound_packets != self.sound_packets, now);
+        self.sound_packets = r.sound_packets;
+        let confirmed = r.capture_running && sending_sound && r.peer_hearing;
+        let connected = r.capture_running && r.peer_listening;
+        let requested = r.setting && r.output_chosen && r.peer_online;
         MuteInputs {
-            setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
-            send_on: devices::choice().output != devices::NONE,
-            tx_active: tx_active && AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
-            peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
-            reaching_peer: reaching_peer(now, RECENT_AUDIO),
-            receiving_audio: self.rx.note(playing, now),
+            setting: r.setting,
+            send_on: r.output_chosen,
+            tx_active: r.capture_running,
+            peer_online: r.peer_online,
+            reaching_peer: self.hold.tick(requested, confirmed, connected, now),
+            receiving_audio: self.rx.note(r.playing_here, now),
         }
     }
 }
@@ -937,13 +1068,151 @@ mod tests {
         assert_eq!(chosen.default_device().as_deref(), Some(SPEAKERS), "nothing chosen: the old default");
     }
 
+    const QUIET_LINK: Readings = Readings {
+        setting: true,
+        output_chosen: true,
+        capture_running: true,
+        sound_packets: 0,
+        peer_online: true,
+        peer_listening: true,
+        peer_hearing: false,
+        playing_here: false,
+    };
+
+    /// A second of live signals, feeding the controller as the service does.
+    fn run(c: &mut MuteController<&mut Outputs>, signals: &mut LiveSignals, r: Readings, at: Instant) {
+        c.tick(signals.apply(r, at), at);
+    }
+
+    /// Sound flowing, as the two ends report it: packets going out and heard from the far side.
+    fn sounding(packets: u64) -> Readings {
+        Readings { sound_packets: packets, peer_hearing: true, ..QUIET_LINK }
+    }
+
     #[test]
     fn a_capture_that_never_delivers_does_not_mute() {
+        // Word that the stream is alive goes out, and the far side has an output open for it, but
+        // nothing is being heard.
         let (mut outputs, flag) = (Outputs::default(), flag("no-capture"));
         let mut c = MuteController::new(&mut outputs, flag);
-        c.tick(MuteInputs { tx_active: false, ..SENDING }, Instant::now());
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..60 {
+            run(&mut c, &mut signals, QUIET_LINK, t + STEP * second);
+        }
         drop(c);
         assert!(outputs.writes.is_empty());
+    }
+
+    #[test]
+    fn sound_the_far_side_doesn_t_confirm_does_not_mute() {
+        let (mut outputs, flag) = (Outputs::default(), flag("unconfirmed"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            let r = Readings { sound_packets: second + 1, ..QUIET_LINK };
+            run(&mut c, &mut signals, r, t + STEP * second as u32);
+        }
+        drop(c);
+        assert!(outputs.writes.is_empty());
+    }
+
+    #[test]
+    fn confirmed_sound_mutes_and_a_pause_between_tracks_does_not_flap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("no-flap"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        // Twenty seconds with nothing playing, and on with the next track.
+        for second in 10..30 {
+            run(&mut c, &mut signals, Readings { sound_packets: 10, ..QUIET_LINK }, t + STEP * second);
+        }
+        for second in 30..40 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1, "muted once, and left: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_long_silence_gives_the_output_back_once_and_doesn_t_flap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("long-silence"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        for second in 10..300 {
+            run(&mut c, &mut signals, Readings { sound_packets: 10, ..QUIET_LINK }, t + STEP * second);
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 2, "{:?}", outputs.writes);
+        assert!(!outputs.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_mute_that_silences_the_capture_can_t_lock_itself_on() {
+        // A Windows output that gives silence once it's muted. Nobody hears a thing, so this must
+        // let go, and stop trying for a while, and try again later.
+        let (mut outputs, flag) = (Outputs::default(), flag("self-silencing"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let (mut packets, mut longest_muted, mut muted_for) = (0, 0, 0);
+        let mut mutes = Vec::new();
+        for second in 0..600u32 {
+            let muted = c.backend.is(SPEAKERS);
+            let r = if muted {
+                // Sound was going out a moment ago and the far side's report lags a little.
+                Readings { sound_packets: packets, ..QUIET_LINK }
+            } else {
+                packets += 1;
+                sounding(packets)
+            };
+            run(&mut c, &mut signals, r, t + STEP * second);
+            muted_for = if c.backend.is(SPEAKERS) { muted_for + 1 } else { 0 };
+            longest_muted = longest_muted.max(muted_for);
+            if !muted && c.backend.is(SPEAKERS) {
+                mutes.push(second);
+            }
+        }
+        assert!(longest_muted <= 6, "muted for {longest_muted} seconds with nobody hearing");
+        assert!(mutes.len() >= 3, "it does try again: {mutes:?}");
+        assert!(mutes.len() <= 12, "but it backs off: {mutes:?}");
+        assert!(signals.hold.next_bar.is_some());
+    }
+
+    #[test]
+    fn the_far_side_going_away_gives_the_output_back_at_once_even_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("gone-in-pause"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        run(&mut c, &mut signals, Readings { sound_packets: 10, ..QUIET_LINK }, t + STEP * 10);
+        assert!(c.backend.is(SPEAKERS));
+        let gone = Readings { sound_packets: 10, peer_listening: false, ..QUIET_LINK };
+        run(&mut c, &mut signals, gone, t + STEP * 11);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_new_request_forgets_any_bar() {
+        let mut hold = SoundHold::default();
+        let t = Instant::now();
+        hold.barred_until = Some(t + LONGEST_BAR);
+        assert!(!hold.tick(true, true, true, t));
+        assert!(hold.barred(t));
+        hold.tick(false, false, false, t);
+        assert!(hold.tick(true, true, true, t));
     }
 
     #[test]

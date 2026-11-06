@@ -12,6 +12,8 @@ const MOST_QUEUED: usize = FRAME_SAMPLES * 6;
 const QUEUE_AFTER_TRIM: usize = FRAME_SAMPLES * 2;
 /// After running dry, a source that isn't leading waits for this much before it joins in again.
 const REJOIN_AT: usize = FRAME_SAMPLES * 2;
+/// Below this a capture has nothing in it: one step of 16-bit audio.
+const SOUND_FLOOR: f32 = 1.0 / 32768.0;
 /// How long a lead source can go without a frame before another takes over.
 const LEAD_PATIENCE: Duration = Duration::from_millis(30);
 /// The limiter holds the sum this far below full scale.
@@ -24,6 +26,17 @@ struct Queue {
     samples: VecDeque<f32>,
     /// Dry and waiting for `REJOIN_AT`.
     refilling: bool,
+    activity: Activity,
+}
+
+/// What a capture has delivered lately. A capture delivering silence is working: it's a capture
+/// delivering nothing that may not be.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// When anything last arrived, silence included.
+    pub data: Option<Instant>,
+    /// When real sound last arrived.
+    pub sound: Option<Instant>,
 }
 
 impl Queue {
@@ -44,7 +57,12 @@ impl Source {
     }
 
     pub fn push(&self, samples: &[f32], signal: &Signal) {
+        let now = Instant::now();
         let mut queue = self.lock();
+        queue.activity.data = Some(now);
+        if samples.iter().any(|sample| sample.abs() >= SOUND_FLOOR) {
+            queue.activity.sound = Some(now);
+        }
         queue.samples.extend(samples);
         if queue.samples.len() > MOST_QUEUED {
             let excess = queue.samples.len() - QUEUE_AFTER_TRIM;
@@ -54,8 +72,13 @@ impl Source {
         signal.notify();
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.lock().samples.len()
+    }
+
+    pub fn activity(&self) -> Activity {
+        self.lock().activity
     }
 
     /// True when `add_to` would take a frame. The two must agree, or the sender is told a frame is
@@ -284,6 +307,19 @@ mod tests {
         b.push(&tone(660.0, 0.5, 1), &signal);
         assert!(!mixer.ready(&[&a, &b], start + Duration::from_millis(10)), "a may still come");
         assert!(mixer.ready(&[&a, &b], start + LEAD_PATIENCE), "b takes over");
+    }
+
+    #[test]
+    fn a_source_tells_silence_from_nothing_at_all() {
+        let (source, signal) = (Source::default(), Signal::default());
+        assert_eq!(source.activity(), Activity::default());
+        source.push(&[0.0; 8], &signal);
+        assert!(source.activity().data.is_some());
+        assert!(source.activity().sound.is_none(), "silence is delivery, not sound");
+        source.push(&[0.0, 0.2], &signal);
+        assert!(source.activity().sound.is_some());
+        source.clear();
+        assert_eq!(source.activity(), Activity::default(), "a new capture starts afresh");
     }
 
     #[test]

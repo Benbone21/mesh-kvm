@@ -143,7 +143,10 @@ pub struct AudioStatus {
     pub bitrate: u32,
     pub tx_volume: u32,
     pub tx_peak: u32,
+    /// The other device says real sound from here is coming out of its output.
     pub tx_reaching: bool,
+    /// The other device has an output open for it, sound or no sound.
+    pub tx_connected: bool,
     /// Percent of what's sent that the other device says isn't arriving.
     pub tx_loss: u32,
     /// Missing from an older service.
@@ -221,8 +224,10 @@ pub fn bitrate_label(kbps: u32) -> String {
 pub fn sending_quality(audio: &AudioStatus, other: &str) -> String {
     if audio.tx_reaching {
         format!("Playing on {other}, {}% lost on the way.", audio.tx_loss)
+    } else if audio.tx_connected {
+        format!("Connected to {other}, with no sound to send right now.")
     } else {
-        format!("Not playing on {other} yet.")
+        format!("Not reaching {other} yet.")
     }
 }
 
@@ -2105,7 +2110,9 @@ mod tests {
     #[test]
     fn quality_lines_read_plainly() {
         let mut audio = AudioStatus { tx_loss: 3, ..Default::default() };
-        assert_eq!(sending_quality(&audio, "Laptop"), "Not playing on Laptop yet.");
+        assert_eq!(sending_quality(&audio, "Laptop"), "Not reaching Laptop yet.");
+        audio.tx_connected = true;
+        assert_eq!(sending_quality(&audio, "Laptop"), "Connected to Laptop, with no sound to send right now.");
         audio.tx_reaching = true;
         assert_eq!(sending_quality(&audio, "Laptop"), "Playing on Laptop, 3% lost on the way.");
         assert_eq!(receiving_quality(&audio), None, "nothing is arriving");

@@ -2,7 +2,7 @@
 
 use crate::audio::devices::{self, Choice};
 use crate::audio::{
-    other_version_arriving, reaching_peer, AUDIO_BITRATE_KBPS, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_BUFFER_MS, AUDIO_RX_LIVE,
+    other_version_arriving, peer_listening, reaching_peer, AUDIO_BITRATE_KBPS, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_BUFFER_MS, AUDIO_RX_LIVE,
     AUDIO_RX_LOSS, AUDIO_RX_MUTED, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_UNREPAIRED, AUDIO_RX_VOLUME_PCT, AUDIO_TX_LOSS,
     AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_VOLUME_PCT, BITRATES, DEFAULT_BITRATE,
 };
@@ -445,6 +445,13 @@ pub fn save_current() {
     }
 }
 
+fn audio_notes(mut notes: Vec<String>) -> Vec<String> {
+    if crate::mute::barred() {
+        notes.push("Sound stopped as soon as this output was muted, so it's staying on for now.".to_string());
+    }
+    notes
+}
+
 pub fn audio_status_json() -> serde_json::Value {
     let (choice, lists, in_use) = (devices::choice(), devices::lists(), devices::in_use());
     let now = std::time::Instant::now();
@@ -455,7 +462,7 @@ pub fn audio_status_json() -> serde_json::Value {
         "play": choice.play,
         "inputs": lists.inputs,
         "outputs": lists.outputs,
-        "notes": in_use.notes,
+        "notes": audio_notes(in_use.notes),
         "echo_safe": in_use.echo_safe,
         "bitrate": AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),
         "tx_volume": AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed),
@@ -463,6 +470,7 @@ pub fn audio_status_json() -> serde_json::Value {
         "tx_packets": AUDIO_TX_PACKETS.load(Ordering::Relaxed),
         "tx_loss": AUDIO_TX_LOSS.load(Ordering::Relaxed),
         "tx_reaching": reaching_peer(now, std::time::Duration::from_secs(2)),
+        "tx_connected": peer_listening(now, std::time::Duration::from_secs(2)),
         "play_only_on_other": AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::SeqCst),
         "rx_muted": AUDIO_RX_MUTED.load(Ordering::Relaxed),
         "rx_volume": AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed),

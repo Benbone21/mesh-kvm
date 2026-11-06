@@ -582,7 +582,9 @@ def audio_checks():
                     answered = answered or back[:6] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4])
             except socket.timeout:
                 pass
-        check("what it hears back says the sound is getting through", local()["audio"]["tx_reaching"] is True)
+        audio = local()["audio"]
+        check("an open output on the other device counts as connected", audio["tx_connected"] is True, str(audio))
+        check("but not as playing, with nothing to hear", audio["tx_reaching"] is False, str(audio))
         check("and it reports back to the other device", answered)
         audio = local()["audio"]
         # Both directions on one output is what calls for process loopback, which Wine doesn't have.

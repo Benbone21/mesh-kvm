@@ -3,7 +3,7 @@
 use super::codec::{Format, OpusEncoder, MAX_PACKET};
 use super::mix::{Limiter, Mixer};
 use super::packet::{self, Body};
-use super::{devices, note_heard_back, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT};
+use super::{devices, note_heard_back, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
 use super::{CHANNELS, OPUS_FRAME, PCM_FRAME};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +33,15 @@ pub static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 fn new_epoch() -> u16 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (now.subsec_nanos() >> 8) as u16 ^ now.as_secs() as u16
+}
+
+/// What became of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sent {
+    Nothing,
+    /// Something went out, with nothing to hear in it.
+    Silence,
+    Sound,
 }
 
 /// Turns frames of audio into numbered packets.
@@ -100,8 +109,8 @@ impl Packetizer {
         self.encoded.resize(MAX_PACKET, 0);
     }
 
-    /// Sends one 10 ms frame, unless it's part of a silence. Returns whether anything went out.
-    pub fn frame(&mut self, pcm: &[f32], send: &mut dyn FnMut(&[u8])) -> bool {
+    /// Sends one 10 ms frame, unless it's part of a silence.
+    pub fn frame(&mut self, pcm: &[f32], send: &mut dyn FnMut(&[u8])) -> Sent {
         debug_assert_eq!(pcm.len(), OPUS_FRAME * CHANNELS);
         let silent = pcm.iter().all(|sample| sample.abs() < SILENCE);
         self.silent_frames = if silent { self.silent_frames.saturating_add(1) } else { 0 };
@@ -109,16 +118,20 @@ impl Packetizer {
             // Said at once, or the far side would take the gap for a stall and wait for it.
             if self.silent_frames == SILENCE_HOLD_FRAMES + 1 {
                 self.quiet(send);
-                return true;
+                return Sent::Silence;
             }
-            return false;
+            return Sent::Nothing;
         }
         if self.kbps == 0 {
             self.send_pcm(pcm, send);
         } else {
             self.send_opus(pcm, send);
         }
-        true
+        if silent {
+            Sent::Silence
+        } else {
+            Sent::Sound
+        }
     }
 
     /// Says the stream is alive with nothing in it.
@@ -169,9 +182,13 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, hub: &Hub, stop: &Atomi
             mixer.mix(&sources, &mut frame);
             limiter.process(&mut frame);
             AUDIO_TX_PEAK_PCT.store(peak_pct(&frame), Ordering::Relaxed);
-            if packetizer.frame(&frame, &mut send) {
+            let sent = packetizer.frame(&frame, &mut send);
+            if sent != Sent::Nothing {
                 last_sent = now;
                 said_quiet = false;
+            }
+            if sent == Sent::Sound {
+                AUDIO_TX_SOUND_PACKETS.fetch_add(1, Ordering::Relaxed);
             }
             now = Instant::now();
         }
@@ -248,6 +265,19 @@ mod tests {
         assert_eq!(parse(&said[0]).unwrap().body, Body::Quiet, "the far side is told at once");
         assert!(collected(&mut packetizer, &silence).is_empty());
         assert_eq!(collected(&mut packetizer, &tone(0.3)).len(), 1);
+    }
+
+    #[test]
+    fn only_a_frame_with_something_in_it_counts_as_sound() {
+        let mut packetizer = Packetizer::new(96);
+        let mut ignore = |_: &[u8]| {};
+        assert_eq!(packetizer.frame(&tone(0.3), &mut ignore), Sent::Sound);
+        let silence = vec![0.0; OPUS_FRAME * CHANNELS];
+        assert_eq!(packetizer.frame(&silence, &mut ignore), Sent::Silence, "a tail going out");
+        for _ in 0..SILENCE_HOLD_FRAMES {
+            assert_eq!(packetizer.frame(&silence, &mut ignore), Sent::Silence);
+        }
+        assert_eq!(packetizer.frame(&silence, &mut ignore), Sent::Nothing);
     }
 
     #[test]

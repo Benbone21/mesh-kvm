@@ -3,8 +3,10 @@
 //! The lists are refreshed in the background by each platform, so reading them costs nothing: the
 //! app asks for status five times a second.
 
+use super::mix::Activity;
 use serde::Serialize;
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Nothing chosen. Saved settings hold this, the default, or a device's id.
 pub const NONE: &str = "";
@@ -125,12 +127,92 @@ impl Resolved {
     }
 }
 
+/// How long a capture gets to start delivering.
+const CAPTURE_GRACE: Duration = Duration::from_secs(4);
+/// How long a microphone can give nothing but silence before that's worth a mention. A real one
+/// picks up some noise, so this much digital silence is a blocked or switched-off one.
+const SILENT_MIC_FOR: Duration = Duration::from_secs(10);
+
+/// How a capture that's wanted is getting on.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureHealth {
+    /// It failed to open or stopped by itself a moment ago.
+    pub failed: bool,
+    /// How long it has been up, and been expected to deliver.
+    pub expected_for: Option<Duration>,
+    pub activity: Activity,
+    /// A microphone runs all the time, where an output capture only delivers while something plays.
+    pub microphone: bool,
+}
+
+impl CaptureHealth {
+    /// A note for the app if there's something wrong, with `help` saying what to try.
+    pub fn note(&self, what: &str, help: &str, now: Instant) -> Option<String> {
+        let finish = |text: String| Some(if help.is_empty() { text } else { format!("{text} {help}") });
+        if self.failed {
+            return finish(format!("The {what} couldn't be opened."));
+        }
+        let up_for = self.expected_for?;
+        let longer_than = |at: Option<Instant>, limit: Duration| {
+            up_for >= limit && at.is_none_or(|at| now.duration_since(at) >= limit)
+        };
+        if longer_than(self.activity.data, CAPTURE_GRACE) {
+            return finish(format!("The {what} isn't delivering any audio."));
+        }
+        if self.microphone && longer_than(self.activity.sound, SILENT_MIC_FOR) {
+            return finish(format!("The {what} is delivering only silence."));
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn listed() -> Vec<Device> {
         vec![Device { id: "usb".into(), name: "USB headset".into() }]
+    }
+
+    fn health(failed: bool, up_for: Option<u64>, data: Option<Instant>, sound: Option<Instant>, microphone: bool) -> CaptureHealth {
+        CaptureHealth {
+            failed,
+            expected_for: up_for.map(Duration::from_secs),
+            activity: Activity { data, sound },
+            microphone,
+        }
+    }
+
+    #[test]
+    fn a_capture_that_failed_or_delivers_nothing_is_called_out() {
+        let t = Instant::now();
+        let later = t + Duration::from_secs(60);
+        let note = |h: CaptureHealth| h.note("microphone", "Try this.", later);
+        assert_eq!(
+            note(health(true, None, None, None, true)).unwrap(),
+            "The microphone couldn't be opened. Try this."
+        );
+        assert_eq!(
+            note(health(false, Some(60), None, None, true)).unwrap(),
+            "The microphone isn't delivering any audio. Try this."
+        );
+        assert_eq!(note(health(false, Some(1), None, None, true)), None, "it has only just started");
+        assert_eq!(note(health(false, Some(60), Some(later), Some(later), true)), None, "all is well");
+    }
+
+    #[test]
+    fn a_microphone_giving_only_digital_silence_is_called_out_but_an_output_is_not() {
+        let t = Instant::now();
+        let later = t + Duration::from_secs(60);
+        let blocked = health(false, Some(60), Some(later), None, true);
+        assert_eq!(blocked.note("microphone", "", later).unwrap(), "The microphone is delivering only silence.");
+        assert_eq!(health(false, Some(60), Some(later), None, false).note("output", "", later), None);
+    }
+
+    #[test]
+    fn nothing_from_a_capture_that_isn_t_expected_to_deliver_says_nothing() {
+        let t = Instant::now();
+        assert_eq!(health(false, None, None, None, false).note("output", "", t), None);
     }
 
     #[test]

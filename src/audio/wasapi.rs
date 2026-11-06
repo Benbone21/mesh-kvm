@@ -7,7 +7,7 @@
 //! kept for that one case, and anything going wrong with it falls back to ordinary loopback and
 //! says so in the status.
 
-use super::devices::{self, Device, InUse, Lists, Resolved};
+use super::devices::{self, CaptureHealth, Device, InUse, Lists, Resolved};
 use super::jitter::RxStream;
 use super::mix::{Signal, Source};
 use super::resample::Resampler;
@@ -50,6 +50,10 @@ const ACTIVATE_WAIT: Duration = Duration::from_secs(3);
 const PROCESS_BUFFER: i64 = 200_000;
 const PROCESS_WAIT_MS: u32 = 100;
 const BITS: u16 = 16;
+/// How long a stream failing stays in the notes.
+const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(4);
+/// What to try when a microphone gives nothing. Windows can block one for every app.
+const MIC_HELP: &str = "Check that Microphone access is on in Windows privacy settings.";
 
 /// Wakes the engine when the choices change.
 static WAKE: LazyLock<Signal> = LazyLock::new(Signal::default);
@@ -130,6 +134,8 @@ struct Worker<K> {
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     last_start: Option<Instant>,
+    /// When it last ended by itself.
+    failed_at: Option<Instant>,
 }
 
 impl<K: PartialEq> Default for Worker<K> {
@@ -139,6 +145,7 @@ impl<K: PartialEq> Default for Worker<K> {
             stop: Arc::default(),
             finished: Arc::new(AtomicBool::new(true)),
             last_start: None,
+            failed_at: None,
         }
     }
 }
@@ -153,6 +160,17 @@ impl<K: PartialEq> Worker<K> {
         self.key = None;
     }
 
+    /// How a capture on this worker is doing.
+    fn health(&self, source: &Source, expected: bool, microphone: bool, now: Instant) -> CaptureHealth {
+        let up_for = self.last_start.filter(|_| expected && self.alive()).map(|at| now.duration_since(at));
+        CaptureHealth {
+            failed: self.failed_at.is_some_and(|at| now.duration_since(at) < FAILURE_SHOWS_FOR),
+            expected_for: up_for,
+            activity: source.activity(),
+            microphone,
+        }
+    }
+
     /// Brings the worker in line with `wanted`, starting `run` if that takes a new stream. `run`
     /// returns when it's told to stop, or when the device goes away.
     fn ensure<F>(&mut self, wanted: Option<K>, now: Instant, run: F)
@@ -160,6 +178,9 @@ impl<K: PartialEq> Worker<K> {
         F: FnOnce(&K, Arc<AtomicBool>) + Send + 'static,
         K: Clone + Send + 'static,
     {
+        if self.key.is_some() && !self.alive() {
+            self.failed_at = Some(now);
+        }
         if self.key != wanted || !self.alive() {
             self.stop();
         }
@@ -506,6 +527,13 @@ fn engine() {
             sent.missing_note("output to send"),
             play.missing_note("output to play on"),
             whole_device.then(|| "While both devices are sending, all of this device's sound is sent, not just this output's.".to_string()),
+            (input != Resolved::Off)
+                .then(|| mic.health(&HUB.mic, true, true, now).note("microphone or line-in", MIC_HELP, now))
+                .flatten(),
+            // Loopback delivers nothing while nothing plays, so only a failure says anything here.
+            (sent != Resolved::Off)
+                .then(|| output.health(&HUB.output, false, false, now).note("output to send", "", now))
+                .flatten(),
         ];
         devices::set_in_use(InUse {
             output: sent_id.clone(),

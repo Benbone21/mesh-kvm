@@ -6,7 +6,7 @@
 //! the graph but those links and our own streams, and they go when the capture stops. The sink's
 //! volume and mute don't touch such a capture, so a muted sink still sends.
 
-use super::devices::{self, Device, InUse, Lists, Resolved};
+use super::devices::{self, CaptureHealth, Device, InUse, Lists, Resolved};
 use super::jitter::RxStream;
 use super::mix::{Signal, Source};
 use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB};
@@ -34,6 +34,8 @@ const LOOK_EVERY: Duration = Duration::from_secs(5);
 const SETTLE: Duration = Duration::from_millis(40);
 /// However many changes there are, the graph is read at most this often.
 const SHORTEST_LOOK_GAP: Duration = Duration::from_millis(250);
+/// How long a capture ending by itself stays in the notes.
+const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(6);
 /// A helper that won't stay up isn't restarted more often than this.
 const RESPAWN_GAP: Duration = Duration::from_secs(1);
 /// pw-play reads a whole period at a time in the middle of the audio graph, and blocks there if the
@@ -100,6 +102,8 @@ struct Node {
     name: String,
     description: String,
     class: String,
+    /// Moving audio right now, not just connected.
+    running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,7 +161,8 @@ fn parse_graph(dump: &str) -> Option<Graph> {
             ("PipeWire:Interface:Node", Some(id)) => {
                 let name = text("node.name").unwrap_or_default();
                 let description = text("node.description").or_else(|| text("node.nick")).unwrap_or_else(|| name.clone());
-                graph.nodes.push(Node { id, name, description, class: text("media.class").unwrap_or_default() });
+                let running = info.and_then(|i| i.get("state")).and_then(Value::as_str) == Some("running");
+                graph.nodes.push(Node { id, name, description, class: text("media.class").unwrap_or_default(), running });
             }
             ("PipeWire:Interface:Port", Some(id)) => {
                 let node = props.and_then(|p| p.get("node.id")).and_then(as_id);
@@ -239,6 +244,12 @@ impl Graph {
             waiting.extend(self.links.iter().filter(|link| link.to_node == at).map(|link| link.from_node));
         }
         false
+    }
+
+    /// Whether anything that should be captured from a sink is really playing, not just connected.
+    fn apps_running_on(&self, sink: &str) -> bool {
+        let Some(sink) = self.nodes.iter().find(|node| node.name == sink) else { return false };
+        self.apps_on(sink.id).into_iter().any(|app| self.node(app).is_some_and(|node| node.running))
     }
 
     /// The apps playing on a sink, leaving out anything that carries our own audio.
@@ -387,6 +398,10 @@ struct Capture {
     /// What the running capture was started with.
     running: Option<Vec<String>>,
     last_spawn: Option<Instant>,
+    /// When the capture last ended by itself.
+    failed_at: Option<Instant>,
+    /// Since when it has been up, with something to deliver.
+    expected_since: Option<Instant>,
 }
 
 /// Reads until the capture ends. Only whole frames go on.
@@ -411,7 +426,7 @@ fn pump(mut stdout: std::process::ChildStdout, source: &'static Source) {
 
 impl Capture {
     fn new(node: &'static str, source: &'static Source) -> Self {
-        Self { node, source, child: None, running: None, last_spawn: None }
+        Self { node, source, child: None, running: None, last_spawn: None, failed_at: None, expected_since: None }
     }
 
     fn stop(&mut self) {
@@ -420,6 +435,7 @@ impl Capture {
             let _ = child.wait();
         }
         self.running = None;
+        self.expected_since = None;
         self.source.clear();
     }
 
@@ -427,9 +443,26 @@ impl Capture {
     fn alive(&mut self) -> bool {
         let ended = self.child.as_mut().is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
         if ended {
+            self.failed_at = Some(Instant::now());
             self.stop();
         }
         self.child.is_some()
+    }
+
+    /// How it's doing, given whether anything should be coming out of it now.
+    fn health(&mut self, expected: bool, microphone: bool, now: Instant) -> CaptureHealth {
+        let running = self.alive();
+        if !(running && expected) {
+            self.expected_since = None;
+        } else if self.expected_since.is_none() {
+            self.expected_since = Some(now);
+        }
+        CaptureHealth {
+            failed: self.failed_at.is_some_and(|at| now.duration_since(at) < FAILURE_SHOWS_FOR),
+            expected_for: self.expected_since.map(|since| now.duration_since(since)),
+            activity: self.source.activity(),
+            microphone,
+        }
     }
 
     /// Brings the capture in line with `wanted`, the arguments it should run with, if any.
@@ -463,7 +496,10 @@ impl Capture {
                 self.child = Some(child);
                 self.running = Some(args);
             }
-            Err(e) => crate::settings::log_note(&format!("Couldn't start pw-record: {e}")),
+            Err(e) => {
+                self.failed_at = Some(now);
+                crate::settings::log_note(&format!("Couldn't start pw-record: {e}"));
+            }
         }
     }
 }
@@ -517,10 +553,15 @@ fn engine() {
         }
         AUDIO_OUTPUT_CAPTURE_LIVE.store(output.alive(), Ordering::Relaxed);
 
+        let mic_health = mic.health(input != Resolved::Off, true, now);
+        let apps_running = sink.as_deref().is_some_and(|sink| graph.apps_running_on(sink));
+        let output_health = output.health(sent != Resolved::Off && apps_running, false, now);
         let notes = [
             input.missing_note("microphone or line-in"),
             sent.missing_note("output to send"),
             play.missing_note("output to play on"),
+            (input != Resolved::Off).then(|| mic_health.note("microphone or line-in", "", now)).flatten(),
+            (sent != Resolved::Off).then(|| output_health.note("output to send", "", now)).flatten(),
         ];
         devices::set_in_use(InUse {
             output: sink,
@@ -768,7 +809,7 @@ mod tests {
       {"id":11,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"headset","node.nick":"Headset","media.class":"Audio/Sink"}}},
       {"id":12,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"mic","node.description":"USB microphone","media.class":"Audio/Source"}}},
       {"id":13,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"webcam","media.class":"Video/Source"}}},
-      {"id":20,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"Firefox","media.class":"Stream/Output/Audio"}}},
+      {"id":20,"type":"PipeWire:Interface:Node","info":{"state":"running","props":{"node.name":"Firefox","media.class":"Stream/Output/Audio"}}},
       {"id":21,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"mesh-kvm-play","media.class":"Stream/Output/Audio"}}},
       {"id":22,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"mesh-kvm-capture","media.class":"Stream/Input/Audio"}}},
       {"id":23,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"mono-app","media.class":"Stream/Output/Audio"}}},
@@ -870,6 +911,13 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_app_is_connected_but_isn_t_expected_to_deliver() {
+        assert!(graph().apps_running_on("speakers"));
+        assert!(!graph().apps_running_on("headset"), "it's linked there, but idle");
+        assert!(!graph().apps_running_on("gone"));
+    }
+
+    #[test]
     fn choosing_another_sink_changes_which_apps_are_heard() {
         let plan = plan_links(&graph(), Some("headset"));
         assert_eq!(plan.add, vec![(240, 220)]);
@@ -888,8 +936,8 @@ mod tests {
     fn our_player_is_left_out_even_through_an_effects_sink() {
         let mut graph = graph();
         // pw-play -> effects sink -> effects output stream -> speakers
-        graph.nodes.push(Node { id: 30, name: "fx".into(), description: "fx".into(), class: "Audio/Sink".into() });
-        graph.nodes.push(Node { id: 31, name: "fx-out".into(), description: "fx".into(), class: "Stream/Output/Audio".into() });
+        graph.nodes.push(Node { id: 30, name: "fx".into(), description: "fx".into(), class: "Audio/Sink".into(), running: true });
+        graph.nodes.push(Node { id: 31, name: "fx-out".into(), description: "fx".into(), class: "Stream/Output/Audio".into(), running: true });
         graph.ports.push(Port { id: 310, node: 31, output: true, channel: "FL".into() });
         graph.links.retain(|link| link.from_node != 21);
         graph.links.push(Link { id: 401, from_node: 21, from_port: 210, to_node: 30, to_port: 0 });

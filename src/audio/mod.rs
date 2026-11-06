@@ -62,6 +62,8 @@ pub static AUDIO_PLAYER_LIVE: AtomicBool = AtomicBool::new(false);
 
 pub static AUDIO_TX_VOLUME_PCT: AtomicU32 = AtomicU32::new(100);
 pub static AUDIO_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones with real sound in them, not silence or word that the stream is alive.
+pub static AUDIO_TX_SOUND_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static AUDIO_TX_PEAK_PCT: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
 /// What the other device says it is losing of what's sent, in percent.
@@ -77,24 +79,39 @@ const REPORT_EVERY: Duration = Duration::from_millis(250);
 /// A wait short enough to send reports on time when nothing is arriving.
 const RECEIVE_WAIT: Duration = Duration::from_millis(50);
 
-/// What the sender last heard back, for deciding whether sound is really reaching the other device.
+/// What the sender last heard back.
 #[derive(Clone, Copy, Default)]
 struct HeardBack {
     at: Option<Instant>,
     playing: bool,
+    sounding: bool,
 }
 
-static HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false });
+static HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false, sounding: false });
 
 fn note_heard_back(report: packet::Report, now: Instant) {
-    *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner) = HeardBack { at: Some(now), playing: report.playing };
+    *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner) =
+        HeardBack { at: Some(now), playing: report.playing, sounding: report.sounding };
     AUDIO_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
 }
 
-/// True while the other device confirms that what's sent is arriving and being played.
-pub fn reaching_peer(now: Instant, within: Duration) -> bool {
+fn heard_back(now: Instant, within: Duration) -> HeardBack {
     let heard = *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner);
-    heard.playing && heard.at.is_some_and(|at| now.duration_since(at) < within)
+    if heard.at.is_some_and(|at| now.duration_since(at) < within) {
+        heard
+    } else {
+        HeardBack::default()
+    }
+}
+
+/// True while the other device says real sound from here is coming out of its output.
+pub fn reaching_peer(now: Instant, within: Duration) -> bool {
+    heard_back(now, within).sounding
+}
+
+/// True while the other device has an output open for what's sent, sound or no sound.
+pub fn peer_listening(now: Instant, within: Duration) -> bool {
+    heard_back(now, within).playing
 }
 
 /// What is being sent out, ready for the sender.
@@ -125,10 +142,20 @@ fn peak_pct(samples: &[f32]) -> u32 {
     (peak * 100.0).min(100.0) as u32
 }
 
+/// Quieter than this, a player isn't making any sound worth the name.
+const SOUND_FLOOR: f32 = 1.0 / 16384.0;
+/// Sound played this recently counts as still playing.
+const SOUNDING_FOR: Duration = Duration::from_secs(1);
+/// When real sound last came out of the output.
+static SOUNDED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Applies the receive volume to `samples` and notes how loud they are.
 fn finish_received(samples: &mut [f32]) {
     let volume = AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed);
     AUDIO_RX_PEAK_PCT.store(peak_pct(samples), Ordering::Relaxed);
+    if volume != 0 && samples.iter().any(|sample| sample.abs() >= SOUND_FLOOR) {
+        *SOUNDED_AT.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+    }
     if volume != 100 {
         let gain = volume as f32 / 100.0;
         samples.iter_mut().for_each(|sample| *sample *= gain);
@@ -187,7 +214,10 @@ fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
     if !alive {
         stream.forget_quality();
     }
-    let report = stream.report(AUDIO_PLAYER_LIVE.load(Ordering::Relaxed));
+    let playing = AUDIO_PLAYER_LIVE.load(Ordering::Relaxed);
+    let sounded_at = *SOUNDED_AT.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut report = stream.report(playing);
+    report.sounding = playing && seen_within(sounded_at, now, SOUNDING_FOR);
     AUDIO_RX_LIVE.store(alive, Ordering::Relaxed);
     AUDIO_RX_PACKETS.store(stream.counts().received, Ordering::Relaxed);
     AUDIO_RX_LOSS.store((stream.loss_percent() * 10.0) as u32, Ordering::Relaxed);
