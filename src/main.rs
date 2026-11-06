@@ -91,6 +91,10 @@ struct Cli {
     /// Open the app window for the service on this device, and exit when it closes
     #[arg(long, alias = "studio")]
     app: bool,
+
+    /// Show the tray icon for the service on this device, and exit when Quit is chosen
+    #[arg(long)]
+    tray: bool,
 }
 
 fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, SocketAddr), String> {
@@ -125,6 +129,31 @@ fn open_studio_when_ready() {
     });
 }
 
+/// Runs the app window, or raises the one that is already open. Returns when the window closes.
+fn run_app_window() {
+    match app::single::claim(app::single::WINDOW_PORT) {
+        app::single::Instance::AlreadyRunning => {
+            app::single::signal_show(app::single::WINDOW_PORT);
+            return;
+        }
+        app::single::Instance::First(listener) => app::single::keep_for_window(listener),
+    }
+    if let Err(e) = app::ui::run_window() {
+        eprintln!("Error: {}", e);
+        settings::log_fatal(&e);
+        std::process::exit(1);
+    }
+}
+
+/// Runs the tray icon until Quit. It never touches the service or input.
+fn run_tray_icon() {
+    if let Err(e) = app::tray::run_tray() {
+        eprintln!("Error: {}", e);
+        settings::log_fatal(&e);
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -139,11 +168,11 @@ fn main() {
     }
 
     if cli.app {
-        if let Err(e) = app::ui::run_window() {
-            eprintln!("Error: {}", e);
-            settings::log_fatal(&e);
-            std::process::exit(1);
-        }
+        run_app_window();
+        return;
+    }
+    if cli.tray {
+        run_tray_icon();
         return;
     }
 
@@ -242,7 +271,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn bare_launch_opens_the_studio() {
+    fn bare_launch_has_no_arguments() {
         assert!(should_open_studio(1));
     }
 
@@ -251,6 +280,12 @@ mod tests {
         assert!(Cli::try_parse_from(["mesh-kvm", "--app"]).unwrap().app);
         assert!(Cli::try_parse_from(["mesh-kvm", "--studio"]).unwrap().app);
         assert!(!Cli::try_parse_from(["mesh-kvm"]).unwrap().app);
+    }
+
+    #[test]
+    fn tray_flag_is_parsed() {
+        assert!(Cli::try_parse_from(["mesh-kvm", "--tray"]).unwrap().tray);
+        assert!(!Cli::try_parse_from(["mesh-kvm"]).unwrap().tray);
     }
 
     #[test]

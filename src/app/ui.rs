@@ -43,7 +43,8 @@ pub fn run_window() -> Result<(), String> {
             .with_title("mesh-kvm")
             .with_app_id("mesh-kvm")
             .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(MIN_WINDOW_SIZE),
+            .with_min_inner_size(MIN_WINDOW_SIZE)
+            .with_icon(super::icon::egui_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -51,6 +52,7 @@ pub fn run_window() -> Result<(), String> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            super::single::serve_focus(cc.egui_ctx.clone());
             let ctx = cc.egui_ctx.clone();
             let client = Client::start(Box::new(move || ctx.request_repaint()));
             Ok(Box::new(Window::new(client)))

@@ -22,7 +22,7 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "wayl
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-ksni = "0.3"
+ksni = { version = "0.3", features = ["blocking"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = "0.15"
