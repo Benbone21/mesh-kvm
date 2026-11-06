@@ -8,7 +8,7 @@ Both devices run the same version. Update them together: a Debian build and a la
 
 ## Build
 
-You need Rust, plus the Windows target and a MinGW cross-compiler for the laptop build.
+You need Rust and a C compiler, plus the Windows target and a MinGW cross-compiler for the laptop build.
 
 ```
 cargo build --release
@@ -53,11 +53,42 @@ Each device has its own switches in the app window.
 
 - Share mouse and Share keyboard turn sharing of each one on or off.
 - Send clipboard and Receive clipboard choose which way the clipboard travels: text, images and files. Copied files move as soon as you copy them, up to 2 GB per copy, and the last two copies stay in a `received` folder beside the settings.
-- Send audio and Play audio choose whether this device sends its sound to the other, and whether it plays the other's.
-- Mute this device while sending silences this device's speakers while it sends its system sound, so you hear it on only one device. It is on by default. The speakers come back when sending stops, the link drops, or sound from the other device is playing here. Sending the microphone doesn't mute. If you had muted the speakers yourself, they stay muted, and if you unmute them by hand, mesh-kvm leaves them alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
 - Start mesh-kvm when this device boots controls starting at login or boot. With it off, the tray still appears at login on Debian, but the service waits until you open the app.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.
+
+## Audio
+
+Each device has its own audio controls, and sound can go both ways at once.
+
+- Microphone or line-in to send, and Output to send, choose what this device sends. Each lists your real devices by name, or None. Choosing anything starts sending, and if you choose both they are sent mixed, turned down just enough that the sum doesn't clip.
+- Play received audio on chooses where sound from the other device plays. Play audio turns it off.
+- Play only on the other device mutes the output you chose to send, so you hear that sound on one device only. It is on by default.
+- Audio quality chooses the bitrate of what this device sends: 64, 96, 128 or 256 kbit/s, or Uncompressed at about 1.6 Mbit/s. Each packet adds about 32 kbit/s on the network on top of that. On poor Wi-Fi, use a lower one: smaller packets get through more often.
+- The lines under each part say how the audio is doing: how much is lost on the way, how much couldn't be repaired, and how much is held back to smooth out the network.
+
+### Play only on the other device
+
+The output is muted only while the other device confirms the sound is arriving and playing. It comes back when you stop sending, the link drops, the other device stops playing, or sound from the other device is playing on that same output. Sending a microphone doesn't mute anything. If you had muted the output yourself, it stays muted, and if you unmute it by hand, mesh-kvm leaves it alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
+
+### Devices coming and going
+
+Plug a device in or take it out and the lists update without restarting anything. If a chosen device isn't there, the system default is used and a note says so, and mesh-kvm goes back to your choice when the device returns. With System default chosen, capture and muting both follow the default to its new device.
+
+### Sending sound both ways
+
+When both devices send an output, each must leave out what it plays, or the sound goes round and round as an echo.
+
+- On Debian, mesh-kvm doesn't record the output. It connects to each app playing there, and leaves itself out, so this always works. It also means that the output's own volume and mute don't change what's sent.
+- On Windows, recording an output includes everything playing on it. If received audio plays on a different output, that's fine. If it plays on the same output, then while both directions are in use mesh-kvm asks Windows for all sound except its own, on Windows 10 version 2004 or later. Windows can't limit that to one output, so a note says that all of the laptop's sound is being sent. If Windows refuses, mesh-kvm goes back to ordinary recording, and the app warns that you may hear an echo.
+
+A microphone that can hear the speakers will still pick them up. Headphones avoid that.
+
+### How it works
+
+Audio travels on UDP port 24851 as Opus in 10 ms packets, or plain PCM in 5 ms packets when Uncompressed is chosen. A jitter buffer on the receiving side holds as little as the network allows: one packet on a clean link, more when packets arrive unevenly, and it shrinks back once things calm down. A missing packet is rebuilt or made up by the decoder rather than left as a gap. Both devices need the same packet format, so update them together. If they differ, audio stays silent and the app says so.
+
+Opus is built from the copy in `third_party/opus`, so building needs only a C compiler, on both targets. `tests/audio_measure.py` measures quality, delay and bandwidth at each bitrate with `tc netem` adding loss and jitter. `tests/audio_devices.py` runs two whole devices beside private sound servers, and checks echo, muting, devices coming and going, and mixing. Neither can reach your real audio.
 
 ## Arranging screens
 
@@ -114,7 +145,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 
 ## Tests
 
-`cargo test` runs the unit tests. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, layout sync, and saving and changing the address:
+`cargo test` runs the unit tests. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, the audio bus, layout sync, and saving and changing the address:
 
 ```
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'

@@ -17,6 +17,7 @@ install -m 644 packaging/deb/mesh-kvm.service "$root/usr/lib/systemd/user/"
 install -m 644 99-mesh-kvm-uinput.rules "$root/usr/lib/udev/rules.d/"
 install -m 755 packaging/deb/postinst packaging/deb/prerm "$root/DEBIAN/"
 install -m 644 README.md "$root/usr/share/doc/mesh-kvm/"
+install -m 644 third_party/opus/COPYING "$root/usr/share/doc/mesh-kvm/opus-COPYING"
 
 # The program writes its own launchers and icon; only their paths differ here.
 home=$out/home
