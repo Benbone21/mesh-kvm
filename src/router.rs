@@ -56,7 +56,6 @@ pub enum Event {
     /// The main device's view of the active device. Repairs a desync, so it never warps.
     PeerActiveView { active: DeviceId },
     /// The peer's manual game lock: refuses crossings like `SetCaptive`, tracked separately.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PeerGameLock(bool),
     PeerPanic,
     Tick { now_ms: u64 },
@@ -548,8 +547,7 @@ impl Router {
     }
 }
 
-/// A stretch of one screen edge, in laptop-local pixels along that edge (`start..=end`).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// A stretch of one screen edge, in pixels along that edge (`start..=end`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeSpan {
     pub edge: SwitchEdge,
@@ -558,13 +556,11 @@ pub struct EdgeSpan {
 }
 
 /// Accumulates outward pointer push against an edge until it exceeds the resistance.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct EdgeTracker {
     resistance: i32,
     pushed: i32,
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 impl EdgeTracker {
     pub const fn new(resistance: i32) -> Self {
         Self { resistance, pushed: 0 }

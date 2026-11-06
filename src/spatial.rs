@@ -1,13 +1,31 @@
-use crate::protocol::SwitchEdge;
-use crate::router::{EdgeSpan, KEEP_CURSOR};
+//! The screen layout, which every device keeps its own copy of, and the API both services serve.
+//!
+//! Positions and shared settings are edited on either device. Each edit raises `revision`, and
+//! the heartbeats tell the other device, which fetches the newer copy. Monitors are facts rather
+//! than edits: each device reports its own, and they never raise the revision.
+
+use crate::platform::Platform;
+pub use crate::protocol::MonitorRect;
+use crate::protocol::{NodeId, SwitchEdge};
+use crate::router::{EdgeSpan, EdgeTracker, KEEP_CURSOR};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// How far in from a screen edge a cursor enters, on both machines.
 const ENTRY_INSET: i32 = 28;
-const LAYOUT_FILE: &str = "/home/bread/mesh-kvm/layout.json";
+const LAYOUT_FILE: &str = "layout.json";
+/// Anything from a file or the network is held to these, so the maths below can't overflow.
+const MAX_COORDINATE: i32 = 1 << 20;
+const MAX_MONITOR_SIZE: i32 = 1 << 16;
+const MAX_MONITORS: usize = 16;
+const MAX_NAME_CHARS: usize = 32;
+const MAX_EDGE_RESISTANCE: i32 = 400;
+/// What a device's screen is taken to be until it reports its own.
+const PLACEHOLDER_SIZE: (i32, i32) = (1920, 1080);
+/// A documentation-only address: asking for the route to it sends nothing.
+const ANY_ROUTED_ADDRESS: &str = "192.0.2.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TouchSide {
@@ -21,458 +39,350 @@ pub enum TouchSide {
     Top,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorRect {
-    pub name: String,
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+fn opposite(edge: SwitchEdge) -> SwitchEdge {
+    match edge {
+        SwitchEdge::Left => SwitchEdge::Right,
+        SwitchEdge::Right => SwitchEdge::Left,
+        SwitchEdge::Top => SwitchEdge::Bottom,
+        SwitchEdge::Bottom => SwitchEdge::Top,
+    }
 }
 
 fn default_true() -> bool {
     true
 }
 
-fn default_native_mode() -> String {
-    "native".to_string()
+fn default_editor() -> NodeId {
+    NodeId::Debian
 }
 
-fn default_win_w() -> i32 {
-    1920
+/// One device in the layout: where its desktop sits, and the monitors on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceLayout {
+    pub node: NodeId,
+    #[serde(default)]
+    pub name: String,
+    /// Where this device's desktop origin sits in the shared layout.
+    pub x: i32,
+    pub y: i32,
+    /// In this device's own desktop coordinates, as it reports them.
+    #[serde(default)]
+    pub monitors: Vec<MonitorRect>,
+    /// Stands in for all the monitors when set, in place of their native sizes.
+    #[serde(default)]
+    pub custom_size: Option<(i32, i32)>,
 }
 
-fn default_win_h() -> i32 {
-    1080
-}
-
-fn default_mouse_speed() -> f32 {
-    0.35
-}
-
-/// Auto-detects all connected Debian displays and their native hardware resolutions & positions via `xrandr --current`.
-pub fn detect_debian_monitors_native() -> (Vec<MonitorRect>, i32, i32) {
-    let mut monitors = Vec::new();
-    if let Ok(output) = Command::new("xrandr").arg("--current").output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut current_mon: Option<MonitorRect> = None;
-
-        for line in text.lines() {
-            if !line.starts_with(' ') && !line.starts_with('\t') && line.contains(" connected") {
-                if let Some(m) = current_mon.take() {
-                    monitors.push(m);
-                }
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                let out_name = parts.first().copied().unwrap_or("Display").to_string();
-                let is_primary = line.contains(" primary ");
-                // Find token matching WxH+X+Y
-                for tok in &parts {
-                    if tok.contains('x') && tok.contains('+') {
-                        let nums: Vec<i32> = tok
-                            .split(|c: char| !c.is_ascii_digit() && c != '-')
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|s| s.parse::<i32>().ok())
-                            .collect();
-                        if nums.len() >= 4 {
-                            let label = if is_primary {
-                                format!("{} (Primary Native)", out_name)
-                            } else {
-                                format!("{} (Native)", out_name)
-                            };
-                            current_mon = Some(MonitorRect {
-                                name: label,
-                                w: nums[0],
-                                h: nums[1],
-                                x: nums[2],
-                                y: nums[3],
-                            });
-                            break;
-                        }
-                    }
-                }
-            } else if line.contains('*') {
-                // Active refresh rate line, e.g. "   2560x1440    359.80*+"
-                if let Some(ref mut m) = current_mon {
-                    for tok in line.split_whitespace() {
-                        if tok.contains('*') {
-                            let clean: String = tok
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                                .collect();
-                            if let Ok(hz) = clean.parse::<f32>() {
-                                let base_name = m
-                                    .name
-                                    .split(' ')
-                                    .next()
-                                    .unwrap_or(&m.name)
-                                    .to_string();
-                                m.name = format!("{} ({:.0}Hz Native)", base_name, hz.round());
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(m) = current_mon.take() {
-            monitors.push(m);
-        }
+impl DeviceLayout {
+    fn placeholder(node: NodeId) -> Self {
+        let (w, h) = PLACEHOLDER_SIZE;
+        let monitors = vec![MonitorRect { name: "Display".to_string(), x: 0, y: 0, w, h }];
+        Self { node, name: String::new(), x: 0, y: 0, monitors, custom_size: None }
     }
 
-    monitors.sort_by_key(|m| (m.x, m.y));
-
-    if monitors.is_empty() {
-        monitors = vec![
-            MonitorRect {
-                name: "DP-3 (240Hz Native)".to_string(),
-                x: 0,
-                y: 360,
-                w: 1920,
-                h: 1080,
-            },
-            MonitorRect {
-                name: "DP-2 (360Hz Native)".to_string(),
-                x: 1920,
-                y: 0,
-                w: 2560,
-                h: 1440,
-            },
-        ];
+    /// This device's screens in the shared layout.
+    pub fn rects(&self) -> Vec<MonitorRect> {
+        if let Some((w, h)) = self.custom_size {
+            return vec![MonitorRect { name: self.name.clone(), x: self.x, y: self.y, w, h }];
+        }
+        let shifted = |m: &MonitorRect| MonitorRect { x: m.x + self.x, y: m.y + self.y, ..m.clone() };
+        self.monitors.iter().map(shifted).collect()
     }
-
-    let total_w = monitors.iter().map(|m| m.x + m.w).max().unwrap_or(4480);
-    let total_h = monitors.iter().map(|m| m.y + m.h).max().unwrap_or(1440);
-    (monitors, total_w, total_h)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `(left, top, right, bottom)` around all of `rects`, with right and bottom exclusive.
+fn bounds(rects: &[MonitorRect]) -> Option<(i32, i32, i32, i32)> {
+    let left = rects.iter().map(|m| m.x).min()?;
+    let top = rects.iter().map(|m| m.y).min()?;
+    let right = rects.iter().map(|m| m.x + m.w).max()?;
+    let bottom = rects.iter().map(|m| m.y + m.h).max()?;
+    Some((left, top, right, bottom))
+}
+
+/// Which copy of the layout is newer: higher revision, and on a tie the higher device id, so that
+/// two devices comparing the same pair always agree.
+pub fn is_newer(candidate: (u64, NodeId), current: (u64, NodeId)) -> bool {
+    (candidate.0, candidate.1 as u8) > (current.0, current.1 as u8)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpatialConfig {
-    pub debian_monitors: Vec<MonitorRect>,
-    pub deb_total_w: i32,
-    pub deb_total_h: i32,
-    /// Position of the Windows laptop in the same 2D pixel space as Debian
-    pub win_x: i32,
-    pub win_y: i32,
-    pub win_w: i32,
-    pub win_h: i32,
-    /// Native physical resolution reported by Windows (or hardware default)
-    #[serde(default = "default_win_w")]
-    pub win_native_w: i32,
-    #[serde(default = "default_win_h")]
-    pub win_native_h: i32,
-    /// "native" (default: uses native resolution of all displays) or "custom"
-    #[serde(default = "default_native_mode")]
-    pub resolution_mode: String,
+    /// Raised by each edit. A copy with a higher one replaces a copy with a lower one.
+    #[serde(default)]
+    pub revision: u64,
+    /// The device that made the edit at `revision`.
+    #[serde(default = "default_editor")]
+    pub editor: NodeId,
+    pub devices: Vec<DeviceLayout>,
     /// Which side of Debian the Windows screen is attached to
     pub attach_side: TouchSide,
-    /// Mouse speed multiplier when controlling Windows from Debian's high-DPI mouse
-    #[serde(default = "default_mouse_speed")]
-    pub mouse_speed: f32,
     /// How many raw mouse counts of pushing against the boundary are needed to cross
     pub edge_resistance: i32,
-    /// Automatically keep mouse captive when a fullscreen or pointer-locked game is running
+    /// Automatically keep mouse captive when a fullscreen or pointer-locked game is running.
+    /// This device's own choice: it doesn't travel with the layout.
     #[serde(default = "default_true")]
     pub auto_game_lock: bool,
-    /// Manually lock mouse & keyboard captive to the currently focused device (Ctrl+Alt+G)
+    /// Manually lock mouse & keyboard captive to the currently focused device (Ctrl+Alt+G).
+    /// This device's own choice: it doesn't travel with the layout.
     #[serde(default)]
     pub manual_game_lock: bool,
 }
 
-impl Default for SpatialConfig {
-    fn default() -> Self {
-        let (debian_monitors, deb_total_w, deb_total_h) = detect_debian_monitors_native();
-        Self {
-            debian_monitors,
-            deb_total_w,
-            deb_total_h,
-            win_x: 2240,
-            win_y: deb_total_h,
-            win_w: 1920,
-            win_h: 1080,
-            win_native_w: 1920,
-            win_native_h: 1080,
-            resolution_mode: "native".to_string(),
-            attach_side: TouchSide::Bottom,
-            mouse_speed: 0.35,
+/// The layout file's fields from before devices were equal.
+#[derive(Deserialize)]
+struct LegacyLayout {
+    debian_monitors: Vec<MonitorRect>,
+    win_x: i32,
+    win_y: i32,
+    win_w: i32,
+    win_h: i32,
+    win_native_w: Option<i32>,
+    win_native_h: Option<i32>,
+    #[serde(default)]
+    resolution_mode: String,
+    attach_side: TouchSide,
+    mouse_speed: Option<f32>,
+    edge_resistance: i32,
+    #[serde(default = "default_true")]
+    auto_game_lock: bool,
+    #[serde(default)]
+    manual_game_lock: bool,
+}
+
+impl LegacyLayout {
+    fn into_config(self) -> SpatialConfig {
+        let (w, h) = (self.win_native_w.unwrap_or(self.win_w), self.win_native_h.unwrap_or(self.win_h));
+        let custom = self.resolution_mode == "custom";
+        SpatialConfig {
+            // Above a device that has never had a layout, so that this arrangement is the one kept.
+            revision: 1,
+            editor: NodeId::Debian,
+            devices: vec![
+                DeviceLayout {
+                    node: NodeId::Debian,
+                    name: String::new(),
+                    x: 0,
+                    y: 0,
+                    monitors: self.debian_monitors,
+                    custom_size: None,
+                },
+                DeviceLayout {
+                    node: NodeId::Windows,
+                    name: String::new(),
+                    x: self.win_x,
+                    y: self.win_y,
+                    monitors: vec![MonitorRect { name: "Laptop display".to_string(), x: 0, y: 0, w, h }],
+                    custom_size: custom.then_some((self.win_w, self.win_h)),
+                },
+            ],
+            attach_side: self.attach_side,
+            edge_resistance: self.edge_resistance,
+            auto_game_lock: self.auto_game_lock,
+            manual_game_lock: self.manual_game_lock,
+        }
+    }
+}
+
+/// What a layout file held.
+#[derive(Debug, PartialEq)]
+pub struct ParsedLayout {
+    pub config: SpatialConfig,
+    /// Debian's pointer speed, which an old layout file carried and settings now do.
+    pub old_pointer_speed: Option<f32>,
+}
+
+/// Reads a layout in either form, or `None` if it is neither. Old field names become the device
+/// list, and every value is brought into range.
+pub fn parse_layout(text: &str) -> Option<ParsedLayout> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let (mut config, old_pointer_speed) = if value.get("devices").is_some() {
+        (serde_json::from_value::<SpatialConfig>(value).ok()?, None)
+    } else {
+        let old: LegacyLayout = serde_json::from_value(value).ok()?;
+        let speed = old.mouse_speed;
+        (old.into_config(), speed)
+    };
+    config.repair();
+    Some(ParsedLayout { config, old_pointer_speed })
+}
+
+/// Brings reported monitors into range and drops any that can't be real.
+pub fn clean_monitors(monitors: Vec<MonitorRect>) -> Vec<MonitorRect> {
+    monitors
+        .into_iter()
+        .filter(|m| m.w > 0 && m.h > 0)
+        .take(MAX_MONITORS)
+        .map(|m| MonitorRect {
+            name: m.name.chars().take(MAX_NAME_CHARS).collect(),
+            x: m.x.clamp(-MAX_COORDINATE, MAX_COORDINATE),
+            y: m.y.clamp(-MAX_COORDINATE, MAX_COORDINATE),
+            w: m.w.min(MAX_MONITOR_SIZE),
+            h: m.h.min(MAX_MONITOR_SIZE),
+        })
+        .collect()
+}
+
+impl SpatialConfig {
+    /// The layout of a device that has never had one. `edge` is the side of this device the other
+    /// one sits on, and `None` puts the laptop to the right of the desktop.
+    pub fn fresh(me: NodeId, edge: Option<SwitchEdge>) -> Self {
+        let edge = edge.unwrap_or(match me {
+            NodeId::Debian => SwitchEdge::Right,
+            NodeId::Windows => SwitchEdge::Left,
+        });
+        let debian_edge = if me == NodeId::Debian { edge } else { opposite(edge) };
+        let attach_side = match debian_edge {
+            SwitchEdge::Right => TouchSide::Right,
+            SwitchEdge::Left => TouchSide::Left,
+            SwitchEdge::Bottom => TouchSide::Bottom,
+            SwitchEdge::Top => TouchSide::Top,
+        };
+        let mut config = Self {
+            revision: 0,
+            editor: me,
+            devices: vec![DeviceLayout::placeholder(NodeId::Debian), DeviceLayout::placeholder(NodeId::Windows)],
+            attach_side,
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
-        }
-    }
-}
-
-impl SpatialConfig {
-    /// Re-snaps `win_x` and `win_y` cleanly onto the outside edge of Debian after `win_w`/`win_h` changes.
-    pub fn resnap_after_resize(&mut self) {
-        match self.attach_side {
-            TouchSide::Right => {
-                self.win_x = self.deb_total_w;
-                self.win_y = self.win_y.clamp(-self.win_h + 240, self.deb_total_h - 240);
-            }
-            TouchSide::Left => {
-                self.win_x = -self.win_w;
-                self.win_y = self.win_y.clamp(-self.win_h + 240, self.deb_total_h - 240);
-            }
-            TouchSide::Bottom => {
-                // Find which Debian monitor it overlaps horizontally with
-                let center_x = self.win_x + self.win_w / 2;
-                let mut target_y = self.deb_total_h;
-                for m in &self.debian_monitors {
-                    if center_x >= m.x && center_x <= m.x + m.w {
-                        target_y = m.y + m.h;
-                        break;
-                    }
-                }
-                self.win_y = target_y;
-                self.win_x = self.win_x.clamp(-self.win_w + 280, self.deb_total_w - 280);
-            }
-            TouchSide::Top => {
-                let center_x = self.win_x + self.win_w / 2;
-                let mut target_y = -self.win_h;
-                for m in &self.debian_monitors {
-                    if center_x >= m.x && center_x <= m.x + m.w {
-                        target_y = m.y - self.win_h;
-                        break;
-                    }
-                }
-                self.win_y = target_y;
-                self.win_x = self.win_x.clamp(-self.win_w + 280, self.deb_total_w - 280);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveTelemetry {
-    pub active_node: String,
-    pub panic_mode: bool,
-    pub deb_cursor_x: i32,
-    pub deb_cursor_y: i32,
-    pub win_cursor_x: i32,
-    pub win_cursor_y: i32,
-    pub peer_addr: String,
-    pub game_captive_active: bool,
-    pub game_reason: String,
-    pub audio_rx_packets: u64,
-    pub audio_rx_peak: u32,
-    pub audio_muted: bool,
-    pub audio_volume: u32,
-    pub audio_tx_enabled: bool,
-    pub audio_tx_packets: u64,
-    pub audio_tx_peak: u32,
-    pub audio_tx_volume: u32,
-    pub audio_tx_source_mode: u32,
-    pub win_peer_reported_res: bool,
-    #[serde(default)]
-    pub peer_online: bool,
-    pub main_conflict: bool,
-}
-
-impl LiveTelemetry {
-    fn new(peer_addr: String) -> Self {
-        Self {
-            active_node: "Debian".to_string(),
-            panic_mode: false,
-            deb_cursor_x: 3200,
-            deb_cursor_y: 720,
-            win_cursor_x: 960,
-            win_cursor_y: 540,
-            peer_addr,
-            game_captive_active: false,
-            game_reason: String::new(),
-            audio_rx_packets: 0,
-            audio_rx_peak: 0,
-            audio_muted: false,
-            audio_volume: 100,
-            audio_tx_enabled: false,
-            audio_tx_packets: 0,
-            audio_tx_peak: 0,
-            audio_tx_volume: 100,
-            audio_tx_source_mode: 0,
-            win_peer_reported_res: false,
-            peer_online: false,
-            main_conflict: false,
-        }
-    }
-}
-
-pub struct SharedSpatialState {
-    pub config: SpatialConfig,
-    pub telemetry: LiveTelemetry,
-    pub pending_manual_switch: Option<String>,
-    pub pending_panic: bool,
-}
-
-/// What the input loop picks up from the Studio.
-pub struct StudioRequests {
-    pub manual_switch: bool,
-    pub panic: bool,
-    pub config: SpatialConfig,
-}
-
-/// Takes pending Studio requests with a config snapshot, or `None` if the lock is busy. The
-/// input loop must never wait here: it runs the link timeout and the failsafe hotkeys.
-pub fn take_studio_requests(state: &RwLock<SharedSpatialState>) -> Option<StudioRequests> {
-    let mut guard = state.try_write().ok()?;
-    Some(StudioRequests {
-        manual_switch: guard.pending_manual_switch.take().is_some(),
-        panic: std::mem::take(&mut guard.pending_panic),
-        config: guard.config.clone(),
-    })
-}
-
-impl SharedSpatialState {
-    pub fn load_or_default(peer_addr: String) -> Self {
-        let mut config = fs::read_to_string(LAYOUT_FILE)
-            .ok()
-            .and_then(|s| serde_json::from_str::<SpatialConfig>(&s).ok())
-            .unwrap_or_default();
-
-        // Always refresh Debian monitors from live hardware native resolutions
-        let (deb_mons, total_w, total_h) = detect_debian_monitors_native();
-        config.debian_monitors = deb_mons;
-        config.deb_total_w = total_w;
-        config.deb_total_h = total_h;
-        if config.resolution_mode.is_empty() {
-            config.resolution_mode = "native".to_string();
-        }
-        if config.resolution_mode == "native" && config.win_native_w > 0 && config.win_native_h > 0
-        {
-            config.win_w = config.win_native_w;
-            config.win_h = config.win_native_h;
-        }
-        config.resnap_after_resize();
-
-        let state = Self {
-            config,
-            telemetry: LiveTelemetry::new(peer_addr),
-            pending_manual_switch: None,
-            pending_panic: false,
         };
-        state.save();
-        state
+        config.resnap();
+        config
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.config) {
-            let _ = fs::write(LAYOUT_FILE, json);
+    /// Leaves exactly one entry per device, with every value in range.
+    fn repair(&mut self) {
+        let mut devices = Vec::with_capacity(2);
+        for node in [NodeId::Debian, NodeId::Windows] {
+            let found = self.devices.iter().find(|d| d.node == node).cloned();
+            devices.push(found.unwrap_or_else(|| DeviceLayout::placeholder(node)));
         }
-    }
-}
-
-impl SpatialConfig {
-    /// Checks if the Debian cursor `(cx, cy)` with movement `(dx, dy)` is touching the shared boundary
-    /// with the Windows screen, and if so returns `(entry_win_x, entry_win_y)` on Windows.
-    pub fn check_debian_to_windows(&self, cx: i32, cy: i32, dx: i32, dy: i32) -> Option<(i32, i32)> {
-        match self.attach_side {
-            TouchSide::Right => {
-                let boundary_x = self.win_x;
-                if dx > 0
-                    && cx >= boundary_x - 4
-                    && cx <= boundary_x + 4
-                    && cy >= self.win_y
-                    && cy <= self.win_y + self.win_h
-                {
-                    let wy = (cy - self.win_y).clamp(12, self.win_h - 12);
-                    return Some((28, wy));
-                }
-            }
-            TouchSide::Left => {
-                let boundary_x = self.win_x + self.win_w;
-                if dx < 0
-                    && cx >= boundary_x - 4
-                    && cx <= boundary_x + 4
-                    && cy >= self.win_y
-                    && cy <= self.win_y + self.win_h
-                {
-                    let wy = (cy - self.win_y).clamp(12, self.win_h - 12);
-                    return Some(((self.win_w - 28).max(12), wy));
-                }
-            }
-            TouchSide::Bottom => {
-                let boundary_y = self.win_y;
-                if dy > 0
-                    && cy >= boundary_y - 4
-                    && cy <= boundary_y + 4
-                    && cx >= self.win_x
-                    && cx <= self.win_x + self.win_w
-                {
-                    let wx = (cx - self.win_x).clamp(12, self.win_w - 12);
-                    return Some((wx, 28));
-                }
-            }
-            TouchSide::Top => {
-                let boundary_y = self.win_y + self.win_h;
-                if dy < 0
-                    && cy >= boundary_y - 4
-                    && cy <= boundary_y + 4
-                    && cx >= self.win_x
-                    && cx <= self.win_x + self.win_w
-                {
-                    let wx = (cx - self.win_x).clamp(12, self.win_w - 12);
-                    return Some((wx, (self.win_h - 28).max(12)));
-                }
-            }
+        for device in &mut devices {
+            device.name = device.name.chars().take(MAX_NAME_CHARS).collect();
+            device.x = device.x.clamp(-MAX_COORDINATE, MAX_COORDINATE);
+            device.y = device.y.clamp(-MAX_COORDINATE, MAX_COORDINATE);
+            device.monitors = clean_monitors(std::mem::take(&mut device.monitors));
+            device.custom_size = device.custom_size.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| {
+                (w.min(MAX_MONITOR_SIZE), h.min(MAX_MONITOR_SIZE))
+            });
         }
-        None
+        self.devices = devices;
+        self.edge_resistance = self.edge_resistance.clamp(0, MAX_EDGE_RESISTANCE);
     }
 
-    /// Adds this movement to the push against the shared boundary in `pushed`, and returns the
-    /// laptop-local entry point once the push reaches `edge_resistance`. Movement that is not
-    /// against the boundary clears the push.
-    pub fn push_debian_edge(
-        &self,
-        cx: i32,
-        cy: i32,
-        dx: i32,
-        dy: i32,
-        pushed: &mut i32,
-    ) -> Option<(i32, i32)> {
-        let Some(entry) = self.check_debian_to_windows(cx, cy, dx, dy) else {
-            *pushed = 0;
-            return None;
+    pub fn device(&self, node: NodeId) -> Option<&DeviceLayout> {
+        self.devices.iter().find(|d| d.node == node)
+    }
+
+    fn device_mut(&mut self, node: NodeId) -> Option<&mut DeviceLayout> {
+        self.devices.iter_mut().find(|d| d.node == node)
+    }
+
+    fn rects(&self, node: NodeId) -> Vec<MonitorRect> {
+        self.device(node).map(DeviceLayout::rects).unwrap_or_default()
+    }
+
+    /// This device's own monitors, in its own desktop coordinates.
+    pub fn monitors(&self, node: NodeId) -> &[MonitorRect] {
+        self.device(node).map_or(&[], |d| &d.monitors)
+    }
+
+    fn stamp(&self) -> (u64, NodeId) {
+        (self.revision, self.editor)
+    }
+
+    /// Records the monitors `node` reports, keeping it against the same edge. True if anything
+    /// changed. No monitors at all means detection failed, so the last known ones stay.
+    pub fn report_monitors(&mut self, node: NodeId, name: &str, monitors: Vec<MonitorRect>) -> bool {
+        let monitors = clean_monitors(monitors);
+        let name: String = name.chars().take(MAX_NAME_CHARS).collect();
+        let Some(device) = self.device_mut(node) else { return false };
+        let renamed = !name.is_empty() && device.name != name;
+        if renamed {
+            device.name = name;
+        }
+        let moved = !monitors.is_empty() && device.monitors != monitors;
+        if moved {
+            device.monitors = monitors;
+            self.resnap();
+        }
+        renamed || moved
+    }
+
+    /// Moves the laptop back onto the edge it is attached to, after a size changed.
+    pub fn resnap(&mut self) {
+        let Some((left, top, right, bottom)) = bounds(&self.rects(NodeId::Debian)) else { return };
+        let Some((win_left, win_top, win_right, win_bottom)) = bounds(&self.rects(NodeId::Windows)) else {
+            return;
         };
-        *pushed = pushed
-            .saturating_add(dx.saturating_abs())
-            .saturating_add(dy.saturating_abs());
-        if *pushed >= self.edge_resistance {
-            *pushed = 0;
-            return Some(entry);
+        let (win_w, win_h) = (win_right - win_left, win_bottom - win_top);
+        // `max` then `min`, so a screen too small for the range doesn't panic.
+        let keep = |v: i32, lo: i32, hi: i32| v.min(hi).max(lo);
+        let keep_y = || keep(win_top, top - win_h + 240, bottom - 240);
+        let keep_x = || keep(win_left, left - win_w + 280, right - 280);
+        // The monitor under the laptop's middle decides how far down or up it goes.
+        let center_x = win_left + win_w / 2;
+        let debian = self.rects(NodeId::Debian);
+        let under = debian.iter().find(|m| center_x >= m.x && center_x <= m.x + m.w);
+        let (x, y) = match self.attach_side {
+            TouchSide::Right => (right, keep_y()),
+            TouchSide::Left => (left - win_w, keep_y()),
+            TouchSide::Bottom => (keep_x(), under.map_or(bottom, |m| m.y + m.h)),
+            TouchSide::Top => (keep_x(), under.map_or(top, |m| m.y) - win_h),
+        };
+        if let Some(laptop) = self.device_mut(NodeId::Windows) {
+            laptop.x += x - win_left;
+            laptop.y += y - win_top;
         }
-        None
     }
 
-    /// The part of the laptop's edge that touches Debian, in laptop-local pixels along that edge.
+    /// The edge of `node` that faces the other device.
+    pub fn facing_edge(&self, node: NodeId) -> SwitchEdge {
+        let debian_edge = match self.attach_side {
+            TouchSide::Right => SwitchEdge::Right,
+            TouchSide::Left => SwitchEdge::Left,
+            TouchSide::Bottom => SwitchEdge::Bottom,
+            TouchSide::Top => SwitchEdge::Top,
+        };
+        if node == NodeId::Debian {
+            debian_edge
+        } else {
+            opposite(debian_edge)
+        }
+    }
+
+    /// The part of `node`'s edge that touches the other device, in `node`'s desktop pixels along
+    /// that edge.
     ///
-    /// Only the monitors closest to the laptop's edge count, so a shorter monitor beside a taller
-    /// one is not treated as touching. With no monitor alongside the laptop the span is empty
-    /// (`start > end`), which no push can cross.
-    pub fn laptop_edge_span(&self) -> EdgeSpan {
-        let (edge, boundary, origin, length) = match self.attach_side {
-            TouchSide::Right => (SwitchEdge::Left, self.win_x, self.win_y, self.win_h),
-            TouchSide::Left => (SwitchEdge::Right, self.win_x + self.win_w, self.win_y, self.win_h),
-            TouchSide::Bottom => (SwitchEdge::Top, self.win_y, self.win_x, self.win_w),
-            TouchSide::Top => (SwitchEdge::Bottom, self.win_y + self.win_h, self.win_x, self.win_w),
+    /// Only the closest monitors count, so a shorter monitor beside a taller one is not treated
+    /// as touching. With nothing alongside, the span is empty (`start > end`), which no push can
+    /// cross.
+    pub fn edge_span(&self, node: NodeId) -> EdgeSpan {
+        let edge = self.facing_edge(node);
+        let empty = EdgeSpan { edge, start: 0, end: -1 };
+        let Some(device) = self.device(node) else { return empty };
+        let side = |m: &MonitorRect, edge: SwitchEdge| match edge {
+            SwitchEdge::Right => m.x + m.w,
+            SwitchEdge::Left => m.x,
+            SwitchEdge::Bottom => m.y + m.h,
+            SwitchEdge::Top => m.y,
         };
-        // (distance from the laptop's edge, overlap start, overlap end), laptop-local and inclusive.
-        let overlaps: Vec<(i32, i32, i32)> = self
-            .debian_monitors
-            .iter()
-            .filter_map(|m| {
-                let (facing, m_start, m_length) = match self.attach_side {
-                    TouchSide::Right => (m.x + m.w, m.y, m.h),
-                    TouchSide::Left => (m.x, m.y, m.h),
-                    TouchSide::Bottom => (m.y + m.h, m.x, m.w),
-                    TouchSide::Top => (m.y, m.x, m.w),
-                };
-                let start = origin.max(m_start);
-                let end = (origin + length).min(m_start + m_length);
-                (start < end).then_some(((facing - boundary).abs(), start - origin, end - 1 - origin))
-            })
-            .collect();
-        let Some(nearest) = overlaps.iter().map(|o| o.0).min() else {
-            return EdgeSpan { edge, start: 0, end: -1 };
-        };
+        let along_x = matches!(edge, SwitchEdge::Top | SwitchEdge::Bottom);
+        let along = |m: &MonitorRect| if along_x { (m.x, m.x + m.w) } else { (m.y, m.y + m.h) };
+        let origin = if along_x { device.x } else { device.y };
+        let (mine, theirs) = (device.rects(), self.rects(node.other()));
+        // (gap between the two monitors, overlap start, overlap end), device-local and inclusive.
+        let mut overlaps = Vec::new();
+        for m in &mine {
+            for o in &theirs {
+                let (start, end) = (along(m).0.max(along(o).0), along(m).1.min(along(o).1));
+                if start < end {
+                    let gap = (side(m, edge) - side(o, opposite(edge))).abs();
+                    overlaps.push((gap, start - origin, end - 1 - origin));
+                }
+            }
+        }
+        let Some(nearest) = overlaps.iter().map(|o| o.0).min() else { return empty };
         let touching = || overlaps.iter().filter(|o| o.0 == nearest);
         EdgeSpan {
             edge,
@@ -481,84 +391,354 @@ impl SpatialConfig {
         }
     }
 
-    /// Converts a laptop-local point to Debian desktop coordinates on the nearest monitor.
-    /// `KEEP_CURSOR` in either coordinate means no warp, so it is returned for both.
-    pub fn laptop_to_debian(&self, x: i32, y: i32) -> (i32, i32) {
+    /// Where a cursor at `(x, y)` on `me` lands on the other device, in that device's own desktop
+    /// coordinates: on its nearest monitor, and in from any edge. `KEEP_CURSOR` in either
+    /// coordinate means no warp, so it is returned for both.
+    pub fn entry_on_peer(&self, me: NodeId, x: i32, y: i32) -> (i32, i32) {
         if x == KEEP_CURSOR || y == KEEP_CURSOR {
             return (KEEP_CURSOR, KEEP_CURSOR);
         }
-        let p = self.clamp_to_debian(x.saturating_add(self.win_x), y.saturating_add(self.win_y));
-        self.inset_on_monitor(p)
+        let (Some(from), Some(to)) = (self.device(me), self.device(me.other())) else { return (x, y) };
+        let rects = to.rects();
+        let point = (x.saturating_add(from.x), y.saturating_add(from.y));
+        let (px, py) = inset_on_monitor(&rects, clamp_to_monitors(&rects, point));
+        (px - to.x, py - to.y)
     }
 
-    /// Pulls a point `ENTRY_INSET` pixels in from any monitor edge it sits on, so entry does not
-    /// land on the boundary pixel. Stays inside the monitor.
-    fn inset_on_monitor(&self, p: (i32, i32)) -> (i32, i32) {
-        let inset = |v: i32, lo: i32, size: i32| {
-            let hi = lo + (size - 1).max(0);
-            let (lo_i, hi_i) = (lo + ENTRY_INSET, hi - ENTRY_INSET);
-            if lo_i > hi_i {
-                // Too small to inset on both sides: use the middle.
-                return lo + (hi - lo) / 2;
+    /// Keeps a warp the peer asked for on one of `me`'s own monitors.
+    pub fn place_on_own(&self, me: NodeId, x: i32, y: i32) -> (i32, i32) {
+        if x == KEEP_CURSOR || y == KEEP_CURSOR {
+            return (KEEP_CURSOR, KEEP_CURSOR);
+        }
+        let monitors = self.monitors(me);
+        inset_on_monitor(monitors, clamp_to_monitors(monitors, (x, y)))
+    }
+
+    /// This copy with the positions and shared settings of `other`. Monitors stay as reported to
+    /// this device, and the game locks stay this device's own.
+    fn with_shared_settings_of(&self, other: &SpatialConfig) -> SpatialConfig {
+        let mut merged = self.clone();
+        for device in &mut merged.devices {
+            if let Some(theirs) = other.device(device.node) {
+                device.x = theirs.x;
+                device.y = theirs.y;
+                device.custom_size = theirs.custom_size;
             }
-            if v == lo {
-                lo_i
-            } else if v == hi {
-                hi_i
-            } else {
-                v
-            }
+        }
+        merged.attach_side = other.attach_side;
+        merged.edge_resistance = other.edge_resistance;
+        merged
+    }
+
+    /// Takes a copy from the other device if it is the newer one. True if it was.
+    pub fn adopt(&mut self, theirs: &SpatialConfig) -> bool {
+        if !is_newer(theirs.stamp(), self.stamp()) {
+            return false;
+        }
+        *self = SpatialConfig { revision: theirs.revision, editor: theirs.editor, ..self.with_shared_settings_of(theirs) };
+        true
+    }
+
+    /// Applies an edit made on `me`, as the newest revision either device has seen.
+    pub fn apply_edit(&mut self, edit: &SpatialConfig, me: NodeId) {
+        let revision = self.revision.max(edit.revision).saturating_add(1);
+        *self = SpatialConfig { revision, editor: me, ..self.with_shared_settings_of(edit) };
+    }
+
+    /// Drops any custom size, as an edit: the screens go back to what the devices report.
+    pub fn reset_sizes(&mut self, me: NodeId) {
+        for device in &mut self.devices {
+            device.custom_size = None;
+        }
+        self.resnap();
+        self.revision = self.revision.saturating_add(1);
+        self.editor = me;
+    }
+}
+
+/// The closest pixel to `(x, y)` on any of `monitors`, or the point itself with none to go on.
+fn clamp_to_monitors(monitors: &[MonitorRect], (x, y): (i32, i32)) -> (i32, i32) {
+    let on_monitor = |m: &MonitorRect| (x.clamp(m.x, m.x + m.w - 1), y.clamp(m.y, m.y + m.h - 1));
+    let distance = |&(px, py): &(i32, i32)| {
+        let (dx, dy) = (i128::from(px) - i128::from(x), i128::from(py) - i128::from(y));
+        dx * dx + dy * dy
+    };
+    monitors.iter().map(on_monitor).min_by_key(distance).unwrap_or((x, y))
+}
+
+/// Pulls a point `ENTRY_INSET` pixels in from any monitor edge it sits on, so entry does not land
+/// on the boundary pixel. Stays inside the monitor.
+fn inset_on_monitor(monitors: &[MonitorRect], p: (i32, i32)) -> (i32, i32) {
+    let inset = |v: i32, lo: i32, size: i32| {
+        let hi = lo + size - 1;
+        let (lo_i, hi_i) = (lo + ENTRY_INSET, hi - ENTRY_INSET);
+        if lo_i > hi_i {
+            // Too small to inset on both sides: use the middle.
+            return lo + (hi - lo) / 2;
+        }
+        if v == lo {
+            lo_i
+        } else if v == hi {
+            hi_i
+        } else {
+            v
+        }
+    };
+    match monitors.iter().find(|m| contains(m, p)) {
+        Some(m) => (inset(p.0, m.x, m.w), inset(p.1, m.y, m.h)),
+        None => p,
+    }
+}
+
+fn contains(m: &MonitorRect, (x, y): (i32, i32)) -> bool {
+    (m.x..m.x + m.w).contains(&x) && (m.y..m.y + m.h).contains(&y)
+}
+
+/// The edge of this device that touches the other one, and how hard the cursor has pushed at it.
+/// The span comes from the other device's `EdgeMap`. Until one arrives, no edge can be crossed.
+pub struct EdgeWatch {
+    span: Option<EdgeSpan>,
+    tracker: EdgeTracker,
+}
+
+impl EdgeWatch {
+    pub const fn new() -> Self {
+        Self { span: None, tracker: EdgeTracker::new(0) }
+    }
+
+    pub fn set_span(&mut self, span: EdgeSpan, resistance: i32) {
+        self.span = Some(span);
+        self.tracker.set_resistance(resistance.clamp(0, MAX_EDGE_RESISTANCE));
+    }
+
+    /// Forgets any push so far, as after a focus change.
+    pub fn reset(&mut self) {
+        let span = EdgeSpan { edge: SwitchEdge::Left, start: 0, end: -1 };
+        self.tracker.push(span, 0, 0, 1, 1, 0, 0, true);
+    }
+
+    /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge.
+    ///
+    /// The tracker works on one rectangle, so it is given the monitor under the cursor, and a
+    /// point that isn't on an outer edge of the desktop doesn't count: the cursor there just
+    /// carries on to the next monitor.
+    pub fn push(&mut self, monitors: &[MonitorRect], (x, y): (i32, i32), (dx, dy): (i32, i32), buttons_held: bool) -> bool {
+        let Some(span) = self.span else { return false };
+        let beyond = match span.edge {
+            SwitchEdge::Left => (x - 1, y),
+            SwitchEdge::Right => (x + 1, y),
+            SwitchEdge::Top => (x, y - 1),
+            SwitchEdge::Bottom => (x, y + 1),
         };
-        let m = self.debian_monitors.iter().find(|m| {
-            m.w > 0 && m.h > 0 && (m.x..m.x + m.w).contains(&p.0) && (m.y..m.y + m.h).contains(&p.1)
-        });
-        match m {
-            Some(m) => (inset(p.0, m.x, m.w), inset(p.1, m.y, m.h)),
-            None if self.debian_monitors.is_empty() => {
-                (inset(p.0, 0, self.deb_total_w), inset(p.1, 0, self.deb_total_h))
+        let monitor = monitors.iter().find(|m| contains(m, (x, y)));
+        let (Some(m), false) = (monitor, monitors.iter().any(|m| contains(m, beyond))) else {
+            self.reset();
+            return false;
+        };
+        let shift = if matches!(span.edge, SwitchEdge::Top | SwitchEdge::Bottom) { m.x } else { m.y };
+        let local = EdgeSpan { edge: span.edge, start: span.start - shift, end: span.end - shift };
+        self.tracker.push(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTelemetry {
+    pub active_node: String,
+    pub panic_mode: bool,
+    /// Where the cursor is on this device, in its own desktop coordinates.
+    pub cursor_x: i32,
+    pub cursor_y: i32,
+    pub peer_addr: String,
+    pub game_captive_active: bool,
+    pub game_reason: String,
+    #[serde(default)]
+    pub peer_online: bool,
+    pub main_conflict: bool,
+}
+
+impl LiveTelemetry {
+    fn new(me: NodeId, peer_addr: String) -> Self {
+        Self {
+            active_node: me.to_string(),
+            panic_mode: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            peer_addr,
+            game_captive_active: false,
+            game_reason: String::new(),
+            peer_online: false,
+            main_conflict: false,
+        }
+    }
+}
+
+pub struct SharedSpatialState {
+    pub me: NodeId,
+    /// `--peer` was given at start, so the address can't be changed from the app.
+    pub peer_pinned: bool,
+    pub config: SpatialConfig,
+    pub telemetry: LiveTelemetry,
+    pub pending_manual_switch: bool,
+    pub pending_panic: bool,
+    /// The newest revision the other device has said it holds.
+    peer_revision: Option<(u64, NodeId)>,
+    /// Where the layout is saved. `None` never saves.
+    file: Option<PathBuf>,
+}
+
+/// What the input loop picks up from the app.
+pub struct StudioRequests {
+    pub manual_switch: bool,
+    pub panic: bool,
+    pub config: SpatialConfig,
+}
+
+/// Takes pending app requests with a config snapshot, or `None` if the lock is busy. The input
+/// loop must never wait here: it runs the link timeout and the failsafe hotkeys.
+pub fn take_studio_requests(state: &RwLock<SharedSpatialState>) -> Option<StudioRequests> {
+    let mut guard = state.try_write().ok()?;
+    Some(StudioRequests {
+        manual_switch: std::mem::take(&mut guard.pending_manual_switch),
+        panic: std::mem::take(&mut guard.pending_panic),
+        config: guard.config.clone(),
+    })
+}
+
+/// The saved layout in `dir`, or else the old one in `old_dir`, which is only ever read: the old
+/// file stays where it is.
+fn load_layout(dir: &Path, old_dir: Option<&Path>) -> Option<ParsedLayout> {
+    let read = |dir: &Path| fs::read_to_string(dir.join(LAYOUT_FILE)).ok().and_then(|text| parse_layout(&text));
+    read(dir).or_else(|| old_dir.and_then(read))
+}
+
+impl SharedSpatialState {
+    /// Loads this device's copy of the layout. The monitors come fresh from the hardware.
+    pub fn load(platform: &dyn Platform, peer_addr: String, peer_pinned: bool) -> Self {
+        let dir = crate::settings::config_dir();
+        let me = platform.node();
+        let parsed = load_layout(&dir, platform.old_layout_dir().as_deref());
+        let (mut config, old_speed) = match parsed {
+            Some(p) => (p.config, p.old_pointer_speed),
+            None => (SpatialConfig::fresh(me, crate::settings::switch_edge()), None),
+        };
+        if let Some(speed) = old_speed {
+            crate::settings::adopt_pointer_speed(speed);
+        }
+        config.report_monitors(me, &crate::settings::device_name(), platform.monitors());
+        let state = Self {
+            me,
+            peer_pinned,
+            config,
+            telemetry: LiveTelemetry::new(me, peer_addr),
+            pending_manual_switch: false,
+            pending_panic: false,
+            peer_revision: None,
+            file: Some(dir.join(LAYOUT_FILE)),
+        };
+        state.save();
+        state
+    }
+
+    pub fn save(&self) {
+        let Some(path) = &self.file else { return };
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.config) {
+            if let Err(e) = crate::settings::write_atomically(path, &json) {
+                crate::settings::log_note(&format!("Couldn't save the layout: {e}"));
             }
-            None => p,
         }
     }
 
-    /// The closest pixel to `(x, y)` on any Debian monitor.
-    fn clamp_to_debian(&self, x: i32, y: i32) -> (i32, i32) {
-        let on_rect = |left: i32, top: i32, w: i32, h: i32| {
-            (x.clamp(left, left + (w - 1).max(0)), y.clamp(top, top + (h - 1).max(0)))
-        };
-        let distance = |&(px, py): &(i32, i32)| {
-            let (dx, dy) = (i128::from(px) - i128::from(x), i128::from(py) - i128::from(y));
-            dx * dx + dy * dy
-        };
-        self.debian_monitors
-            .iter()
-            .map(|m| on_rect(m.x, m.y, m.w, m.h))
-            .min_by_key(distance)
-            .unwrap_or_else(|| on_rect(0, 0, self.deb_total_w, self.deb_total_h))
+    /// True when the other device has said it holds a newer layout than this one.
+    fn peer_is_newer(&self) -> bool {
+        self.peer_revision.is_some_and(|theirs| is_newer(theirs, self.config.stamp()))
     }
 }
 
-
-// ============================================================================================
-// Studio API (Debian = spatial layout master)
-// ============================================================================================
-
-fn debian_autostart_enabled() -> bool {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/bread".to_string());
-    std::path::Path::new(&home)
-        .join(".config/systemd/user/default.target.wants/mesh-kvm.service")
-        .exists()
+/// Records what the other device reported about its screens. Never waits for the lock: a busy
+/// lock just means the next heartbeat does this instead.
+pub fn note_peer_displays(state: &RwLock<SharedSpatialState>, name: &str, monitors: Vec<MonitorRect>) {
+    if let Ok(mut guard) = state.try_write() {
+        let peer = guard.me.other();
+        if guard.config.report_monitors(peer, name, monitors) {
+            guard.save();
+        }
+    }
 }
 
-fn set_debian_autostart(enabled: bool) {
-    let verb = if enabled { "enable" } else { "disable" };
-    let _ = Command::new("systemctl")
-        .args(["--user", verb, "mesh-kvm.service"])
-        .output();
+/// Records the revision the other device says it holds. The sync thread does the rest.
+pub fn note_peer_revision(state: &RwLock<SharedSpatialState>, revision: u64, editor: NodeId) {
+    if let Ok(mut guard) = state.try_write() {
+        guard.peer_revision = Some((revision, editor));
+    }
 }
 
-/// Builds the Debian node's Studio API handler (plugged into the shared `webui` server).
-pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::Handler {
+/// Pushes this device's monitors, which can change while it runs, into its layout.
+fn refresh_own_monitors(state: &RwLock<SharedSpatialState>, platform: &dyn Platform) {
+    let (monitors, name) = (platform.monitors(), crate::settings::device_name());
+    if let Ok(mut guard) = state.write() {
+        let me = guard.me;
+        if guard.config.report_monitors(me, &name, monitors) {
+            guard.save();
+        }
+    }
+}
+
+/// Fetches the other device's copy, if it says it has a newer one. What arrives is held to the
+/// same limits as a saved file.
+fn pull_layout(state: &RwLock<SharedSpatialState>, fetch: impl FnOnce() -> Option<String>) {
+    if !state.read().is_ok_and(|g| g.peer_is_newer()) {
+        return;
+    }
+    let Some(body) = fetch() else { return };
+    let config = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|state| parse_layout(&state.get("config")?.to_string()));
+    if let (Some(theirs), Ok(mut guard)) = (config, state.write()) {
+        if guard.config.adopt(&theirs.config) {
+            guard.save();
+        }
+    }
+}
+
+const SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+/// How many sync passes between looks at this device's monitors. `xrandr` isn't free.
+const PASSES_PER_MONITOR_CHECK: u32 = 10;
+
+/// Keeps this device's copy of the layout current, off the input thread: monitor detection can
+/// hang, and the other device can take a while to answer.
+pub fn start_sync(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>, peer_ip: String) {
+    let spawned = std::thread::Builder::new().name("mesh-kvm-layout-sync".to_string()).spawn(move || {
+        let mut passes = 0u32;
+        loop {
+            std::thread::sleep(SYNC_EVERY);
+            pull_layout(&state, || match crate::webui::http_call(&peer_ip, "GET", "/api/state", "") {
+                Ok((200, body)) => Some(body),
+                _ => None,
+            });
+            passes = passes.wrapping_add(1);
+            if passes.is_multiple_of(PASSES_PER_MONITOR_CHECK) {
+                refresh_own_monitors(&state, platform.as_ref());
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        crate::settings::log_note(&format!("Couldn't start keeping the layout in step: {e}"));
+    }
+}
+
+// ============================================================================================
+// The API both services serve
+// ============================================================================================
+
+fn action_of(val: &serde_json::Value) -> &str {
+    val.get("action").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Builds the API handler (plugged into the shared `webui` server).
+pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>) -> crate::webui::Handler {
     Arc::new(move |req: &crate::webui::HttpRequest| -> Option<String> {
         let path = req.path.split('?').next().unwrap_or("");
         match (req.method.as_str(), path) {
@@ -568,101 +748,49 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
             }
             ("GET", "/api/local") => {
                 let g = state.read().ok()?;
-                let peer_ip = g
-                    .telemetry
-                    .peer_addr
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let mut status = serde_json::json!({
-                    "node": "debian",
-                    "label": "Debian Desktop",
-                    "hostname": crate::webui::hostname(),
-                    "ip": crate::webui::local_ip_toward(&peer_ip),
-                    "peer_ip": peer_ip,
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "os": "Debian 13 (KDE Plasma 6 Wayland)",
-                    "peer_online": g.telemetry.peer_online,
-                    "active_node": g.telemetry.active_node,
-                    "panic_mode": g.telemetry.panic_mode,
-                    "game_lock": g.telemetry.game_captive_active,
-                    "game_reason": g.telemetry.game_reason,
-                    "displays": g.config.debian_monitors,
-                    "cursor": [g.telemetry.deb_cursor_x, g.telemetry.deb_cursor_y],
-                    "autostart": debian_autostart_enabled(),
-                    "input_devices": ["Physical mouse (evdev)", "Desk keyboard (evdev)"],
-                    "audio": crate::settings::audio_status_json(true),
-                });
-                let conflict = g.telemetry.main_conflict;
-                crate::settings::add_toggle_status(&mut status, g.config.mouse_speed, conflict);
-                Some(status.to_string())
+                Some(local_status(&g, platform.as_ref()).to_string())
             }
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
-                let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let act = action_of(&val);
                 if act == "set_main_device" {
                     return Some(set_main_device(&state, &val));
                 }
-                if !handle_local_action(&state, act, &val) {
+                if act == "set_peer" {
+                    return Some(set_peer(&state, &val, req.from_app_here));
+                }
+                if !crate::settings::handle_common_action(act, &val) {
                     match act {
-                        "set_autostart" => set_debian_autostart(
-                            val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-                        ),
-                        // Focus / panic / game lock are master actions; accept them here too
+                        "set_autostart" => {
+                            platform.set_autostart(val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true));
+                        }
+                        // Focus / panic / game lock are layout-wide actions; accept them here too
                         "toggle_focus" | "panic" | "toggle_game_lock" => {
-                            apply_master_action(&state, act, &val);
+                            apply_layout_action(&state, platform.as_ref(), act);
                         }
                         _ => return Some(r#"{"ok":false,"error":"unknown action"}"#.to_string()),
                     }
                 }
-                Some(r#"{"ok":true}"#.to_string())
+                Some(crate::settings::OK_RESPONSE.to_string())
             }
             ("POST", "/api/layout") => {
-                let mut new_cfg: SpatialConfig = match serde_json::from_str(&req.body) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Some(serde_json::json!({ "ok": false, "error": e.to_string() }).to_string())
-                    }
+                let Some(edit) = parse_layout(&req.body) else {
+                    return Some(r#"{"ok":false,"error":"That isn't a layout."}"#.to_string());
                 };
-                // Debian monitors always come from live hardware. xrandr can hang, so it runs
-                // before the lock.
-                let (deb_mons, total_w, total_h) = detect_debian_monitors_native();
                 let mut g = state.write().ok()?;
-                new_cfg.debian_monitors = deb_mons;
-                new_cfg.deb_total_w = total_w;
-                new_cfg.deb_total_h = total_h;
-                new_cfg.win_native_w = g.config.win_native_w;
-                new_cfg.win_native_h = g.config.win_native_h;
-                if new_cfg.resolution_mode == "native" {
-                    new_cfg.win_w = new_cfg.win_native_w;
-                    new_cfg.win_h = new_cfg.win_native_h;
-                }
-                new_cfg.mouse_speed = new_cfg.mouse_speed.clamp(0.05, 2.0);
-                new_cfg.edge_resistance = new_cfg.edge_resistance.clamp(0, 400);
-                println!(
-                    "[Studio] Layout: ({}, {}) {}x{} [{}] side={:?} speed={:.2}x resist={}",
-                    new_cfg.win_x,
-                    new_cfg.win_y,
-                    new_cfg.win_w,
-                    new_cfg.win_h,
-                    new_cfg.resolution_mode,
-                    new_cfg.attach_side,
-                    new_cfg.mouse_speed,
-                    new_cfg.edge_resistance
-                );
-                g.config = new_cfg;
+                let me = g.me;
+                g.config.apply_edit(&edit.config, me);
                 g.save();
-                Some(r#"{"ok":true}"#.to_string())
+                Some(crate::settings::OK_RESPONSE.to_string())
             }
             ("POST", "/api/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
-                let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let act = action_of(&val);
                 if act == "set_main_device" {
                     return Some(set_main_device(&state, &val));
                 }
                 // Legacy audio action names from older UIs
-                let handled_audio = match act.as_str() {
+                let handled_audio = match act {
                     "toggle_audio_mute" => crate::settings::handle_common_action(
                         "set_audio_rx_muted",
                         &serde_json::json!({}),
@@ -673,16 +801,47 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
                     "set_audio_volume" => {
                         crate::settings::handle_common_action("set_audio_rx_volume", &val)
                     }
-                    other => handle_local_action(&state, other, &val),
+                    other => crate::settings::handle_common_action(other, &val),
                 };
                 if !handled_audio {
-                    apply_master_action(&state, &act, &val);
+                    apply_layout_action(&state, platform.as_ref(), act);
                 }
-                Some(r#"{"ok":true}"#.to_string())
+                Some(crate::settings::OK_RESPONSE.to_string())
             }
             _ => None,
         }
     })
+}
+
+/// This device's `/api/local`.
+fn local_status(g: &SharedSpatialState, platform: &dyn Platform) -> serde_json::Value {
+    let peer_ip = g.telemetry.peer_addr.split(':').next().unwrap_or("").to_string();
+    // With no peer yet, the address other devices would use is the one on the default route.
+    let toward = if peer_ip.is_empty() { ANY_ROUTED_ADDRESS } else { peer_ip.as_str() };
+    let mut status = serde_json::json!({
+        "node": g.me.to_string().to_lowercase(),
+        "label": platform.label(),
+        "hostname": crate::webui::hostname(),
+        "ip": crate::webui::local_ip_toward(toward),
+        "paired": !peer_ip.is_empty(),
+        "peer_pinned": g.peer_pinned,
+        "device_name": crate::settings::device_name(),
+        "peer_ip": peer_ip,
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": platform.os_name(),
+        "peer_online": g.telemetry.peer_online,
+        "active_node": g.telemetry.active_node,
+        "panic_mode": g.telemetry.panic_mode,
+        "game_lock": g.telemetry.game_captive_active,
+        "game_reason": g.telemetry.game_reason,
+        "displays": g.config.monitors(g.me),
+        "cursor": [g.telemetry.cursor_x, g.telemetry.cursor_y],
+        "autostart": platform.autostart_enabled(),
+        "input_devices": platform.input_devices(),
+        "audio": crate::settings::audio_status_json(platform.can_pick_audio_source()),
+    });
+    crate::settings::add_toggle_status(&mut status, g.telemetry.main_conflict);
+    status
 }
 
 fn set_main_device(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value) -> String {
@@ -690,42 +849,25 @@ fn set_main_device(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Va
     crate::settings::set_main_device(val, link_up)
 }
 
-/// `settings::handle_common_action`, except that Debian's pointer speed is the layout's
-/// `mouse_speed`, which the input loop picks up from its next config snapshot.
-fn handle_local_action(
-    state: &Arc<RwLock<SharedSpatialState>>,
-    act: &str,
-    val: &serde_json::Value,
-) -> bool {
-    if act != "set_pointer_speed" {
-        return crate::settings::handle_common_action(act, val);
-    }
-    if let Some(speed) = crate::settings::requested_pointer_speed(val) {
-        if let Ok(mut g) = state.write() {
-            g.config.mouse_speed = speed;
-            g.save();
-        }
-    }
-    true
+fn set_peer(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value, from_this_device: bool) -> String {
+    let pinned = state.read().is_ok_and(|g| g.peer_pinned);
+    let is_own_address = |ip: &str| crate::webui::local_ip_toward(ip) == ip;
+    crate::settings::set_peer(val, crate::settings::PeerChange { from_this_device, pinned, is_own_address: &is_own_address })
 }
 
-fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val: &serde_json::Value) {
-    // xrandr can hang, so it runs before the lock.
-    let detected = (act == "reset_native_resolutions").then(detect_debian_monitors_native);
+fn apply_layout_action(state: &Arc<RwLock<SharedSpatialState>>, platform: &dyn Platform, act: &str) {
+    // Monitor detection can hang, so it runs before the lock.
+    let detected = (act == "reset_native_resolutions").then(|| platform.monitors());
     let Ok(mut g) = state.write() else { return };
-    if let Some((deb_mons, total_w, total_h)) = detected {
-        g.config.debian_monitors = deb_mons;
-        g.config.deb_total_w = total_w;
-        g.config.deb_total_h = total_h;
-        g.config.resolution_mode = "native".to_string();
-        g.config.win_w = g.config.win_native_w.max(640);
-        g.config.win_h = g.config.win_native_h.max(480);
-        g.config.resnap_after_resize();
+    let me = g.me;
+    if let Some(monitors) = detected {
+        g.config.report_monitors(me, "", monitors);
+        g.config.reset_sizes(me);
         g.save();
         return;
     }
     match act {
-        "toggle_focus" => g.pending_manual_switch = Some("toggle".to_string()),
+        "toggle_focus" => g.pending_manual_switch = true,
         "panic" => g.pending_panic = true,
         "toggle_game_lock" => {
             g.config.manual_game_lock = !g.config.manual_game_lock;
@@ -743,24 +885,54 @@ fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val:
 mod tests {
     use super::*;
 
+    const OLD_LAYOUT: &str = r#"{
+        "debian_monitors": [
+            {"name": "DP-3 (240Hz Native)", "x": 0, "y": 360, "w": 1920, "h": 1080},
+            {"name": "DP-2 (360Hz Native)", "x": 1920, "y": 0, "w": 2560, "h": 1440}
+        ],
+        "deb_total_w": 4480, "deb_total_h": 1440,
+        "win_x": 1925, "win_y": 1440, "win_w": 2560, "win_h": 1600,
+        "win_native_w": 2560, "win_native_h": 1600,
+        "resolution_mode": "native", "attach_side": "Bottom", "mouse_speed": 0.35,
+        "edge_resistance": 55, "auto_game_lock": true, "manual_game_lock": false
+    }"#;
+
+    fn rect(name: &str, x: i32, y: i32, w: i32, h: i32) -> MonitorRect {
+        MonitorRect { name: name.into(), x, y, w, h }
+    }
+
+    fn dp3() -> MonitorRect {
+        rect("DP-3", 0, 360, 1920, 1080)
+    }
+
+    fn dp2() -> MonitorRect {
+        rect("DP-2", 1920, 0, 2560, 1440)
+    }
+
     /// DP-3 (1920x1080 at 0,360) beside DP-2 (2560x1440 at 1920,0): both end at y = 1440.
     fn layout(attach_side: TouchSide, win_x: i32, win_y: i32) -> SpatialConfig {
         SpatialConfig {
-            debian_monitors: vec![
-                MonitorRect { name: "DP-3".into(), x: 0, y: 360, w: 1920, h: 1080 },
-                MonitorRect { name: "DP-2".into(), x: 1920, y: 0, w: 2560, h: 1440 },
+            revision: 0,
+            editor: NodeId::Debian,
+            devices: vec![
+                DeviceLayout {
+                    node: NodeId::Debian,
+                    name: String::new(),
+                    x: 0,
+                    y: 0,
+                    monitors: vec![dp3(), dp2()],
+                    custom_size: None,
+                },
+                DeviceLayout {
+                    node: NodeId::Windows,
+                    name: String::new(),
+                    x: win_x,
+                    y: win_y,
+                    monitors: vec![rect("Laptop", 0, 0, 1920, 1080)],
+                    custom_size: None,
+                },
             ],
-            deb_total_w: 4480,
-            deb_total_h: 1440,
-            win_x,
-            win_y,
-            win_w: 1920,
-            win_h: 1080,
-            win_native_w: 1920,
-            win_native_h: 1080,
-            resolution_mode: "native".to_string(),
             attach_side,
-            mouse_speed: 0.35,
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
@@ -771,168 +943,599 @@ mod tests {
         EdgeSpan { edge, start, end }
     }
 
+    fn laptop_span(c: &SpatialConfig) -> EdgeSpan {
+        c.edge_span(NodeId::Windows)
+    }
+
+    /// A laptop point, as it lands on Debian.
+    fn to_debian(c: &SpatialConfig, x: i32, y: i32) -> (i32, i32) {
+        c.entry_on_peer(NodeId::Windows, x, y)
+    }
+
+    fn laptop_mut(c: &mut SpatialConfig) -> &mut DeviceLayout {
+        c.device_mut(NodeId::Windows).unwrap()
+    }
+
+    fn debian_mut(c: &mut SpatialConfig) -> &mut DeviceLayout {
+        c.device_mut(NodeId::Debian).unwrap()
+    }
+
+    // ---- Migration ----
+
+    #[test]
+    fn old_field_names_become_the_device_list() {
+        let parsed = parse_layout(OLD_LAYOUT).unwrap();
+        let c = parsed.config;
+        assert_eq!(parsed.old_pointer_speed, Some(0.35));
+        assert_eq!(c.monitors(NodeId::Debian), &[rect("DP-3 (240Hz Native)", 0, 360, 1920, 1080), rect("DP-2 (360Hz Native)", 1920, 0, 2560, 1440)]);
+        let laptop = c.device(NodeId::Windows).unwrap();
+        assert_eq!((laptop.x, laptop.y), (1925, 1440));
+        assert_eq!(laptop.monitors, vec![rect("Laptop display", 0, 0, 2560, 1600)]);
+        assert_eq!(laptop.custom_size, None);
+        assert_eq!(c.attach_side, TouchSide::Bottom);
+        assert_eq!(c.edge_resistance, 55);
+    }
+
+    #[test]
+    fn a_migrated_layout_outranks_a_device_that_never_had_one() {
+        let migrated = parse_layout(OLD_LAYOUT).unwrap().config;
+        let fresh = SpatialConfig::fresh(NodeId::Windows, None);
+        assert!(is_newer(migrated.stamp(), fresh.stamp()));
+    }
+
+    #[test]
+    fn an_old_custom_size_is_kept_and_old_files_without_native_fields_still_parse() {
+        let text = OLD_LAYOUT.replace(r#""resolution_mode": "native""#, r#""resolution_mode": "custom""#).replace(
+            r#""win_w": 2560, "win_h": 1600"#,
+            r#""win_w": 1920, "win_h": 1200"#,
+        );
+        let c = parse_layout(&text).unwrap().config;
+        let laptop = c.device(NodeId::Windows).unwrap();
+        assert_eq!(laptop.custom_size, Some((1920, 1200)));
+        assert_eq!(laptop.monitors[0].w, 2560);
+
+        let oldest = r#"{"debian_monitors":[],"deb_total_w":0,"deb_total_h":0,"win_x":5,"win_y":6,"win_w":1280,"win_h":800,"attach_side":"Left","edge_resistance":9}"#;
+        let parsed = parse_layout(oldest).unwrap();
+        assert_eq!(parsed.old_pointer_speed, None);
+        assert_eq!(parsed.config.device(NodeId::Windows).unwrap().monitors[0].w, 1280);
+    }
+
+    #[test]
+    fn a_new_layout_survives_a_round_trip_with_no_old_speed() {
+        let c = parse_layout(OLD_LAYOUT).unwrap().config;
+        let back = parse_layout(&serde_json::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back, ParsedLayout { config: c, old_pointer_speed: None });
+    }
+
+    #[test]
+    fn nonsense_is_not_a_layout() {
+        for text in ["{nope", "", "null", "42", "{}", r#"{"devices":3}"#, r#"{"devices":[{"node":"Mac","x":0,"y":0}],"attach_side":"Top","edge_resistance":1}"#] {
+            assert_eq!(parse_layout(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn values_out_of_range_are_repaired_on_the_way_in() {
+        let mut c = layout(TouchSide::Bottom, i32::MAX, i32::MIN);
+        c.edge_resistance = 9000;
+        debian_mut(&mut c).monitors = vec![rect(&"n".repeat(99), i32::MIN, 0, i32::MAX, i32::MAX), rect("gone", 0, 0, 0, 5)];
+        laptop_mut(&mut c).custom_size = Some((-1, 7));
+        let c = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert_eq!(c.edge_resistance, 400);
+        let m = &c.monitors(NodeId::Debian)[0];
+        assert_eq!(c.monitors(NodeId::Debian).len(), 1);
+        assert_eq!((m.name.chars().count(), m.x, m.w), (32, -MAX_COORDINATE, MAX_MONITOR_SIZE));
+        let laptop = c.device(NodeId::Windows).unwrap();
+        assert_eq!((laptop.x, laptop.y, laptop.custom_size), (MAX_COORDINATE, -MAX_COORDINATE, None));
+        // None of the maths can overflow or panic on what is left.
+        for node in [NodeId::Debian, NodeId::Windows] {
+            let _ = c.edge_span(node);
+            let _ = c.entry_on_peer(node, i32::MAX, i32::MIN + 1);
+        }
+        let mut c = c;
+        c.resnap();
+    }
+
+    #[test]
+    fn a_missing_device_gets_a_placeholder_and_a_repeat_is_dropped() {
+        let text = r#"{"devices":[{"node":"Debian","x":1,"y":2},{"node":"Debian","x":3,"y":4}],"attach_side":"Top","edge_resistance":1}"#;
+        let c = parse_layout(text).unwrap().config;
+        assert_eq!(c.devices.len(), 2);
+        assert_eq!(c.device(NodeId::Debian).unwrap().x, 1);
+        assert_eq!(c.monitors(NodeId::Windows).len(), 1);
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mesh-kvm-spatial-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_saved_layout_wins_and_the_old_file_is_read_but_never_touched() {
+        let (config, old) = (temp("config"), temp("old"));
+        fs::write(old.join(LAYOUT_FILE), OLD_LAYOUT).unwrap();
+
+        // First run: nothing saved yet, so the old file is imported, and stays where it is.
+        let imported = load_layout(&config, Some(&old)).unwrap();
+        assert_eq!(imported.old_pointer_speed, Some(0.35));
+        assert_eq!(fs::read_to_string(old.join(LAYOUT_FILE)).unwrap(), OLD_LAYOUT);
+
+        // Later runs: the saved copy wins, and the old speed isn't taken again.
+        let mut saved = imported.config;
+        saved.edge_resistance = 77;
+        fs::write(config.join(LAYOUT_FILE), serde_json::to_string(&saved).unwrap()).unwrap();
+        let again = load_layout(&config, Some(&old)).unwrap();
+        assert_eq!(again.config.edge_resistance, 77);
+        assert_eq!(again.old_pointer_speed, None);
+
+        // Windows has no old location, and a corrupt save falls back rather than failing.
+        assert_eq!(load_layout(&old.join("nowhere"), None), None);
+        fs::write(config.join(LAYOUT_FILE), "{nope").unwrap();
+        assert_eq!(load_layout(&config, Some(&old)).unwrap().config.edge_resistance, 55);
+        let _ = fs::remove_dir_all(config);
+        let _ = fs::remove_dir_all(old);
+    }
+
+    #[test]
+    fn a_fresh_layout_puts_the_other_device_on_the_edge_asked_for() {
+        // Debian's right edge and the laptop's left edge are the same arrangement.
+        assert_eq!(SpatialConfig::fresh(NodeId::Debian, None).attach_side, TouchSide::Right);
+        assert_eq!(SpatialConfig::fresh(NodeId::Windows, None).attach_side, TouchSide::Right);
+        assert_eq!(SpatialConfig::fresh(NodeId::Debian, Some(SwitchEdge::Bottom)).attach_side, TouchSide::Bottom);
+        assert_eq!(SpatialConfig::fresh(NodeId::Windows, Some(SwitchEdge::Bottom)).attach_side, TouchSide::Top);
+        let c = SpatialConfig::fresh(NodeId::Debian, None);
+        assert_eq!(c.device(NodeId::Windows).unwrap().x, PLACEHOLDER_SIZE.0);
+    }
+
+    // ---- Revisions ----
+
+    #[test]
+    fn the_higher_revision_wins_and_a_tie_goes_the_same_way_on_both_devices() {
+        assert!(is_newer((5, NodeId::Debian), (4, NodeId::Windows)));
+        assert!(!is_newer((4, NodeId::Windows), (5, NodeId::Debian)));
+        // Each device compares the pair from its own side, and they must agree.
+        assert!(is_newer((5, NodeId::Windows), (5, NodeId::Debian)));
+        assert!(!is_newer((5, NodeId::Debian), (5, NodeId::Windows)));
+        assert!(!is_newer((5, NodeId::Debian), (5, NodeId::Debian)));
+    }
+
+    /// Both devices' copies of the same arrangement.
+    fn pair() -> (SpatialConfig, SpatialConfig) {
+        (layout(TouchSide::Bottom, 2240, 1440), layout(TouchSide::Bottom, 2240, 1440))
+    }
+
+    fn moved_to(c: &SpatialConfig, x: i32) -> SpatialConfig {
+        let mut edit = c.clone();
+        laptop_mut(&mut edit).x = x;
+        edit
+    }
+
+    fn laptop_x(c: &SpatialConfig) -> i32 {
+        c.device(NodeId::Windows).unwrap().x
+    }
+
+    #[test]
+    fn an_edit_raises_the_revision_and_reaches_the_other_copy() {
+        let (mut debian, mut laptop) = pair();
+        let edit = moved_to(&laptop, 100);
+        laptop.apply_edit(&edit, NodeId::Windows);
+        assert_eq!(laptop.stamp(), (1, NodeId::Windows));
+        assert!(debian.adopt(&laptop));
+        assert_eq!(laptop_x(&debian), 100);
+        assert_eq!(debian.stamp(), laptop.stamp());
+        // Settled: neither side takes anything further from the other.
+        assert!(!laptop.adopt(&debian));
+        assert!(!debian.adopt(&laptop));
+    }
+
+    #[test]
+    fn an_edit_made_while_the_other_device_is_away_lands_when_it_returns() {
+        let (mut debian, mut laptop) = pair();
+        // Two edits on one side, and nothing on the other until the link comes back.
+        for x in [100, 200] {
+            let edit = moved_to(&debian, x);
+            debian.apply_edit(&edit, NodeId::Debian);
+        }
+        assert!(!debian.adopt(&laptop), "the stale copy must not undo the edits");
+        assert!(laptop.adopt(&debian));
+        assert_eq!(laptop_x(&laptop), 200);
+    }
+
+    #[test]
+    fn edits_on_both_sides_settle_on_one_copy() {
+        let (mut debian, mut laptop) = pair();
+        let (a, b) = (moved_to(&debian, 111), moved_to(&laptop, 222));
+        debian.apply_edit(&a, NodeId::Debian);
+        laptop.apply_edit(&b, NodeId::Windows);
+        // Both are at revision 1, and each sees the other's copy.
+        let (d, l) = (debian.clone(), laptop.clone());
+        let took = (debian.adopt(&l), laptop.adopt(&d));
+        assert_eq!(took, (true, false));
+        assert_eq!(laptop_x(&debian), laptop_x(&laptop));
+        assert_eq!(laptop_x(&debian), 222);
+    }
+
+    #[test]
+    fn an_edit_on_a_stale_body_still_becomes_the_newest() {
+        let (mut debian, _) = pair();
+        debian.revision = 9;
+        let stale = moved_to(&layout(TouchSide::Bottom, 0, 0), 5);
+        debian.apply_edit(&stale, NodeId::Debian);
+        assert_eq!(debian.revision, 10);
+        assert_eq!(laptop_x(&debian), 5);
+    }
+
+    #[test]
+    fn a_copy_from_the_other_device_keeps_what_belongs_to_this_one() {
+        let (mut debian, mut laptop) = pair();
+        debian.auto_game_lock = false;
+        debian.manual_game_lock = true;
+        laptop.edge_resistance = 90;
+        laptop.attach_side = TouchSide::Right;
+        // The laptop's copy of Debian's monitors is out of date.
+        debian_mut(&mut laptop).monitors = vec![rect("Old", 0, 0, 10, 10)];
+        laptop.revision = 3;
+        assert!(debian.adopt(&laptop));
+        assert_eq!((debian.edge_resistance, debian.attach_side), (90, TouchSide::Right));
+        assert_eq!(debian.monitors(NodeId::Debian), &[dp3(), dp2()]);
+        assert!(!debian.auto_game_lock && debian.manual_game_lock);
+    }
+
+    #[test]
+    fn a_hardware_report_is_not_an_edit() {
+        let (mut debian, _) = pair();
+        assert!(debian.report_monitors(NodeId::Windows, "Laptop", vec![rect("Display 1", 0, 0, 2560, 1600)]));
+        assert_eq!(debian.revision, 0);
+        assert_eq!(debian.device(NodeId::Windows).unwrap().name, "Laptop");
+        assert!(!debian.report_monitors(NodeId::Windows, "Laptop", vec![rect("Display 1", 0, 0, 2560, 1600)]));
+    }
+
+    #[test]
+    fn a_failed_detection_keeps_the_last_known_monitors() {
+        let (mut debian, _) = pair();
+        assert!(!debian.report_monitors(NodeId::Debian, "", vec![]));
+        assert_eq!(debian.monitors(NodeId::Debian).len(), 2);
+    }
+
+    fn shared_at(revision: u64, editor: NodeId, peer: Option<(u64, NodeId)>) -> RwLock<SharedSpatialState> {
+        let mut config = layout(TouchSide::Bottom, 2240, 1440);
+        config.revision = revision;
+        config.editor = editor;
+        RwLock::new(SharedSpatialState {
+            me: NodeId::Debian,
+            peer_pinned: false,
+            config,
+            telemetry: LiveTelemetry::new(NodeId::Debian, String::new()),
+            pending_manual_switch: true,
+            pending_panic: true,
+            peer_revision: peer,
+            file: None,
+        })
+    }
+
+    fn state_body(c: &SpatialConfig) -> Option<String> {
+        Some(serde_json::json!({ "config": c, "telemetry": {} }).to_string())
+    }
+
+    #[test]
+    fn a_newer_copy_is_fetched_and_nothing_is_fetched_otherwise() {
+        let state = shared_at(1, NodeId::Debian, None);
+        pull_layout(&state, || panic!("nothing said the other copy is newer"));
+        note_peer_revision(&state, 1, NodeId::Debian);
+        pull_layout(&state, || panic!("the same revision isn't newer"));
+
+        let mut theirs = layout(TouchSide::Bottom, 7, 1440);
+        theirs.revision = 2;
+        theirs.editor = NodeId::Windows;
+        note_peer_revision(&state, 2, NodeId::Windows);
+        pull_layout(&state, || state_body(&theirs));
+        let g = state.read().unwrap();
+        assert_eq!((laptop_x(&g.config), g.config.revision), (7, 2));
+        assert!(!g.peer_is_newer());
+    }
+
+    #[test]
+    fn a_failed_fetch_tries_again_and_a_bad_reply_changes_nothing() {
+        let state = shared_at(1, NodeId::Debian, Some((2, NodeId::Windows)));
+        pull_layout(&state, || None);
+        pull_layout(&state, || Some("not json".into()));
+        pull_layout(&state, || Some(r#"{"telemetry":{}}"#.into()));
+        let g = state.read().unwrap();
+        assert_eq!(g.config.revision, 1);
+        assert!(g.peer_is_newer());
+    }
+
+    // ---- Geometry ----
+
     #[test]
     fn bottom_attachment_gives_top_span() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1919));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 0, 1919));
     }
 
     #[test]
     fn right_attachment_gives_left_span() {
         let c = layout(TouchSide::Right, 4480, 200);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Left, 0, 1079));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Left, 0, 1079));
     }
 
     #[test]
     fn left_attachment_gives_right_span() {
         // DP-3 starts at y = 360, so the laptop's first 360 rows have no neighbour.
         let c = layout(TouchSide::Left, -1920, 0);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Right, 360, 1079));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Right, 360, 1079));
     }
 
     #[test]
     fn top_attachment_gives_bottom_span() {
         let c = layout(TouchSide::Top, 2240, -1080);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Bottom, 0, 1919));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Bottom, 0, 1919));
     }
 
     #[test]
     fn partial_overlap_is_clamped() {
         // Hanging 640 px past DP-2's right end.
         let c = layout(TouchSide::Bottom, 3200, 1440);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1279));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 0, 1279));
         // Hanging 200 px above DP-2's top.
         let c = layout(TouchSide::Right, 4480, -200);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Left, 200, 1079));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Left, 200, 1079));
     }
 
     #[test]
     fn span_covers_every_monitor_on_the_same_line() {
         let c = layout(TouchSide::Bottom, 1500, 1440);
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 0, 1919));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 0, 1919));
     }
 
     #[test]
     fn monitor_ending_short_of_the_laptop_does_not_count() {
         let mut c = layout(TouchSide::Bottom, 1500, 1440);
-        c.debian_monitors[0].h = 720; // DP-3 now ends at y = 1080
-        assert_eq!(c.laptop_edge_span(), span(SwitchEdge::Top, 420, 1919));
+        debian_mut(&mut c).monitors[0].h = 720; // DP-3 now ends at y = 1080
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 420, 1919));
     }
 
     #[test]
     fn no_overlap_gives_an_empty_span() {
         let c = layout(TouchSide::Bottom, 5000, 1440);
-        let s = c.laptop_edge_span();
+        let s = laptop_span(&c);
         assert_eq!(s.edge, SwitchEdge::Top);
         assert!(s.start > s.end);
+    }
+
+    #[test]
+    fn each_device_gets_its_own_side_of_the_shared_edge() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Bottom, 2240, 4159));
+        assert_eq!(c.edge_span(NodeId::Windows), span(SwitchEdge::Top, 0, 1919));
+    }
+
+    #[test]
+    fn a_laptop_with_a_monitor_at_negative_coordinates_is_laid_out_from_its_own_origin() {
+        // A second monitor to the left of the laptop's main one, so its x is negative.
+        let mut c = layout(TouchSide::Bottom, 2240, 1440);
+        laptop_mut(&mut c).monitors = vec![rect("Display 2", -1000, 0, 1000, 800), rect("Display 1", 0, 0, 1920, 1080)];
+        // In the layout the pair spans 1240..4160, all of it under DP-3 or DP-2.
+        assert_eq!(c.edge_span(NodeId::Windows), span(SwitchEdge::Top, -1000, 1919));
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Bottom, 1240, 4159));
+        // Down from Debian lands on the left monitor, whose x is negative on the laptop.
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 1740, 1439), (-500, 28));
+        // And back up from it lands where it came from.
+        assert_eq!(c.entry_on_peer(NodeId::Windows, -500, 0), (1740, 1411));
+    }
+
+    #[test]
+    fn resnap_keeps_a_negative_monitor_laptop_on_the_edge() {
+        let mut c = layout(TouchSide::Left, -1920, 400);
+        c.report_monitors(NodeId::Windows, "", vec![rect("Display 2", -1000, 0, 1000, 800), rect("Display 1", 0, 0, 1920, 1080)]);
+        // The pair is 2920 wide now, and its right side still meets Debian's left side.
+        let rects = c.rects(NodeId::Windows);
+        assert_eq!(bounds(&rects).unwrap().2, 0);
+        assert_eq!(bounds(&rects).unwrap().0, -2920);
+    }
+
+    #[test]
+    fn a_taller_laptop_stays_against_the_desktop() {
+        let mut c = layout(TouchSide::Top, 2240, -1080);
+        c.report_monitors(NodeId::Windows, "", vec![rect("Display 1", 0, 0, 1920, 1200)]);
+        assert_eq!(c.device(NodeId::Windows).unwrap().y, -1200);
+    }
+
+    #[test]
+    fn a_custom_size_stands_in_for_the_laptop_monitors() {
+        let mut c = layout(TouchSide::Bottom, 1920, 1440);
+        laptop_mut(&mut c).custom_size = Some((1000, 500));
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 0, 999));
+        c.reset_sizes(NodeId::Windows);
+        assert_eq!(laptop_span(&c), span(SwitchEdge::Top, 0, 1919));
+        assert_eq!(c.stamp(), (1, NodeId::Windows));
     }
 
     #[test]
     fn laptop_point_converts_to_debian_coordinates() {
         // Laptop right of DP-2: (-1, 300) is just outside, so it lands on DP-2's last column.
         let c = layout(TouchSide::Right, 4480, 200);
-        assert_eq!(c.laptop_to_debian(-1, 300), (4451, 500));
+        assert_eq!(to_debian(&c, -1, 300), (4451, 500));
+    }
+
+    #[test]
+    fn debian_point_converts_to_laptop_coordinates() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 2340, 1439), (100, 28));
+        let c = layout(TouchSide::Right, 4480, 200);
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 4479, 500), (28, 300));
     }
 
     #[test]
     fn laptop_point_clamps_to_nearest_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_to_debian(100, -1), (2340, 1411));
-        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1411));
+        assert_eq!(to_debian(&c, 100, -1), (2340, 1411));
+        assert_eq!(to_debian(&c, 100, 40), (2340, 1411));
         // Left of the laptop's origin and below DP-3.
-        assert_eq!(c.laptop_to_debian(-1000, 0), (1240, 1411));
+        assert_eq!(to_debian(&c, -1000, 0), (1240, 1411));
         // The empty corner above DP-3 goes to the closer of the two monitors.
         let c = layout(TouchSide::Top, 0, 0);
-        assert_eq!(c.laptop_to_debian(1900, 100), (1948, 100));
-        assert_eq!(c.laptop_to_debian(100, 340), (100, 388));
+        assert_eq!(to_debian(&c, 1900, 100), (1948, 100));
+        assert_eq!(to_debian(&c, 100, 340), (100, 388));
     }
 
     #[test]
     fn keep_cursor_is_not_converted() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_to_debian(KEEP_CURSOR, KEEP_CURSOR), (KEEP_CURSOR, KEEP_CURSOR));
+        let keep = (KEEP_CURSOR, KEEP_CURSOR);
+        assert_eq!(to_debian(&c, KEEP_CURSOR, KEEP_CURSOR), keep);
         // A half-set sentinel must not become a warp to a clamped corner.
-        assert_eq!(c.laptop_to_debian(KEEP_CURSOR, 5), (KEEP_CURSOR, KEEP_CURSOR));
-        assert_eq!(c.laptop_to_debian(5, KEEP_CURSOR), (KEEP_CURSOR, KEEP_CURSOR));
+        assert_eq!(to_debian(&c, KEEP_CURSOR, 5), keep);
+        assert_eq!(to_debian(&c, 5, KEEP_CURSOR), keep);
+        assert_eq!(c.place_on_own(NodeId::Debian, 5, KEEP_CURSOR), keep);
     }
 
     #[test]
-    fn hostile_laptop_coordinates_stay_on_a_monitor() {
+    fn hostile_coordinates_stay_on_a_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.laptop_to_debian(i32::MAX, i32::MAX), (4451, 1411));
-        assert_eq!(c.laptop_to_debian(i32::MIN + 1, i32::MIN + 1), (28, 388));
+        assert_eq!(to_debian(&c, i32::MAX, i32::MAX), (4451, 1411));
+        assert_eq!(to_debian(&c, i32::MIN + 1, i32::MIN + 1), (28, 388));
+        assert_eq!(c.place_on_own(NodeId::Debian, i32::MAX, i32::MAX), (4451, 1411));
+        assert_eq!(c.place_on_own(NodeId::Windows, i32::MIN + 1, i32::MAX), (28, 1051));
     }
 
     #[test]
-    fn laptop_point_without_monitors_uses_the_desktop_box() {
+    fn a_warp_inside_the_screen_is_left_alone() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        assert_eq!(c.place_on_own(NodeId::Windows, 100, 200), (100, 200));
+    }
+
+    #[test]
+    fn a_point_with_no_monitors_to_go_on_stays_as_it_is() {
         let mut c = layout(TouchSide::Bottom, 2240, 1440);
-        c.debian_monitors.clear();
-        assert_eq!(c.laptop_to_debian(100, 40), (2340, 1411));
+        laptop_mut(&mut c).monitors.clear();
+        assert_eq!(c.place_on_own(NodeId::Windows, 100, 40), (100, 40));
     }
 
     #[test]
     fn entry_is_inset_from_the_edge_it_lands_on_only() {
         let c = layout(TouchSide::Right, 4480, 200);
         // Interior points on the free axis keep their coordinate.
-        assert_eq!(c.laptop_to_debian(-1, 700), (4451, 900));
+        assert_eq!(to_debian(&c, -1, 700), (4451, 900));
         // An interior point is untouched.
-        assert_eq!(c.laptop_to_debian(-500, 300), (3980, 500));
+        assert_eq!(to_debian(&c, -500, 300), (3980, 500));
     }
 
     #[test]
     fn inset_stays_inside_a_tiny_monitor() {
         let mut c = layout(TouchSide::Right, 4480, 200);
-        c.debian_monitors = vec![MonitorRect { name: "T".into(), x: 0, y: 0, w: 40, h: 40 }];
-        let (x, y) = c.laptop_to_debian(-4480, -200);
+        debian_mut(&mut c).monitors = vec![rect("T", 0, 0, 40, 40)];
+        let (x, y) = to_debian(&c, -4480, -200);
         assert!((0..40).contains(&x) && (0..40).contains(&y));
     }
 
-    fn shared_state() -> RwLock<SharedSpatialState> {
-        RwLock::new(SharedSpatialState {
-            config: layout(TouchSide::Bottom, 2240, 1440),
-            telemetry: LiveTelemetry::new(String::new()),
-            pending_manual_switch: Some("toggle".to_string()),
-            pending_panic: true,
-        })
+    fn watch(c: &SpatialConfig, node: NodeId) -> EdgeWatch {
+        let mut watch = EdgeWatch::new();
+        watch.set_span(c.edge_span(node), c.edge_resistance);
+        watch
+    }
+
+    #[test]
+    fn no_edge_can_be_crossed_before_a_span_arrives() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let mut edge = EdgeWatch::new();
+        assert!(!edge.push(c.monitors(NodeId::Debian), (2340, 1439), (0, 999), false));
+    }
+
+    #[test]
+    fn edge_push_crosses_after_resistance() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.push(monitors, (2340, 1439), (0, 30), false));
+        assert!(edge.push(monitors, (2340, 1439), (0, 30), false));
+        assert!(!edge.push(monitors, (2340, 1439), (0, 30), false), "the count starts again after a crossing");
+    }
+
+    #[test]
+    fn edge_push_resets_away_from_the_boundary() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        edge.push(monitors, (2340, 1439), (0, 30), false);
+        assert!(!edge.push(monitors, (2340, 1000), (0, 30), false));
+        assert!(!edge.push(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn edge_push_ignores_a_stretch_with_nothing_beside_it() {
+        // The laptop sits under DP-2 only, so the bottom of DP-3 leads nowhere.
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.push(c.monitors(NodeId::Debian), (500, 1439), (0, 99), false));
+    }
+
+    #[test]
+    fn the_edge_between_two_of_a_devices_own_monitors_is_not_crossable() {
+        // On the right of Debian, with the span running down DP-2. The right column of DP-3 lines
+        // up with that span, but the cursor there is only moving on to DP-2.
+        let c = layout(TouchSide::Right, 4480, 360);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.push(monitors, (1919, 700), (500, 0), false));
+        assert!(edge.push(monitors, (4479, 700), (500, 0), false));
+    }
+
+    #[test]
+    fn edge_push_works_on_a_monitor_at_negative_coordinates() {
+        let mut c = layout(TouchSide::Left, -2920, 0);
+        laptop_mut(&mut c).monitors = vec![rect("Display 1", 0, 0, 1920, 1080), rect("Display 2", -1000, 0, 1000, 800)];
+        let mut edge = watch(&c, NodeId::Windows);
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        // The edge is the main monitor's right side, and the span is in laptop coordinates.
+        assert!(edge.push(&monitors, (1919, 700), (99, 0), false));
+        // The left monitor's right side only leads on to the main one.
+        assert!(!edge.push(&monitors, (-1, 700), (99, 0), false));
+        // With the laptop on the other side, it is the negative monitor's left side that counts.
+        let mut c = layout(TouchSide::Right, 4480 + 1000, 0);
+        laptop_mut(&mut c).monitors = monitors.clone();
+        let mut edge = watch(&c, NodeId::Windows);
+        assert_eq!(c.edge_span(NodeId::Windows).edge, SwitchEdge::Left);
+        assert!(edge.push(&monitors, (-1000, 300), (-99, 0), false));
+    }
+
+    #[test]
+    fn a_cursor_off_every_monitor_clears_the_push() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        edge.push(monitors, (2340, 1439), (0, 30), false);
+        assert!(!edge.push(monitors, (100, 100), (0, 30), false));
+        assert!(!edge.push(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn a_held_button_stops_a_crossing() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.push(c.monitors(NodeId::Debian), (2340, 1439), (0, 99), true));
     }
 
     #[test]
     fn studio_requests_are_taken_once() {
-        let state = shared_state();
+        let state = shared_at(0, NodeId::Debian, None);
         let first = take_studio_requests(&state).unwrap();
         assert!(first.manual_switch && first.panic);
-        assert_eq!(first.config.win_x, 2240);
+        assert_eq!(laptop_x(&first.config), 2240);
         let second = take_studio_requests(&state).unwrap();
         assert!(!second.manual_switch && !second.panic);
     }
 
     #[test]
     fn busy_lock_skips_the_sync_and_keeps_requests() {
-        let state = shared_state();
+        let state = shared_at(0, NodeId::Debian, None);
         {
             let _studio = state.read().unwrap();
             assert!(take_studio_requests(&state).is_none());
         }
         let taken = take_studio_requests(&state).unwrap();
         assert!(taken.manual_switch && taken.panic);
-    }
-
-    #[test]
-    fn edge_push_crosses_after_resistance() {
-        let c = layout(TouchSide::Bottom, 2240, 1440);
-        let mut pushed = 0;
-        assert_eq!(c.push_debian_edge(2340, 1439, 0, 30, &mut pushed), None);
-        assert_eq!(pushed, 30);
-        assert_eq!(c.push_debian_edge(2340, 1439, 0, 30, &mut pushed), Some((100, 28)));
-        assert_eq!(pushed, 0);
-    }
-
-    #[test]
-    fn edge_push_resets_away_from_the_boundary() {
-        let c = layout(TouchSide::Bottom, 2240, 1440);
-        let mut pushed = 0;
-        c.push_debian_edge(2340, 1439, 0, 30, &mut pushed);
-        assert_eq!(c.push_debian_edge(2340, 1000, 0, 30, &mut pushed), None);
-        assert_eq!(pushed, 0);
     }
 }

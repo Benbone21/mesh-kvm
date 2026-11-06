@@ -5,11 +5,11 @@ use crate::keymap::{
 };
 use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
-    NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
+    MonitorRect, NodeId, Packet, Payload, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, Event, Router, RouterConfig, KEEP_CURSOR};
-use crate::spatial::{studio_handler, take_studio_requests, SharedSpatialState, SpatialConfig};
+use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -1057,7 +1057,7 @@ struct Core<'a> {
     backend: LinuxBackend,
     peer: UdpPeer<'a>,
     last_focus_change: Instant,
-    edge_pushed: i32,
+    edge: EdgeWatch,
 }
 
 impl Core<'_> {
@@ -1069,7 +1069,7 @@ impl Core<'_> {
         let after = self.router.active();
         if after != before {
             self.last_focus_change = Instant::now();
-            self.edge_pushed = 0;
+            self.edge.reset();
             let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
             println!("[Debian] Focus switched to {name}");
         }
@@ -1083,23 +1083,24 @@ impl Core<'_> {
             && !self.router.panicked()
             && !self.router.captive()
             && self.router.active() == DEBIAN
-            && !self.backend.any_button_held()
             && self.last_focus_change.elapsed() >= EDGE_SETTLE;
         if !can_cross {
             return;
         }
         let cx = self.backend.kwin_x.load(Ordering::Relaxed);
         let cy = self.backend.kwin_y.load(Ordering::Relaxed);
-        if let Some((x, y)) = cfg.push_debian_edge(cx, cy, dx, dy, &mut self.edge_pushed) {
+        let held = self.backend.any_button_held();
+        if self.edge.push(cfg.monitors(NodeId::Debian), (cx, cy), (dx, dy), held) {
+            let (x, y) = cfg.entry_on_peer(NodeId::Debian, cx, cy);
             self.route(Event::EdgeCrossed { x, y, from_peer });
         }
     }
 }
 
 pub fn run_debian_node(
+    spatial_state: Arc<RwLock<SharedSpatialState>>,
     peer_addr: SocketAddr,
     listen_port: u16,
-    _switch_edge: SwitchEdge,
     override_width: Option<i32>,
     override_height: Option<i32>,
     explicit_mouse: Option<String>,
@@ -1108,13 +1109,6 @@ pub fn run_debian_node(
     let width = override_width.unwrap_or(det_w).max(100);
     let height = override_height.unwrap_or(det_h).max(100);
 
-    let spatial_state = Arc::new(RwLock::new(SharedSpatialState::load_or_default(
-        peer_addr.to_string(),
-    )));
-    crate::webui::start(
-        peer_addr.ip().to_string(),
-        studio_handler(Arc::clone(&spatial_state)),
-    )?;
     crate::mute::start();
 
     let vkbd = VirtualKeyboard::new()?;
@@ -1160,7 +1154,7 @@ pub fn run_debian_node(
             peer: WINDOWS,
             main: crate::settings::main_device(),
             sharing: crate::settings::sharing(),
-            pointer_speed: cfg_snapshot.mouse_speed,
+            pointer_speed: crate::settings::pointer_speed(),
         }),
         backend: LinuxBackend {
             vkbd,
@@ -1179,7 +1173,7 @@ pub fn run_debian_node(
             seq: init_seq,
         },
         last_focus_change: Instant::now() - EDGE_SETTLE,
-        edge_pushed: 0,
+        edge: EdgeWatch::new(),
     };
 
     let clock = Instant::now();
@@ -1213,7 +1207,7 @@ pub fn run_debian_node(
     }
 
     loop {
-        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || crate::settings::restart_requested() {
             // Input first: the D-Bus call below can hang if KWin does.
             println!("\n[Debian] Shutting down cleanly; releasing all EVIOCGRAB locks.");
             core.backend.set_blocking(false, false);
@@ -1249,7 +1243,8 @@ pub fn run_debian_node(
             core.route(event);
         }
 
-        core.router.set_pointer_speed(cfg_snapshot.mouse_speed);
+        core.router.set_pointer_speed(crate::settings::pointer_speed());
+        core.edge.set_span(cfg_snapshot.edge_span(NodeId::Debian), cfg_snapshot.edge_resistance);
         let is_game_captive = cfg_snapshot.manual_game_lock
             || (cfg_snapshot.auto_game_lock && kwin_game_active.load(Ordering::Relaxed));
         if core.router.captive() != is_game_captive {
@@ -1292,7 +1287,7 @@ pub fn run_debian_node(
                 }
                 Payload::FocusSwitchAt { target_node, x, y } => {
                     if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
-                        let (x, y) = cfg_snapshot.laptop_to_debian(x, y);
+                        let (x, y) = cfg_snapshot.place_on_own(NodeId::Debian, x, y);
                         core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
                     }
                 }
@@ -1303,32 +1298,10 @@ pub fn run_debian_node(
                     println!("[PANIC] Received PanicRelease from Windows!");
                     core.route(Event::PeerPanic);
                 }
-                Payload::PeerDisplayInfo {
-                    width: peer_w,
-                    height: peer_h,
-                } => {
-                    if peer_w >= 640 && peer_h >= 480 {
-                        if let Ok(mut guard) = spatial_state.write() {
-                            let changed = guard.config.win_native_w != peer_w
-                                || guard.config.win_native_h != peer_h;
-                            guard.config.win_native_w = peer_w;
-                            guard.config.win_native_h = peer_h;
-                            guard.telemetry.win_peer_reported_res = true;
-                            if guard.config.resolution_mode == "native"
-                                && (guard.config.win_w != peer_w || guard.config.win_h != peer_h)
-                            {
-                                guard.config.win_w = peer_w;
-                                guard.config.win_h = peer_h;
-                                guard.config.resnap_after_resize();
-                                guard.save();
-                                println!(
-                                    "[Debian] Auto-synced Windows 11 native display resolution: {}x{}",
-                                    peer_w, peer_h
-                                );
-                            } else if changed {
-                                guard.save();
-                            }
-                        }
+                Payload::PeerDisplayInfo { width, height } => {
+                    if width >= 640 && height >= 480 {
+                        let screen = MonitorRect { name: "Laptop display".to_string(), x: 0, y: 0, w: width, h: height };
+                        crate::spatial::note_peer_displays(&spatial_state, "", vec![screen]);
                     }
                 }
                 _ => {}
@@ -1453,8 +1426,8 @@ pub fn run_debian_node(
                     "Debian".to_string()
                 };
                 guard.telemetry.panic_mode = core.router.panicked();
-                guard.telemetry.deb_cursor_x = kwin_x.load(Ordering::Relaxed);
-                guard.telemetry.deb_cursor_y = kwin_y.load(Ordering::Relaxed);
+                guard.telemetry.cursor_x = kwin_x.load(Ordering::Relaxed);
+                guard.telemetry.cursor_y = kwin_y.load(Ordering::Relaxed);
                 guard.telemetry.game_captive_active = is_game_captive;
                 guard.telemetry.game_reason = if cfg_snapshot.manual_game_lock {
                     "Manual Lock (Ctrl+Alt+G)".to_string()
@@ -1463,24 +1436,6 @@ pub fn run_debian_node(
                 } else {
                     String::new()
                 };
-                guard.telemetry.audio_rx_packets =
-                    crate::audio::AUDIO_RX_PACKETS.load(Ordering::Relaxed);
-                guard.telemetry.audio_rx_peak =
-                    crate::audio::AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed);
-                guard.telemetry.audio_muted =
-                    crate::audio::AUDIO_RX_MUTED.load(Ordering::Relaxed);
-                guard.telemetry.audio_volume =
-                    crate::audio::AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed);
-                guard.telemetry.audio_tx_enabled =
-                    crate::audio::AUDIO_TX_ENABLED.load(Ordering::Relaxed);
-                guard.telemetry.audio_tx_packets =
-                    crate::audio::AUDIO_TX_PACKETS.load(Ordering::Relaxed);
-                guard.telemetry.audio_tx_peak =
-                    crate::audio::AUDIO_TX_PEAK_PCT.load(Ordering::Relaxed);
-                guard.telemetry.audio_tx_volume =
-                    crate::audio::AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed);
-                guard.telemetry.audio_tx_source_mode =
-                    crate::audio::AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed);
                 guard.telemetry.peer_online = core.router.online();
                 guard.telemetry.main_conflict = core.router.main_conflict();
             }
@@ -1490,7 +1445,7 @@ pub fn run_debian_node(
         if last_heartbeat.elapsed() >= Duration::from_millis(400) {
             last_heartbeat = Instant::now();
             core.peer.send(Payload::Heartbeat);
-            let span = cfg_snapshot.laptop_edge_span();
+            let span = cfg_snapshot.edge_span(NodeId::Windows);
             core.peer.send(Payload::EdgeMap {
                 edge: span.edge,
                 start: span.start,

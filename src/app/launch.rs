@@ -11,13 +11,23 @@ fn vbs_run(exe: &str, args: &str) -> String {
 const VBS_HEAD: &str = "Set WshShell = CreateObject(\"WScript.Shell\")\r\n";
 
 /// The script in the Startup folder: starts the service and the tray at login, both windowless.
+/// The service reads the saved address, so that a change in the app is never undone at login.
+/// `peer` is for an address that can't be saved yet.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn windows_vbs(exe: &str, peer: &str, edge: &str) -> String {
-    format!(
-        "{VBS_HEAD}{}{}",
-        vbs_run(exe, &format!("--role windows --peer {peer} --switch-edge {edge}")),
-        vbs_run(exe, "--tray")
-    )
+pub fn windows_vbs(exe: &str, peer: Option<&str>) -> String {
+    let service = match peer {
+        Some(peer) => format!("--role windows --peer {peer}"),
+        None => "--role windows".to_string(),
+    };
+    format!("{VBS_HEAD}{}{}", vbs_run(exe, &service), vbs_run(exe, "--tray"))
+}
+
+/// The address in a login script an older version wrote, if it holds a usable one.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn peer_in_login_script(script: &str) -> Option<String> {
+    let after = script.split_once("--peer ")?.1;
+    let word = after.split(|c: char| c.is_whitespace() || c == '"').next()?;
+    crate::settings::validate_peer(word).ok()
 }
 
 /// The Start Menu script: opens the app window.
@@ -74,8 +84,7 @@ pub fn make_shortcut(lnk: &Path, exe: &str) -> bool {
 pub fn install_windows_launchers(
     programs_dir: &Path,
     exe: &str,
-    peer: &str,
-    edge: &str,
+    peer: Option<&str>,
     autostart: bool,
     shortcut: &dyn Fn(&Path, &str) -> bool,
 ) -> Option<PathBuf> {
@@ -85,7 +94,7 @@ pub fn install_windows_launchers(
     let startup = programs_dir.join("Startup");
     let login = (autostart && startup.exists())
         .then(|| startup.join(LOGIN_SCRIPT))
-        .and_then(|login| std::fs::write(&login, windows_vbs(exe, peer, edge)).ok().map(|_| login));
+        .and_then(|login| std::fs::write(&login, windows_vbs(exe, peer)).ok().map(|_| login));
     let script = programs_dir.join(START_MENU_SCRIPT);
     let lnk = programs_dir.join(START_MENU_SHORTCUT);
     if (lnk.exists() && shortcut_points_at(&lnk, exe)) || shortcut(&lnk, exe) {
@@ -207,13 +216,17 @@ fn running_exe() -> std::io::Result<PathBuf> {
 
 /// Starts this exe again with `arg` (such as `--app` or `--tray`) and does not wait for it.
 pub fn spawn_self(arg: &str) -> std::io::Result<()> {
+    spawn_with(&[arg], &[])
+}
+
+/// Starts this exe again with `args` and does not wait for it. It outlives this process.
+fn spawn_with(args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     let exe = running_exe()?;
-    let mut child = Command::new(exe)
-        .arg(arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut command = Command::new(exe);
+    command.args(args).envs(envs.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
     // Collect the child's exit status when it ends, so it doesn't linger as a zombie.
     let _ = std::thread::Builder::new().name("mesh-kvm-reap".into()).spawn(move || {
         let _ = child.wait();
@@ -221,8 +234,49 @@ pub fn spawn_self(arg: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set on a Windows service started by the one it replaces, which still holds the ports.
+pub const RESTARTING_ENV: &str = "MESH_KVM_RESTARTING";
+
+/// The arguments a restarted service runs with. No arguments on Windows would open the window.
+fn restart_args(args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        return vec!["--role".to_string(), crate::platform::ROLE.to_string()];
+    }
+    args
+}
+
+/// Replaces this service with a new one, which reads the settings again. Only returns on failure.
+pub fn restart_service() -> String {
+    let args = restart_args(std::env::args().skip(1).collect());
+    #[cfg(unix)]
+    {
+        // This keeps the process id, so systemd sees nothing happen, and a detached service stays
+        // running with nobody to start it again. Every socket here closes on exec.
+        use std::os::unix::process::CommandExt;
+        match running_exe() {
+            Ok(exe) => Command::new(exe).args(&args).exec().to_string(),
+            Err(e) => e.to_string(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match spawn_with(&args, &[(RESTARTING_ENV, "1")]) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => e.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_restart_keeps_the_arguments_and_never_turns_into_a_bare_launch() {
+        let kept = vec!["--role".to_string(), "windows".to_string(), "--port".to_string(), "9".to_string()];
+        assert_eq!(restart_args(kept.clone()), kept);
+        assert_eq!(restart_args(vec![]), vec!["--role".to_string(), crate::platform::ROLE.to_string()]);
+    }
+
     #[test]
     fn menu_refresh_prefers_the_current_kde_tool() {
         assert_eq!(refresh_menu(|_| true), Some("kbuildsycoca6"));
@@ -252,10 +306,11 @@ mod tests {
 
     #[test]
     fn login_script_starts_service_and_tray() {
-        let vbs = windows_vbs(EXE, "192.168.8.210", "left");
+        let vbs = windows_vbs(EXE, None);
         let runs: Vec<&str> = vbs.lines().filter(|l| l.contains("WshShell.Run")).collect();
         assert_eq!(runs.len(), 2);
-        assert!(runs.iter().any(|l| l.contains("--role windows --peer 192.168.8.210 --switch-edge left")));
+        assert!(runs.iter().any(|l| l.contains("--role windows")));
+        assert!(!vbs.contains("--peer"), "the saved address is used, so that an app change isn't undone");
         assert_eq!(runs.iter().filter(|l| l.contains("--tray")).count(), 1);
         assert!(runs.iter().all(|l| l.contains(EXE) && l.ends_with(", 0, False")));
     }
@@ -263,13 +318,24 @@ mod tests {
     #[test]
     fn login_script_lines_are_exact_for_a_path_with_spaces() {
         let exe = r"C:\Users\Mary Jane\AppData\Local\mesh-kvm\mesh-kvm.exe";
-        let vbs = windows_vbs(exe, "192.168.8.210", "left");
-        let want_service = "WshShell.Run \"\"\"C:\\Users\\Mary Jane\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe\"\" --role windows --peer 192.168.8.210 --switch-edge left\", 0, False";
+        let vbs = windows_vbs(exe, Some("192.168.8.210"));
+        let want_service = "WshShell.Run \"\"\"C:\\Users\\Mary Jane\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe\"\" --role windows --peer 192.168.8.210\", 0, False";
         let want_tray = "WshShell.Run \"\"\"C:\\Users\\Mary Jane\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe\"\" --tray\", 0, False";
         let lines: Vec<&str> = vbs.lines().collect();
         assert_eq!(lines[0], "Set WshShell = CreateObject(\"WScript.Shell\")");
         assert_eq!(lines[1], want_service);
         assert_eq!(lines[2], want_tray);
+    }
+
+    #[test]
+    fn the_address_comes_out_of_a_login_script_from_an_older_version() {
+        let old = "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
+                   WshShell.Run \"\"\"C:\\mesh-kvm.exe\"\" --role windows --peer 192.168.8.241 --switch-edge left\", 0, False\r\n";
+        assert_eq!(peer_in_login_script(old).as_deref(), Some("192.168.8.241"));
+        let at_end = windows_vbs(EXE, Some("192.168.8.241"));
+        assert_eq!(peer_in_login_script(&at_end).as_deref(), Some("192.168.8.241"));
+        assert_eq!(peer_in_login_script(&windows_vbs(EXE, None)), None);
+        assert_eq!(peer_in_login_script("--peer nonsense"), None);
     }
 
     #[test]
@@ -336,7 +402,7 @@ mod tests {
         let dir = temp("win");
         let programs = programs(&dir);
         std::fs::write(programs.join("mesh-kvm Studio.vbs"), "old").unwrap();
-        install_windows_launchers(&programs, EXE, "192.168.8.210", "left", true, &|_, _| false);
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| false);
         assert!(!programs.join("mesh-kvm Studio.vbs").exists());
         assert!(std::fs::read_to_string(programs.join("mesh-kvm.vbs")).unwrap().contains("--app"));
         let login = std::fs::read_to_string(programs.join("Startup/mesh-kvm-autostart.vbs")).unwrap();
@@ -349,7 +415,7 @@ mod tests {
         let dir = temp("win-lnk");
         let programs = programs(&dir);
         std::fs::write(programs.join("mesh-kvm.vbs"), "stale").unwrap();
-        install_windows_launchers(&programs, EXE, "p", "left", true, &|lnk, exe| {
+        install_windows_launchers(&programs, EXE, None, true, &|lnk, exe| {
             assert_eq!(lnk, programs.join("mesh-kvm.lnk"));
             assert_eq!(exe, EXE);
             true
@@ -362,7 +428,7 @@ mod tests {
     fn a_failed_shortcut_falls_back_to_the_script() {
         let dir = temp("win-fallback");
         let programs = programs(&dir);
-        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| false);
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| false);
         assert!(programs.join("mesh-kvm.vbs").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -380,7 +446,7 @@ mod tests {
     fn the_login_script_is_written_before_the_shortcut_is_made() {
         let dir = temp("win-order");
         let programs = programs(&dir);
-        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| {
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| {
             assert!(programs.join("Startup/mesh-kvm-autostart.vbs").exists());
             true
         });
@@ -398,7 +464,7 @@ mod tests {
         let programs = programs(&dir);
         fake_lnk(&programs.join("mesh-kvm.lnk"), EXE);
         std::fs::write(programs.join("mesh-kvm.vbs"), "stale").unwrap();
-        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| panic!("PowerShell ran"));
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| panic!("PowerShell ran"));
         assert!(!programs.join("mesh-kvm.vbs").exists());
         assert!(programs.join("mesh-kvm.lnk").exists());
         let _ = std::fs::remove_dir_all(dir);
@@ -410,7 +476,7 @@ mod tests {
         let programs = programs(&dir);
         fake_lnk(&programs.join("mesh-kvm.lnk"), r"C:\old\mesh-kvm.exe");
         let made = std::cell::Cell::new(false);
-        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| {
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| {
             made.set(true);
             true
         });
@@ -422,7 +488,7 @@ mod tests {
     fn disabled_autostart_writes_no_startup_script() {
         let dir = temp("win-off");
         let programs = programs(&dir);
-        install_windows_launchers(&programs, EXE, "192.168.8.210", "left", false, &|_, _| false);
+        install_windows_launchers(&programs, EXE, None, false, &|_, _| false);
         assert!(programs.join("mesh-kvm.vbs").exists());
         assert!(!programs.join("Startup/mesh-kvm-autostart.vbs").exists());
         let _ = std::fs::remove_dir_all(dir);

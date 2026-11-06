@@ -1,0 +1,17 @@
+[Unit]
+Description=mesh-kvm: share one mouse, keyboard, clipboard and audio between devices
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+Wants=pipewire.service
+
+[Service]
+Type=simple
+# mesh-kvm saves the other device's address, which the app asks for. To force one instead, add a
+# line such as MESH_KVM_ARGS=--peer 192.168.1.20 here.
+EnvironmentFile=-%h/.config/mesh-kvm/service.env
+ExecStart=/usr/bin/mesh-kvm --role debian $MESH_KVM_ARGS
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

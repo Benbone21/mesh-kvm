@@ -4,7 +4,9 @@
 //!   GET  /api/local              -> this node's live status (node-specific handler)
 //!   POST /api/local/action       -> this node's local actions (audio, autostart, focus, panic...)
 //!   ANY  /api/peer/<path>        -> transparently proxied to http://<peer_ip>:24880/<path>
-//! The Debian node additionally serves the spatial layout master API (/api/state, /api/layout, /api/action).
+//!   GET  /api/state              -> this node's copy of the layout, and live telemetry
+//!   POST /api/layout             -> an edit to the layout
+//!   POST /api/action             -> layout-wide actions (focus, release, game lock...)
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -17,15 +19,21 @@ pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub body: String,
+    /// From a program on this device, and not from a web page in a browser here, which would
+    /// send an `Origin` header.
+    pub from_app_here: bool,
 }
 
 /// Node-specific API handler. Returns `Some(json_body)` if the route was handled.
 pub type Handler = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>;
 
-pub fn start(peer_ip: String, handler: Handler) -> Result<(), String> {
-    let bind_addr = format!("0.0.0.0:{}", UI_PORT);
-    let listener =
-        TcpListener::bind(&bind_addr).map_err(|e| format!("Failed to bind {}: {}", bind_addr, e))?;
+/// Takes the API port. This comes before anything else in the service: it is what keeps a second
+/// one from starting.
+pub fn bind() -> Result<TcpListener, std::io::Error> {
+    TcpListener::bind(("0.0.0.0", UI_PORT))
+}
+
+pub fn start(listener: TcpListener, peer_ip: String, handler: Handler) -> Result<(), String> {
     println!(
         "[Studio] mesh-kvm API listening on port {} (peer proxy -> {}:{})",
         UI_PORT, peer_ip, UI_PORT
@@ -70,18 +78,11 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     let mut parts = first.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
-    let content_len = lines
-        .filter_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or(0)
-        .min(4 * 1024 * 1024);
+    let headers: Vec<(&str, &str)> = lines.filter_map(|l| l.split_once(':')).collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    let content_len = header("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(4 * 1024 * 1024);
+    let from_browser = header("origin").is_some();
+    let from_here = stream.peer_addr().is_ok_and(|a| a.ip().is_loopback());
     while data.len() < header_end + content_len {
         let n = stream.read(&mut buf).ok()?;
         if n == 0 {
@@ -91,7 +92,7 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     }
     let body_end = (header_end + content_len).min(data.len());
     let body = String::from_utf8_lossy(&data[header_end..body_end]).to_string();
-    Some(HttpRequest { method, path, body })
+    Some(HttpRequest { method, path, body, from_app_here: from_here && !from_browser })
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -219,6 +220,25 @@ pub fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends one raw request to a server on `address`, and returns what the handler was told.
+    fn seen_by_handler(address: &str, connect_to: &str, request: &'static str) -> bool {
+        let listener = TcpListener::bind((address, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect((connect_to, port)).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut client = client;
+        client.write_all(request.as_bytes()).unwrap();
+        read_request(&mut stream).unwrap().from_app_here
+    }
+
+    #[test]
+    fn only_a_program_on_this_device_counts_as_the_app_here() {
+        let plain = "POST /api/local/action HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+        let browser = "POST /api/local/action HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n";
+        assert!(seen_by_handler("127.0.0.1", "127.0.0.1", plain));
+        assert!(!seen_by_handler("127.0.0.1", "127.0.0.1", browser));
+    }
 
     #[test]
     fn root_serves_no_page() {

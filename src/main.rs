@@ -6,10 +6,10 @@ mod clipboard;
 mod keymap;
 mod input;
 mod mute;
+mod platform;
 mod protocol;
 mod router;
 mod settings;
-#[cfg(target_os = "linux")]
 mod spatial;
 mod webui;
 
@@ -19,21 +19,6 @@ use protocol::{
 };
 use std::net::SocketAddr;
 
-#[cfg(target_os = "linux")]
-const DEFAULT_ROLE: &str = "debian";
-#[cfg(target_os = "windows")]
-const DEFAULT_ROLE: &str = "windows";
-
-#[cfg(target_os = "linux")]
-const DEFAULT_PEER: &str = "192.168.8.210";
-#[cfg(target_os = "windows")]
-const DEFAULT_PEER: &str = "192.168.8.241";
-
-#[cfg(target_os = "linux")]
-const DEFAULT_EDGE: &str = "right";
-#[cfg(target_os = "windows")]
-const DEFAULT_EDGE: &str = "left";
-
 #[derive(Parser, Debug)]
 #[command(
     name = "mesh-kvm",
@@ -42,16 +27,16 @@ const DEFAULT_EDGE: &str = "left";
 )]
 struct Cli {
     /// Node role: 'debian' or 'windows'
-    #[arg(long, default_value = DEFAULT_ROLE)]
+    #[arg(long, default_value = platform::ROLE)]
     role: NodeId,
 
-    /// Peer IP address (or IP:PORT)
-    #[arg(long, default_value = DEFAULT_PEER)]
-    peer: String,
+    /// Peer IP address (or IP:PORT). Saved, and used in place of the saved one while given
+    #[arg(long)]
+    peer: Option<String>,
 
-    /// Screen edge that switches focus to the peer ('left', 'right', 'top', 'bottom')
-    #[arg(long, default_value = DEFAULT_EDGE)]
-    switch_edge: SwitchEdge,
+    /// Side of this device the peer sits on, for a new layout ('left', 'right', 'top', 'bottom')
+    #[arg(long)]
+    switch_edge: Option<SwitchEdge>,
 
     /// UDP port for asymmetric input mesh (default: 24850)
     #[arg(long, default_value_t = DEFAULT_INPUT_PORT)]
@@ -115,6 +100,20 @@ fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, Sock
     Ok((addr.ip().to_string(), addr))
 }
 
+/// The address to use, and whether `--peer` set it: the flag wins, then what was saved. With
+/// neither, the service has no peer yet.
+fn choose_peer(
+    flag: Option<&str>,
+    saved: Option<&str>,
+    port: u16,
+) -> Result<Option<(String, SocketAddr, bool)>, String> {
+    let Some(text) = flag.or(saved) else {
+        return Ok(None);
+    };
+    let (ip, addr) = parse_peer_socket_addr(text, port)?;
+    Ok(Some((ip, addr, flag.is_some())))
+}
+
 /// True when the program was started with no arguments.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_bare_launch(arg_count: usize) -> bool {
@@ -136,6 +135,13 @@ struct BarePlan {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn bare_launch_plan(service_running: bool, exe_differs: bool) -> BarePlan {
     BarePlan { install_exe: service_running && exe_differs, become_service: !service_running }
+}
+
+/// The address a running service says it uses.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn peer_in_status(body: &str) -> Option<String> {
+    let status: serde_json::Value = serde_json::from_str(body).ok()?;
+    settings::validate_peer(status.get("peer_ip")?.as_str()?).ok()
 }
 
 /// What to tell the person when the window can't open, such as when there is no OpenGL.
@@ -194,7 +200,9 @@ fn main() {
     // becomes the service unless one is already running; the login launcher always passes arguments.
     #[cfg(target_os = "windows")]
     if is_bare_launch(std::env::args_os().len()) {
-        let service_running = webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok();
+        let running = webui::http_call("127.0.0.1", "GET", "/api/local", "").ok();
+        let service_running = running.is_some();
+        let running_peer = running.and_then(|(_, body)| peer_in_status(&body));
         let installed = app::install::installed_exe();
         let exe_differs = match (std::env::current_exe(), &installed) {
             (Ok(current), Some(installed)) => app::install::needs_install(&current, installed),
@@ -213,10 +221,9 @@ fn main() {
                 }
             }
             // The old service wrote the old launchers, which start no tray at login.
-            match parse_peer_socket_addr(&cli.peer, cli.port) {
-                Ok((_, peer_addr)) => input::windows::rewrite_launchers(peer_addr, cli.switch_edge),
-                Err(e) => settings::log_fatal(&e),
-            }
+            settings::load_and_apply();
+            let peer = settings::peer_ip().or(running_peer);
+            platform::windows::rewrite_launchers(peer.as_deref());
         }
         for flag in ["--tray", "--app"] {
             if let Err(e) = app::launch::spawn_self(flag) {
@@ -245,23 +252,85 @@ fn main() {
         return;
     }
 
-    let (peer_ip, peer_addr) = match parse_peer_socket_addr(&cli.peer, cli.port) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: {}", e);
+    run_service(cli);
+}
+
+/// Stops and leaves a note where the app can point to.
+fn fail(message: &str) -> ! {
+    eprintln!("Error: {}", message);
+    settings::log_fatal(message);
+    mute::shutdown();
+    std::process::exit(1);
+}
+
+/// Replaces this process with a fresh service, as the peer changed.
+fn restart() -> ! {
+    let problem = app::launch::restart_service();
+    fail(&format!("mesh-kvm couldn't start itself again: {problem}"));
+}
+
+/// A Windows service that a restart started has to wait for the one before it to end.
+fn wait_for_old_service() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    if std::env::var_os(app::launch::RESTARTING_ENV).is_none() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < WAIT && webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Runs the service until it is told to stop.
+fn run_service(cli: Cli) {
+    wait_for_old_service();
+
+    // First of all, so that a second service stops here and touches nothing.
+    let listener = match webui::bind() {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            println!("mesh-kvm is already running on this device.");
             std::process::exit(1);
         }
+        Err(e) => fail(&format!("Couldn't open port {}: {}", webui::UI_PORT, e)),
     };
 
+    settings::load_and_apply();
+    let saved = settings::peer_ip().or_else(old_install_peer);
+    let chosen = match choose_peer(cli.peer.as_deref(), saved.as_deref(), cli.port) {
+        Ok(chosen) => chosen,
+        Err(e) => fail(&e),
+    };
+    settings::remember_start_flags(chosen.as_ref().map(|(ip, ..)| ip.as_str()), cli.switch_edge);
+
+    let peer_text = chosen.as_ref().map_or_else(String::new, |(_, addr, _)| addr.to_string());
+    let peer_ip = chosen.as_ref().map_or_else(String::new, |(ip, ..)| ip.clone());
+    let pinned = chosen.as_ref().is_some_and(|c| c.2);
     println!(
-        "=== mesh-kvm v{} | Role: {} | Peer: {} | Edge: {} ===",
+        "=== mesh-kvm v{} | Role: {} | Peer: {} ===",
         env!("CARGO_PKG_VERSION"),
         cli.role,
-        peer_addr,
-        cli.switch_edge
+        if peer_text.is_empty() { "none yet" } else { &peer_text },
     );
 
-    settings::load_and_apply();
+    let platform = platform::current(cli.width.zip(cli.height));
+    let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
+    let state = std::sync::Arc::new(std::sync::RwLock::new(state));
+    let handler = spatial::studio_handler(state.clone(), platform.clone());
+    if let Err(e) = webui::start(listener, peer_ip.clone(), handler) {
+        fail(&e);
+    }
+
+    let Some((_, peer_addr, _)) = chosen else {
+        // Nothing to share with yet, so nothing is captured. The app asks for the address.
+        println!("No other device is known yet. Waiting for its address from the app.");
+        while !settings::restart_requested() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        restart();
+    };
+
+    spatial::start_sync(state.clone(), platform, peer_ip.clone());
 
     // Phase 2: Bidirectional Audio Bus (UDP 24851)
     if cli.audio_listen {
@@ -299,16 +368,14 @@ fn main() {
             );
         }
         if let Err(e) = input::linux::run_debian_node(
+            state,
             peer_addr,
             cli.port,
-            cli.switch_edge,
             cli.width,
             cli.height,
             cli.mouse_device,
         ) {
-            eprintln!("[Debian] Fatal error: {}", e);
-            mute::shutdown();
-            std::process::exit(1);
+            fail(&format!("[Debian] {e}"));
         }
     }
 
@@ -321,26 +388,32 @@ fn main() {
                 cli.role
             );
         }
-        if let Err(e) = input::windows::run_windows_node(
-            peer_addr,
-            cli.port,
-            cli.switch_edge,
-            cli.width,
-            cli.height,
-        ) {
-            eprintln!("[Windows] Fatal error: {}", e);
-            settings::log_fatal(&e);
-            mute::shutdown();
-            std::process::exit(1);
+        if let Err(e) = input::windows::run_windows_node(state, peer_addr, cli.port, cli.width, cli.height) {
+            fail(&format!("[Windows] {e}"));
         }
     }
 
     mute::shutdown();
+    if settings::restart_requested() {
+        restart();
+    }
+}
+
+/// An address left by an install from before addresses were saved.
+fn old_install_peer() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        platform::windows::old_login_script_peer()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_bare_launch, Cli};
+    use super::{is_bare_launch, protocol, Cli};
     use clap::Parser;
 
     #[test]
@@ -348,6 +421,35 @@ mod tests {
         let text = super::window_failed_text(std::path::Path::new(r"C:\Users\me\mesh-kvm\mesh-kvm.log"));
         assert!(text.contains("window couldn't start"), "{text}");
         assert!(text.contains(r"C:\Users\me\mesh-kvm\mesh-kvm.log"), "{text}");
+    }
+
+    #[test]
+    fn peer_and_edge_flags_are_optional() {
+        let cli = Cli::try_parse_from(["mesh-kvm"]).unwrap();
+        assert_eq!((cli.peer, cli.switch_edge), (None, None));
+        let cli = Cli::try_parse_from(["mesh-kvm", "--peer", "10.0.0.5", "--switch-edge", "top"]).unwrap();
+        assert_eq!(cli.peer.as_deref(), Some("10.0.0.5"));
+        assert_eq!(cli.switch_edge, Some(protocol::SwitchEdge::Top));
+    }
+
+    #[test]
+    fn the_flag_wins_then_the_saved_peer_and_with_neither_there_is_none() {
+        let port = 24850;
+        let (ip, addr, pinned) = super::choose_peer(Some("10.0.0.5"), Some("10.0.0.6"), port).unwrap().unwrap();
+        assert_eq!((ip.as_str(), addr.port(), pinned), ("10.0.0.5", port, true));
+        let (ip, _, pinned) = super::choose_peer(None, Some("10.0.0.6"), port).unwrap().unwrap();
+        assert_eq!((ip.as_str(), pinned), ("10.0.0.6", false));
+        assert_eq!(super::choose_peer(None, None, port), Ok(None));
+        // A port on the flag is kept, and a mistake on it stops the start.
+        assert_eq!(super::choose_peer(Some("10.0.0.5:9"), None, port).unwrap().unwrap().1.port(), 9);
+        assert!(super::choose_peer(Some("nonsense"), Some("10.0.0.6"), port).is_err());
+    }
+
+    #[test]
+    fn a_running_service_gives_its_peer() {
+        assert_eq!(super::peer_in_status(r#"{"peer_ip":"192.168.8.241"}"#).as_deref(), Some("192.168.8.241"));
+        assert_eq!(super::peer_in_status(r#"{"peer_ip":""}"#), None);
+        assert_eq!(super::peer_in_status("not json"), None);
     }
 
     #[test]

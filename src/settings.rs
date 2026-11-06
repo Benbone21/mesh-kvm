@@ -6,10 +6,11 @@ use crate::audio::{
     AUDIO_TX_VOLUME_PCT,
 };
 use crate::clipboard::{clipboard_note, CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
-use crate::protocol::NodeId;
+use crate::protocol::{NodeId, SwitchEdge};
 use crate::router::{DeviceId, Event, Sharing};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -18,16 +19,24 @@ const MIN_POINTER_SPEED: f64 = 0.05;
 const MAX_POINTER_SPEED: f64 = 2.0;
 const DEFAULT_POINTER_SPEED: f32 = 1.0;
 const DEFAULT_MAIN_DEVICE: DeviceId = NodeId::Debian as DeviceId;
+const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 pub const OK_RESPONSE: &str = r#"{"ok":true}"#;
 
 static MOUSE_SHARING: AtomicBool = AtomicBool::new(true);
 static KEYBOARD_SHARING: AtomicBool = AtomicBool::new(true);
-/// The laptop's pointer speed, as `f32` bits. Debian's is `mouse_speed` in the layout.
+/// This device's pointer speed, as `f32` bits.
 static POINTER_SPEED_BITS: AtomicU32 = AtomicU32::new(DEFAULT_POINTER_SPEED.to_bits());
 static MAIN_DEVICE: AtomicU8 = AtomicU8::new(DEFAULT_MAIN_DEVICE);
 /// Set after the values above change, for the input loop to feed its router.
 static SHARING_PENDING: AtomicBool = AtomicBool::new(false);
 static MAIN_PENDING: AtomicBool = AtomicBool::new(false);
+/// The other device's address, or empty when none is known yet.
+static PEER_IP: Mutex<String> = Mutex::new(String::new());
+/// What this device is called, or empty to go by its hostname.
+static DEVICE_NAME: Mutex<String> = Mutex::new(String::new());
+static SWITCH_EDGE: Mutex<Option<SwitchEdge>> = Mutex::new(None);
+/// Set when the service should start again, for the loop that owns its shutdown.
+static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 /// One save at a time: they share a temp file, and the last to finish must have the newest values.
 static SAVING: Mutex<()> = Mutex::new(());
 
@@ -47,6 +56,12 @@ pub struct LocalSettings {
     pub clipboard_receive: bool,
     pub pointer_speed: f32,
     pub main_device: u8,
+    /// The other device's address. Empty until it is known.
+    pub peer_ip: String,
+    /// What this device is called. Empty means its hostname.
+    pub device_name: String,
+    /// The side of this device the other one sits on, for a layout that doesn't exist yet.
+    pub switch_edge: Option<SwitchEdge>,
 }
 
 fn default_mute_while_sending() -> bool {
@@ -68,6 +83,9 @@ impl Default for LocalSettings {
             clipboard_receive: true,
             pointer_speed: DEFAULT_POINTER_SPEED,
             main_device: DEFAULT_MAIN_DEVICE,
+            peer_ip: String::new(),
+            device_name: String::new(),
+            switch_edge: None,
         }
     }
 }
@@ -82,13 +100,12 @@ pub fn config_dir() -> PathBuf {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/bread".to_string());
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(".config").join("mesh-kvm")
     }
 }
 
 /// Where `log_fatal` and `log_note` write.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn log_path() -> PathBuf {
     config_dir().join("mesh-kvm.log")
 }
@@ -100,7 +117,6 @@ pub fn log_fatal(message: &str) {
 }
 
 /// Writes a plain note to `mesh-kvm.log`, for things worth knowing that aren't fatal.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn log_note(message: &str) {
     append_line(&config_dir(), &format!("Note: {}", message));
 }
@@ -130,7 +146,22 @@ fn parse_settings(text: &str) -> LocalSettings {
     if NodeId::try_from(s.main_device).is_err() {
         s.main_device = DEFAULT_MAIN_DEVICE;
     }
+    s.peer_ip = validate_peer(&s.peer_ip).unwrap_or_default();
     s
+}
+
+/// Checks an address for the other device, with an optional port, and returns its plain form.
+/// Only IPv4 works: the API and the link build `ip:port` strings.
+pub fn validate_peer(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    let ip = text
+        .parse::<Ipv4Addr>()
+        .or_else(|_| text.parse::<SocketAddrV4>().map(|a| *a.ip()))
+        .map_err(|_| "Enter an address like 192.168.1.20.".to_string())?;
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+        return Err("That address can't belong to another device. Enter one like 192.168.1.20.".to_string());
+    }
+    Ok(ip.to_string())
 }
 
 fn clamp_pointer_speed(speed: f64) -> Option<f32> {
@@ -160,9 +191,112 @@ pub fn main_device() -> DeviceId {
     MAIN_DEVICE.load(Ordering::SeqCst)
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn pointer_speed() -> f32 {
     f32::from_bits(POINTER_SPEED_BITS.load(Ordering::SeqCst))
+}
+
+/// Takes on the speed an old layout file carried, which was this device's real speed until now.
+pub fn adopt_pointer_speed(speed: f32) {
+    let speed = clamp_pointer_speed(speed as f64).unwrap_or(DEFAULT_POINTER_SPEED);
+    POINTER_SPEED_BITS.store(speed.to_bits(), Ordering::SeqCst);
+    save_current();
+}
+
+fn peer_slot() -> std::sync::MutexGuard<'static, String> {
+    PEER_IP.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The saved address of the other device, if there is one.
+pub fn peer_ip() -> Option<String> {
+    Some(peer_slot().clone()).filter(|ip| !ip.is_empty())
+}
+
+/// What this device is called: the name it was given, or else its hostname.
+pub fn device_name() -> String {
+    let name = DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if name.is_empty() {
+        crate::webui::hostname()
+    } else {
+        name
+    }
+}
+
+/// The side of this device the other one sits on, if one was ever given.
+pub fn switch_edge() -> Option<SwitchEdge> {
+    *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Keeps what the service was started with, so that it carries on without those flags. A
+/// `--peer` that isn't another device's address, as in a test on one machine, is used but not kept.
+pub fn remember_start_flags(peer: Option<&str>, edge: Option<SwitchEdge>) {
+    let peer = peer.and_then(|text| validate_peer(text).ok());
+    let new_peer = peer.as_ref().is_some_and(|ip| *peer_slot() != *ip);
+    let new_edge = edge.is_some() && switch_edge() != edge;
+    if let (true, Some(ip)) = (new_peer, peer) {
+        *peer_slot() = ip;
+    }
+    if new_edge {
+        *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner) = edge;
+    }
+    if new_peer || new_edge {
+        save_current();
+    }
+}
+
+/// True once the service should start again. Its main loop then shuts down and calls
+/// `restart_service`.
+pub fn restart_requested() -> bool {
+    RESTART_PENDING.load(Ordering::SeqCst)
+}
+
+/// Asks for a restart, after a moment so the reply to the request still gets out.
+fn request_restart() {
+    let spawned = std::thread::Builder::new().name("mesh-kvm-restart".to_string()).spawn(|| {
+        std::thread::sleep(RESTART_DELAY);
+        RESTART_PENDING.store(true, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Who is asking `set_peer`, and what the service can say about the address.
+pub struct PeerChange<'a> {
+    /// The app on this device. Anyone else on the network could otherwise pair this device with
+    /// themselves, which would hand them its keyboard and clipboard.
+    pub from_this_device: bool,
+    /// `--peer` was given at start. It would win again at the next start.
+    pub pinned: bool,
+    pub is_own_address: &'a dyn Fn(&str) -> bool,
+}
+
+/// Handles `set_peer` and returns the response body. The service restarts to use the new address.
+pub fn set_peer(val: &serde_json::Value, who: PeerChange) -> String {
+    change_peer(val, who, save_current, request_restart)
+}
+
+fn change_peer(val: &serde_json::Value, who: PeerChange, save: impl FnOnce(), restart: impl FnOnce()) -> String {
+    let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
+    if !who.from_this_device {
+        return refuse("The other device's address can only be changed from the app on this device.");
+    }
+    if who.pinned {
+        return refuse("mesh-kvm was started with --peer, which sets this address. Remove it from how mesh-kvm starts, then try again.");
+    }
+    let text = val.get("peer").and_then(|v| v.as_str()).unwrap_or("");
+    let ip = match validate_peer(text) {
+        Ok(ip) => ip,
+        Err(e) => return refuse(&e),
+    };
+    if (who.is_own_address)(&ip) {
+        return refuse("That's this device's own address. Enter the other device's address.");
+    }
+    if *peer_slot() != ip {
+        *peer_slot() = ip;
+        save();
+        restart();
+    }
+    OK_RESPONSE.to_string()
 }
 
 /// Toggle changes the router has yet to hear about. The input loops call this every tick and
@@ -196,6 +330,9 @@ pub fn load_and_apply() {
     CLIPBOARD_RECEIVE.store(s.clipboard_receive, Ordering::SeqCst);
     POINTER_SPEED_BITS.store(s.pointer_speed.to_bits(), Ordering::SeqCst);
     MAIN_DEVICE.store(s.main_device, Ordering::SeqCst);
+    *peer_slot() = s.peer_ip;
+    *DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner) = s.device_name;
+    *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner) = s.switch_edge;
 }
 
 fn current_settings() -> LocalSettings {
@@ -212,6 +349,9 @@ fn current_settings() -> LocalSettings {
         clipboard_receive: CLIPBOARD_RECEIVE.load(Ordering::SeqCst),
         pointer_speed: f32::from_bits(POINTER_SPEED_BITS.load(Ordering::SeqCst)),
         main_device: main_device(),
+        peer_ip: peer_slot().clone(),
+        device_name: DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+        switch_edge: switch_edge(),
     }
 }
 
@@ -259,9 +399,8 @@ pub fn audio_status_json(supports_source_select: bool) -> serde_json::Value {
     })
 }
 
-/// Adds the toggles to a `/api/local` status. Debian's pointer speed lives in its layout, so each
-/// node passes its own, along with whether its router has a main conflict.
-pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32, main_conflict: bool) {
+/// Adds the toggles to a `/api/local` status, along with whether the router has a main conflict.
+pub fn add_toggle_status(status: &mut serde_json::Value, main_conflict: bool) {
     let sharing = sharing();
     status["sharing"] = serde_json::json!({ "mouse": sharing.mouse, "keyboard": sharing.keyboard });
     status["clipboard"] = serde_json::json!({
@@ -269,7 +408,7 @@ pub fn add_toggle_status(status: &mut serde_json::Value, pointer_speed: f32, mai
         "receive": CLIPBOARD_RECEIVE.load(Ordering::SeqCst),
         "note": clipboard_note(),
     });
-    status["pointer_speed"] = serde_json::json!(pointer_speed);
+    status["pointer_speed"] = serde_json::json!(pointer_speed());
     status["main_device"] = serde_json::json!(main_device());
     status["main_conflict"] = serde_json::json!(main_conflict);
 }
@@ -469,6 +608,84 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_address_is_checked_and_put_in_plain_form() {
+        assert_eq!(validate_peer("192.168.8.210").unwrap(), "192.168.8.210");
+        assert_eq!(validate_peer("  10.0.0.5\n").unwrap(), "10.0.0.5");
+        assert_eq!(validate_peer("192.168.8.210:24850").unwrap(), "192.168.8.210");
+        for bad in [
+            "", "   ", "laptop", "192.168.8", "192.168.8.300", "192.168.8.210:99999", "http://192.168.8.210",
+            "fe80::1", "192.168.8.210; rm -rf /", "0.0.0.0", "127.0.0.1", "127.0.0.2", "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert!(validate_peer(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_saved_peer_that_is_no_good_is_dropped_and_the_rest_is_kept() {
+        let s = parse_settings(r#"{"peer_ip":"not an address","device_name":"Desk","mouse_sharing":false}"#);
+        assert_eq!(s.peer_ip, "");
+        assert_eq!(s.device_name, "Desk");
+        assert!(!s.mouse_sharing);
+        assert_eq!(parse_settings(r#"{"peer_ip":"192.168.8.210"}"#).peer_ip, "192.168.8.210");
+    }
+
+    #[test]
+    fn peer_name_and_edge_survive_a_round_trip_and_old_files_have_none() {
+        let s = LocalSettings {
+            peer_ip: "192.168.8.210".into(),
+            device_name: "Desk".into(),
+            switch_edge: Some(SwitchEdge::Bottom),
+            ..LocalSettings::default()
+        };
+        let back = parse_settings(&serde_json::to_string_pretty(&s).unwrap());
+        assert_eq!(back.peer_ip, "192.168.8.210");
+        assert_eq!(back.device_name, "Desk");
+        assert_eq!(back.switch_edge, Some(SwitchEdge::Bottom));
+        let old = parse_settings(r#"{"audio_tx_enabled":true}"#);
+        assert_eq!((old.peer_ip.as_str(), old.device_name.as_str(), old.switch_edge), ("", "", None));
+    }
+
+    fn try_peer(val: serde_json::Value, from_this_device: bool, pinned: bool) -> (String, u32, u32) {
+        let (saves, restarts) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let who = PeerChange { from_this_device, pinned, is_own_address: &|ip| ip == "192.168.8.241" };
+        let reply = change_peer(&val, who, || saves.set(saves.get() + 1), || restarts.set(restarts.get() + 1));
+        (reply, saves.get(), restarts.get())
+    }
+
+    #[test]
+    fn a_good_peer_is_saved_once_and_restarts_the_service_once() {
+        let _guard = live_toggles();
+        let (before, peer) = (peer_slot().clone(), json!({ "peer": "192.168.8.210" }));
+        peer_slot().clear();
+        assert_eq!(try_peer(peer.clone(), true, false), (OK_RESPONSE.to_string(), 1, 1));
+        assert_eq!(peer_ip().as_deref(), Some("192.168.8.210"));
+        // Asking again for the same address changes nothing.
+        assert_eq!(try_peer(peer, true, false), (OK_RESPONSE.to_string(), 0, 0));
+        *peer_slot() = before;
+    }
+
+    #[test]
+    fn a_peer_is_refused_with_a_reason_and_nothing_changes() {
+        let _guard = live_toggles();
+        let before = peer_slot().clone();
+        for (val, here, pinned, says) in [
+            (json!({ "peer": "192.168.8.210" }), false, false, "from the app on this device"),
+            (json!({ "peer": "192.168.8.210" }), true, true, "--peer"),
+            (json!({ "peer": "laptop" }), true, false, "like 192.168.1.20"),
+            (json!({}), true, false, "like 192.168.1.20"),
+            (json!({ "peer": "127.0.0.1" }), true, false, "another device"),
+            (json!({ "peer": "192.168.8.241" }), true, false, "own address"),
+        ] {
+            let (reply, saves, restarts) = try_peer(val, here, pinned);
+            assert_refused(&reply);
+            assert!(reply.contains(says), "{reply}");
+            assert_eq!((saves, restarts), (0, 0));
+        }
+        assert_eq!(*peer_slot(), before);
+    }
+
+    #[test]
     fn pointer_speed_is_clamped() {
         let _guard = live_toggles();
         assert!(apply_toggle("set_pointer_speed", &json!({ "speed": 9.0 })));
@@ -648,13 +865,13 @@ mod tests {
     fn status_reports_every_toggle() {
         let _guard = live_toggles();
         let mut status = json!({ "node": "debian" });
-        add_toggle_status(&mut status, 0.5, true);
+        add_toggle_status(&mut status, true);
         assert_eq!(status["node"], "debian");
         assert_eq!(status["sharing"]["mouse"], true);
         assert_eq!(status["sharing"]["keyboard"], true);
         assert_eq!(status["clipboard"]["send"], true);
         assert_eq!(status["clipboard"]["receive"], true);
-        assert_eq!(status["pointer_speed"], 0.5);
+        assert!(status["pointer_speed"].is_number());
         assert_eq!(status["main_device"], 0);
         assert_eq!(status["main_conflict"], true);
     }

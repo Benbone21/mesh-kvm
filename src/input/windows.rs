@@ -4,18 +4,15 @@ use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifie
 use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
-    NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
+    NodeId, Packet, Payload, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
-use crate::router::{
-    Action, DeviceId, EdgeSpan, EdgeTracker, Event, Routed, Router, RouterConfig, KEEP_CURSOR,
-};
-use std::fs;
+use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
+use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -77,18 +74,21 @@ struct GlobalNet {
     peer_addr: SocketAddr,
 }
 
-struct EdgeState {
-    span: Option<EdgeSpan>,
-    tracker: EdgeTracker,
-}
-
 static NET_STATE: OnceLock<GlobalNet> = OnceLock::new();
 static ROUTER: OnceLock<Mutex<Router>> = OnceLock::new();
 /// Filled by `EdgeMap`. Until one arrives no edge touches Debian.
-static EDGE: Mutex<EdgeState> =
-    Mutex::new(EdgeState { span: None, tracker: EdgeTracker::new(0) });
+static EDGE: Mutex<EdgeWatch> = Mutex::new(EdgeWatch::new());
+/// This device's copy of the layout. The hooks use it only through `try_read`.
+static SPATIAL: OnceLock<Arc<RwLock<SharedSpatialState>>> = OnceLock::new();
+/// A copy of this laptop's monitors, for the hooks.
+static MONITORS: Mutex<Vec<MonitorRect>> = Mutex::new(Vec::new());
 static HOTKEYS: Mutex<HotkeyFilter> = Mutex::new(HotkeyFilter::new());
+/// A copy of the layout's manual game lock, for the hooks.
 static MANUAL_GAME_LOCK: AtomicBool = AtomicBool::new(false);
+/// A copy of the layout's automatic game lock, for the hooks.
+static AUTO_GAME_LOCK: AtomicBool = AtomicBool::new(true);
+/// The hotkey was pressed. The watchdog changes the layout, as the hook must not wait for it.
+static GAME_LOCK_HOTKEY: AtomicBool = AtomicBool::new(false);
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Buttons injected for the peer and not yet released.
 static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
@@ -96,8 +96,14 @@ static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
 static KEYS_HELD: [AtomicBool; KEY_SLOTS] = [const { AtomicBool::new(false) }; KEY_SLOTS];
 /// Buttons physically down on this laptop, whatever the router did with them.
 static LOCAL_BUTTONS_MASK: AtomicU8 = AtomicU8::new(0);
+/// The main monitor, where the cursor is parked.
 static SCREEN_WIDTH: AtomicI32 = AtomicI32::new(1920);
 static SCREEN_HEIGHT: AtomicI32 = AtomicI32::new(1080);
+/// The box around every monitor, which can start at negative coordinates.
+static DESKTOP_X: AtomicI32 = AtomicI32::new(0);
+static DESKTOP_Y: AtomicI32 = AtomicI32::new(0);
+static DESKTOP_W: AtomicI32 = AtomicI32::new(1920);
+static DESKTOP_H: AtomicI32 = AtomicI32::new(1080);
 /// The cursor is parked at `pin_position` while the trackpad drives the peer.
 static MOUSE_PINNED: AtomicBool = AtomicBool::new(false);
 /// Last known cursor position, clamped to the screen.
@@ -135,8 +141,38 @@ fn router() -> MutexGuard<'static, Router> {
     router_lock().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn edge_state() -> MutexGuard<'static, EdgeState> {
+fn edge_state() -> MutexGuard<'static, EdgeWatch> {
     EDGE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn monitors() -> MutexGuard<'static, Vec<MonitorRect>> {
+    MONITORS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Copies this laptop's monitors for the hooks, when they have changed.
+fn sync_monitors(latest: &[MonitorRect]) {
+    let mut current = monitors();
+    if current.as_slice() == latest {
+        return;
+    }
+    *current = latest.to_vec();
+    let (Some(left), Some(top)) = (latest.iter().map(|m| m.x).min(), latest.iter().map(|m| m.y).min()) else {
+        return;
+    };
+    let right = latest.iter().map(|m| m.x + m.w).max().unwrap_or(left);
+    let bottom = latest.iter().map(|m| m.y + m.h).max().unwrap_or(top);
+    DESKTOP_X.store(left, Ordering::SeqCst);
+    DESKTOP_Y.store(top, Ordering::SeqCst);
+    DESKTOP_W.store(right - left, Ordering::SeqCst);
+    DESKTOP_H.store(bottom - top, Ordering::SeqCst);
+}
+
+/// The closest point to `pt` in the box around every monitor.
+fn clamp_to_desktop(pt: (i32, i32)) -> (i32, i32) {
+    let (left, top) = (DESKTOP_X.load(Ordering::Relaxed), DESKTOP_Y.load(Ordering::Relaxed));
+    let (w, h) = (DESKTOP_W.load(Ordering::Relaxed), DESKTOP_H.load(Ordering::Relaxed));
+    let (x, y) = win_logic::clamp_to_screen((pt.0 - left, pt.1 - top), w, h);
+    (x + left, y + top)
 }
 
 /// Feeds events to the router, then carries out their actions outside the lock. Returns the
@@ -203,6 +239,9 @@ fn is_windows_game_captive() -> bool {
     if MANUAL_GAME_LOCK.load(Ordering::Relaxed) {
         return true;
     }
+    if !AUTO_GAME_LOCK.load(Ordering::Relaxed) {
+        return false;
+    }
     unsafe {
         let mut ci: CURSORINFO = std::mem::zeroed();
         ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
@@ -258,8 +297,7 @@ fn cursor_pos() -> Option<(i32, i32)> {
 }
 
 fn remember_cursor(pt: (i32, i32)) {
-    let (w, h) = screen_size();
-    let (x, y) = win_logic::clamp_to_screen(pt, w, h);
+    let (x, y) = clamp_to_desktop(pt);
     LAST_X.store(x, Ordering::Relaxed);
     LAST_Y.store(y, Ordering::Relaxed);
 }
@@ -342,189 +380,6 @@ impl InputBackend for WindowsBackend {
     }
 }
 
-fn startup_vbs_path() -> Option<PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(
-        PathBuf::from(appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup")
-            .join("mesh-kvm-autostart.vbs"),
-    )
-}
-
-/// Present when the user turned auto-boot off in the Studio, so startup doesn't reinstall it.
-fn autostart_disabled_marker() -> PathBuf {
-    crate::settings::config_dir().join("autostart-disabled")
-}
-
-fn set_windows_autostart(enabled: bool, peer_addr: SocketAddr, switch_edge: SwitchEdge) {
-    let marker = autostart_disabled_marker();
-    if enabled {
-        let _ = fs::remove_file(&marker);
-        ensure_windows_autorun_installed(peer_addr, switch_edge);
-    } else {
-        let _ = fs::create_dir_all(crate::settings::config_dir());
-        let _ = fs::write(&marker, "");
-        if let Some(vbs) = startup_vbs_path() {
-            let _ = fs::remove_file(vbs);
-        }
-    }
-}
-
-/// Builds the Windows node's Studio API handler (plugged into the shared `webui` server).
-/// Layout and focus live on the Debian master; the UI reaches them through the peer proxy.
-fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webui::Handler {
-    let peer_ip = peer_addr.ip().to_string();
-    Arc::new(move |req: &crate::webui::HttpRequest| -> Option<String> {
-        let path = req.path.split('?').next().unwrap_or("");
-        match (req.method.as_str(), path) {
-            ("GET", "/api/local") => {
-                let mut pt = POINT { x: 0, y: 0 };
-                unsafe {
-                    GetCursorPos(&mut pt);
-                }
-                let (peer_online, active_node, panic_mode, main_conflict) = {
-                    let router = router();
-                    (router.online(), router.active(), router.panicked(), router.main_conflict())
-                };
-                let active = if active_node == PEER { "Debian" } else { "Windows" };
-                let manual = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
-                let captive = is_windows_game_captive();
-                let reason = if manual {
-                    "Manual lock"
-                } else if captive {
-                    "Game is holding the cursor"
-                } else {
-                    ""
-                };
-                let (w, h) = screen_size();
-                let mut status = serde_json::json!({
-                    "node": "windows",
-                    "label": "Windows Laptop",
-                    "hostname": crate::webui::hostname(),
-                    "ip": crate::webui::local_ip_toward(&peer_ip),
-                    "peer_ip": peer_ip,
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "os": "Windows 11",
-                    "peer_online": peer_online,
-                    "active_node": active,
-                    "panic_mode": panic_mode,
-                    "game_lock": captive,
-                    "game_reason": reason,
-                    "displays": [{ "name": "Laptop display", "x": 0, "y": 0, "w": w, "h": h }],
-                    "cursor": [pt.x, pt.y],
-                    "autostart": startup_vbs_path().is_some_and(|p| p.exists()),
-                    "input_devices": ["Laptop keyboard", "Laptop trackpad"],
-                    "audio": crate::settings::audio_status_json(false),
-                });
-                let speed = crate::settings::pointer_speed();
-                crate::settings::add_toggle_status(&mut status, speed, main_conflict);
-                Some(status.to_string())
-            }
-            ("POST", "/api/local/action") => {
-                let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
-                let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                if act == "set_main_device" {
-                    let link_up = router().online();
-                    return Some(crate::settings::set_main_device(&val, link_up));
-                }
-                if !crate::settings::handle_common_action(act, &val) {
-                    match act {
-                        "set_autostart" => set_windows_autostart(
-                            val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-                            peer_addr,
-                            switch_edge,
-                        ),
-                        "panic" => {
-                            route(Event::Panic);
-                        }
-                        "toggle_game_lock" => {
-                            MANUAL_GAME_LOCK.fetch_xor(true, Ordering::SeqCst);
-                        }
-                        _ => return Some(r#"{"ok":false,"error":"unknown action"}"#.to_string()),
-                    }
-                }
-                Some(r#"{"ok":true}"#.to_string())
-            }
-            _ => None,
-        }
-    })
-}
-
-/// Installs `mesh-kvm.exe` into `%LOCALAPPDATA%\mesh-kvm\mesh-kvm.exe` and creates a silent
-/// windowless Startup launcher (service and tray) in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
-/// so the Windows 11 laptop automatically starts `mesh-kvm` in the background on every boot/login.
-fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
-    // The shortcut comes from PowerShell, which takes a moment: keep it off the caller's thread.
-    let _ = std::thread::Builder::new()
-        .name("mesh-kvm-install".into())
-        .spawn(move || install_launchers(peer_addr, switch_edge));
-}
-
-/// Rewrites the Start Menu entry and the login script for the installed exe, without touching the
-/// exe. A double-click over an old running service uses this, so the next login starts the tray.
-pub fn rewrite_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
-    if let Some(installed_exe) = crate::app::install::installed_exe() {
-        write_launchers(&installed_exe, peer_addr, switch_edge);
-    }
-}
-
-fn install_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
-    use crate::app::install;
-    let Some(installed_exe) = install::installed_exe() else {
-        return;
-    };
-
-    install::clear_stale(&installed_exe);
-    if let Ok(cur_exe) = std::env::current_exe() {
-        if install::needs_install(&cur_exe, &installed_exe) {
-            if let Err(e) = install::replace_exe(&cur_exe, &installed_exe) {
-                crate::settings::log_fatal(&e);
-            }
-        }
-    }
-
-    write_launchers(&installed_exe, peer_addr, switch_edge);
-}
-
-fn write_launchers(installed_exe: &std::path::Path, peer_addr: SocketAddr, switch_edge: SwitchEdge) {
-    let Ok(appdata) = std::env::var("APPDATA") else {
-        return;
-    };
-    let exe_to_run = if installed_exe.exists() {
-        installed_exe.to_path_buf()
-    } else if let Ok(cur_exe) = std::env::current_exe() {
-        cur_exe
-    } else {
-        return;
-    };
-
-    let programs_dir = PathBuf::from(&appdata)
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs");
-
-    // When auto-boot is turned off in the app, no Startup script is written at all.
-    let login_script = crate::app::launch::install_windows_launchers(
-        &programs_dir,
-        &exe_to_run.to_string_lossy(),
-        &peer_addr.ip().to_string(),
-        &switch_edge.to_string(),
-        !autostart_disabled_marker().exists(),
-        &crate::app::launch::make_shortcut,
-    );
-    if let Some(vbs_path) = login_script {
-        println!(
-            "[Windows] Auto-Boot installed: '{}' -> starts the service and tray silently at login.",
-            vbs_path.to_string_lossy(),
-        );
-    }
-}
-
 fn hotkeys() -> MutexGuard<'static, HotkeyFilter> {
     HOTKEYS.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -558,7 +413,7 @@ fn local_key(code: u16, pressed: bool) -> bool {
             true
         }
         KeyRoute::Hotkey(Hotkey::GameLock) => {
-            MANUAL_GAME_LOCK.fetch_xor(true, Ordering::SeqCst);
+            GAME_LOCK_HOTKEY.store(true, Ordering::SeqCst);
             true
         }
         KeyRoute::ConsumedSwallowed => true,
@@ -615,21 +470,27 @@ fn push_edge(x: i32, y: i32, dx: i32, dy: i32, from_peer: bool) -> bool {
     if !may_cross || !settled {
         return false;
     }
-    let (w, h) = screen_size();
     let buttons_held = BUTTONS_HELD_MASK.load(Ordering::SeqCst) != 0
         || LOCAL_BUTTONS_MASK.load(Ordering::SeqCst) != 0;
     let pushed_through = {
-        let mut edge = edge_state();
-        match edge.span {
-            Some(span) => edge.tracker.push(span, x, y, w, h, dx, dy, buttons_held),
-            None => false,
-        }
+        let monitors = monitors();
+        edge_state().push(&monitors, (x, y), (dx, dy), buttons_held)
     };
-    pushed_through
-        && route(Event::EdgeCrossed { x, y, from_peer })
-            .actions
-            .iter()
-            .any(|a| matches!(a, Action::SendFocus { .. }))
+    if !pushed_through {
+        return false;
+    }
+    // Where the cursor lands. If the layout is busy, the next push crosses instead.
+    let entry = SPATIAL.get().and_then(|state| {
+        let state = state.try_read().ok()?;
+        Some(state.config.entry_on_peer(NodeId::Windows, x, y))
+    });
+    let Some((x, y)) = entry else {
+        return false;
+    };
+    route(Event::EdgeCrossed { x, y, from_peer })
+        .actions
+        .iter()
+        .any(|a| matches!(a, Action::SendFocus { .. }))
 }
 
 /// Handles physical pointer movement to `pt`. Returns true to keep it from the OS.
@@ -657,8 +518,7 @@ fn local_move(pt: (i32, i32)) -> bool {
         // Blocking ended just now, so the offset was measured from the pin, not a real move.
         return false;
     }
-    let (w, h) = screen_size();
-    let (x, y) = win_logic::clamp_to_screen(pt, w, h);
+    let (x, y) = clamp_to_desktop(pt);
     // On a crossing the event must not reach the OS, or it would drag the cursor off the pin.
     push_edge(x, y, dx, dy, false)
 }
@@ -881,9 +741,9 @@ fn create_session_window() {
 }
 
 pub fn run_windows_node(
+    spatial_state: Arc<RwLock<SharedSpatialState>>,
     peer_addr: SocketAddr,
     listen_port: u16,
-    switch_edge: SwitchEdge,
     override_width: Option<i32>,
     override_height: Option<i32>,
 ) -> Result<(), String> {
@@ -910,6 +770,10 @@ pub fn run_windows_node(
 
     SCREEN_WIDTH.store(width, Ordering::SeqCst);
     SCREEN_HEIGHT.store(height, Ordering::SeqCst);
+    if let Ok(state) = spatial_state.read() {
+        sync_monitors(state.config.monitors(NodeId::Windows));
+    }
+    let _ = SPATIAL.set(Arc::clone(&spatial_state));
     if let Some(pt) = cursor_pos() {
         remember_cursor(pt);
     }
@@ -940,29 +804,23 @@ pub fn run_windows_node(
         peer_addr,
     });
 
-    crate::webui::start(
-        peer_addr.ip().to_string(),
-        studio_handler(peer_addr, switch_edge),
-    )?;
     crate::mute::start();
 
-    // Ensure auto-boot on Windows login is installed. This waits until the web server has the
-    // port, so a process that loses the race to another service doesn't rewrite the launchers.
-    ensure_windows_autorun_installed(peer_addr, switch_edge);
+    // Ensure auto-boot on Windows login is installed. By now this process holds the API port, so
+    // a process that loses the race to another service doesn't rewrite the launchers.
+    crate::platform::windows::ensure_autorun_installed();
 
     // Report true native Windows display resolution to Debian peer immediately
     for _ in 0..3 {
         send_udp_payload(Payload::PeerDisplayInfo { width, height });
     }
 
-    println!(
-        "[Windows] Native display resolution: {}x{}, switch_edge: {}, peer: {}",
-        width, height, switch_edge, peer_addr
-    );
+    println!("[Windows] Native display resolution: {}x{}, peer: {}", width, height, peer_addr);
     println!(
         "[Windows] On-The-Go Watchdog enabled: If Debian peer is unreachable (>1.3s), laptop operates 100% standalone."
     );
 
+    let watchdog_state = Arc::clone(&spatial_state);
     // Spawn the link and game-captive watchdog (every 100ms), which also sends heartbeats.
     // State changes are logged here because the hooks must not print.
     std::thread::Builder::new()
@@ -981,6 +839,25 @@ pub fn run_windows_node(
                 }
                 route(Event::Tick { now_ms: now_ms() });
                 settle_races();
+
+                if GAME_LOCK_HOTKEY.swap(false, Ordering::SeqCst) {
+                    if let Ok(mut state) = watchdog_state.write() {
+                        state.config.manual_game_lock = !state.config.manual_game_lock;
+                        state.save();
+                    }
+                }
+                // If the lock is busy, these wait for the next tick.
+                if let Some(requests) = take_studio_requests(&watchdog_state) {
+                    if requests.panic {
+                        route(Event::Panic);
+                    }
+                    if requests.manual_switch {
+                        route(Event::ManualSwitch);
+                    }
+                    MANUAL_GAME_LOCK.store(requests.config.manual_game_lock, Ordering::SeqCst);
+                    AUTO_GAME_LOCK.store(requests.config.auto_game_lock, Ordering::SeqCst);
+                    sync_monitors(requests.config.monitors(NodeId::Windows));
+                }
 
                 let now_captive = is_windows_game_captive();
                 if now_captive != captive {
@@ -1006,6 +883,27 @@ pub fn run_windows_node(
                         panicked,
                         captive
                     );
+                }
+
+                if let Ok(mut state) = watchdog_state.try_write() {
+                    let (online, active, panicked, _, _) = status;
+                    let manual = MANUAL_GAME_LOCK.load(Ordering::Relaxed);
+                    let telemetry = &mut state.telemetry;
+                    telemetry.active_node = if active == PEER { "Debian" } else { "Windows" }.to_string();
+                    telemetry.panic_mode = panicked;
+                    telemetry.peer_online = online;
+                    telemetry.main_conflict = router().main_conflict();
+                    telemetry.game_captive_active = captive;
+                    telemetry.game_reason = match (manual, captive) {
+                        (true, _) => "Manual lock",
+                        (false, true) => "Game is holding the cursor",
+                        (false, false) => "",
+                    }
+                    .to_string();
+                    if let Some((x, y)) = cursor_pos() {
+                        telemetry.cursor_x = x;
+                        telemetry.cursor_y = y;
+                    }
                 }
 
                 ticks = ticks.wrapping_add(1);
@@ -1058,6 +956,9 @@ pub fn run_windows_node(
                             }
                             Payload::FocusSwitchAt { target_node, x, y } => {
                                 if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
+                                    let (x, y) = spatial_state
+                                        .read()
+                                        .map_or((x, y), |s| s.config.place_on_own(NodeId::Windows, x, y));
                                     route(Event::PeerFocus {
                                         target: target_node as DeviceId,
                                         x,
@@ -1072,9 +973,7 @@ pub fn run_windows_node(
                                 route(Event::PeerGameLock(locked));
                             }
                             Payload::EdgeMap { edge, start, end, resistance } => {
-                                let mut state = edge_state();
-                                state.span = Some(EdgeSpan { edge, start, end });
-                                state.tracker.set_resistance(resistance);
+                                edge_state().set_span(EdgeSpan { edge, start, end }, resistance);
                             }
                             Payload::Heartbeat => {
                                 send_udp_payload(Payload::PeerDisplayInfo { width, height });

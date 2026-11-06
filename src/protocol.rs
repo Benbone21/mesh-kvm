@@ -13,6 +13,16 @@ pub enum NodeId {
     Windows = 1,
 }
 
+impl NodeId {
+    /// The other device of the pair.
+    pub fn other(self) -> NodeId {
+        match self {
+            NodeId::Debian => NodeId::Windows,
+            NodeId::Windows => NodeId::Debian,
+        }
+    }
+}
+
 impl TryFrom<u8> for NodeId {
     type Error = u8;
 
@@ -83,6 +93,16 @@ impl std::fmt::Display for SwitchEdge {
             SwitchEdge::Bottom => write!(f, "bottom"),
         }
     }
+}
+
+/// One monitor. `x` and `y` are in its own device's desktop, and can be negative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorRect {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
