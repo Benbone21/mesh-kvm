@@ -10,6 +10,9 @@
 
 use std::collections::HashSet;
 
+use crate::keymap::{
+    KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
+};
 use crate::protocol::{HeldInput, SwitchEdge};
 
 pub type DeviceId = u8;
@@ -28,6 +31,16 @@ pub const KEEP_CURSOR: i32 = i32::MIN;
 /// How long after a dropout control still goes back to the device that had it. Past this the
 /// person will have settled on the device in front of them.
 pub const RESUME_WINDOW_MS: u64 = 15_000;
+/// Input this soon after the link is lost is hands that hadn't noticed yet, and says nothing.
+pub const RESUME_GRACE_MS: u64 = 300;
+/// Movement this long, with no gap over `MOVE_GAP_MS`, is someone using this device.
+pub const SUSTAINED_MOVE_MS: u64 = 1000;
+pub const MOVE_GAP_MS: u64 = 300;
+
+/// What can sensibly be held down again when control returns. A letter would type by itself.
+const MODIFIERS: [u16; 8] = [
+    KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sharing {
@@ -144,6 +157,22 @@ pub struct Router {
     resume_until: Option<u64>,
     /// Only an answer to a heartbeat sent after this time proves the way back works.
     proof_after: u64,
+    /// When control was taken from the peer, for telling new input from hands still moving.
+    lost_at: u64,
+    /// The first and latest of a run of local movement while control waits to go back.
+    moving: Option<(u64, u64)>,
+    /// Keys that were forwarded when control went, and are still down.
+    carried: HashSet<u16>,
+    /// Keys that went back to the peer with control. The OS here saw them while the link was down,
+    /// so it has to see their release too.
+    restored: HashSet<u16>,
+    /// A device that isn't main is on its own after an outage, and main's views don't change
+    /// that. Only a real switch does, or they would swallow the keyboard of whoever is using it.
+    stay_local: bool,
+    /// When the link last came up.
+    online_since: u64,
+    /// The peer sends reports, so it can answer heartbeats. An older one can't.
+    peer_reports: bool,
     /// When the newest heartbeat the peer has answered was sent. `None` for a peer that doesn't
     /// answer, or hasn't since the link came up.
     answered: Option<u64>,
@@ -176,6 +205,13 @@ impl Router {
             unconfirmed: HeldInput::default(),
             resume_until: None,
             proof_after: 0,
+            lost_at: 0,
+            moving: None,
+            carried: HashSet::new(),
+            restored: HashSet::new(),
+            stay_local: false,
+            online_since: 0,
+            peer_reports: false,
             answered: None,
             carry_x: 0.0,
             carry_y: 0.0,
@@ -229,6 +265,7 @@ impl Router {
         let peer = self.cfg.peer;
         match ev {
             Event::LocalMove { dx, dy } => {
+                self.note_local_move();
                 if self.forwarding(self.cfg.sharing.mouse) {
                     out.swallow = true;
                     let (fx, fy) = self.scale(dx, dy);
@@ -248,6 +285,8 @@ impl Router {
                     let f = self.forwarding(self.cfg.sharing.mouse);
                     if f {
                         self.fwd_buttons.insert(button);
+                    } else {
+                        self.note_local_press();
                     }
                     f
                 } else {
@@ -269,16 +308,19 @@ impl Router {
                         true
                     } else {
                         self.local_keys.insert(scancode);
+                        self.note_local_press();
                         false
                     }
                 } else if self.fwd_keys.remove(&scancode) {
                     true
                 } else {
                     self.local_keys.remove(&scancode);
+                    self.carried.remove(&scancode);
                     false
                 };
                 if route {
-                    out.swallow = true;
+                    let restored = !pressed && self.restored.remove(&scancode);
+                    out.swallow = !restored;
                     out.actions.push(Action::ForwardKey { scancode, pressed });
                 }
             }
@@ -317,6 +359,7 @@ impl Router {
                 if !self.online {
                     self.online = true;
                     self.proof_after = now_ms;
+                    self.online_since = now_ms;
                     // A non-main device stays active for itself until main's first view
                     // proves main hears it.
                     if !self.panicked {
@@ -324,15 +367,23 @@ impl Router {
                     }
                 }
             }
-            Event::PeerHeld(held) => self.check_held(held, &mut out.actions),
+            Event::PeerHeld(held) => {
+                self.peer_reports |= self.online;
+                self.check_held(held, &mut out.actions);
+            }
             Event::PeerHeard { sent_ms, panicked } => {
                 if self.online {
+                    self.peer_reports = true;
                     self.answered = self.answered.max(Some(sent_ms));
                     if panicked {
-                        self.resume_until = None;
+                        self.peer_panicked(sent_ms, &mut out.actions);
                     } else if self.resume_until.is_some() && me == self.cfg.main && sent_ms > self.proof_after {
                         self.resume_until = None;
-                        self.set_active(peer, &mut out.actions);
+                        // A game lock or a split would refuse this as a crossing, so it's refused here.
+                        if !self.captive && !self.peer_game_lock && !self.main_conflict {
+                            self.set_active(peer, &mut out.actions);
+                            self.restore_modifiers(&mut out.actions);
+                        }
                         self.send_view(&mut out.actions);
                     }
                 }
@@ -343,15 +394,12 @@ impl Router {
                     self.link_lost(&mut out.actions);
                 }
                 if self.active != me && !self.view_fresh() {
-                    self.control_lost(&mut out.actions);
-                }
-                if self.online && self.active != me && self.unanswered() {
-                    self.resume_until = Some(self.now + RESUME_WINDOW_MS);
-                    self.proof_after = self.answered.unwrap_or(self.now);
+                    self.note_lost_control();
+                    self.proof_after = self.answered.unwrap_or(self.now).max(self.proof_after);
                     self.control_lost(&mut out.actions);
                 }
                 if self.resume_until.is_some_and(|until| self.now > until) {
-                    self.resume_until = None;
+                    self.give_up_return();
                 }
                 // Longer than a link timeout, so that one lost view does not end the conflict.
                 let stopped = self.peer_views.is_none_or(|(_, last)| {
@@ -375,10 +423,14 @@ impl Router {
                     self.peer_view_heard(&mut out.actions);
                 } else if self.online && known {
                     self.view_heard = Some(self.now);
-                    self.resume_until = None;
+                    let returning = self.resume_until.take().is_some();
+                    self.stay_local &= active == peer;
                     // A view that crossed our own fresh switch on the wire is stale, not a desync.
-                    if !self.panicked && !self.conflicts(active) {
+                    if !self.panicked && !self.conflicts(active) && !self.stay_local {
                         self.set_active(active, &mut out.actions);
+                        if returning && active == peer {
+                            self.restore_modifiers(&mut out.actions);
+                        }
                     }
                 }
             }
@@ -391,12 +443,14 @@ impl Router {
                 if self.online
                     && known
                     && !unproven
+                    && !(self.stay_local && target == peer)
                     && !self.main_conflict
                     && !(self.conflicts(target) && me == self.cfg.main)
                 {
                     self.panicked = false;
                     self.last_switch = None;
                     self.resume_until = None;
+                    self.stay_local = false;
                     // Main only claims focus while it hears us, so this counts like a view.
                     self.view_heard = Some(self.now);
                     self.set_active(target, &mut out.actions);
@@ -427,6 +481,7 @@ impl Router {
                     } else {
                         // Only ask: control moves on main's next view, which proves it heard.
                         // Panic silences views, so this is also how a panic ends from here.
+                        self.stay_local = false;
                         out.actions.push(Action::SendFocus {
                             target,
                             x: KEEP_CURSOR,
@@ -435,7 +490,12 @@ impl Router {
                     }
                 }
             }
-            Event::SetCaptive(c) => self.captive = c,
+            Event::SetCaptive(c) => {
+                self.captive = c;
+                if c && self.resume_until.is_some() {
+                    self.give_up_return();
+                }
+            }
             Event::Panic => {
                 self.enter_panic(&mut out.actions);
                 out.actions.push(Action::SendPanic);
@@ -456,6 +516,7 @@ impl Router {
                 if (device == me || device == peer) && device != self.cfg.main {
                     self.cfg.main = device;
                     self.resume_until = None;
+                    self.stay_local = false;
                     // That the old main heard us says nothing about the new one.
                     self.view_heard = None;
                     self.end_main_conflict();
@@ -513,6 +574,7 @@ impl Router {
 
     fn own_switch(&mut self, target: DeviceId, x: i32, y: i32, actions: &mut Vec<Action>) {
         self.resume_until = None;
+        self.stay_local = false;
         self.set_active(target, actions);
         self.last_switch = Some((self.now, target));
         actions.push(Action::SendFocus { target, x, y });
@@ -565,21 +627,79 @@ impl Router {
         actions.push(Action::ReleaseHeld);
     }
 
-    /// A peer that answers heartbeats has stopped answering this device's, so what's forwarded
-    /// goes nowhere while the keyboard here is swallowed. Main has no views to tell it this.
-    fn unanswered(&self) -> bool {
-        self.cfg.me == self.cfg.main
-            && self.answered.is_some_and(|sent| self.now.saturating_sub(sent) > VIEW_TIMEOUT_MS)
-    }
-
     /// Remembers to hand control back, unless a dropout already has, or no way of knowing the
     /// peer hears this device exists. A device that isn't main gets it back from main's view,
     /// and only says so.
     fn note_lost_control(&mut self) {
         let me = self.cfg.me;
-        let can_prove = me != self.cfg.main || self.answered.is_some();
+        let can_prove = me != self.cfg.main || self.peer_reports;
         if self.active != me && !self.panicked && !self.main_conflict && can_prove {
             self.resume_until = Some(self.now + RESUME_WINDOW_MS);
+            self.lost_at = self.now;
+            self.moving = None;
+        }
+    }
+
+    /// Control stays here. Main says so with its next view. Any other device goes by what it was
+    /// told last, and from now on only a real switch changes that.
+    fn give_up_return(&mut self) {
+        self.resume_until = None;
+        self.stay_local = self.cfg.me != self.cfg.main;
+    }
+
+    /// True when local input can only be someone using this device while control waits to return.
+    fn past_grace(&self) -> bool {
+        self.resume_until.is_some() && self.now.saturating_sub(self.lost_at) >= RESUME_GRACE_MS
+    }
+
+    fn note_local_press(&mut self) {
+        if self.past_grace() {
+            self.give_up_return();
+        }
+    }
+
+    /// A nudge says little, as a desk gets knocked. Steady movement says someone is here.
+    fn note_local_move(&mut self) {
+        if !self.past_grace() {
+            return;
+        }
+        let started = match self.moving {
+            Some((started, latest)) if self.now.saturating_sub(latest) <= MOVE_GAP_MS => started,
+            _ => self.now,
+        };
+        self.moving = Some((started, self.now));
+        if self.now.saturating_sub(started) >= SUSTAINED_MOVE_MS {
+            self.give_up_return();
+        }
+    }
+
+    /// Keys still down when control leaves stay with this device until they come up, and repeats
+    /// of them aren't new typing.
+    fn keep_held_here(&mut self) {
+        self.carried = self.fwd_keys.clone();
+        self.local_keys.extend(self.carried.iter().copied());
+    }
+
+    /// Modifiers still down when control comes back go back with it, or Ctrl held through a dropout
+    /// would do nothing to what's typed next. Buttons don't: the pointer has moved on since.
+    fn restore_modifiers(&mut self, actions: &mut Vec<Action>) {
+        for scancode in std::mem::take(&mut self.carried) {
+            if self.cfg.sharing.keyboard && MODIFIERS.contains(&scancode) && self.local_keys.remove(&scancode) {
+                self.fwd_keys.insert(scancode);
+                self.restored.insert(scancode);
+                actions.push(Action::ForwardKey { scancode, pressed: true });
+            }
+        }
+    }
+
+    /// The peer has released all input. The packets saying so can be lost, and a heartbeat already
+    /// on its way when a switch ended that says nothing, so only an answer sent since counts.
+    fn peer_panicked(&mut self, sent_ms: u64, actions: &mut Vec<Action>) {
+        if self.resume_until.is_some() {
+            self.give_up_return();
+        }
+        if self.active != self.cfg.me && self.last_switch.is_none_or(|(at, _)| sent_ms > at) {
+            self.control_lost(actions);
         }
     }
 
@@ -605,17 +725,22 @@ impl Router {
         self.peer_views = None;
     }
 
-    /// Main counts as hearing this device. Always true on main itself.
+    /// The other device counts as hearing this one. On a device that isn't main that's main's
+    /// views. Main has answers to its heartbeats, from a peer that gives them. Counting from link-up
+    /// covers a peer that has never heard this device, with a firewall in the way, say. Without this
+    /// main would forward to nobody and swallow its own keyboard.
     fn view_fresh(&self) -> bool {
-        self.cfg.me == self.cfg.main
-            || self
-                .view_heard
-                .is_some_and(|heard| self.now.saturating_sub(heard) <= VIEW_TIMEOUT_MS)
+        if self.cfg.me == self.cfg.main {
+            let heard = self.answered.unwrap_or(0).max(self.online_since);
+            return !self.peer_reports || self.now.saturating_sub(heard) <= VIEW_TIMEOUT_MS;
+        }
+        self.view_heard.is_some_and(|heard| self.now.saturating_sub(heard) <= VIEW_TIMEOUT_MS)
     }
 
     /// Main has gone quiet: control comes back here, though the link stays up. The peer may
     /// still hear us, so what it holds for us is released before the sets are cleared.
     fn control_lost(&mut self, actions: &mut Vec<Action>) {
+        self.keep_held_here();
         self.active = self.cfg.me;
         self.last_switch = None;
         self.view_heard = None;
@@ -641,8 +766,12 @@ impl Router {
 
     fn link_lost(&mut self, actions: &mut Vec<Action>) {
         self.note_lost_control();
+        self.keep_held_here();
         self.online = false;
         self.answered = None;
+        self.peer_reports = false;
+        // An outage leaves a device that isn't main on its own, unless it was driving main.
+        self.stay_local |= self.resume_until.is_none() && self.cfg.me != self.cfg.main;
         self.end_main_conflict();
         self.active = self.cfg.me;
         self.last_switch = None;
@@ -664,6 +793,7 @@ impl Router {
     fn reset_held(&mut self) {
         self.fwd_keys.clear();
         self.fwd_buttons.clear();
+        self.restored.clear();
         self.carry_x = 0.0;
         self.carry_y = 0.0;
     }
@@ -1899,6 +2029,8 @@ mod tests {
         exchange_until(&mut debian, &mut laptop, &[8000, 9000, 10_000, 11_000]);
         assert!(!laptop.main_conflict());
         assert_eq!((debian.active(), laptop.active()), (1, 1));
+        // The key held since before the split stays local until it comes up.
+        key(&mut debian, 30, false);
         assert!(key(&mut debian, 30, true).swallow);
         let out = laptop.handle(Event::PeerKey { scancode: 30, pressed: true });
         assert_eq!(out.actions, vec![Action::InjectKey { scancode: 30, pressed: true }]);
@@ -2306,8 +2438,7 @@ mod tests {
         assert!(r.online());
         assert_eq!(r.active(), 0);
         assert!(!out.actions.iter().any(|a| matches!(a, Action::SendActiveView { .. } | Action::SetBlocking { .. })));
-        assert!(!key(&mut r, 31, true).swallow);
-        key(&mut r, 31, false);
+        assert!(!r.handle(Event::LocalMove { dx: 1, dy: 0 }).swallow);
         // An answer to a heartbeat from before it returned proves nothing.
         r.handle(Event::PeerHeard { sent_ms: 2900, panicked: false });
         assert_eq!(r.active(), 0);
@@ -2429,8 +2560,7 @@ mod tests {
         assert!(r.returning());
         r.handle(Event::PeerAlive { now_ms: 3000 });
         assert_eq!(r.active(), 1);
-        assert!(!key(&mut r, 30, true).swallow);
-        key(&mut r, 30, false);
+        assert!(!r.handle(Event::LocalMove { dx: 1, dy: 0 }).swallow);
         r.handle(Event::PeerActiveView { active: 0 });
         assert_eq!(r.active(), 0);
         assert!(!r.returning());
@@ -2496,6 +2626,329 @@ mod tests {
             r.handle(Event::Tick { now_ms });
         }
         assert_eq!(r.active(), 1);
+    }
+
+    /// Router 0 (main) online with a peer whose reports arrive, and nothing answered yet.
+    fn unanswered_router() -> Router {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::PeerHeld(HeldInput::default()));
+        r
+    }
+
+    #[test]
+    fn a_peer_that_never_answered_cannot_keep_this_keyboard() {
+        // It's heard from link-up, but has never heard this device.
+        let mut r = unanswered_router();
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
+        assert_eq!(r.active(), 1);
+        for now_ms in [2000, 3000] {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(Event::Tick { now_ms });
+        }
+        assert_eq!(r.active(), 1);
+        r.handle(Event::PeerAlive { now_ms: 3400 });
+        let out = r.handle(Event::Tick { now_ms: 1000 + VIEW_TIMEOUT_MS + 1 });
+        assert_eq!(r.active(), 0);
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(!key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn a_crossing_to_a_peer_that_cannot_hear_is_refused() {
+        let mut r = unanswered_router();
+        r.handle(Event::PeerAlive { now_ms: 2000 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::Tick { now_ms: 1000 + VIEW_TIMEOUT_MS + 1 });
+        let out = r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
+        assert!(out.actions.is_empty());
+        assert_eq!(r.active(), 0);
+        // Once it answers, the way is open.
+        r.handle(Event::PeerHeard { sent_ms: 3600, panicked: false });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn a_peer_with_no_reports_is_an_older_one_and_keeps_the_old_behaviour() {
+        let mut r = forwarding_router();
+        for now_ms in [2000, 3000, 4000, 5000] {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(Event::Tick { now_ms });
+        }
+        assert_eq!(r.active(), 1);
+    }
+
+    /// `answered_router` after a dropout, with `grace` gone since the link was lost.
+    fn dropped_router(grace: u64) -> Router {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        assert!(r.returning());
+        r.handle(Event::Tick { now_ms: 2400 + grace });
+        r
+    }
+
+    #[test]
+    fn typing_here_during_a_dropout_keeps_control_here() {
+        let mut r = dropped_router(RESUME_GRACE_MS);
+        assert!(!key(&mut r, 30, true).swallow);
+        assert!(!r.returning());
+        let out = r.handle(Event::PeerAlive { now_ms: 3000 });
+        assert!(out.actions.contains(&Action::SendActiveView { active: 0 }));
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn a_click_here_during_a_dropout_keeps_control_here() {
+        let mut r = dropped_router(RESUME_GRACE_MS);
+        r.handle(Event::LocalButton { button: 1, pressed: true });
+        assert!(!r.returning());
+    }
+
+    #[test]
+    fn hands_still_moving_as_the_link_goes_do_not_count() {
+        let mut r = dropped_router(RESUME_GRACE_MS - 1);
+        key(&mut r, 30, true);
+        key(&mut r, 30, false);
+        r.handle(Event::LocalButton { button: 1, pressed: true });
+        assert!(r.returning());
+    }
+
+    #[test]
+    fn a_key_held_through_a_dropout_is_not_taken_for_new_typing() {
+        let mut r = answered_router();
+        key(&mut r, 42, true);
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::Tick { now_ms: 2400 + RESUME_GRACE_MS });
+        // Auto-repeat, and then letting go.
+        assert!(!key(&mut r, 42, true).swallow);
+        key(&mut r, 42, false);
+        assert!(r.returning());
+    }
+
+    #[test]
+    fn a_nudge_of_the_mouse_keeps_the_return_and_steady_movement_ends_it() {
+        let mut r = dropped_router(RESUME_GRACE_MS);
+        let at = 2400 + RESUME_GRACE_MS;
+        r.handle(Event::LocalMove { dx: 5, dy: 0 });
+        r.handle(Event::Tick { now_ms: at + MOVE_GAP_MS + 1 });
+        r.handle(Event::LocalMove { dx: 5, dy: 0 });
+        r.handle(Event::Tick { now_ms: at + 2 * MOVE_GAP_MS + 2 });
+        r.handle(Event::LocalMove { dx: 5, dy: 0 });
+        assert!(r.returning(), "pauses start it over");
+
+        let mut r = dropped_router(RESUME_GRACE_MS);
+        for step in (0..=SUSTAINED_MOVE_MS).step_by(100) {
+            r.handle(Event::Tick { now_ms: at + step });
+            r.handle(Event::LocalMove { dx: 5, dy: 0 });
+        }
+        assert!(!r.returning());
+    }
+
+    /// Router 1 forwarded to by main, or forwarding, that has had a long outage.
+    fn after_long_outage(mut r: Router) -> Router {
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::Tick { now_ms: 2401 + RESUME_WINDOW_MS });
+        assert!(!r.returning());
+        r.handle(Event::PeerAlive { now_ms: 3000 + RESUME_WINDOW_MS });
+        r
+    }
+
+    #[test]
+    fn main_cannot_claim_a_peer_back_after_a_long_outage() {
+        // Was driving main, or being driven by it. Either way it's on its own now.
+        let mut driven = router(1);
+        online(&mut driven);
+        driven.handle(Event::PeerActiveView { active: 1 });
+        for mut r in [after_long_outage(adopted_router(cfg(1))), after_long_outage(driven)] {
+            let out = r.handle(Event::PeerActiveView { active: 0 });
+            assert_eq!(r.active(), 1);
+            assert!(!out.actions.iter().any(|a| matches!(a, Action::SetBlocking { .. })));
+            assert!(!key(&mut r, 30, true).swallow);
+            key(&mut r, 30, false);
+            // Nor can a startup burst, which looks the same.
+            r.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+            assert_eq!(r.active(), 1);
+            r.handle(Event::PeerActiveView { active: 0 });
+            assert_eq!(r.active(), 1);
+        }
+    }
+
+    #[test]
+    fn a_short_dropout_of_a_driven_peer_ends_with_it_still_on_its_own_if_main_keeps_control() {
+        let mut r = router(1);
+        online(&mut r);
+        r.handle(Event::PeerActiveView { active: 1 });
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn a_real_switch_ends_the_stay_on_either_side() {
+        // From here, by pushing across.
+        let mut r = after_long_outage(adopted_router(cfg(1)));
+        r.handle(Event::PeerActiveView { active: 0 });
+        r.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false });
+        assert_eq!(r.active(), 0);
+        assert!(key(&mut r, 30, true).swallow);
+        r.handle(Event::Tick { now_ms: 3000 + RESUME_WINDOW_MS + SWITCH_RACE_MS + 1 });
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+
+        // From main, by giving control to this device, then taking it back.
+        let mut r = after_long_outage(adopted_router(cfg(1)));
+        r.handle(Event::PeerFocus { target: 1, x: 3, y: 4 });
+        r.handle(Event::PeerActiveView { active: 1 });
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn asking_main_for_the_switch_ends_the_stay_too() {
+        let mut r = after_long_outage(adopted_router(cfg(1)));
+        let out = r.handle(Event::ManualSwitch);
+        assert!(out.actions.contains(&Action::SendFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR }));
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn the_first_link_up_still_hands_control_to_main() {
+        let mut r = router(1);
+        online(&mut r);
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn using_this_device_during_a_dropout_stays_on_a_non_main_device_too() {
+        let mut r = adopted_router(cfg(1));
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::Tick { now_ms: 2400 + RESUME_GRACE_MS });
+        key(&mut r, 30, true);
+        key(&mut r, 30, false);
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn a_game_lock_keeps_control_from_returning() {
+        let mut r = dropped_router(0);
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::SetCaptive(true));
+        assert!(!r.returning());
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+
+        // One that the peer holds, which comes back with its heartbeat.
+        let mut r = dropped_router(0);
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerGameLock(true));
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+
+        // Already on before the link went, which the proof finds.
+        let mut r = dropped_router(0);
+        r.captive = true;
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+    }
+
+    #[test]
+    fn a_game_lock_here_stops_a_non_main_device_going_back_too() {
+        let mut r = adopted_router(cfg(1));
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::SetCaptive(true));
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn a_split_keeps_control_from_returning() {
+        let mut r = dropped_router(0);
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.main_conflict = true;
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+    }
+
+    #[test]
+    fn a_peer_that_released_all_input_gets_no_more_of_it() {
+        // Its panic packets were lost, and its heartbeat says so instead.
+        let mut r = answered_router();
+        key(&mut r, 30, true);
+        r.handle(Event::PeerAlive { now_ms: 2000 });
+        let out = r.handle(Event::PeerHeard { sent_ms: 1900, panicked: true });
+        assert_eq!(r.active(), 0);
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: false }));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(!r.panicked(), "nobody here asked for that");
+    }
+
+    #[test]
+    fn a_report_of_a_panic_from_before_a_switch_does_not_undo_it() {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 1500 });
+        r.handle(Event::Panic);
+        r.handle(Event::Tick { now_ms: 1600 });
+        r.handle(Event::PeerAlive { now_ms: 1600 });
+        // The switch ends the panic on both, and a heartbeat already on its way still says panicked.
+        r.handle(Event::ManualSwitch);
+        assert_eq!(r.active(), 1);
+        r.handle(Event::PeerHeard { sent_ms: 1550, panicked: true });
+        assert_eq!(r.active(), 1);
+        // One answering a heartbeat sent since means it, though.
+        r.handle(Event::PeerHeard { sent_ms: 1700, panicked: true });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn a_modifier_held_through_a_dropout_is_held_again_when_control_returns() {
+        let mut r = answered_router();
+        key(&mut r, KEY_LEFTSHIFT, true);
+        key(&mut r, 30, true);
+        r.handle(Event::Tick { now_ms: 2400 });
+        assert_eq!(r.held_forwarded(), HeldInput::default());
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        let out = r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 1);
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: KEY_LEFTSHIFT, pressed: true }));
+        assert!(!out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: true }), "a letter would type by itself");
+        assert_eq!(r.held_forwarded(), held(&[KEY_LEFTSHIFT], &[]));
+        // The OS here saw its repeats while the link was down, so it needs the release as well.
+        let up = key(&mut r, KEY_LEFTSHIFT, false);
+        assert!(!up.swallow);
+        assert_eq!(up.actions, vec![Action::ForwardKey { scancode: KEY_LEFTSHIFT, pressed: false }]);
+    }
+
+    #[test]
+    fn a_modifier_let_go_during_the_dropout_is_not_restored() {
+        let mut r = answered_router();
+        key(&mut r, KEY_LEFTSHIFT, true);
+        r.handle(Event::Tick { now_ms: 2400 });
+        key(&mut r, KEY_LEFTSHIFT, false);
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        let out = r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::ForwardKey { .. })));
+    }
+
+    #[test]
+    fn a_non_main_device_restores_modifiers_on_mains_view() {
+        let mut r = adopted_router(cfg(1));
+        key(&mut r, KEY_LEFTSHIFT, true);
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        let out = r.handle(Event::PeerActiveView { active: 0 });
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: KEY_LEFTSHIFT, pressed: true }));
     }
 
     fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {
