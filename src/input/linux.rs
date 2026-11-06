@@ -1115,6 +1115,7 @@ pub fn run_debian_node(
         peer_addr.ip().to_string(),
         studio_handler(Arc::clone(&spatial_state)),
     )?;
+    crate::mute::start();
 
     let vkbd = VirtualKeyboard::new()?;
     let vmouse = VirtualMouse::new(width, height)?;
@@ -1217,6 +1218,7 @@ pub fn run_debian_node(
             println!("\n[Debian] Shutting down cleanly; releasing all EVIOCGRAB locks.");
             core.backend.set_blocking(false, false);
             core.backend.release_held();
+            crate::mute::shutdown();
             let _ = Command::new("qdbus6")
                 .args([
                     "org.kde.KWin",
@@ -1230,6 +1232,7 @@ pub fn run_debian_node(
 
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
+        crate::audio::AUDIO_PEER_ONLINE.store(core.router.online(), Ordering::Relaxed);
 
         // Check WebUI actions (manual toggle / panic). If the lock is busy they wait for the next
         // iteration and the last config stands.

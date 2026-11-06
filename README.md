@@ -36,6 +36,7 @@ Each device has its own switches in the app window.
 - Share mouse and Share keyboard turn sharing of each one on or off.
 - Send clipboard and Receive clipboard choose which way the clipboard travels.
 - Send audio and Play audio choose whether this device sends its sound to the other, and whether it plays the other's.
+- Mute this device while sending silences this device's speakers while it sends its system sound, so you hear it on only one device. It is on by default. The speakers come back when sending stops, the link drops, or sound from the other device is playing here. Sending the microphone doesn't mute. If you had muted the speakers yourself, they stay muted, and if you unmute them by hand, mesh-kvm leaves them alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
 - Start mesh-kvm when this device boots controls starting at login or boot.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.

@@ -136,6 +136,8 @@ pub struct AudioStatus {
     pub tx_volume: u32,
     pub tx_peak: u32,
     pub tx_source: Option<u32>,
+    /// Missing from an older service, which can't mute itself.
+    pub mute_while_sending: Option<bool>,
     pub rx_muted: bool,
     pub rx_volume: u32,
     pub rx_peak: u32,
@@ -427,6 +429,7 @@ pub enum Control {
     PointerSpeed,
     AudioSend,
     AudioSource,
+    MuteWhileSending,
     SendVolume,
     AudioPlay,
     PlayVolume,
@@ -448,6 +451,7 @@ impl Control {
             Control::PointerSpeed => d.pointer_speed as f64,
             Control::AudioSend => flag(d.audio.tx_enabled),
             Control::AudioSource => d.audio.tx_source.unwrap_or(0) as f64,
+            Control::MuteWhileSending => flag(d.audio.mute_while_sending.unwrap_or(false)),
             Control::SendVolume => d.audio.tx_volume as f64,
             Control::AudioPlay => flag(!d.audio.rx_muted),
             Control::PlayVolume => d.audio.rx_volume as f64,
@@ -468,6 +472,7 @@ impl Control {
             }
             Control::AudioSend => json!({ "action": "set_audio_tx", "enabled": on }),
             Control::AudioSource => json!({ "action": "set_audio_tx_source", "mode": value as u32 }),
+            Control::MuteWhileSending => json!({ "action": "set_mute_while_sending", "enabled": on }),
             Control::SendVolume => json!({ "action": "set_audio_tx_volume", "volume": value as u32 }),
             Control::AudioPlay => json!({ "action": "set_audio_rx_muted", "muted": !on }),
             Control::PlayVolume => json!({ "action": "set_audio_rx_volume", "volume": value as u32 }),
@@ -793,6 +798,11 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
         return Some(
             "All input is released, and each device is using its own keyboard and mouse. Use the switch to reconnect."
                 .into(),
+        );
+    }
+    if local.audio.tx_enabled && snapshot.peer.as_ref().is_some_and(|peer| peer.audio.tx_enabled) {
+        return Some(
+            "Both devices are sending audio, which causes an echo. Turn off Send on one of them.".into(),
         );
     }
     None
@@ -1266,6 +1276,39 @@ mod tests {
         assert_eq!(Control::AudioPlay.action(0.0), json!({"action": "set_audio_rx_muted", "muted": true}));
         assert_eq!(Control::PlayVolume.action(85.0), json!({"action": "set_audio_rx_volume", "volume": 85}));
         assert_eq!(Control::PointerSpeed.action(0.35000000149), json!({"action": "set_pointer_speed", "speed": 0.35}));
+    }
+
+    #[test]
+    fn both_devices_sending_is_called_out() {
+        let linked = || {
+            let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
+            let peer = DeviceStatus { node: "windows".into(), ..local.clone() };
+            Snapshot { local: Some(local), peer: Some(peer), layout: LayoutState::parse(STATE_JSON) }
+        };
+        let mut snap = linked();
+        snap.local.as_mut().unwrap().audio.tx_enabled = true;
+        assert_eq!(status_message(&snap), None, "one device sending is the normal case");
+        snap.peer.as_mut().unwrap().audio.tx_enabled = true;
+        assert_eq!(
+            status_message(&snap).as_deref(),
+            Some("Both devices are sending audio, which causes an echo. Turn off Send on one of them.")
+        );
+    }
+
+    #[test]
+    fn mute_while_sending_reads_and_writes_the_service_field() {
+        let mut d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
+        assert_eq!(d.audio.mute_while_sending, None, "an older service has no such field");
+        assert_eq!(Control::MuteWhileSending.read(&d), 0.0);
+        d.audio.mute_while_sending = Some(true);
+        assert_eq!(Control::MuteWhileSending.read(&d), 1.0);
+        assert_eq!(
+            Control::MuteWhileSending.action(0.0),
+            json!({"action": "set_mute_while_sending", "enabled": false})
+        );
+        let newer = LOCAL_JSON.replace(r#""tx_source":0,"#, r#""tx_source":0,"mute_while_sending":false,"#);
+        let d: DeviceStatus = serde_json::from_str(&newer).unwrap();
+        assert_eq!(d.audio.mute_while_sending, Some(false));
     }
 
     const KEY: (Device, Control) = (Device::Windows, Control::SendVolume);

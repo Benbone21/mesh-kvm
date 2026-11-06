@@ -567,6 +567,9 @@ impl DevicePanel<'_> {
         if self.status.audio.tx_source.is_some() {
             self.source_picker(ui);
         }
+        ui.add_enabled_ui(self.status.audio.mute_while_sending.is_some(), |ui| {
+            self.toggle(ui, Control::MuteWhileSending, "Mute this device while sending");
+        });
         self.slider(ui, Control::SendVolume, "Send volume", percent, VOLUME_RANGE, 5.0);
 
         ui.add_space(6.0);
@@ -906,6 +909,7 @@ mod tests {
         d.audio.tx_volume = 100;
         d.audio.rx_volume = 100;
         d.audio.tx_peak = 60;
+        d.audio.mute_while_sending = Some(true);
         d
     }
 
@@ -926,6 +930,7 @@ mod tests {
         split.local.as_mut().unwrap().main_conflict = true;
         let mut older = linked();
         older.peer.as_mut().unwrap().sharing = None;
+        older.peer.as_mut().unwrap().audio.mute_while_sending = None;
         vec![Snapshot::default(), linked(), no_peer, laptop_alone, split, older]
     }
 

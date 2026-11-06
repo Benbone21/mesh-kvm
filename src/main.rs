@@ -5,6 +5,7 @@ mod audio;
 mod clipboard;
 mod keymap;
 mod input;
+mod mute;
 mod protocol;
 mod router;
 mod settings;
@@ -306,6 +307,7 @@ fn main() {
             cli.mouse_device,
         ) {
             eprintln!("[Debian] Fatal error: {}", e);
+            mute::shutdown();
             std::process::exit(1);
         }
     }
@@ -328,9 +330,12 @@ fn main() {
         ) {
             eprintln!("[Windows] Fatal error: {}", e);
             settings::log_fatal(&e);
+            mute::shutdown();
             std::process::exit(1);
         }
     }
+
+    mute::shutdown();
 }
 
 #[cfg(test)]

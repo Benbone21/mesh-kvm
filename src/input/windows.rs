@@ -18,10 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     GetDC, GetDeviceCaps, ReleaseDC, DESKTOPHORZRES, DESKTOPVERTRES,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -29,11 +30,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorInfo, GetCursorPos, GetMessageW, GetSystemMetrics,
-    SetCursorPos, SetProcessDPIAware, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    CURSORINFO, CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED,
-    LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_MOUSEMOVE, WM_SYSKEYDOWN, WM_SYSKEYUP, XBUTTON1, XBUTTON2,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorInfo, GetCursorPos,
+    GetMessageW, GetSystemMetrics, PostQuitMessage, RegisterClassW, SetCursorPos,
+    SetProcessDPIAware, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO,
+    CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, SM_CXSCREEN,
+    SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_CLOSE, WM_ENDSESSION, WM_KEYDOWN, WM_KEYUP,
+    WM_MOUSEMOVE, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, XBUTTON1, XBUTTON2,
 };
 
 // `win_logic` restates these so that it builds on Linux.
@@ -814,6 +817,69 @@ fn inject_mouse_wheel(delta_x: i32, delta_y: i32) {
     }
 }
 
+/// A logoff or shutdown is the laptop's clean exit, and sleep is the link going away unseen. They
+/// are only announced to top-level windows, so the service keeps a hidden one. Ending the process
+/// from Task Manager announces nothing; the tray cleans up after that.
+unsafe extern "system" fn session_window_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        // Zero means the session isn't ending after all.
+        WM_ENDSESSION if wparam != 0 => {
+            crate::mute::shutdown();
+            0
+        }
+        WM_CLOSE => {
+            PostQuitMessage(0);
+            0
+        }
+        WM_POWERBROADCAST => {
+            match wparam as u32 {
+                PBT_APMSUSPEND => crate::mute::before_sleep(),
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => crate::mute::after_sleep(),
+                _ => {}
+            }
+            1
+        }
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+/// Runs on the thread with the message loop. Failing only loses the unmute at logoff and sleep.
+fn create_session_window() {
+    let name: Vec<u16> = "mesh-kvm-session\0".encode_utf16().collect();
+    let created = unsafe {
+        let instance = GetModuleHandleW(ptr::null());
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(session_window_proc),
+            hInstance: instance,
+            lpszClassName: name.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&class);
+        CreateWindowExW(
+            0,
+            name.as_ptr(),
+            name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        )
+    };
+    if created.is_null() {
+        crate::settings::log_note("Couldn't create the session window, so logging off or sleeping won't unmute this device.");
+    }
+}
+
 pub fn run_windows_node(
     peer_addr: SocketAddr,
     listen_port: u16,
@@ -878,6 +944,7 @@ pub fn run_windows_node(
         peer_addr.ip().to_string(),
         studio_handler(peer_addr, switch_edge),
     )?;
+    crate::mute::start();
 
     // Ensure auto-boot on Windows login is installed. This waits until the web server has the
     // port, so a process that loses the race to another service doesn't rewrite the launchers.
@@ -926,6 +993,7 @@ pub fn run_windows_node(
                     let main = router.main();
                     (router.online(), router.active(), router.panicked(), router.captive(), main)
                 };
+                crate::audio::AUDIO_PEER_ONLINE.store(status.0, Ordering::Relaxed);
                 if logged != Some(status) {
                     logged = Some(status);
                     let (online, active, panicked, captive, main) = status;
@@ -1052,6 +1120,8 @@ pub fn run_windows_node(
         return Err("SetWindowsHookExW(WH_MOUSE_LL) failed".to_string());
     }
     println!("[Windows] Installed WH_MOUSE_LL low-level mouse hook.");
+
+    create_session_window();
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     unsafe {

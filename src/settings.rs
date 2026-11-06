@@ -1,7 +1,7 @@
 //! Per-device persisted settings (audio routing, toggles) + local actions shared by both nodes.
 
 use crate::audio::{
-    AUDIO_RX_MUTED, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_VOLUME_PCT, AUDIO_TEST_CHIME_REQ,
+    AUDIO_MUTE_WHILE_SENDING, AUDIO_RX_DROPPED, AUDIO_RX_MUTED, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_VOLUME_PCT, AUDIO_TEST_CHIME_REQ,
     AUDIO_TX_ENABLED, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOURCE_MODE,
     AUDIO_TX_VOLUME_PCT,
 };
@@ -39,12 +39,18 @@ pub struct LocalSettings {
     pub audio_tx_source: u32,
     pub audio_rx_muted: bool,
     pub audio_rx_volume: u32,
+    #[serde(default = "default_mute_while_sending")]
+    pub mute_while_sending: bool,
     pub mouse_sharing: bool,
     pub keyboard_sharing: bool,
     pub clipboard_send: bool,
     pub clipboard_receive: bool,
     pub pointer_speed: f32,
     pub main_device: u8,
+}
+
+fn default_mute_while_sending() -> bool {
+    true
 }
 
 impl Default for LocalSettings {
@@ -55,6 +61,7 @@ impl Default for LocalSettings {
             audio_tx_source: 0,
             audio_rx_muted: false,
             audio_rx_volume: 100,
+            mute_while_sending: default_mute_while_sending(),
             mouse_sharing: true,
             keyboard_sharing: true,
             clipboard_send: true,
@@ -182,6 +189,7 @@ pub fn load_and_apply() {
     AUDIO_TX_SOURCE_MODE.store(s.audio_tx_source.min(1), Ordering::SeqCst);
     AUDIO_RX_MUTED.store(s.audio_rx_muted, Ordering::SeqCst);
     AUDIO_RX_VOLUME_PCT.store(s.audio_rx_volume.min(150), Ordering::SeqCst);
+    AUDIO_MUTE_WHILE_SENDING.store(s.mute_while_sending, Ordering::SeqCst);
     MOUSE_SHARING.store(s.mouse_sharing, Ordering::SeqCst);
     KEYBOARD_SHARING.store(s.keyboard_sharing, Ordering::SeqCst);
     CLIPBOARD_SEND.store(s.clipboard_send, Ordering::SeqCst);
@@ -197,6 +205,7 @@ fn current_settings() -> LocalSettings {
         audio_tx_source: AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed),
         audio_rx_muted: AUDIO_RX_MUTED.load(Ordering::Relaxed),
         audio_rx_volume: AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed),
+        mute_while_sending: AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst),
         mouse_sharing: MOUSE_SHARING.load(Ordering::SeqCst),
         keyboard_sharing: KEYBOARD_SHARING.load(Ordering::SeqCst),
         clipboard_send: CLIPBOARD_SEND.load(Ordering::SeqCst),
@@ -211,7 +220,7 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 /// Replaces `path` in one step, so that a crash leaves the old file or the new one, never half.
-fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+pub fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     let temp = temp_path(path);
     let mut file = std::fs::File::create(&temp)?;
     file.write_all(text.as_bytes())?;
@@ -241,10 +250,12 @@ pub fn audio_status_json(supports_source_select: bool) -> serde_json::Value {
         } else {
             serde_json::Value::Null
         },
+        "mute_while_sending": AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst),
         "rx_muted": AUDIO_RX_MUTED.load(Ordering::Relaxed),
         "rx_volume": AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed),
         "rx_peak": AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed),
         "rx_packets": AUDIO_RX_PACKETS.load(Ordering::Relaxed),
+        "rx_dropped": AUDIO_RX_DROPPED.load(Ordering::Relaxed),
     })
 }
 
@@ -281,6 +292,7 @@ fn apply_toggle(act: &str, val: &serde_json::Value) -> bool {
             store(&CLIPBOARD_SEND, "send");
             store(&CLIPBOARD_RECEIVE, "receive");
         }
+        "set_mute_while_sending" => store(&AUDIO_MUTE_WHILE_SENDING, "enabled"),
         "set_pointer_speed" => {
             if let Some(speed) = requested_pointer_speed(val) {
                 POINTER_SPEED_BITS.store(speed.to_bits(), Ordering::SeqCst);
@@ -595,6 +607,34 @@ mod tests {
         apply_toggle("set_clipboard", &json!({ "send": true, "receive": true }));
         assert!(CLIPBOARD_SEND.load(Ordering::SeqCst));
         assert!(CLIPBOARD_RECEIVE.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mute_while_sending_is_on_unless_a_file_says_otherwise() {
+        assert!(LocalSettings::default().mute_while_sending);
+        assert!(parse_settings(r#"{"audio_tx_enabled":true}"#).mute_while_sending);
+        assert!(!parse_settings(r#"{"mute_while_sending":false}"#).mute_while_sending);
+    }
+
+    #[test]
+    fn mute_while_sending_is_a_saved_toggle() {
+        let _guard = live_toggles();
+        assert!(apply_toggle("set_mute_while_sending", &json!({ "enabled": false })));
+        assert!(!AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst));
+        assert!(!current_settings().mute_while_sending);
+        assert_eq!(audio_status_json(false)["mute_while_sending"], false);
+        // Nothing usable leaves it alone.
+        apply_toggle("set_mute_while_sending", &json!({ "enabled": "yes" }));
+        apply_toggle("set_mute_while_sending", &json!({}));
+        assert!(!AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst));
+        apply_toggle("set_mute_while_sending", &json!({ "enabled": true }));
+        assert!(current_settings().mute_while_sending);
+        assert_eq!(audio_status_json(false)["mute_while_sending"], true);
+    }
+
+    #[test]
+    fn status_reports_dropped_packets() {
+        assert!(audio_status_json(true)["rx_dropped"].is_u64());
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub fn run_tray() -> Result<(), String> {
         super::single::Instance::AlreadyRunning => return Ok(()),
         super::single::Instance::Failed(e) => return Err(e),
     };
+    crate::mute::start_service_watch();
     platform::run()
 }
 

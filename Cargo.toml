@@ -27,6 +27,11 @@ ksni = { version = "0.3", features = ["blocking"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = "0.15"
 tray-icon = "0.19"
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
