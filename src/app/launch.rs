@@ -1,7 +1,20 @@
 //! Starting mesh-kvm's own pieces: the tray and the window run as separate processes of this exe.
 
+use super::model::ServiceStart;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+/// How often the service is looked for while it starts, and for how many tries: 15 seconds, as the
+/// first start under Windows' scanning or a busy login can take a while.
+const START_POLL: Duration = Duration::from_millis(250);
+const START_POLLS: u32 = 60;
+/// How long a service that has answered must keep answering. Under systemd, one that can't reach
+/// its input devices answers for a moment before it stops.
+const START_SETTLE: Duration = Duration::from_millis(600);
+#[cfg(target_os = "linux")]
+const UNIT: &str = "mesh-kvm.service";
 
 /// Quotes `exe` for a VBScript string that is itself inside a `WshShell.Run` command line.
 fn vbs_run(exe: &str, args: &str) -> String {
@@ -234,6 +247,156 @@ fn spawn_with(args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq)]
+pub enum StartPlan {
+    /// It is already running.
+    Nothing,
+    /// A systemd unit runs it here, so that it restarts and stops with the session.
+    Unit,
+    /// Nothing else will run it, so this exe starts one that outlives it.
+    Detached,
+}
+
+/// How to get a service running here. Doing nothing when one answers is what keeps a second one
+/// from starting, and the API port stops one that slips past this in a race.
+pub fn start_plan(service_answers: bool, unit_exists: bool) -> StartPlan {
+    match (service_answers, unit_exists) {
+        (true, _) => StartPlan::Nothing,
+        (false, true) => StartPlan::Unit,
+        (false, false) => StartPlan::Detached,
+    }
+}
+
+/// What `ensure_service` does to the outside world.
+trait ServiceHost {
+    fn answers(&self) -> bool;
+    fn unit_exists(&self) -> bool;
+    fn start_unit(&self) -> Result<(), String>;
+    fn start_detached(&self) -> Result<(), String>;
+    fn wait(&self, time: Duration);
+}
+
+/// Starts this device's service if none answers, and waits to see it run.
+fn ensure_service(host: &dyn ServiceHost, log: &Path) -> Result<(), String> {
+    let failed = |why: String| format!("mesh-kvm couldn't start on this device: {why}");
+    match start_plan(host.answers(), host.unit_exists()) {
+        StartPlan::Nothing => return Ok(()),
+        StartPlan::Unit => {
+            // A unit that won't start shouldn't leave the person with nothing.
+            if host.start_unit().is_err() {
+                host.start_detached().map_err(failed)?;
+            }
+        }
+        StartPlan::Detached => host.start_detached().map_err(failed)?,
+    }
+    for _ in 0..START_POLLS {
+        host.wait(START_POLL);
+        if host.answers() {
+            host.wait(START_SETTLE);
+            if host.answers() {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!("mesh-kvm didn't start on this device. The reason may be in the log: {}", log.display()))
+}
+
+struct ThisDevice;
+
+impl ServiceHost for ThisDevice {
+    fn answers(&self) -> bool {
+        matches!(crate::webui::http_call("127.0.0.1", "GET", "/api/local", ""), Ok((200, _)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unit_exists(&self) -> bool {
+        Command::new("systemctl")
+            .args(["--user", "cat", UNIT])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unit_exists(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_unit(&self) -> Result<(), String> {
+        // `--no-block`, as the unit's start is watched through the API anyway.
+        let output = Command::new("systemctl")
+            .args(["--user", "--no-block", "start", UNIT])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn start_unit(&self) -> Result<(), String> {
+        Err("this device has no units".to_string())
+    }
+
+    fn start_detached(&self) -> Result<(), String> {
+        // Never with no arguments: on Windows that is a double-click, which opens the window too.
+        spawn_with(&["--role", crate::platform::ROLE], &[]).map_err(|e| e.to_string())
+    }
+
+    fn wait(&self, time: Duration) {
+        std::thread::sleep(time);
+    }
+}
+
+/// Gets this device's service running in the background, for the app and the tray, which must
+/// not wait for it. Starting it can take seconds.
+#[derive(Clone, Default)]
+pub struct ServiceStarter(Arc<Mutex<ServiceStart>>);
+
+impl ServiceStarter {
+    pub fn begin() -> Self {
+        let starter = Self(Arc::new(Mutex::new(ServiceStart::Starting)));
+        let shared = starter.clone();
+        let spawned = std::thread::Builder::new().name("mesh-kvm-service-start".into()).spawn(move || {
+            let log = crate::settings::log_path();
+            let result = ensure_service(&ThisDevice, &log);
+            shared.finish(result);
+        });
+        if let Err(e) = spawned {
+            starter.finish(Err(format!("mesh-kvm couldn't start on this device: {e}")));
+        }
+        starter
+    }
+
+    fn finish(&self, result: Result<(), String>) {
+        if let Err(reason) = &result {
+            crate::settings::log_note(reason);
+        }
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = match result {
+            Ok(()) => ServiceStart::Done,
+            Err(reason) => ServiceStart::Failed(reason),
+        };
+    }
+
+    pub fn state(&self) -> ServiceStart {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    #[cfg(test)]
+    pub fn begin_for_test(state: ServiceStart) -> Self {
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    #[cfg(test)]
+    pub fn finish_for_test(&self, reason: &str) {
+        *self.0.lock().unwrap() = ServiceStart::Failed(reason.to_string());
+    }
+}
+
 /// Set on a Windows service started by the one it replaces, which still holds the ports.
 pub const RESTARTING_ENV: &str = "MESH_KVM_RESTARTING";
 
@@ -270,6 +433,130 @@ pub fn restart_service() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
+    /// A service that starts answering once `after` looks have passed since it was started.
+    #[derive(Default)]
+    struct FakeHost {
+        running: Cell<bool>,
+        unit: bool,
+        unit_fails: bool,
+        detached_fails: bool,
+        /// Looks until a started service answers. `None` means it never does.
+        answers_after: Option<u32>,
+        /// Looks after it first answers that it dies.
+        dies_after: Option<u32>,
+        looks: Cell<u32>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeHost {
+        fn started(&self) -> bool {
+            self.calls.borrow().iter().any(|c| matches!(*c, "unit" | "detached"))
+        }
+    }
+
+    impl super::ServiceHost for FakeHost {
+        fn answers(&self) -> bool {
+            if self.running.get() {
+                return true;
+            }
+            if !self.started() {
+                return false;
+            }
+            let looks = self.looks.get();
+            self.looks.set(looks + 1);
+            let Some(after) = self.answers_after else { return false };
+            looks >= after && self.dies_after.is_none_or(|dies| looks < after + dies)
+        }
+
+        fn unit_exists(&self) -> bool {
+            self.unit
+        }
+
+        fn start_unit(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("unit");
+            if self.unit_fails {
+                self.calls.borrow_mut().clear();
+                self.calls.borrow_mut().push("unit failed");
+                return Err("no such bus".into());
+            }
+            Ok(())
+        }
+
+        fn start_detached(&self) -> Result<(), String> {
+            if self.detached_fails {
+                return Err("permission denied".into());
+            }
+            self.calls.borrow_mut().push("detached");
+            Ok(())
+        }
+
+        fn wait(&self, _time: Duration) {}
+    }
+
+    fn ensure(host: &FakeHost) -> Result<(), String> {
+        super::ensure_service(host, Path::new("/tmp/mesh-kvm.log"))
+    }
+
+    #[test]
+    fn the_plan_starts_nothing_when_a_service_answers() {
+        use super::{start_plan, StartPlan};
+        assert_eq!(start_plan(true, true), StartPlan::Nothing);
+        assert_eq!(start_plan(true, false), StartPlan::Nothing);
+        assert_eq!(start_plan(false, true), StartPlan::Unit);
+        assert_eq!(start_plan(false, false), StartPlan::Detached);
+    }
+
+    #[test]
+    fn a_running_service_is_left_alone() {
+        let host = FakeHost { unit: true, ..Default::default() };
+        host.running.set(true);
+        assert_eq!(ensure(&host), Ok(()));
+        assert!(host.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_unit_is_used_when_there_is_one_and_only_once() {
+        let host = FakeHost { unit: true, answers_after: Some(3), ..Default::default() };
+        assert_eq!(ensure(&host), Ok(()));
+        assert_eq!(*host.calls.borrow(), vec!["unit"]);
+    }
+
+    #[test]
+    fn with_no_unit_a_detached_service_is_started() {
+        let host = FakeHost { answers_after: Some(0), ..Default::default() };
+        assert_eq!(ensure(&host), Ok(()));
+        assert_eq!(*host.calls.borrow(), vec!["detached"]);
+    }
+
+    #[test]
+    fn a_unit_that_will_not_start_falls_back_to_a_detached_service() {
+        let host = FakeHost { unit: true, unit_fails: true, answers_after: Some(0), ..Default::default() };
+        assert_eq!(ensure(&host), Ok(()));
+        assert_eq!(*host.calls.borrow(), vec!["unit failed", "detached"]);
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_started_says_why() {
+        let host = FakeHost { detached_fails: true, ..Default::default() };
+        let error = ensure(&host).unwrap_err();
+        assert!(error.contains("couldn't start") && error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn a_service_that_never_answers_points_at_the_log() {
+        let host = FakeHost::default();
+        let error = ensure(&host).unwrap_err();
+        assert!(error.contains("didn't start") && error.contains("/tmp/mesh-kvm.log"), "{error}");
+    }
+
+    #[test]
+    fn a_service_that_answers_once_and_dies_has_not_started() {
+        let host = FakeHost { answers_after: Some(2), dies_after: Some(1), ..Default::default() };
+        assert!(ensure(&host).is_err());
+    }
+
     #[test]
     fn a_restart_keeps_the_arguments_and_never_turns_into_a_bare_launch() {
         let kept = vec!["--role".to_string(), "windows".to_string(), "--port".to_string(), "9".to_string()];

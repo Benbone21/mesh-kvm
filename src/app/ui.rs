@@ -2,9 +2,10 @@
 //! decisions live in `model`; this file is layout and painting.
 
 use super::client::Client;
+use super::launch::ServiceStarter;
 use super::model::{
     self, Control, ControlsEnabled, Device, DeviceStatus, Edits, LayoutDraft, Light, MapView,
-    Snapshot,
+    ServiceStart, Snapshot,
 };
 use super::theme::{
     self, line, AMBER, AMBER_GROOVE, DEBIAN, DEEP, DIM, EDGE, GREEN, INK, PANEL, RAISED, RED, UNLIT,
@@ -17,7 +18,7 @@ use serde_json::json;
 use std::ops::RangeInclusive;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
@@ -35,9 +36,12 @@ const MIN_POINTER_SPEED: f64 = 0.05;
 const MAX_POINTER_SPEED: f64 = 2.0;
 const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 const EDGE_PUSH_RANGE: RangeInclusive<f64> = 10.0..=180.0;
+/// How often to look at how starting the service is going.
+const START_CHECK: Duration = Duration::from_millis(250);
+const PEER_PROMPT_WIDTH: f32 = 380.0;
 
-/// Opens the window and returns when it closes.
-pub fn run_window() -> Result<(), String> {
+/// Opens the window and returns when it closes. `starter` is getting the service running.
+pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mesh-kvm")
@@ -55,7 +59,7 @@ pub fn run_window() -> Result<(), String> {
             super::single::serve_focus(cc.egui_ctx.clone());
             let ctx = cc.egui_ctx.clone();
             let client = Client::start(super::client::WINDOW_POLL, Box::new(move || ctx.request_repaint()));
-            Ok(Box::new(Window::new(client)))
+            Ok(Box::new(Window::new(client, starter)))
         }),
     )
     .map_err(|e| format!("The mesh-kvm window couldn't start: {e}"))
@@ -70,8 +74,22 @@ struct MapDrag {
     from: (i32, i32),
 }
 
+/// The box that asks for the other device's address.
+#[derive(Default)]
+struct PeerPrompt {
+    /// Opened by hand. On a first run it is open whatever this says, and can't be closed.
+    open: bool,
+    address: String,
+    /// True once the text box has been given the keyboard.
+    focused: bool,
+    saving: Option<Receiver<Result<(), String>>>,
+    error: Option<String>,
+}
+
 struct Window {
     client: Arc<Client>,
+    starter: ServiceStarter,
+    peer_prompt: PeerPrompt,
     edits: Edits,
     layout: LayoutDraft,
     drag: Option<MapDrag>,
@@ -93,9 +111,11 @@ impl eframe::App for Window {
 }
 
 impl Window {
-    fn new(client: Client) -> Self {
+    fn new(client: Client, starter: ServiceStarter) -> Self {
         Self {
             client: Arc::new(client),
+            starter,
+            peer_prompt: PeerPrompt::default(),
             edits: Edits::default(),
             layout: LayoutDraft::default(),
             drag: None,
@@ -111,14 +131,16 @@ impl Window {
     fn show(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) {
         let on = model::enabled(snapshot);
         self.collect_main_change();
+        self.collect_peer_change();
         self.clear_stale_main_error(snapshot, &on);
+        let start = self.starter.state();
         self.layout.follow(snapshot.layout.clone(), self.drag.is_some(), now);
 
         egui::TopBottomPanel::top("top bar")
             .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(24, 14)))
             .show(ctx, |ui| self.top_bar(ui, snapshot, &on));
-        if let Some(message) = model::status_message(snapshot) {
-            let fill = if model::notice_is_serious(snapshot) { RED } else { AMBER };
+        if let Some(message) = model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)) {
+            let fill = if model::notice_is_serious(snapshot, &start) { RED } else { AMBER };
             notice_strip(ctx, "notice", fill, |ui| {
                 ui.label(RichText::new(message).color(DEEP));
             });
@@ -146,21 +168,99 @@ impl Window {
             });
         });
 
+        let first_run = model::needs_peer(snapshot);
+        if first_run || self.peer_prompt.open {
+            self.peer_window(ctx, snapshot, first_run);
+        }
+
         self.end_lost_drag(ctx, now);
-        self.send_changes(snapshot, now);
+        self.send_changes(now);
         let wake = [self.edits.next_wake(now), self.layout.next_wake(now)].into_iter().flatten().min();
         if let Some(wake) = wake {
             ctx.request_repaint_after(wake);
         }
+        if start == ServiceStart::Starting {
+            ctx.request_repaint_after(START_CHECK);
+        }
     }
 
-    fn send_changes(&mut self, snapshot: &Snapshot, now: Instant) {
+    fn collect_peer_change(&mut self) {
+        let Some(change) = &self.peer_prompt.saving else { return };
+        match change.try_recv() {
+            Ok(Ok(())) => self.peer_prompt = PeerPrompt::default(),
+            Ok(Err(reason)) => {
+                self.peer_prompt.error = Some(reason);
+                self.peer_prompt.saving = None;
+            }
+            Err(TryRecvError::Disconnected) => self.peer_prompt.saving = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Hands the address to the service on a background thread, as the UI must not wait for it.
+    fn save_peer(&mut self, ctx: &egui::Context) {
+        let (done, change) = mpsc::channel();
+        let (client, ctx, address) = (self.client.clone(), ctx.clone(), self.peer_prompt.address.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(client.set_peer(&address));
+            ctx.request_repaint();
+        });
+        self.peer_prompt.error = None;
+        self.peer_prompt.saving = Some(change);
+    }
+
+    fn peer_window(&mut self, ctx: &egui::Context, snapshot: &Snapshot, first_run: bool) {
+        let this_address = snapshot.local.as_ref().map_or("", |l| l.ip.as_str());
+        let saving = self.peer_prompt.saving.is_some();
+        let (mut connect, mut cancel) = (false, false);
+        egui::Window::new("Connect to your other device")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(PEER_PROMPT_WIDTH)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Enter the address of the other device. mesh-kvm shows it on that device, next to its name.");
+                if !this_address.is_empty() {
+                    ui.label(small(format!("This device's address is {this_address}.")));
+                }
+                let edit = egui::TextEdit::singleline(&mut self.peer_prompt.address)
+                    .hint_text("192.168.1.20")
+                    .desired_width(ui.available_width());
+                let field = ui.add_enabled(!saving, edit);
+                if !self.peer_prompt.focused {
+                    self.peer_prompt.focused = true;
+                    field.request_focus();
+                }
+                let pressed_enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if let Some(error) = &self.peer_prompt.error {
+                    ui.label(RichText::new(error).color(RED));
+                }
+                ui.horizontal(|ui| {
+                    let ready = !saving && !self.peer_prompt.address.trim().is_empty();
+                    let clicked = ui.add_enabled(ready, egui::Button::new("Connect")).clicked();
+                    connect = clicked || (ready && pressed_enter);
+                    if !first_run {
+                        cancel = ui.add_enabled(!saving, egui::Button::new("Cancel")).clicked();
+                    }
+                    if saving {
+                        ui.label(small("Saving the address."));
+                    }
+                });
+            });
+        if connect {
+            self.save_peer(ctx);
+        }
+        if cancel {
+            self.peer_prompt = PeerPrompt::default();
+        }
+    }
+
+    fn send_changes(&mut self, now: Instant) {
         for ((device, control), value) in self.edits.take_due(now) {
             self.client.local_action(device, control.action(value));
         }
         if let Some(layout) = self.layout.take_due(now) {
-            let body = self.edits.layout_save_body(layout, snapshot, now);
-            self.client.save_layout(body);
+            self.client.save_layout(layout.to_save_json());
         }
     }
 
@@ -277,7 +377,7 @@ impl Window {
         paint_map_well(ui.painter(), well);
 
         let Some(state) = &self.layout.state else {
-            let text = "The layout is stored on the Debian desktop and needs it to be connected.";
+            let text = "The layout shows up here once mesh-kvm is running on this device.";
             let galley = ui.painter().layout(text.into(), body_font(ui), DIM, well.width() - 48.0);
             let at = well.center() - galley.size() / 2.0;
             ui.painter().galley(at, galley, DIM);
@@ -292,13 +392,18 @@ impl Window {
         let painter = ui.painter().with_clip_rect(well);
         let active = snapshot.active();
 
-        for m in &cfg.debian_monitors {
+        for m in cfg.rects(Device::Debian) {
             let colours = (theme::mix(DEEP, DEBIAN, 0.28), DEBIAN);
             paint_screen(&painter, to_rect(m.x, m.y, m.w, m.h), &m.name, (m.w, m.h), colours, active == Some(Device::Debian));
         }
-        let laptop = to_rect(cfg.win_x, cfg.win_y, cfg.win_w, cfg.win_h);
+        let (win_x, win_y, win_w, win_h) = cfg.laptop_box();
+        let laptop = to_rect(win_x, win_y, win_w, win_h);
         let colours = (theme::mix(DEEP, AMBER, 0.16), AMBER);
-        paint_screen(&painter, laptop, Device::Windows.title(), (cfg.win_w, cfg.win_h), colours, active == Some(Device::Windows));
+        let screens = cfg.rects(Device::Windows);
+        for m in &screens {
+            let name = if screens.len() == 1 { Device::Windows.title() } else { m.name.as_str() };
+            paint_screen(&painter, to_rect(m.x, m.y, m.w, m.h), name, (m.w, m.h), colours, active == Some(Device::Windows));
+        }
         if self.drag.is_some() {
             paint_attached_edge(&painter, laptop, &cfg.attach_side);
         }
@@ -315,8 +420,8 @@ impl Window {
             if let Some(pressed) = pressed {
                 let (px, py) = in_map(pressed);
                 let (wx, wy) = view.to_world(px, py);
-                let offset = (wx - cfg.win_x as f32, wy - cfg.win_y as f32);
-                self.drag = Some(MapDrag { view, grab: offset, from: (cfg.win_x, cfg.win_y) });
+                let offset = (wx - win_x as f32, wy - win_y as f32);
+                self.drag = Some(MapDrag { view, grab: offset, from: (win_x, win_y) });
             }
         }
         if let (true, Some(drag), Some(pointer)) = (grab.dragged(), &self.drag, grab.interact_pointer_pos()) {
@@ -332,7 +437,10 @@ impl Window {
 
     fn finish_drag(&mut self, now: Instant) {
         let Some(drag) = self.drag.take() else { return };
-        let moved = self.layout.state.as_ref().is_some_and(|s| (s.config.win_x, s.config.win_y) != drag.from);
+        let moved = self.layout.state.as_ref().is_some_and(|s| {
+            let (x, y, ..) = s.config.laptop_box();
+            (x, y) != drag.from
+        });
         if moved {
             self.layout.edited(now);
         }
@@ -352,12 +460,29 @@ impl Window {
         ui.heading("Main device");
         self.main_device_controls(ui, snapshot, on);
         ui.add_space(10.0);
+        self.other_device_controls(ui, snapshot);
+        ui.add_space(10.0);
         ui.add_enabled_ui(on.release, |ui| {
             let text = RichText::new("Release all input").color(DEEP);
             if wide_button(ui, egui::Button::new(text).fill(RED).stroke(Stroke::NONE)).clicked() {
                 self.client.release_all_input();
             }
         });
+    }
+
+    /// Where the other device is, and the way to change it. A first run asks by itself.
+    fn other_device_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
+        let Some(local) = snapshot.local.as_ref().filter(|l| l.paired == Some(true)) else { return };
+        ui.heading("Other device");
+        ui.label(small(format!("Its address is {}.", local.peer_ip)));
+        ui.add_enabled_ui(!local.peer_pinned, |ui| {
+            if wide_button(ui, egui::Button::new("Change address")).clicked() {
+                self.peer_prompt.open = true;
+            }
+        });
+        if local.peer_pinned {
+            ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
+        }
     }
 
     fn layout_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, now: Instant) {
@@ -403,7 +528,7 @@ impl Window {
         let moved = slider_row(ui, "Push needed to cross a screen edge", push_text, &mut push, EDGE_PUSH_RANGE, 5.0);
 
         let auto_lock = toggle_row(ui, "Keep the mouse on the screen while a game runs", cfg.auto_game_lock).clicked();
-        ui.label(small("This applies to the Debian desktop. The laptop always watches for games."));
+        ui.label(small("This applies to the device you're using it on."));
         let manual_lock = toggle_row(ui, "Lock the mouse to this screen now", cfg.manual_game_lock).clicked();
         let telemetry = snapshot.layout.as_ref().map(|l| &l.telemetry);
         if let Some(hint) = telemetry.and_then(model::game_lock_hint) {
@@ -898,9 +1023,8 @@ mod tests {
     use super::*;
     use crate::app::model::LayoutState;
     use eframe::egui::{Event, PointerButton, RawInput};
-    use std::time::Duration;
 
-    const STATE: &str = r#"{"config":{"debian_monitors":[{"name":"DP-3 (240Hz Native)","x":0,"y":360,"w":1920,"h":1080},{"name":"DP-2 (360Hz Native)","x":1920,"y":0,"w":2560,"h":1440}],"deb_total_w":4480,"deb_total_h":1440,"win_x":1920,"win_y":1440,"win_w":2560,"win_h":1600,"win_native_w":2560,"win_native_h":1600,"resolution_mode":"native","attach_side":"Bottom","mouse_speed":0.35,"edge_resistance":55,"auto_game_lock":true,"manual_game_lock":false},"telemetry":{"active_node":"Debian","deb_cursor_x":3200,"deb_cursor_y":720,"peer_online":true}}"#;
+    const STATE: &str = r#"{"config":{"devices":[{"node":"Debian","x":0,"y":0,"monitors":[{"name":"DP-3 (240Hz Native)","x":0,"y":360,"w":1920,"h":1080},{"name":"DP-2 (360Hz Native)","x":1920,"y":0,"w":2560,"h":1440}]},{"node":"Windows","x":1920,"y":1440,"monitors":[{"name":"Display 1","x":0,"y":0,"w":2560,"h":1600}]}],"attach_side":"Bottom","edge_resistance":55,"auto_game_lock":true,"manual_game_lock":false},"telemetry":{"active_node":"Debian","peer_online":true}}"#;
 
     fn device(node: &str, tx_source: Option<u32>) -> DeviceStatus {
         let mut d: DeviceStatus = serde_json::from_str(&format!(
@@ -927,20 +1051,21 @@ mod tests {
     fn states() -> Vec<Snapshot> {
         let mut no_peer = linked();
         no_peer.peer = None;
-        let laptop_alone = Snapshot { local: Some(device("windows", None)), peer: None, layout: None };
+        let laptop_alone = Snapshot { local: Some(device("windows", None)), peer: None, layout: LayoutState::parse(STATE) };
+        let no_layout = Snapshot { local: Some(device("windows", None)), peer: None, layout: None };
         let mut split = linked();
         split.peer.as_mut().unwrap().main_device = 1;
         split.local.as_mut().unwrap().main_conflict = true;
         let mut older = linked();
         older.peer.as_mut().unwrap().sharing = None;
         older.peer.as_mut().unwrap().audio.mute_while_sending = None;
-        vec![Snapshot::default(), linked(), no_peer, laptop_alone, split, older]
+        vec![Snapshot::default(), linked(), no_peer, laptop_alone, no_layout, split, older]
     }
 
     fn window() -> Window {
         // Nothing listens here, so whatever the tests send goes nowhere.
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        Window::new(Client::start_on(port, Box::new(|| {})))
+        Window::new(Client::start_on(port, Box::new(|| {})), ServiceStarter::default())
     }
 
     fn context() -> egui::Context {
@@ -994,6 +1119,66 @@ mod tests {
         }
     }
 
+    fn unpaired() -> Snapshot {
+        let mut local = device("windows", None);
+        local.paired = Some(false);
+        local.ip = "192.168.8.241".into();
+        Snapshot { local: Some(local), peer: None, layout: LayoutState::parse(STATE) }
+    }
+
+    #[test]
+    fn a_first_run_asks_for_the_address_and_a_failure_keeps_the_box_open() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (unpaired(), Instant::now());
+        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+            frame(&ctx, &mut window, &snapshot, size, vec![], now);
+        }
+        assert!(window.peer_prompt.focused, "the box should be up, ready to type in");
+        window.peer_prompt.address = "192.168.8.210".into();
+        window.save_peer(&ctx);
+        assert!(window.peer_prompt.saving.is_some(), "the save runs off the UI thread");
+        for _ in 0..200 {
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+            if window.peer_prompt.saving.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Nothing listens in this test, so the service can't take it.
+        assert!(window.peer_prompt.error.as_deref().unwrap().contains("didn't answer"));
+        assert_eq!(window.peer_prompt.address, "192.168.8.210", "what was typed stays");
+    }
+
+    #[test]
+    fn a_paired_device_shows_no_box_until_asked() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        snapshot.local.as_mut().unwrap().paired = Some(true);
+        snapshot.local.as_mut().unwrap().peer_ip = "192.168.8.210".into();
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        assert!(!window.peer_prompt.focused);
+        window.peer_prompt.open = true;
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        assert!(window.peer_prompt.focused);
+    }
+
+    #[test]
+    fn a_failed_start_is_shown_and_starting_keeps_the_window_looking() {
+        let (ctx, _) = (context(), ());
+        let client = Client::start_on(
+            std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(),
+            Box::new(|| {}),
+        );
+        let starter = ServiceStarter::begin_for_test(ServiceStart::Starting);
+        let mut window = Window::new(client, starter.clone());
+        let output = frame(&ctx, &mut window, &Snapshot::default(), WINDOW_SIZE, vec![], Instant::now());
+        let repaint = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(repaint <= START_CHECK, "{repaint:?}");
+        starter.finish_for_test("mesh-kvm didn't start on this device.");
+        assert!(matches!(window.starter.state(), ServiceStart::Failed(_)));
+        frame(&ctx, &mut window, &Snapshot::default(), WINDOW_SIZE, vec![], Instant::now());
+    }
+
     #[test]
     fn the_window_is_idle_when_nothing_changes() {
         for snapshot in states() {
@@ -1036,20 +1221,20 @@ mod tests {
         step(&mut window, vec![Event::PointerMoved(start + vec2(60.0, 0.0))]);
         assert!(window.drag.is_some(), "the laptop should be held");
         step(&mut window, vec![Event::PointerMoved(end)]);
-        let held = window.layout.state.as_ref().unwrap().config.win_x;
+        let held = window.layout.state.as_ref().unwrap().config.laptop_box().0;
         assert!(held > 1920, "the laptop should have moved, not {held}");
 
         // A poll arrives saying the laptop is where it was, and the view stays frozen.
         let view = window.drag.as_ref().unwrap().view;
         step(&mut window, vec![]);
-        assert_eq!(window.layout.state.as_ref().unwrap().config.win_x, held);
+        assert_eq!(window.layout.state.as_ref().unwrap().config.laptop_box().0, held);
         assert_eq!(window.drag.as_ref().unwrap().view, view);
 
         step(&mut window, vec![pointer(end, false)]);
         assert!(window.drag.is_none());
         // Held for a moment after release, so the old poll doesn't undo the move.
         step(&mut window, vec![]);
-        assert_eq!(window.layout.state.as_ref().unwrap().config.win_x, held);
+        assert_eq!(window.layout.state.as_ref().unwrap().config.laptop_box().0, held);
     }
 
     #[test]

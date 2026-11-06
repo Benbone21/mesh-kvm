@@ -169,6 +169,11 @@ pub struct DeviceStatus {
     pub audio: AudioStatus,
     /// Missing from a service older than 0.2.0, which is how the app tells it apart.
     pub sharing: Option<Sharing>,
+    /// False until the service knows the other device's address. Missing from a service that
+    /// doesn't save the address, and so keeps the layout only on the Debian desktop.
+    pub paired: Option<bool>,
+    /// `--peer` set the address, so the app can't change it.
+    pub peer_pinned: bool,
     pub clipboard: ClipboardSharing,
     #[serde(default = "default_speed")]
     pub pointer_speed: f32,
@@ -181,6 +186,11 @@ impl DeviceStatus {
     /// True for a service from before this version of the app, which can't take the newer controls.
     pub fn is_older(&self) -> bool {
         self.sharing.is_none()
+    }
+
+    /// True for a service that can't share a layout with this app.
+    fn has_no_shared_layout(&self) -> bool {
+        self.paired.is_none()
     }
 }
 
@@ -196,27 +206,81 @@ fn default_speed() -> f32 {
     1.0
 }
 
+/// One device in the layout: where its desktop sits, and the monitors on it.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LayoutDevice {
+    /// "Debian" or "Windows".
+    pub node: String,
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    /// In the device's own desktop coordinates.
+    pub monitors: Vec<Display>,
+    pub custom_size: Option<(i32, i32)>,
+}
+
+impl LayoutDevice {
+    /// The device's screens in the layout.
+    pub fn rects(&self) -> Vec<Display> {
+        if let Some((w, h)) = self.custom_size {
+            return vec![Display { name: self.name.clone(), x: self.x, y: self.y, w, h }];
+        }
+        let shifted = |m: &Display| Display { x: m.x + self.x, y: m.y + self.y, ..m.clone() };
+        self.monitors.iter().map(shifted).collect()
+    }
+}
+
+/// `(left, top, right, bottom)` around all of `rects`, with right and bottom exclusive.
+fn bounds(rects: &[Display]) -> (i32, i32, i32, i32) {
+    let left = rects.iter().map(|m| m.x).min().unwrap_or(0);
+    let top = rects.iter().map(|m| m.y).min().unwrap_or(0);
+    let right = rects.iter().map(|m| m.x + m.w).max().unwrap_or(left);
+    let bottom = rects.iter().map(|m| m.y + m.h).max().unwrap_or(top);
+    (left, top, right, bottom)
+}
+
 /// The layout, as far as the app edits or draws it.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LayoutConfig {
-    pub debian_monitors: Vec<Display>,
-    pub deb_total_w: i32,
-    pub deb_total_h: i32,
-    pub win_x: i32,
-    pub win_y: i32,
-    pub win_w: i32,
-    pub win_h: i32,
-    pub win_native_w: i32,
-    pub win_native_h: i32,
-    pub resolution_mode: String,
+    pub devices: Vec<LayoutDevice>,
     /// "Right", "Left", "Bottom" or "Top".
     pub attach_side: String,
-    pub mouse_speed: f32,
     pub edge_resistance: i32,
     #[serde(default = "yes")]
     pub auto_game_lock: bool,
     pub manual_game_lock: bool,
+}
+
+impl LayoutConfig {
+    pub fn device(&self, device: Device) -> Option<&LayoutDevice> {
+        self.devices.iter().find(|d| d.node == device.short_name())
+    }
+
+    fn device_mut(&mut self, device: Device) -> Option<&mut LayoutDevice> {
+        self.devices.iter_mut().find(|d| d.node == device.short_name())
+    }
+
+    /// A device's screens in the layout.
+    pub fn rects(&self, device: Device) -> Vec<Display> {
+        self.device(device).map(LayoutDevice::rects).unwrap_or_default()
+    }
+
+    /// The box around the laptop's screens: `(x, y, w, h)`.
+    pub fn laptop_box(&self) -> (i32, i32, i32, i32) {
+        let (left, top, right, bottom) = bounds(&self.rects(Device::Windows));
+        (left, top, right - left, bottom - top)
+    }
+
+    /// Moves the laptop so that its box starts at `(x, y)`.
+    fn move_laptop(&mut self, x: i32, y: i32) {
+        let (left, top, ..) = self.laptop_box();
+        if let Some(laptop) = self.device_mut(Device::Windows) {
+            laptop.x += x - left;
+            laptop.y += y - top;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -224,10 +288,6 @@ pub struct LayoutConfig {
 pub struct Telemetry {
     pub active_node: String,
     pub panic_mode: bool,
-    pub deb_cursor_x: i32,
-    pub deb_cursor_y: i32,
-    pub win_cursor_x: i32,
-    pub win_cursor_y: i32,
     pub peer_addr: String,
     pub game_captive_active: bool,
     pub game_reason: String,
@@ -235,7 +295,7 @@ pub struct Telemetry {
     pub main_conflict: bool,
 }
 
-/// `/api/state`: the layout and live telemetry from the Debian desktop.
+/// `/api/state`: this device's copy of the layout, and its live telemetry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutState {
     pub config: LayoutConfig,
@@ -245,6 +305,7 @@ pub struct LayoutState {
 }
 
 impl LayoutState {
+    /// `None` for a layout from a service that keeps it in the older form.
     pub fn parse(text: &str) -> Option<Self> {
         #[derive(Deserialize)]
         struct State {
@@ -253,6 +314,7 @@ impl LayoutState {
             telemetry: Telemetry,
         }
         let state: State = serde_json::from_str(text).ok()?;
+        state.config.get("devices")?;
         let config = serde_json::from_value(state.config.clone()).ok()?;
         Some(Self { config, telemetry: state.telemetry, raw_config: state.config })
     }
@@ -265,17 +327,14 @@ impl LayoutState {
             out = Value::Object(Default::default());
         }
         let c = &self.config;
-        out["win_x"] = c.win_x.into();
-        out["win_y"] = c.win_y.into();
-        out["win_w"] = c.win_w.into();
-        out["win_h"] = c.win_h.into();
-        out["resolution_mode"] = c.resolution_mode.clone().into();
-        out["attach_side"] = c.attach_side.clone().into();
-        // The service sent a double and the config holds an f32, so writing it back unchanged
-        // would save float noise.
-        if out["mouse_speed"].as_f64().unwrap_or(0.0) as f32 != c.mouse_speed {
-            out["mouse_speed"] = ((c.mouse_speed as f64 * 100.0).round() / 100.0).into();
+        if let Some(devices) = out["devices"].as_array_mut() {
+            for (saved, device) in devices.iter_mut().zip(&c.devices) {
+                saved["x"] = device.x.into();
+                saved["y"] = device.y.into();
+                saved["custom_size"] = json!(device.custom_size);
+            }
         }
+        out["attach_side"] = c.attach_side.clone().into();
         out["edge_resistance"] = c.edge_resistance.into();
         out["auto_game_lock"] = c.auto_game_lock.into();
         out["manual_game_lock"] = c.manual_game_lock.into();
@@ -296,7 +355,7 @@ impl Snapshot {
         [&self.local, &self.peer].into_iter().flatten().find(|d| d.node == device.node())
     }
 
-    fn this_device(&self) -> Option<Device> {
+    pub fn this_device(&self) -> Option<Device> {
         Device::from_node(&self.local.as_ref()?.node)
     }
 
@@ -384,16 +443,44 @@ pub fn device_badge(snapshot: &Snapshot, device: Device) -> (Light, &'static str
     }
 }
 
+/// True when this device's service is waiting to be told the other device's address.
+pub fn needs_peer(snapshot: &Snapshot) -> bool {
+    snapshot.local.as_ref().is_some_and(|d| d.paired == Some(false))
+}
+
+/// How starting this device's service went, for an app that found none running.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ServiceStart {
+    /// Nothing to report: it was running already, or it has started.
+    #[default]
+    Done,
+    Starting,
+    Failed(String),
+}
+
+/// What to say about the service while it is starting or after that failed. A service that
+/// answers settles it, however it came to be running.
+pub fn start_notice(start: &ServiceStart, snapshot: &Snapshot) -> Option<String> {
+    if snapshot.local.is_some() {
+        return None;
+    }
+    match start {
+        ServiceStart::Done => None,
+        ServiceStart::Starting => Some("Starting mesh-kvm on this device.".into()),
+        ServiceStart::Failed(reason) => Some(reason.clone()),
+    }
+}
+
 /// True when the notice is about this device's service rather than the link.
-pub fn notice_is_serious(snapshot: &Snapshot) -> bool {
-    snapshot.local.is_none()
+pub fn notice_is_serious(snapshot: &Snapshot, start: &ServiceStart) -> bool {
+    snapshot.local.is_none() && *start != ServiceStart::Starting
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Release {
-    /// Through the Debian desktop, which owns the layout-wide actions.
+    /// Through this device's layout-wide action, which tells the other device too.
     Everywhere,
-    /// The Debian desktop can't be reached, so only this device lets go.
+    /// This device's service is too old to have that action, so only this device lets go.
     Only(Device),
 }
 
@@ -405,15 +492,12 @@ pub fn release_route(snapshot: &Snapshot) -> Option<Release> {
     snapshot.this_device().map(Release::Only)
 }
 
-/// Where the cursor is in layout coordinates. The laptop reports its own position.
+/// Where the cursor is in layout coordinates. Each device reports its own position.
 pub fn cursor_position(snapshot: &Snapshot, cfg: &LayoutConfig) -> Option<(i32, i32)> {
-    let telemetry = &snapshot.layout.as_ref()?.telemetry;
-    if telemetry.active_node == Device::Windows.short_name() {
-        let [x, y] = snapshot.device(Device::Windows)?.cursor?;
-        Some((cfg.win_x + x, cfg.win_y + y))
-    } else {
-        Some((telemetry.deb_cursor_x, telemetry.deb_cursor_y))
-    }
+    let active = snapshot.active()?;
+    let [x, y] = snapshot.device(active)?.cursor?;
+    let device = cfg.device(active)?;
+    Some((device.x + x, device.y + y))
 }
 
 pub fn game_lock_hint(telemetry: &Telemetry) -> Option<String> {
@@ -533,17 +617,6 @@ impl Edits {
         due
     }
 
-    /// The body for a layout save. The pointer speed isn't part of what a layout edit changes, so
-    /// it comes from the latest poll, or from the slider while a change to it hasn't caught up.
-    /// A draft made before the person moved the slider would otherwise put the old speed back.
-    pub fn layout_save_body(&self, draft: &LayoutState, latest: &Snapshot, now: Instant) -> Value {
-        let polled = latest.layout.as_ref().unwrap_or(draft).config.mouse_speed;
-        let speed = self.shown((Device::Debian, Control::PointerSpeed), polled as f64, now) as f32;
-        let mut layout = draft.clone();
-        layout.config.mouse_speed = speed;
-        layout.to_save_json()
-    }
-
     /// How long until something here needs another look, so the window can stay idle until then.
     pub fn next_wake(&self, now: Instant) -> Option<Duration> {
         self.entries
@@ -642,9 +715,11 @@ fn js_round(v: f64) -> i32 {
 
 /// The named places the laptop can go, one set per Debian monitor.
 pub fn placements(cfg: &LayoutConfig) -> Vec<Placement> {
-    let (w, h) = (cfg.win_w, cfg.win_h);
+    let (.., w, h) = cfg.laptop_box();
+    let desktop = cfg.rects(Device::Debian);
+    let (left, _, right, _) = bounds(&desktop);
     let mut out = Vec::new();
-    for m in &cfg.debian_monitors {
+    for m in &desktop {
         let label = m.name.split(' ').next().unwrap_or("");
         let cx = js_round(m.x as f64 + (m.w - w) as f64 / 2.0);
         let cy = js_round(m.y as f64 + (m.h - h) as f64 / 2.0);
@@ -653,10 +728,10 @@ pub fn placements(cfg: &LayoutConfig) -> Vec<Placement> {
         };
         add("Below", cx, m.y + m.h, "Bottom");
         add("Above", cx, m.y - h, "Top");
-        if m.x <= 0 {
+        if m.x <= left {
             add("Left of", m.x - w, cy, "Left");
         }
-        if m.x + m.w >= cfg.deb_total_w {
+        if m.x + m.w >= right {
             add("Right of", m.x + m.w, cy, "Right");
         }
     }
@@ -665,7 +740,9 @@ pub fn placements(cfg: &LayoutConfig) -> Vec<Placement> {
 
 /// The closest edge placement to a dragged laptop position.
 pub fn snap(cfg: &LayoutConfig, x: i32, y: i32) -> Option<Placement> {
-    let (w, h) = (cfg.win_w, cfg.win_h);
+    let (.., w, h) = cfg.laptop_box();
+    let desktop = cfg.rects(Device::Debian);
+    let (left, _, right, _) = bounds(&desktop);
     let mut best: Option<(f64, Placement)> = None;
     let mut consider = |px: i32, py: i32, side: &str| {
         let d = ((x - px) as f64).hypot((y - py) as f64);
@@ -675,13 +752,13 @@ pub fn snap(cfg: &LayoutConfig, x: i32, y: i32) -> Option<Placement> {
     };
     // `max` then `min`, as the page did, so an inverted range doesn't panic.
     let clamp = |v: i32, lo: i32, hi: i32| v.min(hi).max(lo);
-    for m in &cfg.debian_monitors {
+    for m in &desktop {
         let cy = clamp(y, m.y - h + 240, m.y + m.h - 240);
         let cx = clamp(x, m.x - w + 280, m.x + m.w - 280);
-        if m.x + m.w >= cfg.deb_total_w {
+        if m.x + m.w >= right {
             consider(m.x + m.w, cy, "Right");
         }
-        if m.x <= 0 {
+        if m.x <= left {
             consider(m.x - w, cy, "Left");
         }
         consider(cx, m.y + m.h, "Bottom");
@@ -698,17 +775,17 @@ pub fn drag_target(view: &MapView, pointer: (f32, f32), grab: (f32, f32)) -> (i3
 }
 
 pub fn apply_placement(cfg: &mut LayoutConfig, placement: &Placement) {
-    cfg.win_x = placement.x;
-    cfg.win_y = placement.y;
+    cfg.move_laptop(placement.x, placement.y);
     cfg.attach_side = placement.side.clone();
 }
 
 /// Sets the laptop's size, or its native size for `None`, and keeps it on an edge.
 pub fn set_resolution(cfg: &mut LayoutConfig, size: Option<(i32, i32)>) {
-    let native = (cfg.win_native_w, cfg.win_native_h);
-    cfg.resolution_mode = if size.is_some() { "custom" } else { "native" }.into();
-    (cfg.win_w, cfg.win_h) = size.unwrap_or(native);
-    if let Some(placement) = snap(cfg, cfg.win_x, cfg.win_y) {
+    let (x, y, ..) = cfg.laptop_box();
+    if let Some(laptop) = cfg.device_mut(Device::Windows) {
+        laptop.custom_size = size;
+    }
+    if let Some(placement) = snap(cfg, x, y) {
         apply_placement(cfg, &placement);
     }
 }
@@ -718,16 +795,16 @@ pub fn size_label((w, h): (i32, i32)) -> String {
 }
 
 pub fn resolution_label(cfg: &LayoutConfig) -> String {
-    if cfg.resolution_mode == "native" {
-        "Native".into()
-    } else {
-        size_label((cfg.win_w, cfg.win_h))
+    match cfg.device(Device::Windows).and_then(|d| d.custom_size) {
+        Some(size) => size_label(size),
+        None => "Native".into(),
     }
 }
 
 /// The name of where the laptop is now: a named place, or the edge it was dragged along.
 pub fn position_label(cfg: &LayoutConfig, placements: &[Placement]) -> String {
-    match placements.iter().find(|p| p.x == cfg.win_x && p.y == cfg.win_y) {
+    let (x, y, ..) = cfg.laptop_box();
+    match placements.iter().find(|p| p.x == x && p.y == y) {
         Some(p) => p.label.clone(),
         None => format!("Custom ({} edge)", cfg.attach_side.to_lowercase()),
     }
@@ -736,14 +813,8 @@ pub fn position_label(cfg: &LayoutConfig, placements: &[Placement]) -> String {
 /// Scale and offset that fit every screen, with a margin, into a map of this size.
 pub fn fit(cfg: &LayoutConfig, width: f32, height: f32) -> MapView {
     const PAD: f32 = 16.0;
-    let (mut x0, mut y0) = (cfg.win_x, cfg.win_y);
-    let (mut x1, mut y1) = (cfg.win_x + cfg.win_w, cfg.win_y + cfg.win_h);
-    for m in &cfg.debian_monitors {
-        x0 = x0.min(m.x);
-        y0 = y0.min(m.y);
-        x1 = x1.max(m.x + m.w);
-        y1 = y1.max(m.y + m.h);
-    }
+    let all: Vec<Display> = cfg.devices.iter().flat_map(LayoutDevice::rects).collect();
+    let (x0, y0, x1, y1) = bounds(&all);
     let (span_w, span_h) = (((x1 - x0) as f32).max(1.0), ((y1 - y0) as f32).max(1.0));
     let (w, h) = ((width - PAD * 2.0).max(1.0), (height - PAD * 2.0).max(1.0));
     let scale = (w / span_w).min(h / span_h);
@@ -776,13 +847,17 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
                 .into(),
         );
     };
+    if needs_peer(snapshot) {
+        return Some("mesh-kvm needs the other device's address before it can share anything.".into());
+    }
     let other = if local.node == "debian" { "laptop" } else { "desktop" };
     if snapshot.peer.is_none() {
         return Some(format!(
             "The {other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
         ));
     }
-    if let Some(device) = Device::BOTH.into_iter().find(|d| snapshot.device(*d).is_some_and(DeviceStatus::is_older)) {
+    let older = |d: &DeviceStatus| d.is_older() || d.has_no_shared_layout();
+    if let Some(device) = Device::BOTH.into_iter().find(|d| snapshot.device(*d).is_some_and(older)) {
         return Some(older_message(device));
     }
     if !local.peer_online {
@@ -830,9 +905,9 @@ fn split_message(local: &DeviceStatus, peer: &DeviceStatus) -> Option<String> {
 mod tests {
     use super::*;
 
-    const LOCAL_JSON: &str = r#"{"node":"debian","label":"Debian Desktop","hostname":"bread","ip":"192.168.1.10","peer_ip":"192.168.1.20","version":"0.1.0","os":"Debian 13","peer_online":true,"active_node":"Debian","panic_mode":false,"game_lock":false,"game_reason":"","displays":[{"name":"DP-3","x":0,"y":360,"w":1920,"h":1080}],"cursor":[100,200],"autostart":true,"input_devices":["Physical mouse (evdev)"],"audio":{"tx_enabled":false,"tx_volume":100,"tx_peak":0,"tx_packets":0,"tx_source":0,"rx_muted":false,"rx_volume":100,"rx_peak":0,"rx_packets":0},"sharing":{"mouse":true,"keyboard":false},"clipboard":{"send":true,"receive":false},"pointer_speed":0.35,"main_device":1,"main_conflict":false}"#;
+    const LOCAL_JSON: &str = r#"{"node":"debian","label":"Debian Desktop","hostname":"bread","ip":"192.168.1.10","peer_ip":"192.168.1.20","version":"0.1.0","os":"Debian 13","peer_online":true,"active_node":"Debian","panic_mode":false,"game_lock":false,"game_reason":"","displays":[{"name":"DP-3","x":0,"y":360,"w":1920,"h":1080}],"cursor":[3200,720],"autostart":true,"input_devices":["Physical mouse (evdev)"],"audio":{"tx_enabled":false,"tx_volume":100,"tx_peak":0,"tx_packets":0,"tx_source":0,"rx_muted":false,"rx_volume":100,"rx_peak":0,"rx_packets":0},"sharing":{"mouse":true,"keyboard":false},"paired":true,"clipboard":{"send":true,"receive":false},"pointer_speed":0.35,"main_device":1,"main_conflict":false}"#;
 
-    const STATE_JSON: &str = r#"{"config":{"debian_monitors":[{"name":"DP-3 (240Hz Native)","x":0,"y":360,"w":1920,"h":1080},{"name":"DP-2 (360Hz Native)","x":1920,"y":0,"w":2560,"h":1440}],"deb_total_w":4480,"deb_total_h":1440,"win_x":2240,"win_y":1440,"win_w":2560,"win_h":1600,"win_native_w":2560,"win_native_h":1600,"resolution_mode":"native","attach_side":"Bottom","mouse_speed":0.35,"edge_resistance":55,"auto_game_lock":true,"manual_game_lock":false,"future_field":{"a":1}},"telemetry":{"active_node":"Debian","panic_mode":false,"deb_cursor_x":3200,"deb_cursor_y":720,"win_cursor_x":960,"win_cursor_y":540,"peer_addr":"192.168.1.20:24800","game_captive_active":false,"game_reason":"","audio_muted":false,"peer_online":true,"main_conflict":false}}"#;
+    const STATE_JSON: &str = r#"{"config":{"revision":3,"editor":"Debian","devices":[{"node":"Debian","name":"desk","x":0,"y":0,"monitors":[{"name":"DP-3 (240Hz Native)","x":0,"y":360,"w":1920,"h":1080},{"name":"DP-2 (360Hz Native)","x":1920,"y":0,"w":2560,"h":1440}],"custom_size":null},{"node":"Windows","name":"laptop","x":2240,"y":1440,"monitors":[{"name":"Display 1","x":0,"y":0,"w":2560,"h":1600}],"custom_size":null,"future_device_field":5}],"attach_side":"Bottom","edge_resistance":55,"auto_game_lock":true,"manual_game_lock":false,"future_field":{"a":1}},"telemetry":{"active_node":"Debian","panic_mode":false,"cursor_x":3200,"cursor_y":720,"peer_addr":"192.168.1.20:24800","game_captive_active":false,"game_reason":"","peer_online":true,"main_conflict":false}}"#;
 
     fn cfg() -> LayoutConfig {
         LayoutState::parse(STATE_JSON).unwrap().config
@@ -867,8 +942,8 @@ mod tests {
         let (w, h) = (800.0_f32, 500.0_f32);
         let v = fit(&c, w, h);
         let mut rects: Vec<(i32, i32, i32, i32)> =
-            c.debian_monitors.iter().map(|m| (m.x, m.y, m.w, m.h)).collect();
-        rects.push((c.win_x, c.win_y, c.win_w, c.win_h));
+            c.rects(Device::Debian).iter().map(|m| (m.x, m.y, m.w, m.h)).collect();
+        rects.push(c.laptop_box());
         for (x, y, rw, rh) in rects {
             let (x0, y0) = (v.offset_x + x as f32 * v.scale, v.offset_y + y as f32 * v.scale);
             let (x1, y1) = (x0 + rw as f32 * v.scale, y0 + rh as f32 * v.scale);
@@ -880,11 +955,27 @@ mod tests {
     fn poll_does_not_move_a_dragged_laptop() {
         let current = LayoutState::parse(STATE_JSON).unwrap();
         let mut moved = current.clone();
-        moved.config.win_x = 0;
+        moved.config.move_laptop(0, 1440);
         let kept = merge_poll(Some(current.clone()), Some(moved.clone()), true).unwrap();
-        assert_eq!(kept.config.win_x, 2240);
+        assert_eq!(kept.config.laptop_box().0, 2240);
         let taken = merge_poll(Some(current), Some(moved), false).unwrap();
-        assert_eq!(taken.config.win_x, 0);
+        assert_eq!(taken.config.laptop_box().0, 0);
+    }
+
+    #[test]
+    fn starting_the_service_is_reported_until_it_answers() {
+        let none = Snapshot::default();
+        assert_eq!(start_notice(&ServiceStart::Done, &none), None);
+        assert_eq!(start_notice(&ServiceStart::Starting, &none).as_deref(), Some("Starting mesh-kvm on this device."));
+        assert!(!notice_is_serious(&none, &ServiceStart::Starting));
+        let failed = ServiceStart::Failed("mesh-kvm couldn't start.".into());
+        assert_eq!(start_notice(&failed, &none).as_deref(), Some("mesh-kvm couldn't start."));
+        assert!(notice_is_serious(&none, &failed));
+        assert!(notice_is_serious(&none, &ServiceStart::Done));
+        // Once something answers, a failure from earlier no longer applies.
+        let up = pair(0, 0);
+        assert_eq!(start_notice(&failed, &up), None);
+        assert!(!notice_is_serious(&up, &failed));
     }
 
     #[test]
@@ -930,59 +1021,77 @@ mod tests {
         assert!(sharing.mouse && !sharing.keyboard);
         assert!(d.clipboard.send && !d.clipboard.receive);
         assert_eq!(d.main_device, 1);
-        assert_eq!(d.cursor, Some([100, 200]));
+        assert_eq!(d.cursor, Some([3200, 720]));
         // An older service that lacks the newer fields still parses.
         let old: DeviceStatus = serde_json::from_str(r#"{"node":"windows"}"#).unwrap();
         assert!(old.clipboard.send && old.sharing.is_none() && old.is_older());
         let l = LayoutState::parse(STATE_JSON).unwrap();
-        assert_eq!(l.config.debian_monitors.len(), 2);
+        assert_eq!(l.config.rects(Device::Debian).len(), 2);
         assert_eq!(l.config.attach_side, "Bottom");
-        assert_eq!(l.telemetry.deb_cursor_x, 3200);
+        assert_eq!(l.telemetry.active_node, "Debian");
     }
 
     #[test]
     fn saving_keeps_fields_the_app_does_not_know() {
         let mut l = LayoutState::parse(STATE_JSON).unwrap();
-        l.config.win_x = 5;
+        l.config.move_laptop(5, 1440);
         l.config.attach_side = "Right".into();
         let out = l.to_save_json();
-        assert_eq!(out["win_x"], 5);
+        assert_eq!(out["devices"][1]["x"], 5);
         assert_eq!(out["attach_side"], "Right");
         assert_eq!(out["future_field"]["a"], 1);
-        assert_eq!(out["debian_monitors"][1]["name"], "DP-2 (360Hz Native)");
-        assert_eq!(out["win_native_w"], 2560);
+        assert_eq!(out["devices"][1]["future_device_field"], 5);
+        assert_eq!(out["devices"][0]["monitors"][1]["name"], "DP-2 (360Hz Native)");
+        assert_eq!(out["revision"], 3);
     }
 
     #[test]
-    fn saving_leaves_an_unchanged_mouse_speed_as_the_service_sent_it() {
-        let text = STATE_JSON.replace("\"mouse_speed\":0.35", "\"mouse_speed\":0.1");
-        let saved = LayoutState::parse(&text).unwrap().to_save_json();
-        assert_eq!(saved["mouse_speed"].to_string(), "0.1");
+    fn a_layout_in_the_older_form_is_not_taken_for_an_empty_one() {
+        let old = r#"{"config":{"debian_monitors":[],"win_x":0,"attach_side":"Right"},"telemetry":{}}"#;
+        assert_eq!(LayoutState::parse(old), None);
     }
 
     #[test]
-    fn a_layout_save_keeps_the_pointer_speed_just_set() {
-        let draft = LayoutState::parse(STATE_JSON).unwrap();
-        let latest = Snapshot { layout: Some(draft.clone()), ..Default::default() };
-        let now = Instant::now();
-        let mut edits = Edits::default();
-        let key = (Device::Debian, Control::PointerSpeed);
-        edits.set(key, 0.8, now);
-        assert_eq!(edits.layout_save_body(&draft, &latest, now)["mouse_speed"].to_string(), "0.8");
-        // Once the poll has caught up, the save follows the poll rather than the stale draft.
-        let mut newer = draft.clone();
-        newer.config.mouse_speed = 0.5;
-        let latest = Snapshot { layout: Some(newer), ..Default::default() };
-        let later = now + Duration::from_secs(60);
-        edits.take_due(later);
-        assert_eq!(edits.layout_save_body(&draft, &latest, later)["mouse_speed"].to_string(), "0.5");
+    fn an_older_service_is_named_when_it_cannot_share_the_layout() {
+        let mut snap = pair(0, 0);
+        snap.peer.as_mut().unwrap().paired = None;
+        let msg = status_message(&snap).unwrap();
+        assert_eq!(msg, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        // Its own controls still work, as it does have those actions.
+        assert!(!snap.peer.as_ref().unwrap().is_older());
     }
 
     #[test]
-    fn saving_a_changed_mouse_speed_rounds_it() {
-        let mut l = LayoutState::parse(STATE_JSON).unwrap();
-        l.config.mouse_speed = 0.7;
-        assert_eq!(l.to_save_json()["mouse_speed"].to_string(), "0.7");
+    fn with_no_address_the_app_says_so_and_nothing_else_matters_yet() {
+        let mut local = device("windows", 0);
+        local.paired = Some(false);
+        let snap = Snapshot { local: Some(local), peer: None, layout: LayoutState::parse(STATE_JSON) };
+        assert!(needs_peer(&snap));
+        assert!(status_message(&snap).unwrap().contains("the other device's address"), "not the firewall advice");
+        assert!(!needs_peer(&pair(0, 0)));
+        assert!(!needs_peer(&Snapshot::default()));
+        let mut older = pair(0, 0);
+        older.local.as_mut().unwrap().paired = None;
+        assert!(!needs_peer(&older), "an older service can't take an address");
+    }
+
+    #[test]
+    fn a_laptop_with_a_monitor_left_of_its_main_one_is_boxed_and_moved_as_one() {
+        let mut c = cfg();
+        c.device_mut(Device::Windows).unwrap().monitors = vec![
+            Display { name: "Display 2".into(), x: -1000, y: -200, w: 1000, h: 800 },
+            Display { name: "Display 1".into(), x: 0, y: 0, w: 2560, h: 1600 },
+        ];
+        assert_eq!(c.laptop_box(), (1240, 1240, 3560, 1800));
+        let place = Placement { label: "Custom".into(), x: 0, y: 1440, side: "Bottom".into() };
+        apply_placement(&mut c, &place);
+        assert_eq!(c.laptop_box(), (0, 1440, 3560, 1800));
+        // The device's own origin is where its main monitor is, not where the box starts.
+        let laptop = c.device(Device::Windows).unwrap();
+        assert_eq!((laptop.x, laptop.y), (1000, 1640));
+        let v = fit(&c, 800.0, 500.0);
+        let (sx, _) = v.to_screen(0.0, 1440.0);
+        assert!(sx >= 0.0);
     }
 
     fn place_of(c: &LayoutConfig, x: i32, y: i32) -> (i32, i32, String) {
@@ -1022,7 +1131,7 @@ mod tests {
             let p = ps.iter().find(|p| p.label == label).unwrap();
             (p.x, p.y)
         };
-        (c.win_w, c.win_h) = (1921, 1081);
+        c.device_mut(Device::Windows).unwrap().custom_size = Some((1921, 1081));
         // 1920 + 639 / 2 = 2239.5 rounds up.
         assert_eq!(at(&c, "Below DP-2"), (2240, 1440));
         // 0 + -1 / 2 = -0.5 rounds up to 0.
@@ -1031,7 +1140,7 @@ mod tests {
         assert_eq!(at(&c, "Left of DP-3"), (-1921, 360));
         assert_eq!(at(&c, "Right of DP-2"), (4480, 180));
         // -1.5 rounds up to -1, not away from zero.
-        c.win_w = 1923;
+        c.device_mut(Device::Windows).unwrap().custom_size = Some((1923, 1081));
         assert_eq!(at(&c, "Below DP-3"), (-1, 1440));
     }
 
@@ -1054,20 +1163,20 @@ mod tests {
     fn resolution_change_keeps_the_laptop_on_an_edge() {
         let mut c = cfg();
         set_resolution(&mut c, Some((1920, 1080)));
-        assert_eq!((c.win_w, c.win_h, c.resolution_mode.as_str()), (1920, 1080, "custom"));
-        assert_eq!((c.win_x, c.win_y, c.attach_side.as_str()), (2240, 1440, "Bottom"));
+        assert_eq!(c.laptop_box(), (2240, 1440, 1920, 1080));
+        assert_eq!(c.attach_side, "Bottom");
         assert_eq!(resolution_label(&c), "1920 \u{d7} 1080");
         set_resolution(&mut c, None);
-        assert_eq!((c.win_w, c.win_h), (2560, 1600));
+        assert_eq!((c.laptop_box().2, c.laptop_box().3), (2560, 1600));
         assert_eq!(resolution_label(&c), "Native");
     }
 
     #[test]
     fn position_label_names_a_place_or_the_edge() {
         let mut c = cfg();
-        c.win_x = 1920;
+        c.move_laptop(1920, 1440);
         assert_eq!(position_label(&c, &placements(&c)), "Below DP-2");
-        c.win_x = 2240;
+        c.move_laptop(2240, 1440);
         assert_eq!(position_label(&c, &placements(&c)), "Custom (bottom edge)");
     }
 
@@ -1189,19 +1298,17 @@ mod tests {
 
     #[test]
     fn only_local_controls_work_without_the_peer() {
-        // On the laptop, with the Debian desktop gone there is no layout either.
-        let snap = Snapshot { local: Some(device("windows", 0)), peer: None, layout: None };
-        let on = enabled(&snap);
-        assert_eq!(
-            on,
-            ControlsEnabled { switch: false, main_device: false, layout: false, release: true, test_sound: false }
-        );
-        // On the desktop, the layout is still there to edit.
-        let mut snap = pair(0, 0);
-        snap.peer = None;
-        let on = enabled(&snap);
-        assert!(on.layout && on.release);
-        assert!(!on.switch && !on.main_device && !on.test_sound);
+        // Either device can still edit its own copy of the layout.
+        for this_device in ["debian", "windows"] {
+            let snap = Snapshot {
+                local: Some(device(this_device, 0)),
+                peer: None,
+                layout: LayoutState::parse(STATE_JSON),
+            };
+            let on = enabled(&snap);
+            assert!(on.layout && on.release, "{this_device}");
+            assert!(!on.switch && !on.main_device && !on.test_sound, "{this_device}");
+        }
     }
 
     #[test]
@@ -1248,8 +1355,11 @@ mod tests {
     }
 
     #[test]
-    fn release_goes_through_debian_when_it_can() {
+    fn release_reaches_both_devices_when_this_service_can_do_that() {
         assert_eq!(release_route(&pair(0, 0)), Some(Release::Everywhere));
+        let mut laptop_here = pair(0, 0);
+        laptop_here.local.as_mut().unwrap().node = "windows".into();
+        assert_eq!(release_route(&laptop_here), Some(Release::Everywhere));
         let alone = Snapshot { local: Some(device("windows", 0)), peer: None, layout: None };
         assert_eq!(release_route(&alone), Some(Release::Only(Device::Windows)));
         assert_eq!(release_route(&Snapshot::default()), None);
@@ -1261,8 +1371,12 @@ mod tests {
         let c = snap.layout.as_ref().unwrap().config.clone();
         assert_eq!(cursor_position(&snap, &c), Some((3200, 720)));
         snap.layout.as_mut().unwrap().telemetry.active_node = "Windows".into();
-        // The laptop's own cursor (100, 200), from its corner at (2240, 1440).
+        snap.peer.as_mut().unwrap().cursor = Some([100, 200]);
+        // The laptop's own cursor (100, 200), from its origin at (2240, 1440).
         assert_eq!(cursor_position(&snap, &c), Some((2340, 1640)));
+        // A monitor to the left of the laptop's main one has negative coordinates.
+        snap.peer.as_mut().unwrap().cursor = Some([-100, 200]);
+        assert_eq!(cursor_position(&snap, &c), Some((2140, 1640)));
         snap.peer.as_mut().unwrap().cursor = None;
         assert_eq!(cursor_position(&snap, &c), None);
     }
@@ -1351,14 +1465,14 @@ mod tests {
         assert_eq!(edits.next_wake(t + HOLD), None);
     }
 
-    fn layout_at(win_x: i32) -> Option<LayoutState> {
+    fn layout_at(x: i32) -> Option<LayoutState> {
         let mut l = LayoutState::parse(STATE_JSON).unwrap();
-        l.config.win_x = win_x;
+        l.config.move_laptop(x, 1440);
         Some(l)
     }
 
     fn drafted_x(draft: &LayoutDraft) -> i32 {
-        draft.state.as_ref().unwrap().config.win_x
+        draft.state.as_ref().unwrap().config.laptop_box().0
     }
 
     #[test]
@@ -1376,9 +1490,9 @@ mod tests {
     fn a_saved_edit_is_not_undone_by_a_poll_from_before_the_save() {
         let (mut draft, t) = (LayoutDraft::default(), Instant::now());
         draft.follow(layout_at(1), false, t);
-        draft.state.as_mut().unwrap().config.win_x = 5;
+        draft.state.as_mut().unwrap().config.move_laptop(5, 1440);
         draft.edited(t);
-        assert_eq!(draft.take_due(t).unwrap().config.win_x, 5);
+        assert_eq!(draft.take_due(t).unwrap().config.laptop_box().0, 5);
         draft.follow(layout_at(1), false, t + HOLD / 2);
         assert_eq!(drafted_x(&draft), 5);
         draft.follow(layout_at(5), false, t + HOLD);

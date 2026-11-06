@@ -135,12 +135,20 @@ impl Client {
         self.send(device, "/api/local/action", action);
     }
 
-    /// Sends a layout-wide action such as `toggle_focus` or `panic`. The Debian desktop owns these.
-    pub fn master_action(&self, action: &str) {
-        self.send(Device::Debian, "/api/action", serde_json::json!({ "action": action }));
+    /// This device, which is where layout-wide actions and layout edits go.
+    fn send_here(&self, path: &str, body: serde_json::Value) {
+        match self.snapshot().this_device() {
+            Some(device) => self.send(device, path, body),
+            None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
+        }
     }
 
-    /// Release all input: through the Debian desktop when its layout is reachable, else only here.
+    /// Sends a layout-wide action such as `toggle_focus` or `panic` to this device's service.
+    pub fn master_action(&self, action: &str) {
+        self.send_here("/api/action", serde_json::json!({ "action": action }));
+    }
+
+    /// Release all input on both devices, or only here if this service is too old for that.
     pub fn release_all_input(&self) {
         match release_route(&self.snapshot()) {
             Some(Release::Everywhere) => self.master_action("panic"),
@@ -149,9 +157,29 @@ impl Client {
         }
     }
 
-    /// Saves a layout. `body` is what `LayoutState::to_save_json` or `Edits::layout_save_body` made.
+    /// Saves a layout on this device, which passes it on. `body` is what
+    /// `LayoutState::to_save_json` made.
     pub fn save_layout(&self, body: serde_json::Value) {
-        self.send(Device::Debian, "/api/layout", body);
+        self.send_here("/api/layout", body);
+    }
+
+    /// Gives this device's service the other device's address. Returns the service's reason if it
+    /// refuses, which is worded for the person to read.
+    ///
+    /// This blocks on the network, so the UI must call it off the UI thread.
+    pub fn set_peer(&self, address: &str) -> Result<(), String> {
+        let address = crate::settings::validate_peer(address)?;
+        let body = serde_json::json!({ "action": "set_peer", "peer": address }).to_string();
+        match http_call_port(LOCALHOST, self.port, "POST", "/api/local/action", &body) {
+            Ok((200, reply)) => {
+                let reply: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
+                if reply["ok"] == false {
+                    return Err(reply["error"].as_str().unwrap_or("mesh-kvm didn't accept that address.").to_string());
+                }
+                Ok(())
+            }
+            _ => Err("mesh-kvm didn't answer on this device. Check that it's running, then try again.".to_string()),
+        }
     }
 
     /// Makes `device` the main one on both devices, changing the other device first. Returns the
@@ -249,9 +277,8 @@ fn poll_once(port: u16) -> Snapshot {
         return Snapshot::default();
     };
     let peer = get(port, "/api/peer/api/local").and_then(|b| serde_json::from_str::<DeviceStatus>(&b).ok());
-    // The layout lives on the Debian desktop.
-    let state_path = if local.node == "debian" { "/api/state" } else { "/api/peer/api/state" };
-    let layout = get(port, state_path).and_then(|b| LayoutState::parse(&b));
+    // Every device keeps its own copy of the layout.
+    let layout = get(port, "/api/state").and_then(|b| LayoutState::parse(&b));
     Snapshot { local: Some(local), peer, layout }
 }
 
@@ -267,7 +294,7 @@ mod tests {
     /// A status for `stub` that closes the connection with no reply.
     const HANG_UP: u16 = 0;
 
-    const STATE: &str = r#"{"config":{"debian_monitors":[{"name":"DP-2 (360Hz Native)","x":0,"y":0,"w":2560,"h":1440}],"deb_total_w":2560,"deb_total_h":1440,"win_x":0,"win_y":1440,"win_w":1920,"win_h":1080,"attach_side":"Bottom","future_field":7},"telemetry":{"active_node":"Debian","peer_online":true}}"#;
+    const STATE: &str = r#"{"config":{"devices":[{"node":"Debian","x":0,"y":0,"monitors":[{"name":"DP-2 (360Hz Native)","x":0,"y":0,"w":2560,"h":1440}]},{"node":"Windows","x":0,"y":1440,"monitors":[{"name":"Display 1","x":0,"y":0,"w":1920,"h":1080}]}],"attach_side":"Bottom","future_field":7},"telemetry":{"active_node":"Debian","peer_online":true}}"#;
 
     /// A tiny HTTP server on an ephemeral port. `route` gets (method, path, body) and returns
     /// (status, body). Every request is logged.
@@ -327,7 +354,7 @@ mod tests {
                 (200, local_json(if node == "debian" { "windows" } else { "debian" }))
             }
             ("GET", "/api/peer/api/local") => (peer_status, r#"{"error":"peer unreachable"}"#.into()),
-            ("GET", "/api/state") | ("GET", "/api/peer/api/state") => (200, STATE.into()),
+            ("GET", "/api/state") => (200, STATE.into()),
             ("POST", p) => (200, action_reply(p)),
             _ => (404, "{}".into()),
         })
@@ -399,29 +426,75 @@ mod tests {
         client.local_action(Device::Windows, serde_json::json!({"action": "panic"}));
         client.master_action("toggle_focus");
         let mut layout = client.snapshot().layout.unwrap();
-        layout.config.win_x = 42;
+        layout.config.attach_side = "Right".into();
         client.save_layout(layout.to_save_json());
         wait_for("four posts", || posts(&log).len() == 4);
         let p = posts(&log);
         assert_eq!(p[0].0, "/api/peer/api/local/action");
         assert!(p[0].1.contains("set_autostart"));
         assert_eq!(p[1].0, "/api/local/action");
-        assert_eq!(p[2].0, "/api/peer/api/action");
+        assert_eq!(p[2].0, "/api/action");
         assert!(p[2].1.contains("toggle_focus"));
-        assert_eq!(p[3].0, "/api/peer/api/layout");
+        assert_eq!(p[3].0, "/api/layout");
         let saved: serde_json::Value = serde_json::from_str(&p[3].1).unwrap();
-        assert_eq!(saved["win_x"], 42);
+        assert_eq!(saved["attach_side"], "Right");
         assert_eq!(saved["future_field"], 7);
     }
 
     #[test]
-    fn debian_client_sends_master_actions_to_itself() {
-        let (port, log) = pair("debian", 200, ok_reply);
+    fn either_device_sends_layout_actions_and_edits_to_itself() {
+        for node in ["debian", "windows"] {
+            let (port, log) = pair(node, 200, ok_reply);
+            let (client, _rx) = start(port);
+            ready(&client);
+            client.master_action("panic");
+            client.save_layout(client.snapshot().layout.unwrap().to_save_json());
+            wait_for("the posts", || posts(&log).len() == 2);
+            assert_eq!(posts(&log)[0].0, "/api/action", "{node}");
+            assert_eq!(posts(&log)[1].0, "/api/layout", "{node}");
+        }
+    }
+
+    #[test]
+    fn the_layout_is_read_here_even_with_the_other_device_gone() {
+        for node in ["debian", "windows"] {
+            let (port, log) = pair(node, 502, ok_reply);
+            let (client, _rx) = start(port);
+            wait_for("the layout", || client.snapshot().layout.is_some());
+            let asked: Vec<String> = log.lock().unwrap().iter().map(|r| r.1.clone()).collect();
+            assert!(asked.iter().all(|path| path != "/api/peer/api/state"), "{asked:?}");
+        }
+    }
+
+    #[test]
+    fn an_address_goes_to_this_device_and_a_refusal_comes_back_as_written() {
+        let (port, log) = pair("debian", 502, |_| r#"{"ok":false,"error":"That's this device's own address."}"#.into());
         let (client, _rx) = start(port);
-        ready(&client);
-        client.master_action("panic");
-        wait_for("the post", || !posts(&log).is_empty());
-        assert_eq!(posts(&log)[0].0, "/api/action");
+        wait_for("the local device", || client.snapshot().local.is_some());
+        assert_eq!(client.set_peer("192.168.8.210").unwrap_err(), "That's this device's own address.");
+        let p = posts(&log);
+        assert_eq!(p[0].0, "/api/local/action");
+        let body: serde_json::Value = serde_json::from_str(&p[0].1).unwrap();
+        assert_eq!((body["action"].as_str(), body["peer"].as_str()), (Some("set_peer"), Some("192.168.8.210")));
+    }
+
+    #[test]
+    fn a_bad_address_never_leaves_the_app_and_a_good_one_is_put_in_plain_form() {
+        let (port, log) = pair("debian", 502, ok_reply);
+        let (client, _rx) = start(port);
+        wait_for("the local device", || client.snapshot().local.is_some());
+        assert!(client.set_peer("my laptop").unwrap_err().contains("like 192.168.1.20"));
+        assert!(posts(&log).is_empty());
+        client.set_peer(" 192.168.8.210:24850 ").unwrap();
+        assert!(posts(&log)[0].1.contains(r#""peer":"192.168.8.210""#), "{:?}", posts(&log));
+    }
+
+    #[test]
+    fn an_address_with_no_service_says_what_to_do() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (client, rx) = start(port);
+        rx.recv_timeout(Duration::from_secs(1)).expect("a first update");
+        assert!(client.set_peer("192.168.8.210").unwrap_err().contains("didn't answer"));
     }
 
     #[test]

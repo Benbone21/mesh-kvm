@@ -174,7 +174,7 @@ fn run_app_window() {
             std::process::exit(1);
         }
     }
-    if let Err(e) = app::ui::run_window() {
+    if let Err(e) = app::ui::run_window(app::launch::ServiceStarter::begin()) {
         eprintln!("Error: {}", e);
         settings::log_fatal(&e);
         // A window started from a menu has nowhere to print, so say it in a box.

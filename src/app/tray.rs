@@ -2,7 +2,8 @@
 //! menu either opens the app window or sends the same actions the window does.
 
 use super::client::Client;
-use super::model::Snapshot;
+use super::launch::ServiceStarter;
+use super::model::{ServiceStart, Snapshot};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,13 +53,15 @@ fn notices(shared: &SharedNotices) -> std::sync::MutexGuard<'_, Notices> {
 }
 
 /// The tooltip now: a failed action's message, or what the service says.
-fn current_text(client: &Client, shared: &SharedNotices) -> String {
+fn current_text(client: &Client, shared: &SharedNotices, start: &ServiceStart) -> String {
     let now = Instant::now();
     if let Some(problem) = client.last_error() {
         client.dismiss_error();
         notices(shared).show(&problem, now);
     }
-    notices(shared).text(tooltip(&client.snapshot()), now)
+    let snapshot = client.snapshot();
+    let base = super::model::start_notice(start, &snapshot).map_or_else(|| tooltip(&snapshot), |text| format!("mesh-kvm: {text}"));
+    notices(shared).text(base, now)
 }
 
 #[derive(Clone, Copy)]
@@ -90,7 +93,7 @@ pub fn run_tray() -> Result<(), String> {
         super::single::Instance::Failed(e) => return Err(e),
     };
     crate::mute::start_service_watch();
-    platform::run()
+    platform::run(ServiceStarter::begin())
 }
 
 #[cfg(target_os = "linux")]
@@ -160,12 +163,12 @@ mod platform {
         }
     }
 
-    pub fn run() -> Result<(), String> {
+    pub fn run(starter: ServiceStarter) -> Result<(), String> {
         let client = Arc::new(Client::start(POLL_EVERY, Box::new(|| {})));
         let shared = SharedNotices::default();
         let quit = Arc::new(AtomicBool::new(false));
         let tray = MeshTray {
-            text: current_text(&client, &shared),
+            text: current_text(&client, &shared, &starter.state()),
             client: client.clone(),
             notices: shared.clone(),
             quit: quit.clone(),
@@ -178,7 +181,7 @@ mod platform {
             .map_err(|e| format!("The tray icon couldn't start: {e}"))?;
         while !quit.load(Ordering::SeqCst) && !handle.is_closed() {
             std::thread::sleep(Duration::from_millis(REFRESH_EVERY_MS));
-            let text = current_text(&client, &shared);
+            let text = current_text(&client, &shared, &starter.state());
             handle.update(|tray| {
                 if tray.text != text {
                     tray.text = text;
@@ -223,7 +226,7 @@ mod platform {
         }
     }
 
-    pub fn run() -> Result<(), String> {
+    pub fn run(starter: ServiceStarter) -> Result<(), String> {
         let client = Client::start(POLL_EVERY, Box::new(|| {}));
         let shared = SharedNotices::default();
         let open = MenuItem::new("Open", true, None);
@@ -250,7 +253,7 @@ mod platform {
                 OPEN_REQUESTED.store(true, Ordering::SeqCst);
             }
         }));
-        let mut shown = current_text(&client, &shared);
+        let mut shown = current_text(&client, &shared, &starter.state());
         let tray = build_with_retry(&menu, &icon, &shown)?;
 
         // A timer wakes the message loop, so the tooltip and menu clicks are handled promptly.
@@ -272,7 +275,7 @@ mod platform {
             if OPEN_REQUESTED.swap(false, Ordering::SeqCst) {
                 perform(Action::Open, &client, &shared);
             }
-            let text = current_text(&client, &shared);
+            let text = current_text(&client, &shared, &starter.state());
             if text != shown {
                 let _ = tray.set_tooltip(Some(&text));
                 shown = text;
