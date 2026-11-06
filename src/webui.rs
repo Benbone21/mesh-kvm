@@ -219,6 +219,7 @@ pub fn hostname() -> String {
 }
 
 /// Opens the Studio UI in a chromeless app window on this device.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // Only a bare Windows launch still uses it.
 pub fn open_app_window() {
     let url = format!("http://127.0.0.1:{}", UI_PORT);
 

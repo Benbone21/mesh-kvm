@@ -1,6 +1,6 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
-use super::model::{DeviceStatus, LayoutState, Snapshot};
+use super::model::{Device, DeviceStatus, LayoutState, Snapshot};
 use crate::webui::{http_call_port, UI_PORT};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -9,52 +9,20 @@ use std::time::Duration;
 
 const POLL_EVERY: Duration = Duration::from_millis(200);
 const LOCALHOST: &str = "127.0.0.1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Device {
-    Debian,
-    Windows,
-}
-
-impl Device {
-    /// The `node` value in `/api/local`.
-    fn node(self) -> &'static str {
-        match self {
-            Device::Debian => "debian",
-            Device::Windows => "windows",
-        }
-    }
-
-    /// The `device` value of `set_main_device`.
-    fn id(self) -> u8 {
-        match self {
-            Device::Debian => 0,
-            Device::Windows => 1,
-        }
-    }
-
-    fn other(self) -> Device {
-        match self {
-            Device::Debian => Device::Windows,
-            Device::Windows => Device::Debian,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Device::Debian => "the Debian desktop",
-            Device::Windows => "the Windows laptop",
-        }
-    }
-}
+/// What the peer proxy answers when the other device doesn't.
+const PEER_UNREACHABLE: u16 = 502;
+const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
 
 struct Job {
+    device: Device,
     path: String,
     body: String,
 }
 
 struct Shared {
     snapshot: Mutex<Snapshot>,
+    /// Why the last change didn't go through, worded for the person to read.
+    last_error: Mutex<Option<String>>,
     stop: AtomicBool,
 }
 
@@ -72,32 +40,37 @@ impl Client {
         Self::start_on(UI_PORT, on_update)
     }
 
-    fn start_on(port: u16, on_update: Box<dyn Fn() + Send>) -> Self {
-        let shared = Arc::new(Shared { snapshot: Mutex::default(), stop: AtomicBool::new(false) });
+    pub(super) fn start_on(port: u16, on_update: Box<dyn Fn() + Send>) -> Self {
+        let shared = Arc::new(Shared {
+            snapshot: Mutex::default(),
+            last_error: Mutex::default(),
+            stop: AtomicBool::new(false),
+        });
         let poller = shared.clone();
         std::thread::Builder::new()
             .name("mesh-kvm-app-poll".into())
             .spawn(move || {
-                let mut last: Option<Snapshot> = None;
+                let mut last: Option<(Snapshot, Option<String>)> = None;
                 while !poller.stop.load(Ordering::Relaxed) {
                     let snap = poll_once(port);
-                    let changed = last.as_ref() != Some(&snap);
                     *lock(&poller.snapshot) = snap.clone();
-                    if changed {
+                    let now = (snap, lock(&poller.last_error).clone());
+                    if last.as_ref() != Some(&now) {
                         on_update();
                     }
-                    last = Some(snap);
+                    last = Some(now);
                     std::thread::sleep(POLL_EVERY);
                 }
             })
             .expect("start the poll thread");
         let (jobs, queue) = mpsc::channel::<Job>();
+        let sender = shared.clone();
         std::thread::Builder::new()
             .name("mesh-kvm-app-send".into())
             .spawn(move || {
                 for job in queue {
-                    // The next poll shows whether it worked.
-                    let _ = http_call_port(LOCALHOST, port, "POST", &job.path, &job.body);
+                    let reply = http_call_port(LOCALHOST, port, "POST", &job.path, &job.body);
+                    *lock(&sender.last_error) = send_problem(job.device, reply);
                 }
             })
             .expect("start the send thread");
@@ -108,6 +81,15 @@ impl Client {
         lock(&self.shared.snapshot).clone()
     }
 
+    /// Why the last change didn't go through. A later change that works clears it.
+    pub fn last_error(&self) -> Option<String> {
+        lock(&self.shared.last_error).clone()
+    }
+
+    pub fn dismiss_error(&self) {
+        *lock(&self.shared.last_error) = None;
+    }
+
     /// The path to reach `device`'s own API: here, or through the peer proxy.
     fn route(&self, device: Device, path: &str) -> Option<String> {
         let snapshot = self.snapshot();
@@ -115,24 +97,27 @@ impl Client {
         Some(if here == device.node() { path.to_string() } else { format!("/api/peer{path}") })
     }
 
-    fn send(&self, path: Option<String>, body: serde_json::Value) {
-        if let Some(path) = path {
-            let _ = self.jobs.send(Job { path, body: body.to_string() });
+    fn send(&self, device: Device, path: &str, body: serde_json::Value) {
+        match self.route(device, path) {
+            Some(path) => {
+                let _ = self.jobs.send(Job { device, path, body: body.to_string() });
+            }
+            None => *lock(&self.shared.last_error) = Some(NOT_RUNNING.into()),
         }
     }
 
     /// Sends an action such as `{"action": "set_autostart", "enabled": true}` to one device.
     pub fn local_action(&self, device: Device, action: serde_json::Value) {
-        self.send(self.route(device, "/api/local/action"), action);
+        self.send(device, "/api/local/action", action);
     }
 
     /// Sends a layout-wide action such as `toggle_focus` or `panic`. The Debian desktop owns these.
     pub fn master_action(&self, action: &str) {
-        self.send(self.route(Device::Debian, "/api/action"), serde_json::json!({ "action": action }));
+        self.send(Device::Debian, "/api/action", serde_json::json!({ "action": action }));
     }
 
     pub fn save_layout(&self, layout: &LayoutState) {
-        self.send(self.route(Device::Debian, "/api/layout"), layout.to_save_json());
+        self.send(Device::Debian, "/api/layout", layout.to_save_json());
     }
 
     /// Makes `device` the main one on both devices, changing the other device first. Returns the
@@ -163,14 +148,14 @@ impl Client {
                         ));
                     }
                 }
+                Ok((PEER_UNREACHABLE, _)) | Err(_) => {
+                    return Err(format!("Couldn't reach {}. Check that mesh-kvm is running on it, then try again.", target.name()))
+                }
                 Ok((status, _)) => {
                     return Err(format!(
                         "{} didn't accept the change (status {status}). Restart mesh-kvm on it, then try again.",
                         capitalised(target.name())
                     ))
-                }
-                Err(e) => {
-                    return Err(format!("Couldn't reach {}. Check that mesh-kvm is running on it, then try again. ({e})", target.name()))
                 }
             }
         }
@@ -191,6 +176,25 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+}
+
+/// What went wrong with a queued change, if anything. The service's own error text here is for
+/// developers, such as a JSON parse error, so none of it reaches the person.
+fn send_problem(device: Device, reply: Result<(u16, String), String>) -> Option<String> {
+    let refused = || {
+        format!("{} didn't accept that change. Try again, or restart mesh-kvm on it.", capitalised(device.name()))
+    };
+    match reply {
+        Ok((200, body)) => {
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            (body["ok"] == false).then(refused)
+        }
+        Ok((PEER_UNREACHABLE, _)) => {
+            Some(format!("Couldn't reach {}, so that change wasn't made. Check that mesh-kvm is running on it, then try again.", device.name()))
+        }
+        Ok(_) => Some(refused()),
+        Err(_) => Some("mesh-kvm didn't answer on this device, so that change may not have been made. Check that it's running, then try again.".into()),
+    }
 }
 
 fn get(port: u16, path: &str) -> Option<String> {
@@ -219,6 +223,9 @@ mod tests {
     use std::sync::mpsc;
 
     type Log = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    /// A status for `stub` that closes the connection with no reply.
+    const HANG_UP: u16 = 0;
 
     const STATE: &str = r#"{"config":{"debian_monitors":[{"name":"DP-2 (360Hz Native)","x":0,"y":0,"w":2560,"h":1440}],"deb_total_w":2560,"deb_total_h":1440,"win_x":0,"win_y":1440,"win_w":1920,"win_h":1080,"attach_side":"Bottom","future_field":7},"telemetry":{"active_node":"Debian","peer_online":true}}"#;
 
@@ -258,6 +265,9 @@ mod tests {
                     let body = String::from_utf8_lossy(&data[head_end..head_end + len]).to_string();
                     let (status, out) = route(&method, &path, &body);
                     seen.lock().unwrap().push((method, path, body));
+                    if status == HANG_UP {
+                        return;
+                    }
                     let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
                 });
             }
@@ -421,5 +431,81 @@ mod tests {
         let err = client.set_main_device(Device::Windows).unwrap_err();
         assert!(err.contains("out of reach"), "{err}");
         assert!(posts(&log).is_empty());
+    }
+
+    #[test]
+    fn main_device_errors_leave_out_transport_details() {
+        let (port, _) = stub(|method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, local_json("debian")),
+            ("GET", "/api/peer/api/local") => (200, local_json("windows")),
+            ("GET", "/api/state") => (200, STATE.into()),
+            _ => (HANG_UP, String::new()),
+        });
+        let (client, _rx) = start(port);
+        ready(&client);
+        let err = client.set_main_device(Device::Debian).unwrap_err();
+        assert_eq!(err, "Couldn't reach the Windows laptop. Check that mesh-kvm is running on it, then try again.");
+    }
+
+    #[test]
+    fn a_refused_change_sets_a_plain_error_and_wakes_the_window() {
+        let (port, _) = pair("debian", 200, |_| r#"{"ok":false,"error":"unknown action"}"#.into());
+        let (client, rx) = start(port);
+        ready(&client);
+        while rx.try_recv().is_ok() {}
+        client.local_action(Device::Windows, serde_json::json!({"action": "nonsense"}));
+        wait_for("the error", || client.last_error().is_some());
+        let err = client.last_error().unwrap();
+        assert!(err.starts_with("The Windows laptop didn't accept"), "{err}");
+        assert!(!err.contains("unknown action"), "{err}");
+        rx.recv_timeout(Duration::from_secs(1)).expect("an update for the error");
+    }
+
+    #[test]
+    fn a_change_that_works_clears_the_error() {
+        let (port, _) = pair("debian", 200, |path| {
+            if path.ends_with("/api/layout") {
+                r#"{"ok":false,"error":"missing field"}"#.into()
+            } else {
+                r#"{"ok":true}"#.into()
+            }
+        });
+        let (client, _rx) = start(port);
+        ready(&client);
+        client.save_layout(&client.snapshot().layout.unwrap());
+        wait_for("the error", || client.last_error().is_some());
+        client.master_action("panic");
+        wait_for("the error to clear", || client.last_error().is_none());
+    }
+
+    #[test]
+    fn dismissing_clears_the_error() {
+        let (port, _) = pair("debian", 200, |_| r#"{"ok":false}"#.into());
+        let (client, _rx) = start(port);
+        ready(&client);
+        client.master_action("panic");
+        wait_for("the error", || client.last_error().is_some());
+        client.dismiss_error();
+        assert_eq!(client.last_error(), None);
+    }
+
+    #[test]
+    fn an_action_with_no_service_says_so() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (client, rx) = start(port);
+        rx.recv_timeout(Duration::from_secs(1)).expect("a first update");
+        client.master_action("panic");
+        assert!(client.last_error().unwrap().contains("Start mesh-kvm"));
+    }
+
+    #[test]
+    fn send_problems_say_what_to_do_next() {
+        let problem = |reply| send_problem(Device::Windows, reply).unwrap();
+        assert!(problem(Ok((502, "{}".into()))).contains("Couldn't reach the Windows laptop"));
+        assert!(problem(Ok((404, "{}".into()))).contains("didn't accept"));
+        let down = problem(Err("connect 127.0.0.1:24880: refused".into()));
+        assert!(down.contains("Check that it's running") && !down.contains("refused"), "{down}");
+        assert_eq!(send_problem(Device::Windows, Ok((200, r#"{"ok":true}"#.into()))), None);
+        assert_eq!(send_problem(Device::Windows, Ok((200, "not json".into()))), None);
     }
 }

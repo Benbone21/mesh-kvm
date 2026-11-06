@@ -1,6 +1,5 @@
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
-#[allow(dead_code)] // Until the window lands.
 mod app;
 mod audio;
 mod clipboard;
@@ -89,9 +88,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_CLIPBOARD_PORT)]
     clipboard_port: u16,
 
-    /// Open the Studio UI window for the daemon already running on this device, then exit
-    #[arg(long)]
-    studio: bool,
+    /// Open the app window for the service on this device, and exit when it closes
+    #[arg(long, alias = "studio")]
+    app: bool,
 }
 
 fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, SocketAddr), String> {
@@ -126,21 +125,6 @@ fn open_studio_when_ready() {
     });
 }
 
-/// The Windows build has no console, so a fatal error would otherwise vanish.
-#[cfg(target_os = "windows")]
-fn log_fatal(message: &str) {
-    use std::io::Write;
-    let dir = settings::config_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("mesh-kvm.log"))
-    {
-        let _ = writeln!(file, "Fatal error: {}", message);
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
 
@@ -154,11 +138,12 @@ fn main() {
         open_studio_when_ready();
     }
 
-    if cli.studio {
-        if let Err(e) = webui::http_call("127.0.0.1", "GET", "/api/local", "") {
-            eprintln!("[Studio] Warning: mesh-kvm daemon is not responding: {}", e);
+    if cli.app {
+        if let Err(e) = app::ui::run_window() {
+            eprintln!("Error: {}", e);
+            settings::log_fatal(&e);
+            std::process::exit(1);
         }
-        webui::open_app_window();
         return;
     }
 
@@ -245,7 +230,7 @@ fn main() {
             cli.height,
         ) {
             eprintln!("[Windows] Fatal error: {}", e);
-            log_fatal(&e);
+            settings::log_fatal(&e);
             std::process::exit(1);
         }
     }
@@ -253,11 +238,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::should_open_studio;
+    use super::{should_open_studio, Cli};
+    use clap::Parser;
 
     #[test]
     fn bare_launch_opens_the_studio() {
         assert!(should_open_studio(1));
+    }
+
+    #[test]
+    fn studio_flag_opens_the_app_window() {
+        assert!(Cli::try_parse_from(["mesh-kvm", "--app"]).unwrap().app);
+        assert!(Cli::try_parse_from(["mesh-kvm", "--studio"]).unwrap().app);
+        assert!(!Cli::try_parse_from(["mesh-kvm"]).unwrap().app);
     }
 
     #[test]

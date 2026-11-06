@@ -80,6 +80,21 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
+/// Writes a fatal error to `mesh-kvm.log`. The Windows build has no console, and a window started
+/// from a menu has nowhere to print, so the error would otherwise vanish.
+pub fn log_fatal(message: &str) {
+    append_fatal(&config_dir(), message);
+}
+
+fn append_fatal(dir: &Path, message: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(mut file) =
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("mesh-kvm.log"))
+    {
+        let _ = writeln!(file, "Fatal error: {}", message);
+    }
+}
+
 fn settings_path() -> PathBuf {
     config_dir().join("local-settings.json")
 }
@@ -347,6 +362,16 @@ mod tests {
         assert!(s.clipboard_receive);
         assert_eq!(s.pointer_speed, 1.0);
         assert_eq!(s.main_device, 0);
+    }
+
+    #[test]
+    fn fatal_errors_add_to_the_log() {
+        let dir = std::env::temp_dir().join(format!("mesh-kvm-fatal-{}", std::process::id()));
+        append_fatal(&dir, "no OpenGL");
+        append_fatal(&dir, "still no OpenGL");
+        let log = std::fs::read_to_string(dir.join("mesh-kvm.log")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(log, "Fatal error: no OpenGL\nFatal error: still no OpenGL\n");
     }
 
     #[test]
