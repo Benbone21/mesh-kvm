@@ -2153,6 +2153,7 @@ version = "0.4.0"
 dependencies = [
  "arboard",
  "bincode",
+ "cc",
  "clap",
  "cpal",
  "eframe",
@@ -2162,6 +2163,7 @@ dependencies = [
  "serde_json",
  "tray-icon",
  "windows 0.58.0",
+ "windows-core 0.58.0",
  "windows-sys 0.59.0",
 ]
 
