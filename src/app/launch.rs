@@ -80,18 +80,28 @@ pub fn install_windows_launchers(
     shortcut: &dyn Fn(&Path, &str) -> bool,
 ) -> Option<PathBuf> {
     let _ = std::fs::remove_file(programs_dir.join(OLD_START_MENU_SCRIPT));
+    // The login script goes first: PowerShell takes a moment, and the app reads this file to
+    // show the start-at-boot switch.
+    let startup = programs_dir.join("Startup");
+    let login = (autostart && startup.exists())
+        .then(|| startup.join(LOGIN_SCRIPT))
+        .and_then(|login| std::fs::write(&login, windows_vbs(exe, peer, edge)).ok().map(|_| login));
     let script = programs_dir.join(START_MENU_SCRIPT);
-    if shortcut(&programs_dir.join(START_MENU_SHORTCUT), exe) {
+    let lnk = programs_dir.join(START_MENU_SHORTCUT);
+    if (lnk.exists() && shortcut_points_at(&lnk, exe)) || shortcut(&lnk, exe) {
         let _ = std::fs::remove_file(&script);
     } else {
         let _ = std::fs::write(&script, windows_app_vbs(exe));
     }
-    let startup = programs_dir.join("Startup");
-    if !autostart || !startup.exists() {
-        return None;
-    }
-    let login = startup.join(LOGIN_SCRIPT);
-    std::fs::write(&login, windows_vbs(exe, peer, edge)).ok().map(|_| login)
+    login
+}
+
+/// True when the shortcut file holds `exe`, as text or as the wide characters Windows stores.
+fn shortcut_points_at(lnk: &Path, exe: &str) -> bool {
+    let Ok(bytes) = std::fs::read(lnk) else { return false };
+    let wide: Vec<u8> = exe.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let has = |needle: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle);
+    has(exe.as_bytes()) || has(&wide)
 }
 
 /// Quotes `exe` as the Desktop Entry spec wants, when it needs it.
@@ -155,7 +165,7 @@ pub fn write_linux_launchers(home: &Path, exe: &str) -> std::io::Result<Vec<Path
 #[cfg(target_os = "linux")]
 pub fn install_linux_launchers() -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "HOME isn't set, so there is nowhere to write the launchers.".to_string())?;
-    let exe = std::env::current_exe().map_err(|e| format!("Couldn't find where mesh-kvm is installed: {e}"))?;
+    let exe = running_exe().map_err(|e| format!("Couldn't find where mesh-kvm is installed: {e}"))?;
     let written = write_linux_launchers(Path::new(&home), &exe.to_string_lossy())
         .map_err(|e| format!("Couldn't write the launchers: {e}"))?;
     for path in written {
@@ -164,9 +174,21 @@ pub fn install_linux_launchers() -> Result<(), String> {
     Ok(())
 }
 
+/// Linux reports `current_exe` with " (deleted)" on the end once a rebuild has replaced the file.
+fn without_deleted_suffix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(clean) => PathBuf::from(clean),
+        None => path,
+    }
+}
+
+fn running_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe().map(without_deleted_suffix)
+}
+
 /// Starts this exe again with `arg` (such as `--app` or `--tray`) and does not wait for it.
 pub fn spawn_self(arg: &str) -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = running_exe()?;
     let mut child = Command::new(exe)
         .arg(arg)
         .stdin(Stdio::null())
@@ -308,6 +330,57 @@ mod tests {
         let programs = programs(&dir);
         install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| false);
         assert!(programs.join("mesh-kvm.vbs").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_replaced_exe_loses_the_deleted_suffix() {
+        assert_eq!(
+            without_deleted_suffix(PathBuf::from("/opt/mesh-kvm (deleted)")),
+            PathBuf::from("/opt/mesh-kvm")
+        );
+        assert_eq!(without_deleted_suffix(PathBuf::from("/opt/mesh-kvm")), PathBuf::from("/opt/mesh-kvm"));
+    }
+
+    #[test]
+    fn the_login_script_is_written_before_the_shortcut_is_made() {
+        let dir = temp("win-order");
+        let programs = programs(&dir);
+        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| {
+            assert!(programs.join("Startup/mesh-kvm-autostart.vbs").exists());
+            true
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fake_lnk(path: &Path, exe: &str) {
+        let wide: Vec<u8> = exe.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(path, [b"L\0\0\0 junk ".as_slice(), &wide, b" more"].concat()).unwrap();
+    }
+
+    #[test]
+    fn a_shortcut_that_already_points_at_the_exe_is_left_alone() {
+        let dir = temp("win-skip");
+        let programs = programs(&dir);
+        fake_lnk(&programs.join("mesh-kvm.lnk"), EXE);
+        std::fs::write(programs.join("mesh-kvm.vbs"), "stale").unwrap();
+        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| panic!("PowerShell ran"));
+        assert!(!programs.join("mesh-kvm.vbs").exists());
+        assert!(programs.join("mesh-kvm.lnk").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_shortcut_to_another_path_is_made_again() {
+        let dir = temp("win-moved");
+        let programs = programs(&dir);
+        fake_lnk(&programs.join("mesh-kvm.lnk"), r"C:\old\mesh-kvm.exe");
+        let made = std::cell::Cell::new(false);
+        install_windows_launchers(&programs, EXE, "p", "left", true, &|_, _| {
+            made.set(true);
+            true
+        });
+        assert!(made.get());
         let _ = std::fs::remove_dir_all(dir);
     }
 

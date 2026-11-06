@@ -40,13 +40,13 @@ Each device has its own switches in the app window.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.
 
-## Update the laptop
+## Updating
 
-Update the laptop first. A new laptop with an old Debian stays local and safe. A new Debian with an old laptop forwards input into nothing until you press Ctrl+Alt+F11.
+The wire format is the same as before, so the devices work together whichever one you update first. Update both. If one device still runs an older mesh-kvm, the app says which one and turns off the controls it can't use.
 
-1. End every `mesh-kvm.exe` in Task Manager (Details tab). The service, the tray icon and the window are separate processes, so there are several.
-2. Copy the new `mesh-kvm.exe` to the laptop and run it once with the same `--peer` as before. It installs itself over the old copy (the old one is moved aside and deleted later), and the installed copy takes effect at the next login. Double-clicking a newer download while mesh-kvm runs also installs it, but the running processes keep the old version until you end them.
-3. Update and restart Debian.
+1. On the laptop, double-click the new `mesh-kvm.exe`. This is the normal way to install. If mesh-kvm is already running, the new copy is installed over the old one (the old one is moved aside and deleted later), the launchers are rewritten so the tray starts at login, and the new version takes effect once every `mesh-kvm.exe` is ended in Task Manager (Details tab) and started again, or at the next login.
+2. On Debian, replace the binary, restart mesh-kvm, then run `mesh-kvm --install-launchers` once to refresh the menu entry and the tray's autostart entry.
+3. Delete old downloads. Running any `mesh-kvm.exe`, old ones included, replaces the installed copy, so an old download double-clicked later puts the old version back.
 
 ## Hotkeys
 

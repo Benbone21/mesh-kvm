@@ -3,7 +3,7 @@
 
 use super::client::Client;
 use super::model::{
-    self, Control, ControlsEnabled, Device, DeviceStatus, Edits, LayoutDraft, Light, MapView, Release,
+    self, Control, ControlsEnabled, Device, DeviceStatus, Edits, LayoutDraft, Light, MapView,
     Snapshot,
 };
 use super::theme::{
@@ -54,7 +54,7 @@ pub fn run_window() -> Result<(), String> {
             theme::apply(&cc.egui_ctx);
             super::single::serve_focus(cc.egui_ctx.clone());
             let ctx = cc.egui_ctx.clone();
-            let client = Client::start(Box::new(move || ctx.request_repaint()));
+            let client = Client::start(super::client::WINDOW_POLL, Box::new(move || ctx.request_repaint()));
             Ok(Box::new(Window::new(client)))
         }),
     )
@@ -206,14 +206,6 @@ impl Window {
         self.main_change = Some(change);
     }
 
-    fn release_all_input(&self, snapshot: &Snapshot) {
-        match model::release_route(snapshot) {
-            Some(Release::Everywhere) => self.client.master_action("panic"),
-            Some(Release::Only(device)) => self.client.local_action(device, json!({ "action": "panic" })),
-            None => {}
-        }
-    }
-
     fn top_bar(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), SWITCH_SIZE[1]), Sense::hover());
         let switch_rect = Rect::from_center_size(bar.center(), SWITCH_SIZE.into());
@@ -363,7 +355,7 @@ impl Window {
         ui.add_enabled_ui(on.release, |ui| {
             let text = RichText::new("Release all input").color(DEEP);
             if wide_button(ui, egui::Button::new(text).fill(RED).stroke(Stroke::NONE)).clicked() {
-                self.release_all_input(snapshot);
+                self.client.release_all_input();
             }
         });
     }
@@ -411,6 +403,7 @@ impl Window {
         let moved = slider_row(ui, "Push needed to cross a screen edge", push_text, &mut push, EDGE_PUSH_RANGE, 5.0);
 
         let auto_lock = toggle_row(ui, "Keep the mouse on the screen while a game runs", cfg.auto_game_lock).clicked();
+        ui.label(small("This applies to the Debian desktop. The laptop always watches for games."));
         let manual_lock = toggle_row(ui, "Lock the mouse to this screen now", cfg.manual_game_lock).clicked();
         let telemetry = snapshot.layout.as_ref().map(|l| &l.telemetry);
         if let Some(hint) = telemetry.and_then(model::game_lock_hint) {
@@ -543,17 +536,21 @@ impl DevicePanel<'_> {
 
     fn input_and_clipboard(&mut self, ui: &mut Ui) {
         let other = self.device.other().nickname();
-        section(ui, "Mouse and keyboard");
-        self.toggle(ui, Control::MouseSharing, "Share mouse");
-        self.toggle(ui, Control::KeyboardSharing, "Share keyboard");
-        let speed_label = format!("Pointer speed on {other}");
-        let range = MIN_POINTER_SPEED..=MAX_POINTER_SPEED;
-        self.slider(ui, Control::PointerSpeed, &speed_label, |v| format!("{v:.2}\u{d7}"), range, 0.05);
+        // An older service has no actions for these, so they stay off rather than failing.
+        let newer = !self.status.is_older();
+        ui.add_enabled_ui(newer, |ui| {
+            section(ui, "Mouse and keyboard");
+            self.toggle(ui, Control::MouseSharing, "Share mouse");
+            self.toggle(ui, Control::KeyboardSharing, "Share keyboard");
+            let speed_label = format!("Pointer speed on {other}");
+            let range = MIN_POINTER_SPEED..=MAX_POINTER_SPEED;
+            self.slider(ui, Control::PointerSpeed, &speed_label, |v| format!("{v:.2}\u{d7}"), range, 0.05);
 
-        ui.add_space(6.0);
-        section(ui, "Clipboard");
-        self.toggle(ui, Control::ClipboardSend, &format!("Send clipboard to {other}"));
-        self.toggle(ui, Control::ClipboardReceive, &format!("Receive clipboard from {other}"));
+            ui.add_space(6.0);
+            section(ui, "Clipboard");
+            self.toggle(ui, Control::ClipboardSend, &format!("Send clipboard to {other}"));
+            self.toggle(ui, Control::ClipboardReceive, &format!("Receive clipboard from {other}"));
+        });
 
         ui.add_space(6.0);
         section(ui, "Startup");
@@ -904,6 +901,7 @@ mod tests {
             r#"{{"node":"{node}","hostname":"{node}-host","ip":"192.168.8.2","peer_online":true,"active_node":"Debian","cursor":[10,20]}}"#
         ))
         .unwrap();
+        d.sharing = Some(Default::default());
         d.audio.tx_source = tx_source;
         d.audio.tx_volume = 100;
         d.audio.rx_volume = 100;
@@ -926,7 +924,9 @@ mod tests {
         let mut split = linked();
         split.peer.as_mut().unwrap().main_device = 1;
         split.local.as_mut().unwrap().main_conflict = true;
-        vec![Snapshot::default(), linked(), no_peer, laptop_alone, split]
+        let mut older = linked();
+        older.peer.as_mut().unwrap().sharing = None;
+        vec![Snapshot::default(), linked(), no_peer, laptop_alone, split, older]
     }
 
     fn window() -> Window {

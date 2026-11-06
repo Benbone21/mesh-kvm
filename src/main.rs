@@ -137,6 +137,22 @@ fn bare_launch_plan(service_running: bool, exe_differs: bool) -> BarePlan {
     BarePlan { install_exe: service_running && exe_differs, become_service: !service_running }
 }
 
+/// What to tell the person when the window can't open, such as when there is no OpenGL.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn window_failed_text(log: &std::path::Path) -> String {
+    format!(
+        "The mesh-kvm window couldn't start. The sharing itself isn't affected.\n\nThe reason is in the log:\n{}",
+        log.display()
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn show_message_box(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("mesh-kvm").as_ptr(), MB_OK | MB_ICONERROR) };
+}
+
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
 fn run_app_window() {
     match app::single::claim(app::single::WINDOW_PORT) {
@@ -154,6 +170,9 @@ fn run_app_window() {
     if let Err(e) = app::ui::run_window() {
         eprintln!("Error: {}", e);
         settings::log_fatal(&e);
+        // A window started from a menu has nowhere to print, so say it in a box.
+        #[cfg(target_os = "windows")]
+        show_message_box(&window_failed_text(&settings::log_path()));
         std::process::exit(1);
     }
 }
@@ -191,6 +210,11 @@ fn main() {
                     )),
                     Err(e) => settings::log_fatal(&e),
                 }
+            }
+            // The old service wrote the old launchers, which start no tray at login.
+            match parse_peer_socket_addr(&cli.peer, cli.port) {
+                Ok((_, peer_addr)) => input::windows::rewrite_launchers(peer_addr, cli.switch_edge),
+                Err(e) => settings::log_fatal(&e),
             }
         }
         for flag in ["--tray", "--app"] {
@@ -313,6 +337,13 @@ fn main() {
 mod tests {
     use super::{is_bare_launch, Cli};
     use clap::Parser;
+
+    #[test]
+    fn a_window_that_cannot_start_says_where_the_log_is() {
+        let text = super::window_failed_text(std::path::Path::new(r"C:\Users\me\mesh-kvm\mesh-kvm.log"));
+        assert!(text.contains("window couldn't start"), "{text}");
+        assert!(text.contains(r"C:\Users\me\mesh-kvm\mesh-kvm.log"), "{text}");
+    }
 
     #[test]
     fn bare_launch_has_no_arguments() {

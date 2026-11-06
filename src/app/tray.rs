@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REFRESH_EVERY_MS: u64 = 500;
+/// The tray only needs the tooltip, so it polls the service less often than the window does.
+const POLL_EVERY: Duration = Duration::from_secs(2);
 /// How long a failed action shows in the tooltip.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 
@@ -76,7 +78,7 @@ fn perform(action: Action, client: &Client, shared: &SharedNotices) {
         }
         // These go to the service in the background; a refusal comes back through `last_error`.
         Action::SwitchDevice => client.master_action("toggle_focus"),
-        Action::ReleaseAll => client.master_action("panic"),
+        Action::ReleaseAll => client.release_all_input(),
     }
 }
 
@@ -132,6 +134,11 @@ mod platform {
             }]
         }
 
+        /// A left-click opens the window; the menu stays on the right-click.
+        fn activate(&mut self, _x: i32, _y: i32) {
+            perform(Action::Open, &self.client, &self.notices);
+        }
+
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip { title: self.text.clone(), ..Default::default() }
         }
@@ -153,7 +160,7 @@ mod platform {
     }
 
     pub fn run() -> Result<(), String> {
-        let client = Arc::new(Client::start(Box::new(|| {})));
+        let client = Arc::new(Client::start(POLL_EVERY, Box::new(|| {})));
         let shared = SharedNotices::default();
         let quit = Arc::new(AtomicBool::new(false));
         let tray = MeshTray {
@@ -185,7 +192,10 @@ mod platform {
 mod platform {
     use super::*;
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+    static OPEN_REQUESTED: AtomicBool = AtomicBool::new(false);
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, SetTimer, TranslateMessage, MSG,
     };
@@ -213,7 +223,7 @@ mod platform {
     }
 
     pub fn run() -> Result<(), String> {
-        let client = Client::start(Box::new(|| {}));
+        let client = Client::start(POLL_EVERY, Box::new(|| {}));
         let shared = SharedNotices::default();
         let open = MenuItem::new("Open", true, None);
         let switch = MenuItem::new("Switch device", true, None);
@@ -233,8 +243,12 @@ mod platform {
             crate::app::icon::SIZE,
         )
         .map_err(|e| format!("The tray icon picture is unusable: {e}"))?;
-        // Nothing reads icon hover and click events, so don't let them pile up in the channel.
-        TrayIconEvent::set_event_handler(Some(|_| {}));
+        // A left-click opens the window. The handler only notes it; the loop below does the work.
+        TrayIconEvent::set_event_handler(Some(|event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                OPEN_REQUESTED.store(true, Ordering::SeqCst);
+            }
+        }));
         let mut shown = current_text(&client, &shared);
         let tray = build_with_retry(&menu, &icon, &shown)?;
 
@@ -253,6 +267,9 @@ mod platform {
                 if let Some((_, action)) = actions.iter().find(|(id, _)| *id == event.id) {
                     perform(*action, &client, &shared);
                 }
+            }
+            if OPEN_REQUESTED.swap(false, Ordering::SeqCst) {
+                perform(Action::Open, &client, &shared);
             }
             let text = current_text(&client, &shared);
             if text != shown {

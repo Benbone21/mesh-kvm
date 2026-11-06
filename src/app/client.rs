@@ -1,6 +1,6 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
-use super::model::{Device, DeviceStatus, LayoutState, Snapshot};
+use super::model::{older_message, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
 use crate::webui::{http_call_port, UI_PORT};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 /// How long an error stays up before a later change that works may clear it.
 const ERROR_HOLD: Duration = Duration::from_secs(5);
-const POLL_EVERY: Duration = Duration::from_millis(200);
+/// How often the window polls.
+pub const WINDOW_POLL: Duration = Duration::from_millis(200);
+/// What a service answers for an action it doesn't have, which an older one does for newer controls.
+const UNKNOWN_ACTION: &str = "unknown action";
 const LOCALHOST: &str = "127.0.0.1";
 /// What the peer proxy answers when the other device doesn't.
 const PEER_UNREACHABLE: u16 = 502;
@@ -39,15 +42,20 @@ pub struct Client {
 
 impl Client {
     /// `on_update` runs on the poll thread after the first poll and after each change.
-    pub fn start(on_update: Box<dyn Fn() + Send>) -> Self {
-        Self::start_on(UI_PORT, on_update)
+    pub fn start(interval: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
+        Self::start_every(UI_PORT, interval, on_update)
     }
 
+    #[cfg(test)]
     pub(super) fn start_on(port: u16, on_update: Box<dyn Fn() + Send>) -> Self {
-        Self::start_holding(port, ERROR_HOLD, on_update)
+        Self::start_every(port, WINDOW_POLL, on_update)
     }
 
-    fn start_holding(port: u16, error_hold: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
+    fn start_every(port: u16, interval: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
+        Self::start_holding(port, interval, ERROR_HOLD, on_update)
+    }
+
+    fn start_holding(port: u16, interval: Duration, error_hold: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
         let shared = Arc::new(Shared {
             snapshot: Mutex::default(),
             last_error: Mutex::default(),
@@ -67,7 +75,7 @@ impl Client {
                         on_update();
                     }
                     last = Some(now);
-                    std::thread::sleep(POLL_EVERY);
+                    std::thread::sleep(interval);
                 }
             })
             .expect("start the poll thread");
@@ -132,6 +140,15 @@ impl Client {
         self.send(Device::Debian, "/api/action", serde_json::json!({ "action": action }));
     }
 
+    /// Release all input: through the Debian desktop when its layout is reachable, else only here.
+    pub fn release_all_input(&self) {
+        match release_route(&self.snapshot()) {
+            Some(Release::Everywhere) => self.master_action("panic"),
+            Some(Release::Only(device)) => self.local_action(device, serde_json::json!({ "action": "panic" })),
+            None => {}
+        }
+    }
+
     /// Saves a layout. `body` is what `LayoutState::to_save_json` or `Edits::layout_save_body` made.
     pub fn save_layout(&self, body: serde_json::Value) {
         self.send(Device::Debian, "/api/layout", body);
@@ -159,6 +176,9 @@ impl Client {
                 Ok((200, reply)) => {
                     let reply: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
                     if reply["ok"] == false {
+                        if reply["error"] == UNKNOWN_ACTION {
+                            return Err(older_message(target));
+                        }
                         return Err(reply["error"].as_str().map_or_else(
                             || format!("{} didn't accept the change. Try again.", capitalised(target.name())),
                             str::to_string,
@@ -204,6 +224,9 @@ fn send_problem(device: Device, reply: Result<(u16, String), String>) -> Option<
     match reply {
         Ok((200, body)) => {
             let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            if body["ok"] == false && body["error"] == UNKNOWN_ACTION {
+                return Some(older_message(device));
+            }
             (body["ok"] == false).then(refused)
         }
         Ok((PEER_UNREACHABLE, _)) => {
@@ -323,7 +346,7 @@ mod tests {
     }
 
     fn start_holding(port: u16, hold: Duration) -> Client {
-        Client::start_holding(port, hold, Box::new(|| {}))
+        Client::start_holding(port, WINDOW_POLL, hold, Box::new(|| {}))
     }
 
     fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -470,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_refused_change_sets_a_plain_error_and_wakes_the_window() {
-        let (port, _) = pair("debian", 200, |_| r#"{"ok":false,"error":"unknown action"}"#.into());
+        let (port, _) = pair("debian", 200, |_| r#"{"ok":false,"error":"bad request"}"#.into());
         let (client, rx) = start(port);
         ready(&client);
         while rx.try_recv().is_ok() {}
@@ -478,8 +501,40 @@ mod tests {
         wait_for("the error", || client.last_error().is_some());
         let err = client.last_error().unwrap();
         assert!(err.starts_with("The Windows laptop didn't accept"), "{err}");
-        assert!(!err.contains("unknown action"), "{err}");
+        assert!(!err.contains("bad request"), "{err}");
         rx.recv_timeout(Duration::from_secs(1)).expect("an update for the error");
+    }
+
+    #[test]
+    fn release_all_input_falls_back_to_this_device_without_the_layout() {
+        let (port, log) = stub(|method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, local_json("windows")),
+            ("POST", _) => (200, r#"{"ok":true}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        let (client, _rx) = start(port);
+        wait_for("the local status", || client.snapshot().local.is_some());
+        client.release_all_input();
+        wait_for("the request", || log.lock().unwrap().iter().any(|(m, _, _)| m == "POST"));
+        let posts: Vec<_> = log.lock().unwrap().iter().filter(|(m, _, _)| m == "POST").cloned().collect();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].1, "/api/local/action");
+        assert!(posts[0].2.contains("panic"));
+    }
+
+    #[test]
+    fn an_unknown_action_reply_means_an_older_service() {
+        let (port, _) = pair("debian", 200, |_| r#"{"ok":false,"error":"unknown action"}"#.into());
+        let (client, _rx) = start(port);
+        ready(&client);
+        client.local_action(Device::Windows, serde_json::json!({"action": "set_sharing", "mouse": false}));
+        wait_for("the error", || client.last_error().is_some());
+        assert_eq!(
+            client.last_error().unwrap(),
+            "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in."
+        );
+        let err = client.set_main_device(Device::Debian).unwrap_err();
+        assert_eq!(err, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
     }
 
     #[test]

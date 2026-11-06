@@ -461,11 +461,16 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
         .spawn(move || install_launchers(peer_addr, switch_edge));
 }
 
+/// Rewrites the Start Menu entry and the login script for the installed exe, without touching the
+/// exe. A double-click over an old running service uses this, so the next login starts the tray.
+pub fn rewrite_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
+    if let Some(installed_exe) = crate::app::install::installed_exe() {
+        write_launchers(&installed_exe, peer_addr, switch_edge);
+    }
+}
+
 fn install_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
     use crate::app::install;
-    let Ok(appdata) = std::env::var("APPDATA") else {
-        return;
-    };
     let Some(installed_exe) = install::installed_exe() else {
         return;
     };
@@ -479,8 +484,15 @@ fn install_launchers(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
         }
     }
 
+    write_launchers(&installed_exe, peer_addr, switch_edge);
+}
+
+fn write_launchers(installed_exe: &std::path::Path, peer_addr: SocketAddr, switch_edge: SwitchEdge) {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return;
+    };
     let exe_to_run = if installed_exe.exists() {
-        installed_exe
+        installed_exe.to_path_buf()
     } else if let Ok(cur_exe) = std::env::current_exe() {
         cur_exe
     } else {

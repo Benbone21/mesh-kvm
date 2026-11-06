@@ -80,6 +80,12 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
+/// Where `log_fatal` and `log_note` write.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn log_path() -> PathBuf {
+    config_dir().join("mesh-kvm.log")
+}
+
 /// Writes a fatal error to `mesh-kvm.log`. The Windows build has no console, and a window started
 /// from a menu has nowhere to print, so the error would otherwise vanish.
 pub fn log_fatal(message: &str) {

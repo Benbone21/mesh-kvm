@@ -163,13 +163,29 @@ pub struct DeviceStatus {
     pub cursor: Option<[i32; 2]>,
     pub autostart: bool,
     pub audio: AudioStatus,
-    pub sharing: Sharing,
+    /// Missing from a service older than 0.2.0, which is how the app tells it apart.
+    pub sharing: Option<Sharing>,
     pub clipboard: ClipboardSharing,
     #[serde(default = "default_speed")]
     pub pointer_speed: f32,
     /// 0 is Debian, 1 is the laptop.
     pub main_device: u8,
     pub main_conflict: bool,
+}
+
+impl DeviceStatus {
+    /// True for a service from before this version of the app, which can't take the newer controls.
+    pub fn is_older(&self) -> bool {
+        self.sharing.is_none()
+    }
+}
+
+/// What to say about a device whose service is older than the app.
+pub fn older_message(device: Device) -> String {
+    let name = device.name();
+    let mut c = name.chars();
+    let name: String = c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect());
+    format!("{name} is running an older mesh-kvm. Update it, or sign out and back in.")
 }
 
 fn default_speed() -> f32 {
@@ -300,6 +316,11 @@ impl Snapshot {
         Device::BOTH.into_iter().find(|d| d.short_name() == node)
     }
 
+    /// True when either reachable device runs a service older than the app.
+    fn any_older(&self) -> bool {
+        [&self.local, &self.peer].into_iter().flatten().any(DeviceStatus::is_older)
+    }
+
     /// True while the router on either device has fallen back to local input over two mains.
     fn main_conflict(&self) -> bool {
         [&self.local, &self.peer].into_iter().flatten().any(|d| d.main_conflict)
@@ -331,7 +352,7 @@ pub fn enabled(snapshot: &Snapshot) -> ControlsEnabled {
     ControlsEnabled {
         // The router ignores a manual switch during a main conflict.
         switch: linked && !snapshot.main_conflict(),
-        main_device: linked,
+        main_device: linked && !snapshot.any_older(),
         layout: snapshot.layout.is_some(),
         release: snapshot.local.is_some(),
         test_sound: linked,
@@ -422,8 +443,8 @@ impl Control {
     /// The control's value in a device's status. Switches are 0 or 1.
     pub fn read(self, d: &DeviceStatus) -> f64 {
         match self {
-            Control::MouseSharing => flag(d.sharing.mouse),
-            Control::KeyboardSharing => flag(d.sharing.keyboard),
+            Control::MouseSharing => flag(d.sharing.as_ref().is_none_or(|s| s.mouse)),
+            Control::KeyboardSharing => flag(d.sharing.as_ref().is_none_or(|s| s.keyboard)),
             Control::PointerSpeed => d.pointer_speed as f64,
             Control::AudioSend => flag(d.audio.tx_enabled),
             Control::AudioSource => d.audio.tx_source.unwrap_or(0) as f64,
@@ -754,6 +775,9 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
             "The {other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
         ));
     }
+    if let Some(device) = Device::BOTH.into_iter().find(|d| snapshot.device(*d).is_some_and(DeviceStatus::is_older)) {
+        return Some(older_message(device));
+    }
     if !local.peer_online {
         return Some(format!(
             "The {other} is found but not linked yet, so each device is working on its own. Wait a few seconds, or restart mesh-kvm on both devices."
@@ -762,7 +786,9 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     if let Some(message) = snapshot.peer.as_ref().and_then(|peer| split_message(local, peer)) {
         return Some(message);
     }
-    let panic = snapshot.layout.as_ref().map_or(local.panic_mode, |l| l.telemetry.panic_mode);
+    let panic = snapshot.layout.as_ref().is_some_and(|l| l.telemetry.panic_mode)
+        || local.panic_mode
+        || snapshot.peer.as_ref().is_some_and(|p| p.panic_mode);
     if panic {
         return Some(
             "All input is released, and each device is using its own keyboard and mouse. Use the switch to reconnect."
@@ -887,13 +913,15 @@ mod tests {
         let d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
         assert_eq!(d.node, "debian");
         assert!(d.peer_online);
-        assert!(d.sharing.mouse && !d.sharing.keyboard);
+        assert!(!d.is_older());
+        let sharing = d.sharing.as_ref().unwrap();
+        assert!(sharing.mouse && !sharing.keyboard);
         assert!(d.clipboard.send && !d.clipboard.receive);
         assert_eq!(d.main_device, 1);
         assert_eq!(d.cursor, Some([100, 200]));
         // An older service that lacks the newer fields still parses.
         let old: DeviceStatus = serde_json::from_str(r#"{"node":"windows"}"#).unwrap();
-        assert!(old.sharing.mouse && old.sharing.keyboard && old.clipboard.send);
+        assert!(old.clipboard.send && old.sharing.is_none() && old.is_older());
         let l = LayoutState::parse(STATE_JSON).unwrap();
         assert_eq!(l.config.debian_monitors.len(), 2);
         assert_eq!(l.config.attach_side, "Bottom");
@@ -1029,6 +1057,39 @@ mod tests {
         assert_eq!(position_label(&c, &placements(&c)), "Below DP-2");
         c.win_x = 2240;
         assert_eq!(position_label(&c, &placements(&c)), "Custom (bottom edge)");
+    }
+
+    #[test]
+    fn an_older_service_is_named_and_the_controls_that_need_it_are_off() {
+        let mut snap = pair(1, 1);
+        snap.peer.as_mut().unwrap().sharing = None;
+        let msg = status_message(&snap).unwrap();
+        assert_eq!(msg, "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+        assert!(!enabled(&snap).main_device);
+        assert!(enabled(&snap).test_sound);
+        let mut snap = pair(1, 1);
+        snap.local.as_mut().unwrap().sharing = None;
+        assert!(status_message(&snap).unwrap().starts_with("The Debian desktop is running an older mesh-kvm."));
+        assert!(!enabled(&snap).main_device);
+        // A current pair is unaffected.
+        assert!(enabled(&pair(1, 1)).main_device);
+    }
+
+    #[test]
+    fn the_older_text_names_the_device() {
+        assert_eq!(older_message(Device::Windows), "The Windows laptop is running an older mesh-kvm. Update it, or sign out and back in.");
+    }
+
+    #[test]
+    fn the_panic_notice_shows_when_either_device_reports_it() {
+        let mut snap = pair(1, 1);
+        snap.local.as_mut().unwrap().main_device = 1;
+        assert_eq!(status_message(&snap), None);
+        snap.peer.as_mut().unwrap().panic_mode = true;
+        assert!(status_message(&snap).unwrap().starts_with("All input is released"));
+        let mut snap = pair(1, 1);
+        snap.local.as_mut().unwrap().panic_mode = true;
+        assert!(status_message(&snap).unwrap().starts_with("All input is released"));
     }
 
     fn device(node: &str, main_device: u8) -> DeviceStatus {
