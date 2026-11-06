@@ -1,6 +1,6 @@
 # mesh-kvm
 
-mesh-kvm shares one mouse and keyboard between a Debian desktop and a Windows laptop. Move the pointer off the edge of one screen and it appears on the other. It also shares the clipboard and audio. The same program runs on both machines, one build per operating system.
+mesh-kvm shares one mouse and keyboard between a Debian desktop and a Windows laptop. Move the pointer off the edge of one screen and it appears on the other. It also shares the clipboard and audio, and it's made to hold up on poor Wi-Fi. The same program runs on both machines, one build per operating system.
 
 The two devices are equal. Each one is both client and host, each keeps its own copy of the layout, and you can arrange screens and switch devices from either one. A Mac version is planned, but there is no Mac build yet.
 
@@ -90,6 +90,20 @@ Audio travels on UDP port 24851 as Opus in 10 ms packets, or plain PCM in 5 ms p
 
 Opus is built from the copy in `third_party/opus`, so building needs only a C compiler, on both targets. Its licence is under Licences in the Settings menu, and `mesh-kvm --licenses` shows it too. `tests/audio_measure.py` measures quality, delay and bandwidth at each bitrate with `tc netem` adding loss and jitter. `tests/audio_devices.py` runs two whole devices beside private sound servers, and checks echo, muting, devices coming and going, and mixing. Neither can reach your real audio.
 
+## Bad Wi-Fi
+
+mesh-kvm is built for a network that loses packets, delays them, and now and then stops for a few seconds.
+
+- Keys and mouse buttons can't stick. Every heartbeat, about 2.5 times a second, says what the sending device is holding down. A key the other device has down that the sender no longer holds is let go at once.
+- A lost press corrects itself too, more carefully. A key is pressed late only if two heartbeats in a row say it's held, so a quick tap that got lost stays lost rather than turning up after you've let go. A mouse button is pressed late only if the pointer hasn't moved, as it would otherwise land on something else.
+- Input that arrives late or out of order is dropped. Mouse movement can't cost a keystroke, as they are kept apart.
+- In a dropout, once 1.35 seconds pass with nothing heard, everything held is let go on both devices, and each one has its own keyboard and mouse. When the link is back, control returns to the device that had it, usually within a second. Until the other device has shown it can hear this one, nothing is swallowed, so a link that only works one way can't take your keyboard.
+- Control doesn't return if you chose Release all input during the dropout, on either device, or if the dropout lasts more than 15 seconds. By then you've probably settled on the device in front of you. Pushing across an edge or using the switch counts as your choice too.
+- If the other device stops hearing this one while its own packets still arrive, this device takes its keyboard and mouse back after 2.5 seconds, and control returns in the same way.
+- Text you copy while the other device can't be reached goes when the link is back. Only the newest copy waits, and for at most 10 minutes. Anything copied since on either device takes its place, and if both devices have text waiting, both end up with the later one. Images and files don't wait: a note under Clipboard says what stayed behind, and to copy it again.
+
+The Input section shows how the link looks from each device: the worst loss in either direction, counting what audio loses as well as the link's own packets, and the time for a packet to get there and back. Hover over it for each direction. It stands out from 5% loss or 150 ms. While the link is down it gives no figures, and the other device shows as Link down.
+
 ## Arranging screens
 
 Every monitor on both devices appears in the app, including ones to the left of or above a device's main screen, with its name, resolution and refresh rate.
@@ -112,7 +126,7 @@ Debian uses `kscreen-doctor`, from the `libkscreen-bin` package, and Windows use
 
 ## Updating
 
-This version changes what the devices send each other, so update both before you use them together. Until then, crossing between them won't work properly. If one device still runs an older mesh-kvm, the app says which one and turns off the controls it can't use.
+This version changes what the devices send each other, so update both before you use them together. If one device still runs an older mesh-kvm, the app says which one and turns off the controls it can't use. Against a 0.5 device, input still works as it did, with no correcting of lost keys and no return of control, and the app says so. The clipboard doesn't reach that device until it's updated, and a note says that too.
 
 Your settings carry over. The first start finds the address in the `--peer` your launchers already use and saves it. On Debian, it imports `layout.json` along with its pointer speed, and leaves the old file where it is. It looks in the folder the service runs in, then `~/mesh-kvm`, then the folders above the program.
 
@@ -145,10 +159,10 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 
 ## Tests
 
-`cargo test` runs the unit tests. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, the audio bus, layout sync, and saving and changing the address:
+`cargo test` runs the unit tests. `tests/netem_link.py` puts two devices on a bad network with `tc netem`, with a pretend person typing on one and a tone playing to the other. It covers loss, delay, reordering, 2-second dropouts in both directions, a one-way link, Release all input during a dropout, and a restart, and checks that no key sticks, audio keeps playing and control returns. Its top comment says how to run it. Input there is the real router, link and sockets with the keyboard and mouse left out, and audio has private sound servers, so it can't reach your real desktop or audio. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, held keys and late packets, dropouts, the audio bus, layout sync, and saving and changing the address:
 
 ```
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
 ```
 
-The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`.
+The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`. Set `WINE_LINK_PREFIX` to put the Wine prefix somewhere other than `/tmp`.
