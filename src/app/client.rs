@@ -5,8 +5,10 @@ use crate::webui::{http_call_port, UI_PORT};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+/// How long an error stays up before a later change that works may clear it.
+const ERROR_HOLD: Duration = Duration::from_secs(5);
 const POLL_EVERY: Duration = Duration::from_millis(200);
 const LOCALHOST: &str = "127.0.0.1";
 /// What the peer proxy answers when the other device doesn't.
@@ -22,7 +24,8 @@ struct Job {
 struct Shared {
     snapshot: Mutex<Snapshot>,
     /// Why the last change didn't go through, worded for the person to read.
-    last_error: Mutex<Option<String>>,
+    last_error: Mutex<Option<(String, Instant)>>,
+    error_hold: Duration,
     stop: AtomicBool,
 }
 
@@ -41,9 +44,14 @@ impl Client {
     }
 
     pub(super) fn start_on(port: u16, on_update: Box<dyn Fn() + Send>) -> Self {
+        Self::start_holding(port, ERROR_HOLD, on_update)
+    }
+
+    fn start_holding(port: u16, error_hold: Duration, on_update: Box<dyn Fn() + Send>) -> Self {
         let shared = Arc::new(Shared {
             snapshot: Mutex::default(),
             last_error: Mutex::default(),
+            error_hold,
             stop: AtomicBool::new(false),
         });
         let poller = shared.clone();
@@ -54,7 +62,7 @@ impl Client {
                 while !poller.stop.load(Ordering::Relaxed) {
                     let snap = poll_once(port);
                     *lock(&poller.snapshot) = snap.clone();
-                    let now = (snap, lock(&poller.last_error).clone());
+                    let now = (snap, lock(&poller.last_error).as_ref().map(|(m, _)| m.clone()));
                     if last.as_ref() != Some(&now) {
                         on_update();
                     }
@@ -70,7 +78,14 @@ impl Client {
             .spawn(move || {
                 for job in queue {
                     let reply = http_call_port(LOCALHOST, port, "POST", &job.path, &job.body);
-                    *lock(&sender.last_error) = send_problem(job.device, reply);
+                    let mut error = lock(&sender.last_error);
+                    match send_problem(job.device, reply) {
+                        Some(message) => *error = Some((message, Instant::now())),
+                        // A change that works clears an old error, but not one the person
+                        // has had no time to read.
+                        None if error.as_ref().is_some_and(|(_, at)| at.elapsed() >= sender.error_hold) => *error = None,
+                        None => {}
+                    }
                 }
             })
             .expect("start the send thread");
@@ -81,9 +96,10 @@ impl Client {
         lock(&self.shared.snapshot).clone()
     }
 
-    /// Why the last change didn't go through. A later change that works clears it.
+    /// Why the last change didn't go through. It stays for at least five seconds, until
+    /// dismissed or until a later change that works clears it after that.
     pub fn last_error(&self) -> Option<String> {
-        lock(&self.shared.last_error).clone()
+        lock(&self.shared.last_error).as_ref().map(|(m, _)| m.clone())
     }
 
     pub fn dismiss_error(&self) {
@@ -102,7 +118,7 @@ impl Client {
             Some(path) => {
                 let _ = self.jobs.send(Job { device, path, body: body.to_string() });
             }
-            None => *lock(&self.shared.last_error) = Some(NOT_RUNNING.into()),
+            None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
         }
     }
 
@@ -116,8 +132,9 @@ impl Client {
         self.send(Device::Debian, "/api/action", serde_json::json!({ "action": action }));
     }
 
-    pub fn save_layout(&self, layout: &LayoutState) {
-        self.send(Device::Debian, "/api/layout", layout.to_save_json());
+    /// Saves a layout. `body` is what `LayoutState::to_save_json` or `Edits::layout_save_body` made.
+    pub fn save_layout(&self, body: serde_json::Value) {
+        self.send(Device::Debian, "/api/layout", body);
     }
 
     /// Makes `device` the main one on both devices, changing the other device first. Returns the
@@ -305,6 +322,10 @@ mod tests {
         (client, rx)
     }
 
+    fn start_holding(port: u16, hold: Duration) -> Client {
+        Client::start_holding(port, hold, Box::new(|| {}))
+    }
+
     fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
         for _ in 0..200 {
             if done() {
@@ -356,7 +377,7 @@ mod tests {
         client.master_action("toggle_focus");
         let mut layout = client.snapshot().layout.unwrap();
         layout.config.win_x = 42;
-        client.save_layout(&layout);
+        client.save_layout(layout.to_save_json());
         wait_for("four posts", || posts(&log).len() == 4);
         let p = posts(&log);
         assert_eq!(p[0].0, "/api/peer/api/local/action");
@@ -470,12 +491,33 @@ mod tests {
                 r#"{"ok":true}"#.into()
             }
         });
-        let (client, _rx) = start(port);
+        let client = start_holding(port, Duration::from_millis(100));
         ready(&client);
-        client.save_layout(&client.snapshot().layout.unwrap());
+        client.save_layout(client.snapshot().layout.unwrap().to_save_json());
         wait_for("the error", || client.last_error().is_some());
+        std::thread::sleep(Duration::from_millis(150));
         client.master_action("panic");
         wait_for("the error to clear", || client.last_error().is_none());
+    }
+
+    #[test]
+    fn a_change_that_works_cannot_clear_a_fresh_error() {
+        let (port, log) = pair("debian", 200, |path| {
+            if path.ends_with("/api/layout") {
+                r#"{"ok":false,"error":"missing field"}"#.into()
+            } else {
+                r#"{"ok":true}"#.into()
+            }
+        });
+        let client = start_holding(port, Duration::from_secs(60));
+        ready(&client);
+        client.save_layout(client.snapshot().layout.unwrap().to_save_json());
+        wait_for("the error", || client.last_error().is_some());
+        let before = client.last_error();
+        client.master_action("panic");
+        wait_for("the action to be sent", || posts(&log).iter().any(|(p, _)| p.ends_with("/api/action")));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(client.last_error(), before);
     }
 
     #[test]

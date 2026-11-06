@@ -505,6 +505,17 @@ impl Edits {
         due
     }
 
+    /// The body for a layout save. The pointer speed isn't part of what a layout edit changes, so
+    /// it comes from the latest poll, or from the slider while a change to it hasn't caught up.
+    /// A draft made before the person moved the slider would otherwise put the old speed back.
+    pub fn layout_save_body(&self, draft: &LayoutState, latest: &Snapshot, now: Instant) -> Value {
+        let polled = latest.layout.as_ref().unwrap_or(draft).config.mouse_speed;
+        let speed = self.shown((Device::Debian, Control::PointerSpeed), polled as f64, now) as f32;
+        let mut layout = draft.clone();
+        layout.config.mouse_speed = speed;
+        layout.to_save_json()
+    }
+
     /// How long until something here needs another look, so the window can stay idle until then.
     pub fn next_wake(&self, now: Instant) -> Option<Duration> {
         self.entries
@@ -907,6 +918,24 @@ mod tests {
         let text = STATE_JSON.replace("\"mouse_speed\":0.35", "\"mouse_speed\":0.1");
         let saved = LayoutState::parse(&text).unwrap().to_save_json();
         assert_eq!(saved["mouse_speed"].to_string(), "0.1");
+    }
+
+    #[test]
+    fn a_layout_save_keeps_the_pointer_speed_just_set() {
+        let draft = LayoutState::parse(STATE_JSON).unwrap();
+        let latest = Snapshot { layout: Some(draft.clone()), ..Default::default() };
+        let now = Instant::now();
+        let mut edits = Edits::default();
+        let key = (Device::Debian, Control::PointerSpeed);
+        edits.set(key, 0.8, now);
+        assert_eq!(edits.layout_save_body(&draft, &latest, now)["mouse_speed"].to_string(), "0.8");
+        // Once the poll has caught up, the save follows the poll rather than the stale draft.
+        let mut newer = draft.clone();
+        newer.config.mouse_speed = 0.5;
+        let latest = Snapshot { layout: Some(newer), ..Default::default() };
+        let later = now + Duration::from_secs(60);
+        edits.take_due(later);
+        assert_eq!(edits.layout_save_body(&draft, &latest, later)["mouse_speed"].to_string(), "0.5");
     }
 
     #[test]

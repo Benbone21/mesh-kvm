@@ -77,6 +77,9 @@ struct Window {
     drag: Option<MapDrag>,
     main_change: Option<Receiver<Result<(), String>>>,
     main_error: Option<String>,
+    /// The device the failed change was for, and whether the link has been seen down since.
+    main_choice: Option<Device>,
+    main_link_was_down: bool,
     /// Last frame's heights, so that cards in a row can match the tallest.
     side_height: f32,
     device_height: f32,
@@ -98,15 +101,18 @@ impl Window {
             drag: None,
             main_change: None,
             main_error: None,
+            main_choice: None,
+            main_link_was_down: false,
             side_height: 0.0,
             device_height: 0.0,
         }
     }
 
     fn show(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) {
-        self.collect_main_change();
-        self.layout.follow(snapshot.layout.clone(), self.drag.is_some(), now);
         let on = model::enabled(snapshot);
+        self.collect_main_change();
+        self.clear_stale_main_error(snapshot, &on);
+        self.layout.follow(snapshot.layout.clone(), self.drag.is_some(), now);
 
         egui::TopBottomPanel::top("top bar")
             .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(24, 14)))
@@ -141,19 +147,20 @@ impl Window {
         });
 
         self.end_lost_drag(ctx, now);
-        self.send_changes(now);
+        self.send_changes(snapshot, now);
         let wake = [self.edits.next_wake(now), self.layout.next_wake(now)].into_iter().flatten().min();
         if let Some(wake) = wake {
             ctx.request_repaint_after(wake);
         }
     }
 
-    fn send_changes(&mut self, now: Instant) {
+    fn send_changes(&mut self, snapshot: &Snapshot, now: Instant) {
         for ((device, control), value) in self.edits.take_due(now) {
             self.client.local_action(device, control.action(value));
         }
         if let Some(layout) = self.layout.take_due(now) {
-            self.client.save_layout(layout);
+            let body = self.edits.layout_save_body(layout, snapshot, now);
+            self.client.save_layout(body);
         }
     }
 
@@ -169,6 +176,22 @@ impl Window {
         }
     }
 
+    /// Drops the main device error once it no longer applies: the devices link up again after
+    /// being apart, or the polled main device is the one that was chosen.
+    fn clear_stale_main_error(&mut self, snapshot: &Snapshot, on: &ControlsEnabled) {
+        if self.main_error.is_none() || self.main_change.is_some() {
+            return;
+        }
+        if !on.main_device {
+            self.main_link_was_down = true;
+        }
+        let recovered = on.main_device && self.main_link_was_down;
+        let done = self.main_choice.is_some() && snapshot.main_device() == self.main_choice;
+        if recovered || done {
+            self.main_error = None;
+        }
+    }
+
     /// Asks both devices to change on a background thread, as it can take seconds.
     fn choose_main(&mut self, ctx: &egui::Context, device: Device) {
         let (done, change) = mpsc::channel();
@@ -178,6 +201,8 @@ impl Window {
             ctx.request_repaint();
         });
         self.main_error = None;
+        self.main_choice = Some(device);
+        self.main_link_was_down = false;
         self.main_change = Some(change);
     }
 
@@ -770,11 +795,16 @@ fn slider_row(
     range: RangeInclusive<f64>,
     step: f64,
 ) -> bool {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-    let shown = ui.painter().text(rect.right_center(), Align2::RIGHT_CENTER, value_text, body_font(ui), AMBER);
-    let label_room = rect.with_max_x(shown.left() - 8.0);
-    let painter = ui.painter().with_clip_rect(label_room);
-    painter.text(rect.left_center(), Align2::LEFT_CENTER, label, body_font(ui), INK);
+    // The label wraps in the room the value leaves, so the two never touch.
+    let value_galley = ui.painter().layout_no_wrap(value_text, body_font(ui), AMBER);
+    let label_width = (ui.available_width() - value_galley.size().x - 12.0).max(40.0);
+    let label_galley = ui.painter().layout(label.to_owned(), body_font(ui), INK, label_width);
+    let height = label_galley.size().y.max(value_galley.size().y).max(20.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let top = rect.top() + (height - label_galley.size().y) / 2.0;
+    ui.painter().galley(Pos2::new(rect.left(), top), label_galley, INK);
+    let value_pos = Pos2::new(rect.right() - value_galley.size().x, rect.center().y - value_galley.size().y / 2.0);
+    ui.painter().galley(value_pos, value_galley, AMBER);
 
     let before = *value;
     ui.spacing_mut().slider_width = ui.available_width();
@@ -1029,6 +1059,34 @@ mod tests {
         }
         let error = window.main_error.as_deref().unwrap();
         assert!(error.contains("Start mesh-kvm"), "{error}");
+    }
+
+    #[test]
+    fn main_error_goes_when_the_link_recovers_or_the_choice_takes_hold() {
+        let mut window = window();
+        let (down, up) = (Snapshot::default(), linked());
+        let set = |w: &mut Window| {
+            w.main_error = Some("Couldn't reach the laptop.".into());
+            w.main_choice = Some(Device::Windows);
+            w.main_link_was_down = false;
+        };
+        set(&mut window);
+        window.clear_stale_main_error(&down, &model::enabled(&down));
+        assert!(window.main_error.is_some());
+        window.clear_stale_main_error(&up, &model::enabled(&up));
+        assert!(window.main_error.is_none());
+
+        // A refusal while the link is up stays until something changes.
+        set(&mut window);
+        window.clear_stale_main_error(&up, &model::enabled(&up));
+        assert!(window.main_error.is_some());
+        // The poll showing the chosen device clears it.
+        let mut chosen = up.clone();
+        for d in [chosen.local.as_mut(), chosen.peer.as_mut()].into_iter().flatten() {
+            d.main_device = Device::Windows.id();
+        }
+        window.clear_stale_main_error(&chosen, &model::enabled(&chosen));
+        assert!(window.main_error.is_none());
     }
 
     #[test]
