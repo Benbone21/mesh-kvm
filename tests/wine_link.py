@@ -41,6 +41,9 @@ PEER = "10.77.0.2"
 STRANGER = "10.77.0.3"
 ANOTHER_PEER = "10.77.0.9"
 INPUT_PORT = 24850
+AUDIO_PORT = 24851
+AUDIO_MAGIC = b"MKAU"
+AUDIO_VERSION = 2
 API_PORT = 24880
 LOCAL = f"http://127.0.0.1:{API_PORT}"
 DESKTOP_NAME = "wine-link-desktop"
@@ -526,6 +529,71 @@ def api_checks(peer, inbox):
     call("/api/action", {"action": "toggle_focus"})
 
 
+def audio_checks():
+    # s. The audio bus: quiet about other versions, live both ways, and a fallback that works.
+    with other_device():
+        ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ours.bind((PEER, AUDIO_PORT))
+        ours.settimeout(1)
+    audio = local()["audio"]
+    check("audio reports its device lists", isinstance(audio["inputs"], list) and isinstance(audio["outputs"], list),
+          str(audio))
+    check("nothing is chosen, so nothing is sent", audio["tx_enabled"] is False and audio["input"] == "")
+
+    old = b"MKVA" + struct.pack("<Q", 2) + b"\x55" * 960
+    for _ in range(5):
+        ours.sendto(old, (LAPTOP, AUDIO_PORT))
+    seen = wait_for(lambda s: s["audio"]["rx_other_version"], 5)
+    check("the old packet format is noticed", seen is not None)
+    check("and none of it is played", local()["audio"]["rx_peak"] == 0)
+    garbage = b"MKAU\x09\x01" + b"\xff" * 300
+    ours.sendto(garbage, (LAPTOP, AUDIO_PORT))
+    check("a later version is left alone too", local()["audio"]["rx_packets"] == 0)
+
+    reply = call("/api/local/action", {"action": "set_audio_device", "role": "output", "id": "default"})
+    check("choosing an output is accepted", reply.get("ok") is True, str(reply))
+    audio = wait_for(lambda s: s["audio"]["tx_enabled"], 5)
+    check("choosing anything starts sending", audio is not None)
+    packets = []
+    deadline = time.time() + 4
+    while time.time() < deadline and not packets:
+        try:
+            data, sender = ours.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if data[:4] == AUDIO_MAGIC:
+            packets.append((data, sender))
+    check("the sender says it's alive even with nothing playing", bool(packets))
+    if packets:
+        data, sender = packets[0]
+        check("in the new format", data[4] == AUDIO_VERSION, str(data[:8]))
+        # Tell it the sound is reaching a speaker here, and keep a stream coming the other way.
+        report = AUDIO_MAGIC + bytes([AUDIO_VERSION, 4]) + data[6:8] + bytes(4) + struct.pack("<IBBHH", 5, 3, 1, 20, 0)
+        quiet = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3]) + struct.pack("<HI", 77, 0)
+        deadline = time.time() + 4
+        answered = False
+        ours.settimeout(0.1)
+        while time.time() < deadline:
+            ours.sendto(report, sender)
+            ours.sendto(quiet, (LAPTOP, AUDIO_PORT))
+            try:
+                while True:
+                    back, _ = ours.recvfrom(2048)
+                    answered = answered or back[:6] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4])
+            except socket.timeout:
+                pass
+        check("what it hears back says the sound is getting through", local()["audio"]["tx_reaching"] is True)
+        check("and it reports back to the other device", answered)
+        audio = local()["audio"]
+        # Both directions on one output is what calls for process loopback, which Wine doesn't have.
+        check("with process loopback refused, it falls back and says an echo is possible",
+              audio["echo_safe"] is False, str(audio["echo_safe"]))
+        check("and it keeps on sending", local()["audio"]["tx_enabled"] is True)
+    call("/api/local/action", {"action": "set_audio_device", "role": "output", "id": ""})
+    check("choosing None stops sending", wait_for(lambda s: not s["audio"]["tx_enabled"], 5) is not None)
+    ours.close()
+
+
 def layout_checks(peer, inbox, holder):
     # n. An edit on the laptop raises the revision, and Debian hears of it.
     config = state()["config"]
@@ -731,6 +799,7 @@ def test(exe_path):
                   fields["x"] == 2559 - 28, str(fields))
         keyboard_checks(peer, inbox, exe)
         api_checks(peer, inbox)
+        audio_checks()
         layout_checks(peer, inbox, layout)
         display_checks()
         security_checks(pinned_peer=True)
