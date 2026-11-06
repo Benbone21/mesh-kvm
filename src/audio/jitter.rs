@@ -418,6 +418,12 @@ impl RxStream {
         self.unrepaired_percent
     }
 
+    /// The stream has ended, so what it was like no longer says anything.
+    pub fn forget_quality(&mut self) {
+        self.loss_percent = 0.0;
+        self.unrepaired_percent = 0.0;
+    }
+
     /// Reads the latest loss and sums it up for the sender.
     pub fn report(&mut self, playing: bool) -> Report {
         let counts = self.jitter.counts();

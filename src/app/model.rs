@@ -151,7 +151,8 @@ pub struct AudioStatus {
     pub rx_muted: bool,
     pub rx_volume: u32,
     pub rx_peak: u32,
-    pub rx_packets: u64,
+    /// A stream from the other device is alive.
+    pub rx_live: bool,
     /// Percent of what's sent here that isn't arriving in time, and what couldn't be rebuilt.
     pub rx_loss: f32,
     pub rx_unrepaired: f32,
@@ -225,9 +226,9 @@ pub fn sending_quality(audio: &AudioStatus, other: &str) -> String {
     }
 }
 
-/// How what's arriving is getting on, once anything has.
+/// How what's arriving is getting on, while anything is.
 pub fn receiving_quality(audio: &AudioStatus) -> Option<String> {
-    (audio.rx_packets > 0).then(|| {
+    audio.rx_live.then(|| {
         format!(
             "Received: {:.1}% lost, {:.1}% couldn't be repaired, {} ms held back to smooth it out.",
             audio.rx_loss, audio.rx_unrepaired, audio.rx_buffer_ms
@@ -2107,8 +2108,8 @@ mod tests {
         assert_eq!(sending_quality(&audio, "Laptop"), "Not playing on Laptop yet.");
         audio.tx_reaching = true;
         assert_eq!(sending_quality(&audio, "Laptop"), "Playing on Laptop, 3% lost on the way.");
-        assert_eq!(receiving_quality(&audio), None, "nothing has arrived");
-        audio.rx_packets = 10;
+        assert_eq!(receiving_quality(&audio), None, "nothing is arriving");
+        audio.rx_live = true;
         audio.rx_loss = 2.5;
         audio.rx_unrepaired = 0.4;
         audio.rx_buffer_ms = 30;
@@ -2116,6 +2117,8 @@ mod tests {
             receiving_quality(&audio).unwrap(),
             "Received: 2.5% lost, 0.4% couldn't be repaired, 30 ms held back to smooth it out."
         );
+        audio.rx_live = false;
+        assert_eq!(receiving_quality(&audio), None, "the stream ended, so its figures are gone");
     }
 
     const KEY: (Device, Control) = (Device::Windows, Control::SendVolume);

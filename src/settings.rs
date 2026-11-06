@@ -2,8 +2,8 @@
 
 use crate::audio::devices::{self, Choice};
 use crate::audio::{
-    reaching_peer, AUDIO_BITRATE_KBPS, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_BUFFER_MS, AUDIO_RX_LOSS, AUDIO_RX_MUTED,
-    AUDIO_RX_OTHER_VERSION, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_UNREPAIRED, AUDIO_RX_VOLUME_PCT, AUDIO_TX_LOSS,
+    other_version_arriving, reaching_peer, AUDIO_BITRATE_KBPS, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_BUFFER_MS, AUDIO_RX_LIVE,
+    AUDIO_RX_LOSS, AUDIO_RX_MUTED, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_UNREPAIRED, AUDIO_RX_VOLUME_PCT, AUDIO_TX_LOSS,
     AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_VOLUME_PCT, BITRATES, DEFAULT_BITRATE,
 };
 use crate::clipboard::{clipboard_note, CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
@@ -471,7 +471,8 @@ pub fn audio_status_json() -> serde_json::Value {
         "rx_loss": f64::from(AUDIO_RX_LOSS.load(Ordering::Relaxed)) / 10.0,
         "rx_unrepaired": f64::from(AUDIO_RX_UNREPAIRED.load(Ordering::Relaxed)) / 10.0,
         "rx_buffer_ms": AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed),
-        "rx_other_version": AUDIO_RX_OTHER_VERSION.load(Ordering::Relaxed) > 0,
+        "rx_live": AUDIO_RX_LIVE.load(Ordering::Relaxed),
+        "rx_other_version": other_version_arriving(now),
     })
 }
 

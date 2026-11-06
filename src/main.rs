@@ -339,17 +339,17 @@ fn run_service(cli: Cli) {
     spatial::start_sync(state.clone(), platform, peer_ip.clone());
 
     // Phase 2: Bidirectional Audio Bus (UDP 24851)
-    if cli.audio_listen {
-        if let Err(e) = audio::start_audio_listener(cli.audio_port) {
-            eprintln!("[Audio] Warning: failed to start audio listener: {}", e);
-        }
-    }
     let audio_target_str = cli
         .audio_send_to
         .clone()
         .unwrap_or_else(|| peer_ip.clone());
     match parse_peer_socket_addr(&audio_target_str, cli.audio_port) {
         Ok((_, audio_addr)) => {
+            if cli.audio_listen {
+                if let Err(e) = audio::start_audio_listener(cli.audio_port, audio_addr) {
+                    eprintln!("[Audio] Warning: failed to start audio listener: {}", e);
+                }
+            }
             if let Err(e) = audio::start_audio_sender(audio_addr) {
                 eprintln!("[Audio] Warning: failed to start audio sender: {}", e);
             }

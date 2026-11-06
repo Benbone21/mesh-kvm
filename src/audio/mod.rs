@@ -55,8 +55,8 @@ pub static AUDIO_RX_LOSS: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_RX_UNREPAIRED: AtomicU32 = AtomicU32::new(0);
 /// How much delay the jitter buffer is holding, in ms.
 pub static AUDIO_RX_BUFFER_MS: AtomicU32 = AtomicU32::new(0);
-/// Audio from a mesh-kvm of another version is arriving, and being ignored.
-pub static AUDIO_RX_OTHER_VERSION: AtomicU64 = AtomicU64::new(0);
+/// A stream from the other device is alive, so the figures above mean something.
+pub static AUDIO_RX_LIVE: AtomicBool = AtomicBool::new(false);
 /// The output is open and not switched off, so what's received can be heard.
 pub static AUDIO_PLAYER_LIVE: AtomicBool = AtomicBool::new(false);
 
@@ -181,50 +181,74 @@ pub fn choices_changed() {
     platform::choices_changed();
 }
 
-fn publish_received(stream: &mut RxStream, reply: Option<(&UdpSocket, SocketAddr, u16)>) {
+/// Reads the stream's figures for the app, and returns what to tell the sender.
+fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
+    let alive = stream.alive(now);
+    if !alive {
+        stream.forget_quality();
+    }
     let report = stream.report(AUDIO_PLAYER_LIVE.load(Ordering::Relaxed));
+    AUDIO_RX_LIVE.store(alive, Ordering::Relaxed);
     AUDIO_RX_PACKETS.store(stream.counts().received, Ordering::Relaxed);
     AUDIO_RX_LOSS.store((stream.loss_percent() * 10.0) as u32, Ordering::Relaxed);
     AUDIO_RX_UNREPAIRED.store((stream.unrepaired_percent() * 10.0) as u32, Ordering::Relaxed);
-    AUDIO_RX_BUFFER_MS.store(stream.buffered_ms() as u32, Ordering::Relaxed);
-    if let Some((socket, to, epoch)) = reply {
-        let mut out = Vec::with_capacity(32);
-        packet::write_report(&mut out, epoch, report);
-        let _ = socket.send_to(&out, to);
-    }
+    AUDIO_RX_BUFFER_MS.store(if alive { stream.buffered_ms() as u32 } else { 0 }, Ordering::Relaxed);
+    report
 }
 
-/// Takes packets off the socket until `stop`, and tells the sender how it's going.
-fn receive_loop(socket: &UdpSocket, stream: &Mutex<RxStream>, stop: &AtomicBool) {
+/// When audio of another version last came from the other device.
+static OTHER_VERSION_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// How long the app keeps saying so after the last of it.
+const OTHER_VERSION_FOR: Duration = Duration::from_secs(10);
+
+fn seen_within(at: Option<Instant>, now: Instant, within: Duration) -> bool {
+    at.is_some_and(|at| now.duration_since(at) < within)
+}
+
+/// True while audio from a mesh-kvm of another version is arriving, and being ignored.
+pub fn other_version_arriving(now: Instant) -> bool {
+    seen_within(*OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner), now, OTHER_VERSION_FOR)
+}
+
+/// Takes the other device's packets off the socket until `stop`, and tells it how it's going.
+/// Anyone can send to a UDP port, so what comes from elsewhere is dropped before it's looked at.
+fn receive_loop(socket: &UdpSocket, stream: &Mutex<RxStream>, peer: SocketAddr, stop: &AtomicBool) {
     let _ = socket.set_read_timeout(Some(RECEIVE_WAIT));
     let mut buf = [0u8; 2048];
     let mut reply_to = None;
     let mut next_report = Instant::now();
+    let mut out = Vec::with_capacity(32);
     while !stop.load(Ordering::Relaxed) {
         let received = socket.recv_from(&mut buf);
         let now = Instant::now();
-        if let Ok((len, from)) = received {
+        if let Some((len, from)) = received.ok().filter(|(_, from)| crate::input::from_peer(*from, peer)) {
             match packet::parse(&buf[..len]) {
                 Ok(packet) if !matches!(packet.body, Body::Report(_)) => {
                     reply_to = Some((from, packet.epoch));
                     stream.lock().unwrap_or_else(PoisonError::into_inner).push(&packet, now);
                 }
                 Err(Refused::OtherVersion) => {
-                    AUDIO_RX_OTHER_VERSION.fetch_add(1, Ordering::Relaxed);
+                    *OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner) = Some(now);
                 }
                 _ => {}
             }
         }
         if now >= next_report {
             next_report = now + REPORT_EVERY;
-            let mut stream = stream.lock().unwrap_or_else(PoisonError::into_inner);
-            let target = reply_to.filter(|_| stream.alive(now)).map(|(to, epoch)| (socket, to, epoch));
-            publish_received(&mut stream, target);
+            // The socket waits for no lock: playback takes this one on every buffer.
+            let (report, alive) = {
+                let mut stream = stream.lock().unwrap_or_else(PoisonError::into_inner);
+                (publish_received(&mut stream, now), stream.alive(now))
+            };
+            if let Some((to, epoch)) = reply_to.filter(|_| alive) {
+                packet::write_report(&mut out, epoch, report);
+                let _ = socket.send_to(&out, to);
+            }
         }
     }
 }
 
-pub fn start_audio_listener(port: u16) -> Result<(), String> {
+pub fn start_audio_listener(port: u16, peer: SocketAddr) -> Result<(), String> {
     let stream = Arc::new(Mutex::new(RxStream::default()));
     platform::start_playback(Arc::clone(&stream));
     std::thread::Builder::new()
@@ -239,7 +263,7 @@ pub fn start_audio_listener(port: u16) -> Result<(), String> {
                 }
             };
             println!("[Audio-RX] Listening on UDP {}", bind_addr);
-            receive_loop(&socket, &stream, &AtomicBool::new(false));
+            receive_loop(&socket, &stream, peer, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -262,4 +286,68 @@ pub fn start_audio_sender(target_addr: SocketAddr) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the receive loop for a moment on a socket of its own, with `127.0.0.1` as the peer.
+    fn received_from(source: &str, data: &[u8]) -> (u64, Option<Instant>) {
+        let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = listen.local_addr().unwrap();
+        let stream = Mutex::new(RxStream::default());
+        let stop = AtomicBool::new(false);
+        *OTHER_VERSION_AT.lock().unwrap() = None;
+        std::thread::scope(|scope| {
+            scope.spawn(|| receive_loop(&listen, &stream, SocketAddr::from(([127, 0, 0, 1], 24851)), &stop));
+            let sender = UdpSocket::bind((source, 0)).unwrap();
+            sender.send_to(data, to).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            stop.store(true, Ordering::SeqCst);
+        });
+        let received = stream.lock().unwrap().counts().received;
+        (received, *OTHER_VERSION_AT.lock().unwrap())
+    }
+
+    fn audio_packet() -> Vec<u8> {
+        let mut out = Vec::new();
+        packet::write_audio(&mut out, codec::Format::Opus, 1, 0, &[0xfc, 0xff, 0xfe]);
+        out
+    }
+
+    #[test]
+    fn only_the_other_device_is_listened_to() {
+        // These share one test, as they share the note of another version.
+        assert_eq!(received_from("127.0.0.1", &audio_packet()).0, 1);
+        assert_eq!(received_from("127.0.0.2", &audio_packet()).0, 0, "a stranger's audio");
+        let mut old = Vec::from(*b"MKVA");
+        old.extend_from_slice(&[0; 20]);
+        assert!(received_from("127.0.0.1", &old).1.is_some());
+        assert!(received_from("127.0.0.2", &old).1.is_none(), "a stranger can't raise the note");
+    }
+
+    #[test]
+    fn the_note_about_another_version_clears_once_it_stops_arriving() {
+        let t = Instant::now();
+        assert!(!seen_within(None, t, OTHER_VERSION_FOR));
+        assert!(seen_within(Some(t), t + OTHER_VERSION_FOR - Duration::from_millis(1), OTHER_VERSION_FOR));
+        assert!(!seen_within(Some(t), t + OTHER_VERSION_FOR, OTHER_VERSION_FOR));
+    }
+
+    #[test]
+    fn a_stream_that_ended_leaves_no_figures_behind() {
+        let mut stream = RxStream::default();
+        let t = Instant::now();
+        let data = audio_packet();
+        stream.push(&packet::parse(&data).unwrap(), t);
+        let mut late = audio_packet();
+        late[8..12].copy_from_slice(&100u32.to_le_bytes());
+        stream.report(true);
+        stream.push(&packet::parse(&late).unwrap(), t);
+        publish_received(&mut stream, t);
+        assert!(stream.loss_percent() > 10.0);
+        publish_received(&mut stream, t + Duration::from_secs(3));
+        assert_eq!(stream.loss_percent(), 0.0);
+    }
 }

@@ -128,13 +128,21 @@ impl Packetizer {
     }
 }
 
-fn read_reports(socket: &UdpSocket) {
+/// Takes in what the other device says. Reports decide whether speakers get muted, so only one
+/// from the very address audio goes to counts.
+fn read_reports(socket: &UdpSocket, target: SocketAddr) -> u32 {
     let mut buf = [0u8; 64];
-    while let Ok((len, _)) = socket.recv_from(&mut buf) {
+    let mut taken = 0;
+    while let Ok((len, from)) = socket.recv_from(&mut buf) {
+        if from != target {
+            continue;
+        }
         if let Ok(packet::Packet { body: Body::Report(report), .. }) = packet::parse(&buf[..len]) {
             note_heard_back(report, Instant::now());
+            taken += 1;
         }
     }
+    taken
 }
 
 /// Runs until `stop`. Frames go out the moment a source has one, so this adds no delay of its own.
@@ -154,7 +162,7 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, hub: &Hub, stop: &Atomi
     while !stop.load(Ordering::Relaxed) {
         let sending = devices::sending();
         hub.signal.wait(if sending { WAIT_WHEN_SENDING } else { WAIT_WHEN_IDLE });
-        read_reports(socket);
+        read_reports(socket, target);
         packetizer.set_quality(AUDIO_BITRATE_KBPS.load(Ordering::Relaxed), AUDIO_TX_LOSS.load(Ordering::Relaxed));
         let mut now = Instant::now();
         while mixer.ready(&sources, now) {
@@ -250,6 +258,21 @@ mod tests {
         packetizer.quiet(&mut |data| sent.push(data.to_vec()));
         assert_eq!(parse(&sent[0]).unwrap().seq, 1);
         assert_eq!(parse(&sent[0]).unwrap().body, Body::Quiet);
+    }
+
+    #[test]
+    fn only_a_report_from_the_address_audio_goes_to_counts() {
+        let receiving = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiving.set_nonblocking(true).unwrap();
+        let to = receiving.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stranger = UdpSocket::bind("127.0.0.2:0").unwrap();
+        let mut report = Vec::new();
+        packet::write_report(&mut report, 1, packet::Report::default());
+        stranger.send_to(&report, to).unwrap();
+        peer.send_to(&report, to).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(read_reports(&receiving, peer.local_addr().unwrap()), 1);
     }
 
     #[test]

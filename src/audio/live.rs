@@ -40,7 +40,7 @@ fn packet_path() {
 
     let listen = UdpSocket::bind(("127.0.0.1", port)).unwrap();
     let for_receiver = Arc::clone(&stream);
-    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, stop));
+    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, SocketAddr::from(([127, 0, 0, 1], 0)), stop));
     AUDIO_PLAYER_LIVE.store(true, Ordering::SeqCst);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let sender = std::thread::spawn(move || {
@@ -107,8 +107,9 @@ fn whole_device() {
         play: env("MK_CHOOSE_PLAY").unwrap_or_else(|| "default".into()),
     });
     AUDIO_PEER_ONLINE.store(true, Ordering::SeqCst);
-    start_audio_listener(listen_port).unwrap();
-    start_audio_sender(SocketAddr::from(([127, 0, 0, 1], peer_port))).unwrap();
+    let peer = SocketAddr::from(([127, 0, 0, 1], peer_port));
+    start_audio_listener(listen_port, peer).unwrap();
+    start_audio_sender(peer).unwrap();
     if env("MK_MUTE").is_some() {
         crate::mute::start();
     }
