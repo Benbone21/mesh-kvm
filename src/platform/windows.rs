@@ -94,9 +94,6 @@ impl Platform for WindowsPlatform {
         &["Keyboard", "Pointing device"]
     }
 
-    fn can_pick_audio_source(&self) -> bool {
-        false
-    }
 }
 
 /// What the person sees in Windows' display settings: `\\.\DISPLAY2` is "Display 2".

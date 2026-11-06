@@ -500,9 +500,6 @@ impl DisplayManager {
             fn input_devices(&self) -> &'static [&'static str] {
                 &[]
             }
-            fn can_pick_audio_source(&self) -> bool {
-                false
-            }
         }
         let manager = Self::with(Arc::new(Blank), REVERT_AFTER, LIMITS, None, Box::new(|_| {}));
         let mode = DisplayMode { width: 1, height: 1, millihertz: 1, id: String::new() };
@@ -584,9 +581,6 @@ mod tests {
         fn set_autostart(&self, _: bool) {}
         fn input_devices(&self) -> &'static [&'static str] {
             &[]
-        }
-        fn can_pick_audio_source(&self) -> bool {
-            false
         }
         fn displays(&self) -> Vec<DisplayInfo> {
             while self.stuck.load(Ordering::SeqCst) {

@@ -1010,9 +1010,6 @@ pub fn studio_handler(
                         "set_audio_rx_muted",
                         &serde_json::json!({}),
                     ),
-                    "toggle_audio_tx" => {
-                        crate::settings::handle_common_action("set_audio_tx", &serde_json::json!({}))
-                    }
                     "set_audio_volume" => {
                         crate::settings::handle_common_action("set_audio_rx_volume", &val)
                     }
@@ -1053,7 +1050,7 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "cursor": [g.telemetry.cursor_x, g.telemetry.cursor_y],
         "autostart": platform.autostart_enabled(),
         "input_devices": platform.input_devices(),
-        "audio": crate::settings::audio_status_json(platform.can_pick_audio_source()),
+        "audio": crate::settings::audio_status_json(),
         "display_change": displays.status_json(),
     });
     crate::settings::add_toggle_status(&mut status, g.telemetry.main_conflict);
@@ -1646,9 +1643,6 @@ mod tests {
         fn set_autostart(&self, _: bool) {}
         fn input_devices(&self) -> &'static [&'static str] {
             &[]
-        }
-        fn can_pick_audio_source(&self) -> bool {
-            false
         }
     }
 

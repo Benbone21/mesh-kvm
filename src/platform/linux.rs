@@ -108,9 +108,6 @@ impl Platform for LinuxPlatform {
         &["Physical mouse (evdev)", "Desk keyboard (evdev)"]
     }
 
-    fn can_pick_audio_source(&self) -> bool {
-        true
-    }
 
     fn old_layout_dirs(&self) -> Vec<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from);

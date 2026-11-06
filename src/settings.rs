@@ -1,9 +1,10 @@
 //! Per-device persisted settings (audio routing, toggles) + local actions shared by both nodes.
 
+use crate::audio::devices::{self, Choice};
 use crate::audio::{
-    AUDIO_MUTE_WHILE_SENDING, AUDIO_RX_DROPPED, AUDIO_RX_MUTED, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_VOLUME_PCT, AUDIO_TEST_CHIME_REQ,
-    AUDIO_TX_ENABLED, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOURCE_MODE,
-    AUDIO_TX_VOLUME_PCT,
+    reaching_peer, AUDIO_BITRATE_KBPS, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_BUFFER_MS, AUDIO_RX_LOSS, AUDIO_RX_MUTED,
+    AUDIO_RX_OTHER_VERSION, AUDIO_RX_PACKETS, AUDIO_RX_PEAK_PCT, AUDIO_RX_UNREPAIRED, AUDIO_RX_VOLUME_PCT, AUDIO_TX_LOSS,
+    AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_VOLUME_PCT, BITRATES, DEFAULT_BITRATE,
 };
 use crate::clipboard::{clipboard_note, CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
 use crate::protocol::{NodeId, SwitchEdge};
@@ -45,13 +46,23 @@ static SAVING: Mutex<()> = Mutex::new(());
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalSettings {
+    /// From before the choice of devices: only read, to work out the choices below.
+    #[serde(skip_serializing)]
     pub audio_tx_enabled: bool,
-    pub audio_tx_volume: u32,
+    #[serde(skip_serializing)]
     pub audio_tx_source: u32,
+    /// What to send, as a device id, `default`, or empty for nothing. Missing from older settings.
+    pub audio_input: Option<String>,
+    pub audio_output: Option<String>,
+    /// Where received audio plays: a device id or `default`.
+    pub audio_play: String,
+    /// In kbit/s, with zero meaning uncompressed.
+    pub audio_bitrate: u32,
+    pub audio_tx_volume: u32,
     pub audio_rx_muted: bool,
     pub audio_rx_volume: u32,
-    #[serde(default = "default_mute_while_sending")]
-    pub mute_while_sending: bool,
+    #[serde(alias = "mute_while_sending")]
+    pub play_only_on_other: bool,
     pub mouse_sharing: bool,
     pub keyboard_sharing: bool,
     pub clipboard_send: bool,
@@ -66,19 +77,19 @@ pub struct LocalSettings {
     pub switch_edge: Option<SwitchEdge>,
 }
 
-fn default_mute_while_sending() -> bool {
-    true
-}
-
 impl Default for LocalSettings {
     fn default() -> Self {
         Self {
             audio_tx_enabled: false,
-            audio_tx_volume: 100,
             audio_tx_source: 0,
+            audio_input: None,
+            audio_output: None,
+            audio_play: devices::DEFAULT.to_string(),
+            audio_bitrate: DEFAULT_BITRATE,
+            audio_tx_volume: 100,
             audio_rx_muted: false,
             audio_rx_volume: 100,
-            mute_while_sending: default_mute_while_sending(),
+            play_only_on_other: true,
             mouse_sharing: true,
             keyboard_sharing: true,
             clipboard_send: true,
@@ -346,12 +357,12 @@ pub fn load_and_apply() {
     let s = std::fs::read_to_string(settings_path())
         .map(|text| parse_settings(&text))
         .unwrap_or_default();
-    AUDIO_TX_ENABLED.store(s.audio_tx_enabled, Ordering::SeqCst);
+    devices::set_choice(audio_choice(&s, cfg!(target_os = "linux")));
+    AUDIO_BITRATE_KBPS.store(usable_bitrate(s.audio_bitrate), Ordering::SeqCst);
     AUDIO_TX_VOLUME_PCT.store(s.audio_tx_volume.min(150), Ordering::SeqCst);
-    AUDIO_TX_SOURCE_MODE.store(s.audio_tx_source.min(1), Ordering::SeqCst);
     AUDIO_RX_MUTED.store(s.audio_rx_muted, Ordering::SeqCst);
     AUDIO_RX_VOLUME_PCT.store(s.audio_rx_volume.min(150), Ordering::SeqCst);
-    AUDIO_MUTE_WHILE_SENDING.store(s.mute_while_sending, Ordering::SeqCst);
+    AUDIO_PLAY_ONLY_ON_OTHER.store(s.play_only_on_other, Ordering::SeqCst);
     MOUSE_SHARING.store(s.mouse_sharing, Ordering::SeqCst);
     KEYBOARD_SHARING.store(s.keyboard_sharing, Ordering::SeqCst);
     CLIPBOARD_SEND.store(s.clipboard_send, Ordering::SeqCst);
@@ -363,14 +374,41 @@ pub fn load_and_apply() {
     *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner) = s.switch_edge;
 }
 
+/// What to send and play. Older settings had one Send switch and, on Linux, a choice of source.
+/// Windows only ever sent its system sound, whatever a settings file held.
+fn audio_choice(s: &LocalSettings, mic_selectable: bool) -> Choice {
+    let from_old_switch = |wants_mic: bool| {
+        let selected = s.audio_tx_enabled && (s.audio_tx_source == 1 && mic_selectable) == wants_mic;
+        if selected { devices::DEFAULT } else { devices::NONE }.to_string()
+    };
+    Choice {
+        input: s.audio_input.clone().unwrap_or_else(|| from_old_switch(true)),
+        output: s.audio_output.clone().unwrap_or_else(|| from_old_switch(false)),
+        play: if s.audio_play.is_empty() { devices::DEFAULT.to_string() } else { s.audio_play.clone() },
+    }
+}
+
+fn usable_bitrate(kbps: u32) -> u32 {
+    if BITRATES.contains(&kbps) {
+        kbps
+    } else {
+        DEFAULT_BITRATE
+    }
+}
+
 fn current_settings() -> LocalSettings {
+    let choice = devices::choice();
     LocalSettings {
-        audio_tx_enabled: AUDIO_TX_ENABLED.load(Ordering::Relaxed),
+        audio_input: Some(choice.input),
+        audio_output: Some(choice.output),
+        audio_play: choice.play,
+        audio_bitrate: AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),
         audio_tx_volume: AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed),
-        audio_tx_source: AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed),
         audio_rx_muted: AUDIO_RX_MUTED.load(Ordering::Relaxed),
         audio_rx_volume: AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed),
-        mute_while_sending: AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst),
+        play_only_on_other: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::SeqCst),
+        audio_tx_enabled: false,
+        audio_tx_source: 0,
         mouse_sharing: MOUSE_SHARING.load(Ordering::SeqCst),
         keyboard_sharing: KEYBOARD_SHARING.load(Ordering::SeqCst),
         clipboard_send: CLIPBOARD_SEND.load(Ordering::SeqCst),
@@ -407,23 +445,33 @@ pub fn save_current() {
     }
 }
 
-pub fn audio_status_json(supports_source_select: bool) -> serde_json::Value {
+pub fn audio_status_json() -> serde_json::Value {
+    let (choice, lists, in_use) = (devices::choice(), devices::lists(), devices::in_use());
+    let now = std::time::Instant::now();
     serde_json::json!({
-        "tx_enabled": AUDIO_TX_ENABLED.load(Ordering::Relaxed),
+        "tx_enabled": devices::sending(),
+        "input": choice.input,
+        "output": choice.output,
+        "play": choice.play,
+        "inputs": lists.inputs,
+        "outputs": lists.outputs,
+        "notes": in_use.notes,
+        "echo_safe": in_use.echo_safe,
+        "bitrate": AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),
         "tx_volume": AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed),
         "tx_peak": AUDIO_TX_PEAK_PCT.load(Ordering::Relaxed),
         "tx_packets": AUDIO_TX_PACKETS.load(Ordering::Relaxed),
-        "tx_source": if supports_source_select {
-            serde_json::json!(AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed))
-        } else {
-            serde_json::Value::Null
-        },
-        "mute_while_sending": AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst),
+        "tx_loss": AUDIO_TX_LOSS.load(Ordering::Relaxed),
+        "tx_reaching": reaching_peer(now, std::time::Duration::from_secs(2)),
+        "play_only_on_other": AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::SeqCst),
         "rx_muted": AUDIO_RX_MUTED.load(Ordering::Relaxed),
         "rx_volume": AUDIO_RX_VOLUME_PCT.load(Ordering::Relaxed),
         "rx_peak": AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed),
         "rx_packets": AUDIO_RX_PACKETS.load(Ordering::Relaxed),
-        "rx_dropped": AUDIO_RX_DROPPED.load(Ordering::Relaxed),
+        "rx_loss": f64::from(AUDIO_RX_LOSS.load(Ordering::Relaxed)) / 10.0,
+        "rx_unrepaired": f64::from(AUDIO_RX_UNREPAIRED.load(Ordering::Relaxed)) / 10.0,
+        "rx_buffer_ms": AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed),
+        "rx_other_version": AUDIO_RX_OTHER_VERSION.load(Ordering::Relaxed) > 0,
     })
 }
 
@@ -460,7 +508,7 @@ fn apply_toggle(act: &str, val: &serde_json::Value) -> bool {
             store(&CLIPBOARD_SEND, "send");
             store(&CLIPBOARD_RECEIVE, "receive");
         }
-        "set_mute_while_sending" => store(&AUDIO_MUTE_WHILE_SENDING, "enabled"),
+        "set_play_only_on_other" => store(&AUDIO_PLAY_ONLY_ON_OTHER, "enabled"),
         "set_pointer_speed" => {
             if let Some(speed) = requested_pointer_speed(val) {
                 POINTER_SPEED_BITS.store(speed.to_bits(), Ordering::SeqCst);
@@ -491,6 +539,27 @@ fn change_main_device(val: &serde_json::Value, link_up: bool, save: impl FnOnce(
     OK_RESPONSE.to_string()
 }
 
+/// Applies a device choice. Returns false for an unknown role or a choice that can't be right:
+/// received audio always plays somewhere, so `play` can't be nothing.
+fn change_audio_device(role: Option<&str>, id: &str) -> bool {
+    let mut choice = devices::choice();
+    match role {
+        Some("input") => choice.input = id.to_string(),
+        Some("output") => choice.output = id.to_string(),
+        Some("play") if id != devices::NONE => choice.play = id.to_string(),
+        _ => return false,
+    }
+    devices::set_choice(choice);
+    crate::audio::choices_changed();
+    true
+}
+
+fn change_bitrate(kbps: Option<u64>) {
+    if let Some(kbps) = kbps.filter(|kbps| BITRATES.contains(&(*kbps as u32))) {
+        AUDIO_BITRATE_KBPS.store(kbps as u32, Ordering::SeqCst);
+    }
+}
+
 /// Handles actions common to both nodes. Returns true if the action was recognised.
 pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
     if apply_toggle(act, val) {
@@ -500,18 +569,18 @@ pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
     let num = |k: &str| val.get(k).and_then(|v| v.as_u64());
     let flag = |k: &str| val.get(k).and_then(|v| v.as_bool());
     match act {
-        "set_audio_tx" => {
-            let en = flag("enabled").unwrap_or(!AUDIO_TX_ENABLED.load(Ordering::Relaxed));
-            AUDIO_TX_ENABLED.store(en, Ordering::SeqCst);
+        "set_audio_device" => {
+            let id = val.get("id").and_then(|v| v.as_str()).unwrap_or(devices::NONE);
+            if !change_audio_device(val.get("role").and_then(|v| v.as_str()), id) {
+                return true;
+            }
+        }
+        "set_audio_bitrate" => {
+            change_bitrate(num("kbps"));
         }
         "set_audio_tx_volume" => {
             if let Some(v) = num("volume") {
                 AUDIO_TX_VOLUME_PCT.store(v.min(150) as u32, Ordering::SeqCst);
-            }
-        }
-        "set_audio_tx_source" => {
-            if let Some(v) = num("mode") {
-                AUDIO_TX_SOURCE_MODE.store((v as u32).min(1), Ordering::SeqCst);
             }
         }
         "set_audio_rx_muted" => {
@@ -527,7 +596,6 @@ pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
             // target: "peer" sends a chime across the audio bus to the other device,
             //         "local" plays it on this device's speakers (Linux only).
             let to_peer = val.get("target").and_then(|v| v.as_str()) != Some("local");
-            AUDIO_TEST_CHIME_REQ.store(false, Ordering::SeqCst);
             crate::audio::trigger_test_chime(!to_peer, to_peer);
             return true;
         }
@@ -876,36 +944,105 @@ mod tests {
     }
 
     #[test]
-    fn mute_while_sending_is_on_unless_a_file_says_otherwise() {
-        assert!(LocalSettings::default().mute_while_sending);
-        assert!(parse_settings(r#"{"audio_tx_enabled":true}"#).mute_while_sending);
-        assert!(!parse_settings(r#"{"mute_while_sending":false}"#).mute_while_sending);
+    fn play_only_on_the_other_device_is_on_unless_a_file_says_otherwise() {
+        assert!(LocalSettings::default().play_only_on_other);
+        assert!(parse_settings(r#"{"audio_tx_enabled":true}"#).play_only_on_other);
+        assert!(!parse_settings(r#"{"mute_while_sending":false}"#).play_only_on_other, "the old name");
+        assert!(!parse_settings(r#"{"play_only_on_other":false}"#).play_only_on_other);
     }
 
     #[test]
-    fn mute_while_sending_is_a_saved_toggle() {
+    fn play_only_on_the_other_device_is_a_saved_toggle() {
         let _guard = live_toggles();
-        assert!(apply_toggle("set_mute_while_sending", &json!({ "enabled": false })));
-        assert!(!AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst));
-        assert!(!current_settings().mute_while_sending);
-        assert_eq!(audio_status_json(false)["mute_while_sending"], false);
+        assert!(apply_toggle("set_play_only_on_other", &json!({ "enabled": false })));
+        assert!(!AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::SeqCst));
+        assert!(!current_settings().play_only_on_other);
+        assert_eq!(audio_status_json()["play_only_on_other"], false);
         // Nothing usable leaves it alone.
-        apply_toggle("set_mute_while_sending", &json!({ "enabled": "yes" }));
-        apply_toggle("set_mute_while_sending", &json!({}));
-        assert!(!AUDIO_MUTE_WHILE_SENDING.load(Ordering::SeqCst));
-        apply_toggle("set_mute_while_sending", &json!({ "enabled": true }));
-        assert!(current_settings().mute_while_sending);
-        assert_eq!(audio_status_json(false)["mute_while_sending"], true);
+        apply_toggle("set_play_only_on_other", &json!({ "enabled": "yes" }));
+        apply_toggle("set_play_only_on_other", &json!({}));
+        assert!(!AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::SeqCst));
+        apply_toggle("set_play_only_on_other", &json!({ "enabled": true }));
+        assert!(current_settings().play_only_on_other);
+        assert_eq!(audio_status_json()["play_only_on_other"], true);
     }
 
     #[test]
-    fn status_reports_dropped_packets() {
-        assert!(audio_status_json(true)["rx_dropped"].is_u64());
+    fn the_old_send_switch_becomes_a_device_choice() {
+        let choice = |text: &str, linux: bool| audio_choice(&parse_settings(text), linux);
+        let (off, default) = (devices::NONE.to_string(), devices::DEFAULT.to_string());
+
+        let system_sound = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":0}"#, true);
+        assert_eq!((system_sound.input, system_sound.output), (off.clone(), default.clone()));
+
+        let microphone = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":1}"#, true);
+        assert_eq!((microphone.input, microphone.output), (default.clone(), off.clone()));
+
+        let windows = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":1}"#, false);
+        assert_eq!((windows.input, windows.output), (off.clone(), default.clone()), "it only ever sent system sound");
+
+        let not_sending = choice(r#"{"audio_tx_enabled":false,"audio_tx_source":1}"#, true);
+        assert_eq!((not_sending.input, not_sending.output), (off.clone(), off.clone()));
+        assert_eq!(not_sending.play, default);
+    }
+
+    #[test]
+    fn a_saved_choice_wins_over_the_old_switch_and_the_old_switch_is_not_saved_again() {
+        let text = r#"{"audio_tx_enabled":true,"audio_input":"usb-mic","audio_output":"","audio_play":"headset"}"#;
+        let s = parse_settings(text);
+        let choice = audio_choice(&s, true);
+        assert_eq!((choice.input.as_str(), choice.output.as_str(), choice.play.as_str()), ("usb-mic", "", "headset"));
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(!saved.contains("audio_tx_enabled") && !saved.contains("audio_tx_source"), "{saved}");
+        assert!(saved.contains("play_only_on_other") && !saved.contains("mute_while_sending"), "{saved}");
+    }
+
+    #[test]
+    fn a_bitrate_that_is_not_on_offer_becomes_the_default() {
+        assert_eq!(usable_bitrate(64), 64);
+        assert_eq!(usable_bitrate(0), 0, "uncompressed");
+        assert_eq!(usable_bitrate(77), DEFAULT_BITRATE);
+        assert_eq!(parse_settings("{}").audio_bitrate, DEFAULT_BITRATE);
+    }
+
+    #[test]
+    fn device_choices_and_the_bitrate_change_through_actions() {
+        let _guard = live_toggles();
+        let before = devices::choice();
+        assert!(change_audio_device(Some("input"), "usb-mic"));
+        assert!(change_audio_device(Some("output"), "speakers"));
+        assert!(change_audio_device(Some("play"), "headset"));
+        assert_eq!(audio_status_json()["input"], "usb-mic");
+        assert_eq!(audio_status_json()["tx_enabled"], true, "choosing anything starts sending");
+        assert!(!change_audio_device(Some("play"), devices::NONE), "it always plays somewhere");
+        assert_eq!(devices::choice().play, "headset");
+        assert!(!change_audio_device(Some("nonsense"), "x"));
+        assert!(!change_audio_device(None, "x"));
+        for role in ["input", "output"] {
+            change_audio_device(Some(role), devices::NONE);
+        }
+        assert_eq!(audio_status_json()["tx_enabled"], false);
+        devices::set_choice(before);
+
+        let kbps = AUDIO_BITRATE_KBPS.load(Ordering::SeqCst);
+        change_bitrate(Some(256));
+        assert_eq!(audio_status_json()["bitrate"], 256);
+        change_bitrate(Some(5));
+        assert_eq!(audio_status_json()["bitrate"], 256, "not on offer");
+        AUDIO_BITRATE_KBPS.store(kbps, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn status_says_what_the_app_needs_to_show() {
+        let status = audio_status_json();
+        for field in ["rx_loss", "rx_unrepaired", "rx_buffer_ms", "tx_loss", "tx_reaching", "inputs", "outputs", "notes"] {
+            assert!(!status[field].is_null(), "{field}");
+        }
     }
 
     #[test]
     fn other_actions_are_not_toggles() {
-        assert!(!apply_toggle("set_audio_tx", &json!({})));
+        assert!(!apply_toggle("set_audio_tx_volume", &json!({})));
         assert!(!apply_toggle("nonsense", &json!({})));
     }
 

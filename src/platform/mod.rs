@@ -102,8 +102,6 @@ pub trait Platform: Send + Sync {
     fn autostart_enabled(&self) -> bool;
     fn set_autostart(&self, enabled: bool);
     fn input_devices(&self) -> &'static [&'static str];
-    /// True if this device can choose between system sound and the microphone.
-    fn can_pick_audio_source(&self) -> bool;
     /// Where an install from before layouts moved to the config folder may have left its
     /// `layout.json`, best guess first.
     fn old_layout_dirs(&self) -> Vec<PathBuf> {

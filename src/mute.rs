@@ -1,12 +1,12 @@
-//! Silences this device's speakers while its system audio plays on the other device, so sound
-//! comes from only one of them. Losing the link always gives the speakers back.
+//! Silences the output being sent while its sound plays on the other device, so sound comes from
+//! only one of them. Losing the link always gives the output back.
 //!
-//! Everything is tied to the device that was muted, not to whichever is the default now: the
-//! default changes under us when a headset, dock or screen comes and goes.
+//! Everything is tied to the device that was muted, not to whichever is chosen or the default now:
+//! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    AUDIO_MUTE_WHILE_SENDING, AUDIO_PEER_ONLINE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT,
-    AUDIO_TX_ENABLED, AUDIO_TX_PACKETS, AUDIO_TX_SOURCE_MODE,
+    devices, reaching_peer, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_PACKETS,
 };
 use crate::settings::write_atomically;
 use serde::{Deserialize, Serialize};
@@ -36,28 +36,21 @@ static STOPPED: AtomicBool = AtomicBool::new(false);
 static SLEEPING: AtomicBool = AtomicBool::new(false);
 static RELEASED_FOR_SLEEP: AtomicBool = AtomicBool::new(false);
 
-/// Mute only while all are true and no audio from the other device is playing here: this device
-/// may be the one the sound is meant to come from, and muting it could silence both.
-/// A microphone doesn't play through the speakers, so sending it is no reason to silence them.
+/// Mute only while all are true and no audio from the other device is playing on this same output:
+/// muting it would silence what's being received.
 pub fn should_mute(
     setting: bool,
     sending: bool,
     peer_online: bool,
-    system_audio_source: bool,
+    reaching_peer: bool,
     receiving_audio: bool,
 ) -> bool {
-    setting && sending && peer_online && system_audio_source && !receiving_audio
-}
-
-/// Whether the chosen source is system audio. Windows has no source choice: it always sends
-/// system audio, whatever mode a settings file holds.
-fn is_system_audio(mode: u32, mic_selectable: bool) -> bool {
-    !mic_selectable || mode == 0
+    setting && sending && peer_online && reaching_peer && !receiving_audio
 }
 
 /// The output devices of this machine. A device is named by an identity that outlives replugging.
 pub trait MuteBackend {
-    /// The current default output, or None when it can't be found.
+    /// The output to mute, or None when it can't be found.
     fn default_device(&mut self) -> Option<String>;
     /// None when the device is absent or can't be read.
     fn is_muted(&mut self, device: &str) -> Option<bool>;
@@ -68,12 +61,15 @@ pub trait MuteBackend {
 #[derive(Debug, Clone, Copy)]
 pub struct MuteInputs {
     pub setting: bool,
-    /// The Send switch.
+    /// An output is chosen to send. A microphone doesn't play through the speakers, so sending
+    /// one is no reason to silence them.
     pub send_on: bool,
-    /// Packets went out recently, so the capture really is working.
+    /// The capture is running and packets went out recently.
     pub tx_active: bool,
     pub peer_online: bool,
-    pub system_audio_source: bool,
+    /// The other device says the sound is arriving and playing there.
+    pub reaching_peer: bool,
+    /// Sound from the other device is playing on the output that would be muted.
     pub receiving_audio: bool,
 }
 
@@ -83,7 +79,7 @@ impl MuteInputs {
             self.setting,
             self.send_on && self.tx_active,
             self.peer_online,
-            self.system_audio_source,
+            self.reaching_peer,
             self.receiving_audio,
         )
     }
@@ -91,7 +87,7 @@ impl MuteInputs {
     /// Whether the person is asking for muting. A dropped link or a quiet moment isn't sending
     /// starting again, so neither may undo a manual unmute.
     fn requested(self) -> bool {
-        self.setting && self.send_on && self.system_audio_source
+        self.setting && self.send_on
     }
 }
 
@@ -360,18 +356,17 @@ impl LiveSignals {
         let tx_packets = AUDIO_TX_PACKETS.load(Ordering::Relaxed);
         let tx_active = self.tx.note(tx_packets != self.tx_packets, now);
         self.tx_packets = tx_packets;
-        // With Play off nothing comes out of these speakers, so there is nothing to protect.
+        let in_use = devices::in_use();
+        // With Play off, or playing elsewhere, muting this output silences none of it.
         let playing = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
-            && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0;
+            && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0
+            && in_use.play == in_use.output;
         MuteInputs {
-            setting: AUDIO_MUTE_WHILE_SENDING.load(Ordering::Relaxed),
-            send_on: AUDIO_TX_ENABLED.load(Ordering::Relaxed),
-            tx_active,
+            setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
+            send_on: devices::choice().output != devices::NONE,
+            tx_active: tx_active && AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
             peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
-            system_audio_source: is_system_audio(
-                AUDIO_TX_SOURCE_MODE.load(Ordering::Relaxed),
-                cfg!(target_os = "linux"),
-            ),
+            reaching_peer: reaching_peer(now, RECENT_AUDIO),
             receiving_audio: self.rx.note(playing, now),
         }
     }
@@ -381,12 +376,30 @@ fn flag() -> MuteFlag {
     MuteFlag::new(crate::settings::config_dir().join(FLAG_FILE))
 }
 
+/// Points the controller at the output being sent, whichever device that is now. It works out the
+/// same answer the capture does, so the two can't end up on different devices.
+struct ChosenOutput<B: MuteBackend>(B);
+
+impl<B: MuteBackend> MuteBackend for ChosenOutput<B> {
+    fn default_device(&mut self) -> Option<String> {
+        devices::in_use().output.or_else(|| self.0.default_device())
+    }
+
+    fn is_muted(&mut self, device: &str) -> Option<bool> {
+        self.0.is_muted(device)
+    }
+
+    fn set_muted(&mut self, device: &str, muted: bool) -> bool {
+        self.0.set_muted(device, muted)
+    }
+}
+
 /// Starts the polling thread. Only the service may call this, once it holds its port: a second
 /// copy must not act on the running service's record.
 pub fn start() {
     STARTED.store(true, Ordering::SeqCst);
     let spawned = std::thread::Builder::new().name("mesh-kvm-mute".to_string()).spawn(|| {
-        let mut controller = MuteController::new(platform::backend(), flag());
+        let mut controller = MuteController::new(ChosenOutput(platform::backend()), flag());
         let mut signals = LiveSignals::default();
         let mut reported = false;
         while !STOP.load(Ordering::SeqCst) {
@@ -731,7 +744,7 @@ mod tests {
         send_on: true,
         tx_active: true,
         peer_online: true,
-        system_audio_source: true,
+        reaching_peer: true,
         receiving_audio: false,
     };
     const STOPPED: MuteInputs = MuteInputs { send_on: false, ..SENDING };
@@ -744,14 +757,6 @@ mod tests {
             let [a, b, c, d, e] = [1, 2, 4, 8, 16].map(|bit| bits & bit != 0);
             assert_eq!(should_mute(a, b, c, d, e), bits == 15, "{a} {b} {c} {d} {e}");
         }
-    }
-
-    #[test]
-    fn the_microphone_is_not_system_audio_but_windows_has_no_microphone_source() {
-        assert!(is_system_audio(0, true));
-        assert!(!is_system_audio(1, true), "Linux's microphone");
-        assert!(is_system_audio(0, false));
-        assert!(is_system_audio(1, false), "the laptop always sends loopback");
     }
 
     #[cfg(target_os = "linux")]
@@ -886,7 +891,7 @@ mod tests {
     fn anything_that_ends_the_need_unmutes() {
         for off in [
             MuteInputs { setting: false, ..SENDING },
-            MuteInputs { system_audio_source: false, ..SENDING },
+            MuteInputs { reaching_peer: false, ..SENDING },
             MuteInputs { tx_active: false, ..SENDING },
             MuteInputs { receiving_audio: true, ..SENDING },
         ] {
@@ -898,6 +903,38 @@ mod tests {
             c.tick(off, t + STEP);
             assert!(!c.backend.is(SPEAKERS), "{off:?}");
         }
+    }
+
+    #[test]
+    fn sound_the_other_device_isn_t_playing_is_no_reason_to_mute() {
+        let (mut outputs, flag) = (Outputs::default(), flag("not-reaching"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        c.tick(MuteInputs { reaching_peer: false, ..SENDING }, Instant::now());
+        drop(c);
+        assert!(outputs.writes.is_empty());
+    }
+
+    #[test]
+    fn a_silenced_other_device_gives_the_speakers_back_and_returning_mutes_again() {
+        let (mut outputs, flag) = (Outputs::default(), flag("reach-back"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        c.tick(MuteInputs { reaching_peer: false, ..SENDING }, t + STEP);
+        assert!(!c.backend.is(SPEAKERS));
+        c.tick(SENDING, t + STEP * 2);
+        assert!(c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn the_chosen_output_is_what_gets_muted_not_the_default() {
+        // `ChosenOutput` reads this from the audio engine; in a test nothing is in use yet.
+        let mut outputs = Outputs::default();
+        let mut chosen = ChosenOutput(&mut outputs);
+        devices::set_in_use(devices::InUse { output: Some(HEADSET.into()), ..Default::default() });
+        assert_eq!(chosen.default_device().as_deref(), Some(HEADSET));
+        devices::set_in_use(devices::InUse::default());
+        assert_eq!(chosen.default_device().as_deref(), Some(SPEAKERS), "nothing chosen: the old default");
     }
 
     #[test]
