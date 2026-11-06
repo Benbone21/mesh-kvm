@@ -1,7 +1,6 @@
-//! Cross-platform embedded Studio UI server (TCP 24880).
+//! Cross-platform local API server (TCP 24880), used by the native app.
 //!
-//! Every node (Debian + Windows) serves the exact same single-page Studio UI and exposes:
-//!   GET  /                       -> Studio UI (src/ui/index.html, embedded at compile time)
+//! Every node (Debian + Windows) exposes the following. Any other path, including `/`, is a 404:
 //!   GET  /api/local              -> this node's live status (node-specific handler)
 //!   POST /api/local/action       -> this node's local actions (audio, autostart, focus, panic...)
 //!   ANY  /api/peer/<path>        -> transparently proxied to http://<peer_ip>:24880/<path>
@@ -13,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const UI_PORT: u16 = 24880;
-const INDEX_HTML: &str = include_str!("ui/index.html");
 
 pub struct HttpRequest {
     pub method: String,
@@ -29,7 +27,7 @@ pub fn start(peer_ip: String, handler: Handler) -> Result<(), String> {
     let listener =
         TcpListener::bind(&bind_addr).map_err(|e| format!("Failed to bind {}: {}", bind_addr, e))?;
     println!(
-        "[Studio] mesh-kvm Studio UI running at http://localhost:{} (peer proxy -> {}:{})",
+        "[Studio] mesh-kvm API listening on port {} (peer proxy -> {}:{})",
         UI_PORT, peer_ip, UI_PORT
     );
     std::thread::Builder::new()
@@ -136,7 +134,7 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         return;
     }
 
-    respond(&mut stream, "200 OK", "text/html; charset=utf-8", INDEX_HTML);
+    respond(&mut stream, "404 Not Found", "application/json", r#"{"error":"not found"}"#);
 }
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
@@ -215,5 +213,25 @@ pub fn hostname() -> String {
         std::fs::read_to_string("/etc/hostname")
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| "debian".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_serves_no_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler: Handler = Arc::new(|_| None);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, "127.0.0.1", handler);
+        });
+        let (status, body) = http_call_port("127.0.0.1", addr.port(), "GET", "/", "").unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 404);
+        assert!(!body.contains("<html"));
     }
 }

@@ -1198,7 +1198,7 @@ pub fn run_debian_node(
     }
 
     println!(
-        "[Debian] Spatial Studio UI ready at: http://localhost:24880 (or http://192.168.8.241:24880)"
+        "[Debian] Spatial API ready on port 24880"
     );
 
     // A laptop that outlived a Debian restart may still think it is active. A main laptop must
