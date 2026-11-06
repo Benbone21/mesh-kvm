@@ -569,6 +569,22 @@ def peer_change_refused(body, headers=None, base=LOCAL):
     return call("/api/local/action", {"action": "set_peer", **body}, headers, base)
 
 
+def display_checks():
+    # An exe with no X server has no monitors, so the list is empty, but the calls are all there.
+    listed = call("/api/displays")
+    check("/api/displays answers with a list", isinstance(listed.get("displays"), list), str(listed))
+    check("/api/local says no screen change is waiting", local()["display_change"]["change"] is None)
+    reply = call("/api/local/action", {"action": "set_display_mode", "output": "Display 9", "width": 1, "height": 1, "millihertz": 1})
+    check("a mode the monitor doesn't list is refused", reply.get("ok") is False, str(reply))
+    reply = call("/api/local/action", {"action": "set_device_name", "name": "Wine box"})
+    check("a device can be renamed", reply.get("ok") and local()["device_name"] == "Wine box", str(reply))
+    named = next(d for d in state()["config"]["devices"] if d["node"] == "Windows")
+    check("the new name reaches the layout at once", named["name"] == "Wine box", named["name"])
+    reply = call("/api/local/action", {"action": "set_device_name", "name": "x" * 33})
+    check("a name that is too long is refused", reply.get("ok") is False, str(reply))
+    call("/api/local/action", {"action": "set_device_name", "name": ""})
+
+
 def security_checks(pinned_peer):
     # q. Only the app on this device can pair it with something else.
     with other_device():
@@ -582,6 +598,8 @@ def security_checks(pinned_peer):
     hostile = {"revision": 2 ** 64 - 1, "edge_resistance": before["edge_resistance"] + 5}
     for path, body in (("/api/layout", hostile), ("/api/action", {"action": "panic"}),
                        ("/api/local/action", {"action": "set_sharing", "mouse": False}),
+                       ("/api/local/action", {"action": "set_display_mode", "output": "Display 1"}),
+                       ("/api/local/action", {"action": "set_device_name", "name": "Stranger"}),
                        ("/api/peer/api/action", {"action": "panic"})):
         status = post_from(STRANGER, path, body)
         check(f"POST {path} from a stranger is refused", status == 403, str(status))
@@ -678,6 +696,9 @@ def test(exe_path):
     os.makedirs(PREFIX, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     env.update(WINEPREFIX=PREFIX, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
+    # Wine looks for the desktop's Wayland socket here, and setting up a prefix can hang on it.
+    env["XDG_RUNTIME_DIR"] = os.path.join(os.path.dirname(PREFIX), "wine_link_run")
+    os.makedirs(env["XDG_RUNTIME_DIR"], mode=0o700, exist_ok=True)
     if os.environ.get("WINE_LINK_DISPLAY"):
         env["DISPLAY"] = os.environ["WINE_LINK_DISPLAY"]
     log = open(os.path.join(os.path.dirname(PREFIX), "wine_link.log"), "w")
@@ -711,6 +732,7 @@ def test(exe_path):
         keyboard_checks(peer, inbox, exe)
         api_checks(peer, inbox)
         layout_checks(peer, inbox, layout)
+        display_checks()
         security_checks(pinned_peer=True)
         second_service_check(exe)
         saved_peer_checks(exe)
