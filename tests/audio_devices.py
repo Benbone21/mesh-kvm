@@ -12,7 +12,7 @@ your real audio, and all of it ends when this script does:
     unshare -rnpf --kill-child --mount-proc python3 tests/audio_devices.py path/to/test-binary
 
 The test binary is what `cargo test --release --no-run` prints. Name scenes after it to run only
-those: loop, both, mute, hotplug, mix, delay. Set NETEM to add loss and jitter, for example
+those: idle, loop, both, mute, hotplug, mix, delay. Set NETEM to add loss and jitter, for example
 NETEM="delay 5ms 8ms distribution normal loss 5%". numpy must be importable.
 """
 import json
@@ -184,6 +184,26 @@ def echo_test():
     stop(a, b); pa.kill(); pb.kill(); pa.wait(); pb.wait()
     time.sleep(1)
 
+def highest_serial(name):
+    objects = json.loads(tool(name, "pw-dump", "-N").stdout)
+    return max(o.get("info", {}).get("props", {}).get("object.serial", 0) if isinstance(o.get("info"), dict) else 0
+               for o in objects)
+
+
+def idle_test():
+    scene("a device with nothing to do leaves the sound server alone")
+    a = device("a", 24951, 24952, 9)
+    time.sleep(3)
+    before = highest_serial("a")
+    time.sleep(5)
+    # Each read of the graph is a new client, so a service that wakes itself shows up here. This
+    # script's own pw-dump is one, and the five-second look another.
+    grown = highest_serial("a") - before
+    check("it isn't reading the graph over and over", grown <= 8, f"{grown} new objects in 5 seconds")
+    stop(a)
+    time.sleep(0.5)
+
+
 def delay_test(kbps):
     scene(f"delay from speakers to speakers, {f'{kbps} kbit/s' if kbps else 'uncompressed'}")
     a = device("a", 24951, 24952, 12, MK_CHOOSE_OUTPUT="default", MK_KBPS=str(kbps))
@@ -337,7 +357,7 @@ def mix_test():
 def main():
     global BASE, BIN
     BIN = sys.argv[1]
-    which = sys.argv[2:] or ["loop", "both", "mute", "hotplug", "mix", "delay"]
+    which = sys.argv[2:] or ["idle", "loop", "both", "mute", "hotplug", "mix", "delay"]
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     BASE = tempfile.mkdtemp(prefix="mkpw.", dir=os.environ.get("AUDIO_TMP", "/tmp"))
     try:
@@ -346,7 +366,7 @@ def main():
         time.sleep(1.5)
         if os.environ.get("NETEM"):
             subprocess.run([TC, "qdisc", "add", "dev", "lo", "root", "netem", *os.environ["NETEM"].split()], check=True)
-        scenes = {"loop": no_loop_test, "both": echo_test, "mute": mute_test, "hotplug": hotplug_test, "mix": mix_test}
+        scenes = {"idle": idle_test, "loop": no_loop_test, "both": echo_test, "mute": mute_test, "hotplug": hotplug_test, "mix": mix_test}
         for name, scene_run in scenes.items():
             if name in which:
                 scene_run()

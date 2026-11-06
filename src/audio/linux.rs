@@ -32,6 +32,8 @@ const TOOL_DEADLINE: Duration = Duration::from_secs(2);
 const LOOK_EVERY: Duration = Duration::from_secs(5);
 /// Changes come in bursts, so this long is left for the rest of a burst before looking.
 const SETTLE: Duration = Duration::from_millis(40);
+/// However many changes there are, the graph is read at most this often.
+const SHORTEST_LOOK_GAP: Duration = Duration::from_millis(250);
 /// A helper that won't stay up isn't restarted more often than this.
 const RESPAWN_GAP: Duration = Duration::from_secs(1);
 /// pw-play reads a whole period at a time in the middle of the audio graph, and blocks there if the
@@ -320,19 +322,50 @@ fn apply_links(plan: &LinkPlan) {
     }
 }
 
-/// Keeps `pw-dump --monitor` running, and wakes the engine whenever it says anything. What it says
-/// isn't read: changes come in pieces, and looking at the whole graph takes 10 ms.
+/// Tells which of `pw-dump --monitor`'s changes matter. Clients don't: every `pw-dump` and `pw-link`
+/// this service runs is one coming and going, and waking on those would never stop. A removal gives
+/// only an id, so this keeps the ids it would care about.
+#[derive(Default)]
+struct GraphChanges {
+    relevant: HashSet<u64>,
+}
+
+impl GraphChanges {
+    fn matters(&mut self, object: &Value) -> bool {
+        let Some(id) = object.get("id").and_then(Value::as_u64) else { return false };
+        match object.get("type").and_then(Value::as_str) {
+            Some(
+                "PipeWire:Interface:Node"
+                | "PipeWire:Interface:Port"
+                | "PipeWire:Interface:Link"
+                | "PipeWire:Interface:Metadata",
+            ) => {
+                self.relevant.insert(id);
+                true
+            }
+            Some(_) => false,
+            None => self.relevant.remove(&id),
+        }
+    }
+}
+
+/// Keeps `pw-dump --monitor` running, and wakes the engine when something that matters changes. The
+/// changes themselves come in pieces, and looking at the whole graph takes 10 ms.
 fn watch_graph() {
-    use std::io::Read;
     loop {
         let mut command = Command::new("pw-dump");
         command.args(["-m", "-N"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
         tell_kernel_to_end_it_with_us(&mut command);
         if let Ok(mut child) = command.spawn() {
-            if let Some(mut stdout) = child.stdout.take() {
-                let mut buf = [0u8; 16384];
-                while stdout.read(&mut buf).is_ok_and(|read| read > 0) {
-                    WAKE.notify();
+            if let Some(stdout) = child.stdout.take() {
+                let mut changes = GraphChanges::default();
+                let reader = std::io::BufReader::new(stdout);
+                for batch in serde_json::Deserializer::from_reader(reader).into_iter::<Vec<Value>>() {
+                    let Ok(batch) = batch else { break };
+                    // Not `any`, which would stop at the first and miss ids further on.
+                    if batch.iter().filter(|object| changes.matters(object)).count() > 0 {
+                        WAKE.notify();
+                    }
                 }
             }
             let _ = child.kill();
@@ -445,13 +478,21 @@ fn unconnected_args() -> Vec<String> {
     ["--target", "0", "-P", "node.autoconnect=false"].map(String::from).to_vec()
 }
 
+/// How long to wait before looking at the graph.
+fn look_wait(last_look: Option<Instant>, now: Instant) -> Duration {
+    let until_allowed = last_look.map_or(Duration::ZERO, |at| (at + SHORTEST_LOOK_GAP).saturating_duration_since(now));
+    until_allowed.max(SETTLE)
+}
+
 fn engine() {
     let mut mic = Capture::new(MIC_NODE, &HUB.mic);
     let mut output = Capture::new(CAPTURE_NODE, &HUB.output);
+    let mut last_look = None;
     loop {
         WAKE.wait(LOOK_EVERY);
-        std::thread::sleep(SETTLE);
+        std::thread::sleep(look_wait(last_look, Instant::now()));
         let now = Instant::now();
+        last_look = Some(now);
         let Some(graph) = read_graph() else {
             // No sound server yet. The captures stay as they are: it may just be restarting.
             AUDIO_OUTPUT_CAPTURE_LIVE.store(false, Ordering::Relaxed);
@@ -764,6 +805,37 @@ mod tests {
         assert_eq!(inputs, ["USB microphone"]);
         assert_eq!(lists.default_output.as_deref(), Some("speakers"));
         assert_eq!(lists.default_input.as_deref(), Some("mic"), "written as text or as an object");
+    }
+
+    #[test]
+    fn the_service_s_own_clients_coming_and_going_change_nothing() {
+        let mut changes = GraphChanges::default();
+        let client = serde_json::json!({"id": 51, "type": "PipeWire:Interface:Client", "info": {"props": {}}});
+        assert!(!changes.matters(&client), "a pw-dump starting");
+        assert!(!changes.matters(&client), "and updating");
+        assert!(!changes.matters(&serde_json::json!({"id": 51, "info": null})), "and leaving");
+        assert!(!changes.matters(&serde_json::json!({"id": 7, "type": "PipeWire:Interface:Module"})));
+    }
+
+    #[test]
+    fn nodes_ports_links_and_metadata_matter_and_so_does_their_going() {
+        let mut changes = GraphChanges::default();
+        for (id, kind) in [(10, "Node"), (11, "Port"), (12, "Link"), (13, "Metadata")] {
+            let object = serde_json::json!({"id": id, "type": format!("PipeWire:Interface:{kind}"), "info": {}});
+            assert!(changes.matters(&object), "{kind}");
+        }
+        for id in [10, 11, 12, 13] {
+            assert!(changes.matters(&serde_json::json!({"id": id, "info": null})));
+            assert!(!changes.matters(&serde_json::json!({"id": id, "info": null})), "it only goes once");
+        }
+    }
+
+    #[test]
+    fn the_graph_is_not_read_more_often_than_the_limit_however_often_it_changes() {
+        let t = Instant::now();
+        assert_eq!(look_wait(None, t), SETTLE);
+        assert_eq!(look_wait(Some(t), t), SHORTEST_LOOK_GAP);
+        assert_eq!(look_wait(Some(t), t + SHORTEST_LOOK_GAP), SETTLE);
     }
 
     #[test]
