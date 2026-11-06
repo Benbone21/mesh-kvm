@@ -10,7 +10,7 @@ the mode change countdown the way the real service does. Run it where that port 
 --name-style long tries names that don't fit. --audio picks how the audio section starts: idle,
 sending, failure, echo, missing or old. POST {"state": ...} to /fake/audio to change it while running,
 and GET /fake/requests for the audio actions the app has sent. --link picks how the link looks: good,
-poor, measuring, returning, down or older. POST {"state": ...} to /fake/link to change that too.
+poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/link to change that too.
 """
 
 import argparse
@@ -114,6 +114,7 @@ def link_states():
         "measuring": (True, nothing | {"peer_version": "unknown", "returning": False}),
         "returning": (False, nothing | {"peer_version": "unknown", "returning": True}),
         "down": (False, nothing | {"peer_version": "unknown", "returning": False}),
+        "oneway": (True, nothing | {"measured": True, "loss_in": 0.2, "peer_version": "same", "returning": False, "one_way": True}),
         "older": (True, figures | {"loss_in": 0.2, "loss_out": 0, "round_trip_ms": None, "peer_version": "older"}),
     }
 
