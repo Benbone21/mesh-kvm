@@ -26,6 +26,12 @@ struct Queue {
     refilling: bool,
 }
 
+impl Queue {
+    fn has_frame(&self) -> bool {
+        self.samples.len() >= if self.refilling { REJOIN_AT } else { FRAME_SAMPLES }
+    }
+}
+
 /// Where a capture leaves its audio. Interleaved stereo at 48 kHz.
 #[derive(Default)]
 pub struct Source {
@@ -52,13 +58,16 @@ impl Source {
         self.lock().samples.len()
     }
 
+    /// True when `add_to` would take a frame. The two must agree, or the sender is told a frame is
+    /// ready that never comes out, and spins.
+    fn has_frame(&self) -> bool {
+        self.lock().has_frame()
+    }
+
     /// Adds one frame to `mix`, or nothing when it hasn't got one.
     fn add_to(&self, mix: &mut [f32]) {
         let mut queue = self.lock();
-        if queue.refilling && queue.samples.len() < REJOIN_AT {
-            return;
-        }
-        if queue.samples.len() < FRAME_SAMPLES {
+        if !queue.has_frame() {
             queue.refilling = true;
             return;
         }
@@ -107,14 +116,14 @@ pub struct Mixer {
 impl Mixer {
     /// True when a frame is due. A lead that goes quiet hands over after a moment.
     pub fn ready(&mut self, sources: &[&Source], now: Instant) -> bool {
-        if self.lead.and_then(|lead| sources.get(lead)).is_some_and(|lead| lead.len() >= FRAME_SAMPLES) {
+        if self.lead.and_then(|lead| sources.get(lead)).is_some_and(|lead| lead.has_frame()) {
             self.lead_fed = Some(now);
             return true;
         }
         if self.lead_fed.is_some_and(|fed| now.duration_since(fed) < LEAD_PATIENCE) {
             return false;
         }
-        self.lead = sources.iter().position(|source| source.len() >= FRAME_SAMPLES);
+        self.lead = sources.iter().position(|source| source.has_frame());
         self.lead_fed = self.lead.map(|_| now);
         self.lead.is_some()
     }
@@ -270,9 +279,32 @@ mod tests {
         a.push(&tone(440.0, 0.5, 0), &signal);
         assert!(mixer.ready(&[&a, &b], start));
         mixer.mix(&[&a, &b], &mut mix);
+        // It sat out that frame, so it needs a little in hand, as any source does to join in.
         b.push(&tone(660.0, 0.5, 0), &signal);
+        b.push(&tone(660.0, 0.5, 1), &signal);
         assert!(!mixer.ready(&[&a, &b], start + Duration::from_millis(10)), "a may still come");
         assert!(mixer.ready(&[&a, &b], start + LEAD_PATIENCE), "b takes over");
+    }
+
+    #[test]
+    fn a_refilling_lead_is_not_ready_until_it_can_really_give_a_frame() {
+        let (lead, signal) = (Source::default(), Signal::default());
+        let mut mixer = Mixer::default();
+        let mut mix = vec![0.0; FRAME_SAMPLES];
+        let now = Instant::now();
+        lead.push(&tone(440.0, 0.5, 0), &signal);
+        assert!(mixer.ready(&[&lead], now));
+        mixer.mix(&[&lead], &mut mix);
+        lead.push(&tone(440.0, 0.5, 1)[..100], &signal);
+        mixer.mix(&[&lead], &mut mix);
+        // Short of a frame, so it's refilling. One whole frame isn't enough to rejoin.
+        lead.push(&tone(440.0, 0.5, 2), &signal);
+        assert!(!mixer.ready(&[&lead], now), "the sender would spin on a frame that never comes out");
+        lead.push(&tone(440.0, 0.5, 3), &signal);
+        assert!(mixer.ready(&[&lead], now));
+        let before = lead.len();
+        mixer.mix(&[&lead], &mut mix);
+        assert_eq!(lead.len(), before - FRAME_SAMPLES);
     }
 
     #[test]
