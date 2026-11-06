@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const UI_PORT: u16 = 24880;
+/// What `local_ip_toward` gives when there is no route to the address.
+pub const UNKNOWN_ADDRESS: &str = "unknown";
 
 pub struct HttpRequest {
     pub method: String,
@@ -201,7 +203,7 @@ pub fn local_ip_toward(peer_ip: &str) -> String {
             s.local_addr()
         })
         .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+        .unwrap_or_else(|_| UNKNOWN_ADDRESS.to_string())
 }
 
 pub fn hostname() -> String {

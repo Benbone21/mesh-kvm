@@ -10,6 +10,7 @@ use super::model::{
 use super::theme::{
     self, line, AMBER, AMBER_GROOVE, DEBIAN, DEEP, DIM, EDGE, GREEN, INK, PANEL, RAISED, RED, UNLIT,
 };
+use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
     self, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Margin, Painter, Pos2, Rect,
     Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextStyle, Ui,
@@ -191,6 +192,8 @@ impl Window {
             Ok(Err(reason)) => {
                 self.peer_prompt.error = Some(reason);
                 self.peer_prompt.saving = None;
+                // Enter took the keyboard from the box, and the person has an address to fix.
+                self.peer_prompt.focused = false;
             }
             Err(TryRecvError::Disconnected) => self.peer_prompt.saving = None,
             Err(TryRecvError::Empty) => {}
@@ -220,7 +223,7 @@ impl Window {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label("Enter the address of the other device. mesh-kvm shows it on that device, next to its name.");
-                if !this_address.is_empty() {
+                if !this_address.is_empty() && this_address != UNKNOWN_ADDRESS {
                     ui.label(small(format!("This device's address is {this_address}.")));
                 }
                 let edit = egui::TextEdit::singleline(&mut self.peer_prompt.address)
@@ -1147,6 +1150,8 @@ mod tests {
         // Nothing listens in this test, so the service can't take it.
         assert!(window.peer_prompt.error.as_deref().unwrap().contains("didn't answer"));
         assert_eq!(window.peer_prompt.address, "192.168.8.210", "what was typed stays");
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert!(window.peer_prompt.focused, "the box has the keyboard again, to fix the address");
     }
 
     #[test]
