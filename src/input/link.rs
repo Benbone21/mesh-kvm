@@ -253,6 +253,8 @@ struct PressQueue {
     /// Each with its number, and when it came.
     waiting: Vec<(u32, PressEvent, u64)>,
     gap_since: Option<u64>,
+    /// The press number of a report that was ahead of what's been acted on.
+    ahead_of: Option<u32>,
     /// How far the sender's clock is behind this one on the fastest delivery seen, and when.
     offset: Option<(i64, u64)>,
     stats: PressStats,
@@ -347,9 +349,17 @@ impl PressQueue {
         }
     }
 
-    /// The number of the last press acted on.
-    fn applied(&self) -> Option<u32> {
-        self.next.map(|next| next.wrapping_sub(1))
+    /// Whether a report made at press `order` says anything about now. Behind the presses acted on,
+    /// it knows less than this device does. Ahead of them, it may have overtaken some: it would let
+    /// go of Ctrl with the C still on its way. Still ahead a heartbeat later, the ones it knew of
+    /// were lost, which is what reports are for.
+    fn report_counts(&mut self, order: u32) -> bool {
+        let Some(next) = self.next else { return true };
+        let applied = next.wrapping_sub(1);
+        let lead = order.wrapping_sub(applied) as i32;
+        let lost = self.ahead_of.is_some_and(|earlier| (earlier.wrapping_sub(applied) as i32) > 0);
+        self.ahead_of = (lead > 0).then_some(order);
+        lead == 0 || (lead > 0 && lost)
     }
 
     /// The link dropped. What was waiting has had its chance, and the numbers carry on.
@@ -475,9 +485,7 @@ impl PeerLink {
             self.heard = Some((state.beat, now_ms));
         }
         let mut events = vec![Event::LinkLoss(self.worst_loss())];
-        // Behind what's been acted on, it knows less than this device does.
-        let current = self.presses.applied().is_none_or(|applied| (state.press_order.wrapping_sub(applied) as i32) >= 0);
-        if current && !copy {
+        if !copy && self.presses.report_counts(state.press_order) {
             events.push(Event::PeerHeld(state.held));
         }
         if let Some((_, sent_ms)) = self.sent.iter().find(|(beat, _)| *beat == state.echo).copied() {
@@ -867,9 +875,27 @@ mod tests {
         assert!(!link.heard_state(&old, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
         let current = sender.next_state(HeldInput::default(), false, false, 2, 0);
         assert!(link.heard_state(&current, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
-        // One that's ahead means presses went missing, which is what it's for.
-        let ahead = sender.next_state(HeldInput::default(), false, false, 7, 0);
-        assert!(link.heard_state(&ahead, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
+    }
+
+    #[test]
+    fn a_report_that_overtakes_presses_waits_for_them() {
+        // It says Ctrl is up, and C is on its way: acting on that would turn Ctrl+C into a bare C.
+        let (mut link, mut sender) = (pressed_link(), PeerLink::default());
+        let held = |events: &[Event]| events.iter().any(|e| matches!(e, Event::PeerHeld(_)));
+        let ahead = sender.next_state(HeldInput::default(), false, false, 4, 0);
+        assert!(!held(&link.heard_state(&ahead, 0)));
+        link.take_presses(4, 0, &[tap(2, true), tap(3, true), tap(4, true)], 0);
+        let caught_up = sender.next_state(HeldInput::default(), false, false, 4, 400);
+        assert!(held(&link.heard_state(&caught_up, 400)));
+    }
+
+    #[test]
+    fn a_report_still_ahead_a_heartbeat_later_means_presses_were_lost() {
+        let (mut link, mut sender) = (pressed_link(), PeerLink::default());
+        let first = sender.next_state(HeldInput::default(), false, false, 7, 0);
+        assert!(!link.heard_state(&first, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
+        let second = sender.next_state(HeldInput::default(), false, false, 7, 400);
+        assert!(link.heard_state(&second, 400).iter().any(|e| matches!(e, Event::PeerHeld(_))));
     }
 
     #[test]

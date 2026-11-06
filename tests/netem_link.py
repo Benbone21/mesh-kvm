@@ -742,7 +742,9 @@ def restart_receiver():
     source, target, _, _ = forwarding_pair(16)
     source.do(button=1, pressed=True)
     source.do(button=1, pressed=False)
-    target.wait_for(lambda s: s["moves"] >= 0 and not s["buttons"], 1)
+    end = time.time() + 1
+    while time.time() < end and len(target.injected) < 2:
+        time.sleep(0.005)
     check("the click landed", any(e["input"] == BUTTONS + 1 and e["pressed"] for e in target.injected), str(target.injected[-3:]))
     target.p.kill()
     target.p.wait()
