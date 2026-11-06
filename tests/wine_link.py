@@ -35,7 +35,7 @@ import urllib.request
 
 DEFAULT_EXE = str(pathlib.Path(__file__).resolve().parent.parent
                   / "target/x86_64-pc-windows-gnu/release/mesh-kvm.exe")
-PREFIX = "/tmp/claude-1000/mk/wineprefix"
+PREFIX = os.environ.get("WINE_LINK_PREFIX", "/tmp/claude-1000/mk/wineprefix")
 LAPTOP = "10.77.0.1"
 PEER = "10.77.0.2"
 STRANGER = "10.77.0.3"
@@ -51,7 +51,8 @@ DESKTOP_NAME = "wine-link-desktop"
 DEBIAN, WINDOWS = 0, 1
 LEFT, RIGHT, TOP, BOTTOM = 0, 1, 2, 3
 (MOUSE_MOVE, MOUSE_BUTTON, MOUSE_WHEEL, KEY_EVENT, _FOCUS_SWITCH, _FOCUS_ACK, PANIC_RELEASE, HEARTBEAT,
- PEER_DISPLAY_INFO, EDGE_MAP, FOCUS_SWITCH_AT, GAME_LOCK, ACTIVE_VIEW, LAYOUT_REVISION) = range(14)
+ PEER_DISPLAY_INFO, EDGE_MAP, FOCUS_SWITCH_AT, GAME_LOCK, ACTIVE_VIEW, LAYOUT_REVISION, LINK_STATE) = range(15)
+LINK_PROTOCOL = 1
 
 failures = 0
 seq = 0
@@ -117,6 +118,22 @@ def focus_switch_at(node, x, y):
 
 def mouse_move(dx, dy):
     return packet(struct.pack("<Iii", MOUSE_MOVE, dx, dy))
+
+
+def key_event(scancode, pressed):
+    return packet(struct.pack("<IHB", KEY_EVENT, scancode, 1 if pressed else 0))
+
+
+def mouse_button(button, pressed):
+    return packet(struct.pack("<IBB", MOUSE_BUTTON, button, 1 if pressed else 0))
+
+
+def link_state(beat, echo=0, age=0, keys=(), buttons=(), protocol=LINK_PROTOCOL, panicked=False):
+    words = [0, 0, 0, 0]
+    for key in keys:
+        words[key // 64] |= 1 << (key % 64)
+    mask = sum(1 << (button - 1) for button in buttons)
+    return packet(struct.pack("<IHIIIHB4QB", LINK_STATE, protocol, beat, echo, age, 0, 1 if panicked else 0, *words, mask))
 
 
 def edge_map(edge, start, end, resistance):
@@ -190,6 +207,13 @@ def parse(data):
     if kind == KEY_EVENT:
         scancode, pressed = r.take("HB")
         return source, kind, {"scancode": scancode, "pressed": pressed != 0}
+    if kind == LINK_STATE:
+        protocol, beat, echo, age, loss, panicked = r.take("HIIIHB")
+        words = r.take("4Q")
+        mask = r.take("B")
+        keys = [k for k in range(256) if words[k // 64] >> (k % 64) & 1]
+        return source, kind, {"protocol": protocol, "beat": beat, "echo": echo, "age": age, "loss": loss,
+                              "panicked": panicked != 0, "keys": keys, "buttons": mask}
     return source, kind, {}
 
 
@@ -511,6 +535,152 @@ def input_checks(peer, inbox):
     return crossing
 
 
+class Beats:
+    """Plays a peer on this version: numbered heartbeats, each answering the exe's last one."""
+
+    def __init__(self, peer, inbox):
+        self.peer, self.inbox, self.beat = peer, inbox, 100
+
+    def send(self, keys=(), buttons=()):
+        self.beat += 1
+        states = [fields for _, kind, fields in list(self.inbox.seen) if kind == LINK_STATE]
+        echo = states[-1]["beat"] if states else 0
+        self.peer.send(heartbeat())
+        self.peer.send(link_state(self.beat, echo, 0, keys, buttons))
+
+    def pump(self, seconds, **held):
+        end = time.time() + seconds
+        while time.time() < end:
+            self.send(**held)
+            time.sleep(0.2)
+
+
+def held_here():
+    return local()["link"]["held_here"]
+
+
+def link_state_checks(peer, inbox):
+    # The peer so far is a device from before LinkState: heartbeats and nothing more.
+    peer.pump(3.5, heartbeat, lambda: active_view(WINDOWS))
+    check("a peer that sends no LinkState is taken for an older version", local()["link"]["peer_version"] == "older",
+          str(local()["link"]))
+
+    inbox.clear()
+    first = inbox.wait_for(LINK_STATE, 2, keep_alive=lambda: peer.send(heartbeat()))
+    check("the exe sends LinkState with every heartbeat, on this protocol, holding nothing",
+          bool(first) and first[1]["protocol"] == LINK_PROTOCOL and first[1]["keys"] == [] and first[1]["buttons"] == 0, str(first))
+    beats = Beats(peer, inbox)
+    beats.send()
+    sent = beats.beat
+    inbox.clear()
+    answer = inbox.wait_for(LINK_STATE, 2, lambda f: f["echo"] >= sent, keep_alive=beats.send)
+    check("it answers the peer's heartbeat", answer is not None, str(answer))
+    beats.pump(4)
+    link = local()["link"]
+    check("a peer on this version is known", link["peer_version"] == "same", str(link))
+    check("loss and the round trip are measured", link["measured"] and link["round_trip_ms"] is not None and link["loss_in"] < 5, str(link))
+
+    # Focus on the laptop: what the peer's heartbeat says corrects what got lost.
+    st = peer.give_focus_to_laptop(400, 300)
+    check("focus is on the laptop for this", view(st)[1] == "Windows", str(view(st)))
+    peer.send(key_event(30, True))
+    peer.send(mouse_button(1, True))
+    check("a key and a button are down", wait_for(lambda s: s["link"]["held_here"] == 2, 2) is not None, str(held_here()))
+    beats.send(keys=[30], buttons=[1])
+    time.sleep(0.2)
+    check("a report that agrees changes nothing", held_here() == 2, str(held_here()))
+    beats.send()
+    check("what the peer no longer holds is let go", wait_for(lambda s: s["link"]["held_here"] == 0, 2) is not None, str(held_here()))
+
+    beats.send(keys=[31])
+    time.sleep(0.2)
+    check("a missed press isn't pressed on one report", held_here() == 0, str(held_here()))
+    beats.send(keys=[31])
+    check("but is on the second", wait_for(lambda s: s["link"]["held_here"] == 1, 2) is not None, str(held_here()))
+    beats.send()
+    wait_for(lambda s: s["link"]["held_here"] == 0, 2)
+
+    # Late packets: built first, sent after something newer.
+    global seq
+    late = key_event(32, True)
+    peer.send(key_event(33, False))
+    peer.send(late)
+    time.sleep(0.3)
+    check("a press that arrives after newer input is dropped", held_here() == 0, str(held_here()))
+    # Newer than everything, and then a report from before it.
+    report = link_state(beats.beat, keys=[])
+    peer.send(key_event(32, True))
+    peer.send(report)
+    time.sleep(0.3)
+    check("a report older than a press doesn't undo it", held_here() == 1, str(held_here()))
+    peer.send(key_event(32, False))
+    wait_for(lambda s: s["link"]["held_here"] == 0, 2)
+
+    # The peer starts again from low numbers, well behind what it sent before.
+    seq += 1 << 20
+    peer.send(heartbeat())
+    peer.send(key_event(34, False))
+    seq = 1
+    peer.send(key_event(34, True))
+    check("a peer that restarts from a low number is heard straight away",
+          wait_for(lambda s: s["link"]["held_here"] == 1, 2) is not None, str(held_here()))
+    peer.send(key_event(34, False))
+    wait_for(lambda s: s["link"]["held_here"] == 0, 2)
+    beats.pump(0.5)
+
+    # Packets from a version this one can't read.
+    peer.send(b"MKVM" + struct.pack("<QII", 1 << 30, DEBIAN, 99))
+    time.sleep(0.2)
+    check("a packet that can't be read means another version", local()["link"]["peer_version"] == "other", str(local()["link"]))
+
+
+def dropout_checks(peer, inbox):
+    beats = Beats(peer, inbox)
+    # Control is with Debian, so the laptop's keyboard and mouse go there.
+    st = peer.drive_to_debian()
+    beats.pump(0.5)
+    check("focus is with Debian for this", view(st) == (True, "Debian"), str(view(st)))
+    st = wait_for(lambda s: not s["peer_online"], 3)
+    check("with the link gone the laptop has its own input, and says control is going back",
+          view(st) == (False, "Windows") and st["link"]["returning"] is True, str(st and st["link"]))
+    check("and it shows no figures", st["link"]["measured"] is False and st["link"]["round_trip_ms"] is None, str(st["link"]))
+    end = time.time() + 2
+    while time.time() < end and view(local())[1] != "Debian":
+        beats.send()
+        peer.send(active_view(DEBIAN))
+        time.sleep(0.2)
+    st = local()
+    check("control goes back to Debian with main's view", view(st) == (True, "Debian") and not st["link"]["returning"], str(st["link"]))
+
+    # With the laptop as main, the return is up to it. That's the case with its keyboard at stake.
+    reply = call("/api/local/action", {"action": "set_main_device", "device": WINDOWS})
+    beats.pump(0.6)
+    check("the laptop can be made main", local()["main_device"] == WINDOWS, str(reply))
+    st = wait_for(lambda s: True, 1)
+    if view(st)[1] != "Debian":
+        call("/api/action", {"action": "toggle_focus"})
+    beats.pump(0.6)
+    check("with control on Debian", view(local()) == (True, "Debian"), str(view(local())))
+    st = wait_for(lambda s: not s["peer_online"], 3)
+    check("the dropout gives the laptop its input back", view(st) == (False, "Windows") and st["link"]["returning"], str(view(st)))
+    peer.send(heartbeat())
+    st = wait_for(lambda s: s["peer_online"], 2)
+    time.sleep(0.5)
+    peer.send(heartbeat())
+    check("with the link back and nothing answered it stays local", view(local()) == (True, "Windows"), str(view(local())))
+    inbox.clear()
+    deadline = time.time() + 3
+    while time.time() < deadline and view(local())[1] != "Debian":
+        beats.send()
+        time.sleep(0.2)
+    check("an answer sends control back to Debian", view(local()) == (True, "Debian"), str(view(local())))
+    call("/api/action", {"action": "toggle_focus"})
+    beats.pump(0.5)
+    call("/api/local/action", {"action": "set_main_device", "device": DEBIAN})
+    beats.pump(0.6)
+    check("back to Debian as main", local()["main_device"] == DEBIAN, str(local()["main_device"]))
+
+
 def api_checks(peer, inbox):
     # m. Both layout-wide actions work from the laptop, and reach Debian.
     peer.send(heartbeat())
@@ -756,6 +926,29 @@ def keyboard_checks(peer, inbox, exe):
     key = inbox.wait_for(KEY_EVENT, 3, lambda f: f["scancode"] == 30 and f["pressed"],
                          keep_alive=lambda: (peer.send(heartbeat()), peer.send(active_view(DEBIAN))))
     check("a key pressed on the laptop is forwarded to Debian", key is not None)
+    beats = Beats(peer, inbox)
+    alive = lambda: (beats.send(), peer.send(active_view(DEBIAN)))
+    subprocess.run(["xdotool", "keydown", "b"], env=env)
+    inbox.clear()
+    held = inbox.wait_for(LINK_STATE, 3, lambda f: 48 in f["keys"], keep_alive=alive)
+    check("the laptop's heartbeat says what it holds", held is not None, str(held))
+    subprocess.run(["xdotool", "keyup", "b"], env=env)
+    inbox.clear()
+    clear = inbox.wait_for(LINK_STATE, 3, lambda f: not f["keys"], keep_alive=alive)
+    check("and stops once it's let go", clear is not None, str(clear))
+    # Past the link timeout the laptop's own keyboard is free again, with nothing left forwarding.
+    subprocess.run(["xdotool", "keydown", "b"], env=env)
+    time.sleep(0.2)
+    st = wait_for(lambda s: not s["peer_online"], 3)
+    subprocess.run(["xdotool", "keyup", "b"], env=env)
+    check("a stall frees the laptop's keyboard", view(st) == (False, "Windows"), str(view(st)))
+    inbox.clear()
+    subprocess.run(["xdotool", "key", "c"], env=env)
+    time.sleep(0.3)
+    stray = [f for _, kind, f in list(inbox.seen) if kind == KEY_EVENT]
+    check("and its keys stay on the laptop", not stray, str(stray))
+    st = peer.drive_to_debian()
+    check("focus goes back to Debian", view(st) == (True, "Debian"), str(view(st)))
     inbox.clear()
     subprocess.run(["xdotool", "mousemove_relative", "--", "30", "20"], env=env)
     moved = inbox.wait_for(MOUSE_MOVE, 3, keep_alive=lambda: (peer.send(heartbeat()), peer.send(active_view(DEBIAN))))
@@ -802,6 +995,8 @@ def test(exe_path):
             fields = crossing[1]
             check("the crossing lands on Debian's own monitor, in from the edge",
                   fields["x"] == 2559 - 28, str(fields))
+        link_state_checks(peer, inbox)
+        dropout_checks(peer, inbox)
         keyboard_checks(peer, inbox, exe)
         api_checks(peer, inbox)
         audio_checks()

@@ -921,9 +921,11 @@ pub fn run_windows_node(
                     telemetry.active_node = if active == PEER { "Debian" } else { "Windows" }.to_string();
                     telemetry.panic_mode = panicked;
                     telemetry.peer_online = online;
-                    let router = router();
-                    telemetry.main_conflict = router.main_conflict();
-                    telemetry.link = link().quality(&router, now_ms());
+                    {
+                        let router = router();
+                        telemetry.main_conflict = router.main_conflict();
+                        telemetry.link = link().quality(&router, now_ms());
+                    }
                     telemetry.game_captive_active = captive;
                     telemetry.game_reason = match (manual, captive) {
                         (true, _) => "Manual lock",
