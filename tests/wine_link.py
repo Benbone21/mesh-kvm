@@ -52,7 +52,7 @@ DEBIAN, WINDOWS = 0, 1
 LEFT, RIGHT, TOP, BOTTOM = 0, 1, 2, 3
 (MOUSE_MOVE, MOUSE_BUTTON, MOUSE_WHEEL, KEY_EVENT, _FOCUS_SWITCH, _FOCUS_ACK, PANIC_RELEASE, HEARTBEAT,
  PEER_DISPLAY_INFO, EDGE_MAP, FOCUS_SWITCH_AT, GAME_LOCK, ACTIVE_VIEW, LAYOUT_REVISION, LINK_STATE, PRESSES) = range(16)
-LINK_PROTOCOL = 1
+LINK_PROTOCOL = 2
 
 failures = 0
 seq = 0
@@ -130,16 +130,21 @@ def mouse_button(button, pressed):
 
 def presses(newest, events):
     """`events` are (input, pressed), oldest first, the last of them numbered `newest`."""
-    body = struct.pack("<IIQ", PRESSES, newest, len(events))
-    return packet(body + b"".join(struct.pack("<HB", i, 1 if p else 0) for i, p in events))
+    body = struct.pack("<IIQQ", PRESSES, newest, clock_ms(), len(events))
+    return packet(body + b"".join(struct.pack("<HBBQ", i, 0, 1 if p else 0, clock_ms()) for i, p in events))
 
 
-def link_state(beat, echo=0, age=0, keys=(), buttons=(), protocol=LINK_PROTOCOL, panicked=False, press_order=0):
+def clock_ms():
+    return int(time.monotonic() * 1000)
+
+
+def link_state(beat, echo=0, age=0, keys=(), buttons=(), protocol=LINK_PROTOCOL, panicked=False, press_order=0, main=True):
     words = [0, 0, 0, 0]
     for key in keys:
         words[key // 64] |= 1 << (key % 64)
     mask = sum(1 << (button - 1) for button in buttons)
-    return packet(struct.pack("<IHIIIHBI4QB", LINK_STATE, protocol, beat, echo, age, 0, 1 if panicked else 0, press_order, *words, mask))
+    return packet(struct.pack("<IHIIIHBIBQ4QB", LINK_STATE, protocol, beat, echo, age, 0, 1 if panicked else 0, press_order,
+                              1 if main else 0, clock_ms(), *words, mask))
 
 
 def edge_map(edge, start, end, resistance):
@@ -214,15 +219,16 @@ def parse(data):
         scancode, pressed = r.take("HB")
         return source, kind, {"scancode": scancode, "pressed": pressed != 0}
     if kind == LINK_STATE:
-        protocol, beat, echo, age, loss, panicked, order = r.take("HIIIHBI")
+        protocol, beat, echo, age, loss, panicked, order, _, _ = r.take("HIIIHBIBQ")
         words = r.take("4Q")
         mask = r.take("B")
         keys = [k for k in range(256) if words[k // 64] >> (k % 64) & 1]
         return source, kind, {"protocol": protocol, "beat": beat, "echo": echo, "age": age, "loss": loss,
                               "panicked": panicked != 0, "order": order, "keys": keys, "buttons": mask}
     if kind == PRESSES:
-        newest = r.take("I")
-        return source, kind, {"newest": newest, "events": [r.take("HB") for _ in range(r.take("Q"))]}
+        newest, _ = r.take("IQ")
+        events = [r.take("HBBQ") for _ in range(r.take("Q"))]
+        return source, kind, {"newest": newest, "events": [(i, p) for i, _, p, _ in events]}
     return source, kind, {}
 
 

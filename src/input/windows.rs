@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
-use super::link::{press_event, PeerLink, PeerVersion, PressLog};
+use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
@@ -301,12 +301,28 @@ fn send_link_state() {
     }
     let order = presses().newest();
     let seq = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let (held, panicked) = {
+    let (held, panicked, main) = {
         let router = router();
-        (router.held_forwarded(), router.panicked())
+        (router.held_forwarded(), router.panicked(), router.main() == ME)
     };
-    let state = link().next_state(held, panicked, order, now_ms());
+    let state = link().next_state(held, panicked, main, order, now_ms());
     send_numbered(seq, Payload::LinkState(state));
+    for _ in 1..REPORT_COPIES {
+        send_udp_payload(Payload::LinkState(state));
+    }
+}
+
+/// Lets go of any modifier waiting to go back that Windows says is up. A release can go unseen by
+/// the hook, on the secure desktop say, and restoring that would hold Ctrl down on the peer. A key
+/// the hook swallowed never reached Windows, so it counts as up unless auto-repeat got through while
+/// the link was down. That just means it stays here, which is the safe way round.
+fn drop_unheld_modifiers() {
+    let carried = router().carried_modifiers();
+    for scancode in carried {
+        if win_logic::modifier_vk(scancode).is_some_and(|vk| !os_key_down(vk)) {
+            route(Event::LocalKey { scancode, pressed: false });
+        }
+    }
 }
 
 struct UdpPeer;
@@ -1038,6 +1054,7 @@ pub fn run_windows_node(
                                 });
                             }
                             Payload::ActiveView { active_node } => {
+                                drop_unheld_modifiers();
                                 route(Event::PeerActiveView { active: active_node as DeviceId });
                             }
                             Payload::GameLock { locked } => {
@@ -1053,11 +1070,12 @@ pub fn run_windows_node(
                                 crate::spatial::note_peer_revision(&spatial_state, revision, editor);
                             }
                             Payload::LinkState(state) => {
+                                drop_unheld_modifiers();
                                 let events = link().heard_state(&state, now_ms());
                                 route_events(&events);
                             }
-                            Payload::Presses { newest, events } => {
-                                let ready = link().take_presses(newest, &events, now_ms());
+                            Payload::Presses { newest, sent_ms, events } => {
+                                let ready = link().take_presses(newest, sent_ms, &events, now_ms());
                                 route_presses(&ready);
                             }
                             Payload::PanicRelease => {

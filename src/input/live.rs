@@ -3,9 +3,9 @@
 //! thing, and only the keyboard and mouse are pretend: this records what would have been injected,
 //! so the test can't reach the real desktop.
 
-use super::link::{press_event, PeerLink, PeerVersion, PressLog};
+use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, from_peer, InputBackend, PeerSender};
-use crate::protocol::{NodeId, Packet, Payload, PressEvent, FIRST_BUTTON, MAX_PACKET_SIZE, PACKET_MAGIC};
+use crate::protocol::{NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, PACKET_MAGIC};
 use crate::router::{DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 const HEARTBEAT: Duration = Duration::from_millis(400);
 const STATUS_EVERY: Duration = Duration::from_millis(20);
+/// Where buttons start in what's logged.
+const BUTTONS: u16 = 256;
 
 fn number(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
@@ -45,7 +47,7 @@ impl InputBackend for Recorder {
         self.moves += 1;
     }
     fn inject_button(&mut self, button: u8, pressed: bool) {
-        log_injected(FIRST_BUTTON + u16::from(button), pressed);
+        log_injected(BUTTONS + u16::from(button), pressed);
         if pressed {
             self.buttons.insert(button);
         } else {
@@ -134,8 +136,8 @@ impl Device {
                     self.route(event);
                 }
             }
-            Payload::Presses { newest, events } => {
-                for event in self.link.take_presses(newest, &events, now_ms) {
+            Payload::Presses { newest, sent_ms, events } => {
+                for event in self.link.take_presses(newest, sent_ms, &events, now_ms) {
                     self.route(press_event(event));
                 }
             }
@@ -244,8 +246,11 @@ fn whole_device() {
                 device.udp.send(tail);
             }
             let order = device.udp.presses.newest();
-            let state = device.link.next_state(device.router.held_forwarded(), device.router.panicked(), order, now_ms);
-            device.udp.send(Payload::LinkState(state));
+            let main = device.router.main() == me;
+            let state = device.link.next_state(device.router.held_forwarded(), device.router.panicked(), main, order, now_ms);
+            for _ in 0..REPORT_COPIES {
+                device.udp.send(Payload::LinkState(state));
+            }
         }
         if now >= next_status {
             next_status = now + STATUS_EVERY;

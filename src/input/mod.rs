@@ -169,8 +169,8 @@ mod tests {
         apply(&actions, &mut FakeBackend::default(), &mut peer);
         let key = PressEvent::key(30, true);
         let button = PressEvent::button(1, true);
-        let mut want = vec![Payload::Presses { newest: 1, events: vec![key] }; 3];
-        want.extend(vec![Payload::Presses { newest: 2, events: vec![key, button] }; 3]);
+        let mut want = vec![Payload::Presses { newest: 1, sent_ms: 0, events: vec![key] }; 3];
+        want.extend(vec![Payload::Presses { newest: 2, sent_ms: 0, events: vec![key, button] }; 3]);
         assert_eq!(format!("{:?}", peer.0), format!("{:?}", want));
     }
 

@@ -2,8 +2,8 @@
 //! cfg-gated, so its tests cannot run on the Debian machine that builds this project.
 
 use crate::keymap::{
-    KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL,
-    KEY_SCROLLLOCK,
+    KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT,
+    KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_SCROLLLOCK,
 };
 use crate::protocol::{
     MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
@@ -72,6 +72,21 @@ pub fn settled_input(router: &Router, me: DeviceId) -> SettledInput {
         block_keyboard: remote && sharing.keyboard,
         injecting: live && !router.main_conflict() && router.active() == me,
     }
+}
+
+/// The virtual key Windows knows a modifier by, for asking if it's down.
+pub fn modifier_vk(scancode: u16) -> Option<u16> {
+    Some(match scancode {
+        KEY_LEFTSHIFT => 0xA0,
+        KEY_RIGHTSHIFT => 0xA1,
+        KEY_LEFTCTRL => 0xA2,
+        KEY_RIGHTCTRL => 0xA3,
+        KEY_LEFTALT => 0xA4,
+        KEY_RIGHTALT => 0xA5,
+        KEY_LEFTMETA => 0x5B,
+        KEY_RIGHTMETA => 0x5C,
+        _ => return None,
+    })
 }
 
 /// Movement carried by one mouse-hook event at `pt`, or `None` for an event that is only our
@@ -316,6 +331,13 @@ mod tests {
     const PIN: (i32, i32) = (960, 540);
     const OS_DOWN: OsModifiers = OsModifiers { ctrl: true, alt: true };
     const OS_UP: OsModifiers = OsModifiers { ctrl: false, alt: false };
+
+    #[test]
+    fn modifiers_map_to_the_left_and_right_keys_windows_tracks() {
+        assert_eq!(modifier_vk(KEY_LEFTCTRL), Some(0xA2));
+        assert_eq!(modifier_vk(KEY_RIGHTMETA), Some(0x5C));
+        assert_eq!(modifier_vk(KEY_G), None);
+    }
 
     #[test]
     fn offset_while_local_is_from_the_last_position() {

@@ -9,7 +9,7 @@ pub const PACKET_MAGIC: [u8; 4] = *b"MKVM";
 pub const MAX_PACKET_SIZE: usize = 1400;
 /// What `LinkState` carries is understood by devices on the same number. Changes when packets
 /// change in a way both devices must update together for.
-pub const LINK_PROTOCOL: u16 = 1;
+pub const LINK_PROTOCOL: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -169,23 +169,25 @@ impl HeldInput {
     }
 }
 
-/// Input numbers from here up are mouse buttons, and below it are keys.
-pub const FIRST_BUTTON: u16 = 256;
-
 /// A key or button going down or up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressEvent {
+    /// A scancode, or a button number if `button` says so. Linux has keys numbered above 255, so
+    /// the two can't share one range.
     pub input: u16,
+    pub button: bool,
     pub pressed: bool,
+    /// When this happened, on the sender's clock.
+    pub at_ms: u64,
 }
 
 impl PressEvent {
     pub fn key(scancode: u16, pressed: bool) -> Self {
-        PressEvent { input: scancode, pressed }
+        PressEvent { input: scancode, button: false, pressed, at_ms: 0 }
     }
 
     pub fn button(button: u8, pressed: bool) -> Self {
-        PressEvent { input: FIRST_BUTTON + u16::from(button), pressed }
+        PressEvent { input: u16::from(button), button: true, pressed, at_ms: 0 }
     }
 }
 
@@ -206,6 +208,10 @@ pub struct LinkState {
     /// The newest numbered press this report knows of. A device that has already acted on a newer
     /// one has nothing to learn from it.
     pub press_order: u32,
+    /// The sender counts itself as the main device.
+    pub main: bool,
+    /// When this was sent, on the sender's clock.
+    pub sent_ms: u64,
     /// What this device has forwarded and not yet released.
     pub held: HeldInput,
 }
@@ -249,7 +255,8 @@ pub enum Payload {
     /// number of the last of `events`, and the ones before it are the events just before that,
     /// so any one packet that gets through repairs what was lost ahead of it. Older devices can't
     /// read this, so a device sends `KeyEvent` and `MouseButton` until it has heard a `LinkState`.
-    Presses { newest: u32, events: Vec<PressEvent> },
+    /// `sent_ms` is when it left, on the sender's clock, to tell how far behind a packet is.
+    Presses { newest: u32, sent_ms: u64, events: Vec<PressEvent> },
 }
 
 impl Packet {
@@ -326,7 +333,7 @@ mod tests {
         held.set_key(30, true);
         held.set_key(255, true);
         held.set_button(MOUSE_BTN_EXTRA, true);
-        let state = LinkState { protocol: LINK_PROTOCOL, beat: 7, echo: 6, echo_age_ms: 120, loss_tenths: 25, panicked: true, press_order: 9, held };
+        let state = LinkState { protocol: LINK_PROTOCOL, beat: 7, echo: 6, echo_age_ms: 120, loss_tenths: 25, panicked: true, press_order: 9, main: true, sent_ms: 7, held };
         match round_trip(Payload::LinkState(state)) {
             Payload::LinkState(back) => {
                 assert_eq!(back, state);
@@ -361,7 +368,7 @@ mod tests {
     #[test]
     fn a_device_without_link_state_fails_to_read_it_and_nothing_else() {
         // An older build has one variant fewer, which bincode refuses. This is the index it sees.
-        let state = LinkState { protocol: LINK_PROTOCOL, beat: 1, echo: 0, echo_age_ms: 0, loss_tenths: 0, panicked: false, press_order: 0, held: HeldInput::default() };
+        let state = LinkState { protocol: LINK_PROTOCOL, beat: 1, echo: 0, echo_age_ms: 0, loss_tenths: 0, panicked: false, press_order: 0, main: false, sent_ms: 0, held: HeldInput::default() };
         let bytes = Packet::new(0, NodeId::Debian, Payload::LinkState(state)).encode().unwrap();
         assert_eq!(bytes[16..20], 14u32.to_le_bytes());
         assert!(bytes.len() < MAX_PACKET_SIZE);

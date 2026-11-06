@@ -3,10 +3,10 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::link::{press_event, PeerLink, PeerVersion, PressLog};
+use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
-    NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
+    HeldInput, NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
     MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
@@ -574,6 +574,14 @@ fn track_held(held: &mut HashSet<u16>, ev: &InputEvent) {
     }
 }
 
+/// A device can be grabbed with nothing down, or with only keys the peer is holding. The desktop
+/// never saw those go down, as they went down under a grab, and only came back to the peer with
+/// control after a dropout. So it can't be left with a key stuck, and without the grab everything
+/// typed under a held Ctrl would land here.
+fn free_to_grab(held: &HashSet<u16>, forwarded: &HeldInput) -> bool {
+    held.iter().all(|key| forwarded.keys().any(|forwarded| forwarded == *key))
+}
+
 /// Whether a device should be grabbed now. A grab hides the release of any key already down from
 /// the desktop, leaving that key stuck on Debian, so a new grab waits until the device is idle.
 /// Letting go never waits.
@@ -973,13 +981,16 @@ struct LinuxBackend {
     block_keyboards: bool,
     kwin_x: Arc<AtomicI32>,
     kwin_y: Arc<AtomicI32>,
+    /// What the router has forwarded and not released, as of the last read of the devices.
+    forwarded: HeldInput,
 }
 
 impl LinuxBackend {
     /// Moves every device toward the wanted grab state, and retries any failed `EVIOCGRAB`. Must
     /// run straight after the devices are read: a new grab trusts `held`, and a key pressed since
     /// the last read would end up stuck.
-    fn sync_grabs(&mut self) {
+    fn sync_grabs(&mut self, forwarded: HeldInput) {
+        self.forwarded = forwarded;
         self.update_grabs(true);
     }
 
@@ -989,7 +1000,7 @@ impl LinuxBackend {
             (&mut self.keyboards, self.block_keyboards),
         ] {
             for device in devices {
-                let idle = may_start && device.held.is_empty();
+                let idle = may_start && free_to_grab(&device.held, &self.forwarded);
                 device.set_grab(should_grab(wanted, device.grabbed, idle));
             }
         }
@@ -1176,6 +1187,7 @@ pub fn run_debian_node(
             block_keyboards: false,
             kwin_x: Arc::clone(&kwin_x),
             kwin_y: Arc::clone(&kwin_y),
+            forwarded: HeldInput::default(),
         },
         peer: UdpPeer {
             socket: &socket,
@@ -1332,8 +1344,8 @@ pub fn run_debian_node(
                         core.route(event);
                     }
                 }
-                Payload::Presses { newest, events } => {
-                    for event in link.take_presses(newest, &events, now_ms()) {
+                Payload::Presses { newest, sent_ms, events } => {
+                    for event in link.take_presses(newest, sent_ms, &events, now_ms()) {
                         core.route(press_event(event));
                     }
                 }
@@ -1450,7 +1462,7 @@ pub fn run_debian_node(
         }
 
         // Straight after the reads, so held state is as fresh as it can be.
-        core.backend.sync_grabs();
+        core.backend.sync_grabs(core.router.held_forwarded());
 
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
@@ -1489,8 +1501,11 @@ pub fn run_debian_node(
                 core.peer.send(tail);
             }
             let order = core.peer.presses.newest();
-            let state = link.next_state(core.router.held_forwarded(), core.router.panicked(), order, now_ms());
-            core.peer.send(Payload::LinkState(state));
+            let main = core.router.main() == DEBIAN;
+            let state = link.next_state(core.router.held_forwarded(), core.router.panicked(), main, order, now_ms());
+            for _ in 0..REPORT_COPIES {
+                core.peer.send(Payload::LinkState(state));
+            }
         }
 
         std::thread::sleep(Duration::from_micros(500));
@@ -1611,6 +1626,17 @@ mod tests {
         let drop = InputEvent { type_: EV_SYN, code: SYN_DROPPED, value: 0, ..Default::default() };
         track_held(&mut held, &drop);
         assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_grab_can_start_with_only_a_forwarded_key_down() {
+        let mut forwarded = HeldInput::default();
+        forwarded.set_key(KEY_LEFTCTRL, true);
+        let held = |keys: &[u16]| keys.iter().copied().collect::<HashSet<u16>>();
+        assert!(free_to_grab(&held(&[]), &HeldInput::default()));
+        assert!(free_to_grab(&held(&[KEY_LEFTCTRL]), &forwarded));
+        assert!(!free_to_grab(&held(&[KEY_LEFTCTRL]), &HeldInput::default()));
+        assert!(!free_to_grab(&held(&[KEY_LEFTCTRL, KEY_G]), &forwarded), "the desktop may have seen that one");
     }
 
     #[test]

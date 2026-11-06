@@ -16,7 +16,7 @@ servers. Nothing here can reach your real desktop or audio, and all of it ends w
 
 The test binary is what `cargo test --release --no-run` prints. The scenes are clean, loss, delay,
 reorder, mixed, dropout, reverse, flood, stay, stayreverse, oneway, oneway-start, outage,
-outagereverse, flapping, panic, release and restart. numpy must be importable. Set AUDIO_TMP
+outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy and bursty. numpy must be importable. Set AUDIO_TMP
 to keep the sound servers' files somewhere other than /tmp.
 """
 import json
@@ -281,10 +281,10 @@ class Sound:
         return float(loud.mean()) if len(loud) else 0.0, longest * 50
 
 
-def forwarding_pair(seconds, main=0, sender=0):
+def forwarding_pair(seconds, main=0, sender=0, ports=(PORT_A, PORT_B)):
     """Two devices, with `sender`'s keyboard driving the other, and control settled there."""
-    a = Device(0, PORT_A, PORT_B, seconds, main)
-    b = Device(1, PORT_B, PORT_A, seconds, main)
+    a = Device(0, ports[0], ports[1], seconds, main)
+    b = Device(1, ports[1], ports[0], seconds, main)
     devices = (a, b)
     source, target = devices[sender], devices[1 - sender]
     source.wait_for(lambda s: s["online"], 5)
@@ -600,6 +600,101 @@ def replace_loss(base):
     return [*base[:at], "loss", "100%", *base[at + 2:]]
 
 
+class Bounces:
+    """Counts each time control leaves the device it should be on, however briefly."""
+
+    def __init__(self, device, wanted):
+        self.count, self.was_right, self.wanted = 0, True, wanted
+        device.watchers.append(self.watch)
+
+    def watch(self, status):
+        right = status["active"] == self.wanted and status["blocking"] == [True, True] and status["online"]
+        self.count += self.was_right and not right
+        self.was_right = right
+
+
+def stays_put(name, args, seconds):
+    """Both ways of being driven at once: from main, which goes by answers, and to it, by views."""
+    print(f"\n=== {name}: netem {' '.join(args)} for {seconds} seconds", flush=True)
+    clean()
+    from_main = forwarding_pair(seconds + 12)
+    to_main = forwarding_pair(seconds + 12, main=0, sender=1, ports=(PORT_A + 2, PORT_B + 2))
+    counters = [Bounces(from_main[0], 1), Bounces(to_main[0], 0)]
+    netem(*args)
+    person = Person(from_main[0], from_main[1])
+    typist = threading.Thread(target=person.typing, args=(random.Random(name),), daemon=True)
+    typist.start()
+    time.sleep(seconds)
+    quality = from_main[0].last.get("link", {})
+    person.running = False
+    typist.join()
+    person.stop()
+    clean()
+    print(f"    link as measured: {quality}", flush=True)
+    print(f"    control bounced {counters[0].count} times driving from main and {counters[1].count} times driving it", flush=True)
+    check("control doesn't bounce from main", counters[0].count == 0, str(counters[0].count))
+    check("control doesn't bounce to main", counters[1].count == 0, str(counters[1].count))
+    time.sleep(1)
+    judge_typing(person, from_main[1], name)
+    numbers.append((f"{name} bounces", counters[0].count, counters[1].count, f"over {seconds} s"))
+    for device in (*from_main[:2], *to_main[:2]):
+        device.stop()
+
+
+def tbf(rate):
+    subprocess.run([TC, "qdisc", "change", "dev", "lo", "root", "tbf", "rate", rate, "burst", "1600", "limit", "20000000"], check=True)
+
+
+def queued_stall():
+    print("\n=== queued: nothing is lost in the stall, it all arrives at once 2 seconds late", flush=True)
+    clean()
+    subprocess.run([TC, "qdisc", "add", "dev", "lo", "root", "tbf", "rate", "1gbit", "burst", "1600", "limit", "20000000"], check=True)
+    source, target, source_id, target_id = forwarding_pair(20)
+    person = Person(source, target)
+    rng = random.Random("queued")
+    before = target.last.get("presses", 0)
+    for key in Person.KEYS[:6]:
+        person.tap(key, rng)
+        time.sleep(0.05)
+    time.sleep(0.6)
+    clean_presses = len(person.sent) // 2
+    check("typing is getting through first", target.last.get("presses", 0) - before == clean_presses, str(target.last.get("presses")))
+
+    mark = len(target.injected)
+    stale_before = target.last.get("waits", {}).get("stale", 0)
+    tbf("8bit")
+    went = time.time()
+    # Typed into the stall: some of these will be well over a second old when they come out.
+    typed = []
+    while time.time() - went < 1.2:
+        key = Person.KEYS[len(typed) % len(Person.KEYS)]
+        person.press(key)
+        time.sleep(0.02)
+        person.release(key)
+        typed.append((time.time() - went, key))
+        time.sleep(0.08)
+    time.sleep(max(2.0 - (time.time() - went), 0))
+    tbf("1gbit")
+    freed = time.time()
+    time.sleep(2.5)
+    late = [e for e in target.injected[mark:] if e["pressed"]]
+    seen = [e["input"] for e in late]
+    stale = target.last.get("waits", {}).get("stale", 0) - stale_before
+    # The filter lets a little through as the stall starts. All the rest is over a second old by the
+    # time it's out, as it went in during the first 1.2 seconds of two.
+    too_old = sum(at < 0.9 for at, _ in typed) - 2
+    print(f"    {len(typed)} taps typed into the stall, {len(seen)} presses injected, {stale} dropped as stale", flush=True)
+    check("nothing from before the stall is typed again", all(key in [k for _, k in typed] for key in seen), str(seen))
+    check("nothing is typed twice", len(seen) == len(set(seen)), str(seen))
+    check("a press over a second old is dropped", stale >= too_old and len(seen) + stale == len(typed), f"{stale} stale, {len(seen)} of {len(typed)}")
+    gone = target.wait_for(lambda s: not s["held"], 2)
+    check("every release got out", gone is not None, str(target.last.get("held")))
+    numbers.append(("queued", f"{len(typed)} typed", f"{len(seen)} injected", f"stale {stale}", f"out at {freed - went:.1f} s"))
+    source.stop()
+    target.stop()
+    clean()
+
+
 def release_during():
     print("\n=== release: Release all input during a dropout", flush=True)
     clean()
@@ -641,10 +736,32 @@ def restart():
     target.stop()
 
 
+def restart_receiver():
+    print("\n=== restart-receiver: a click restarts the device it lands on", flush=True)
+    clean()
+    source, target, _, _ = forwarding_pair(16)
+    source.do(button=1, pressed=True)
+    source.do(button=1, pressed=False)
+    target.wait_for(lambda s: s["moves"] >= 0 and not s["buttons"], 1)
+    check("the click landed", any(e["input"] == BUTTONS + 1 and e["pressed"] for e in target.injected), str(target.injected[-3:]))
+    target.p.kill()
+    target.p.wait()
+    fresh = Device(1, PORT_B, PORT_A, 12, 0)
+    fresh.wait_for(lambda s: s["online"], 3)
+    time.sleep(1.5)
+    check("the new run isn't clicked again by what's repeated", not fresh.injected, str(fresh.injected))
+    source.do(key=31, pressed=True)
+    got = fresh.wait_for(lambda s: 31 in s["held"], 2)
+    source.do(key=31, pressed=False)
+    check("and new presses reach it", got is not None, str(fresh.last.get("held")))
+    fresh.stop()
+    source.stop()
+
+
 def main():
     audio.BIN = sys.argv[1]
     which = sys.argv[2:] or ["clean", "loss", "delay", "reorder", "mixed", "dropout", "reverse", "flood", "stay", "stayreverse", "oneway",
-                             "oneway-start", "outage", "outagereverse", "flapping", "panic", "release", "restart"]
+                             "oneway-start", "outage", "outagereverse", "flapping", "panic", "release", "restart", "restart-receiver", "queued", "lossy", "bursty"]
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     audio.BASE = tempfile.mkdtemp(prefix="mknet.", dir=os.environ.get("AUDIO_TMP", "/tmp"))
     try:
@@ -681,6 +798,15 @@ def main():
             long_outage("outagereverse", main=0, sender=1)
         if "flapping" in which:
             flapping()
+        if "restart-receiver" in which:
+            restart_receiver()
+        if "queued" in which:
+            queued_stall()
+        if "lossy" in which:
+            stays_put("lossy", ["loss", "30%"], int(os.environ.get("BOUNCE_SECONDS", 120)))
+        if "bursty" in which:
+            # A good state with 2% chance of a burst, of 4 packets or so, all lost.
+            stays_put("bursty", ["loss", "gemodel", "2%", "25%", "100%", "0%"], int(os.environ.get("BOUNCE_SECONDS", 120)))
         if "panic" in which:
             panic_on_receiver()
         if "release" in which:

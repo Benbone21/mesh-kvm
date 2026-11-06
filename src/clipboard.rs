@@ -52,6 +52,8 @@ static BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The note, and whether it says something went wrong.
 static NOTE: Mutex<(String, bool)> = Mutex::new((String::new(), false));
 static OUTBOX: Mutex<Outbox> = Mutex::new(Outbox { waiting: None });
+/// The other device has given an answer before, so it isn't a 0.5 device.
+static PEER_ANSWERS: AtomicBool = AtomicBool::new(false);
 
 /// What the clipboard last did, for the app to show, and whether that was a failure.
 pub fn clipboard_note() -> (String, bool) {
@@ -737,9 +739,9 @@ fn answer_wait(bytes: u64) -> Duration {
     ANSWER_WAIT + Duration::from_secs(bytes.min(MAX_IN_FLIGHT) / SLOWEST_BYTES_PER_SECOND)
 }
 
-fn read_answer(stream: &mut TcpStream) -> Sent {
+fn read_answer(stream: &mut TcpStream, answers: &AtomicBool) -> Sent {
     let mut answer = [0u8; 1];
-    match stream.read(&mut answer) {
+    let sent = match stream.read(&mut answer) {
         Ok(0) => Sent::NoAnswer,
         Ok(_) => match answer[0] {
             ANSWER_TAKEN => Sent::Taken,
@@ -751,11 +753,24 @@ fn read_answer(stream: &mut TcpStream) -> Sent {
         // It was there, and hung up on what it was sent: a 0.5 device closes with the text unread.
         Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe) => Sent::NoAnswer,
         Err(e) => Sent::Unreachable(e.to_string()),
+    };
+    match sent {
+        // One that has answered before can read all this, so it was restarting.
+        Sent::NoAnswer if answers.load(Ordering::SeqCst) => Sent::Unreachable("It closed part way through".to_string()),
+        Sent::NoAnswer | Sent::Unreachable(_) => sent,
+        answered => {
+            answers.store(true, Ordering::SeqCst);
+            answered
+        }
     }
 }
 
 /// A write that succeeded only means the text left this device, so the answer is what counts.
 fn send_text(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent {
+    send_text_to(target_addr, text, copied_at, &PEER_ANSWERS)
+}
+
+fn send_text_to(target_addr: SocketAddr, text: &str, copied_at: Instant, answers: &AtomicBool) -> Sent {
     if text.len() > MAX_FRAME_BYTES {
         return Sent::TooLarge;
     }
@@ -768,9 +783,9 @@ fn send_text(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent {
         .and_then(|()| write_frame(&mut stream, &ClipboardPayload::Text(text.to_string())));
     let _ = stream.set_read_timeout(Some(answer_wait(text.len() as u64)));
     match written {
-        Ok(()) => read_answer(&mut stream),
+        Ok(()) => read_answer(&mut stream, answers),
         // It may have closed on seeing a stamp it can't read, and an answer tells the two apart.
-        Err(e) => match read_answer(&mut stream) {
+        Err(e) => match read_answer(&mut stream, answers) {
             Sent::Unreachable(_) => Sent::Unreachable(e),
             sent => sent,
         },
@@ -799,7 +814,7 @@ fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, t
             write_frame(&mut stream, &stamp).map_err(|e| unsent(what, &e))?;
             write_frame(&mut stream, &payload).map_err(|e| unsent(what, &e))?;
             let _ = stream.set_read_timeout(Some(answer_wait(size)));
-            answer_note(read_answer(&mut stream), what, "Sent an image")
+            answer_note(read_answer(&mut stream, &PEER_ANSWERS), what, "Sent an image")
         }
         Snapshot::Files(paths) => {
             let sources = collect_entries(&paths).map_err(|e| unsent("the files", &e))?;
@@ -813,7 +828,7 @@ fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, t
                 .map_err(|e| unsent(&count, &e))?;
             let size = sources.iter().map(|(_, entry)| entry.size).sum();
             let _ = stream.set_read_timeout(Some(answer_wait(size)));
-            answer_note(read_answer(&mut stream), &count, &format!("Sent {count}"))
+            answer_note(read_answer(&mut stream, &PEER_ANSWERS), &count, &format!("Sent {count}"))
         }
     }
 }
@@ -1005,8 +1020,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap();
         let other = close_like_0_5(listener);
-        assert_eq!(send_text(target, "hello", Instant::now()), Sent::NoAnswer);
+        assert_eq!(send_text_to(target, "hello", Instant::now(), &AtomicBool::new(false)), Sent::NoAnswer);
         other.join().unwrap();
+    }
+
+    #[test]
+    fn a_device_that_has_answered_before_is_only_restarting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let answers = AtomicBool::new(false);
+        let other = take_one(listener.try_clone().unwrap(), Some(ANSWER_TAKEN));
+        assert_eq!(send_text_to(target, "hello", Instant::now(), &answers), Sent::Taken);
+        other.join().unwrap();
+
+        let other = close_like_0_5(listener);
+        let sent = send_text_to(target, "hello", Instant::now(), &answers);
+        other.join().unwrap();
+        assert!(matches!(sent, Sent::Unreachable(_)), "{sent:?}");
+        let outbox = Mutex::new(Outbox { waiting: None });
+        settle_text(sent, 9, "hello".into(), Instant::now(), &outbox);
+        assert!(matches!(outbox.lock().unwrap().due(9, true, Instant::now()), Due::Send { .. }), "so it's tried again");
     }
 
     /// Run by hand against the published 0.5 program, listening on `MK_CLIP_TARGET`.
@@ -1014,7 +1047,7 @@ mod tests {
     #[ignore = "needs a running 0.5 device"]
     fn a_real_0_5_device_is_told_apart() {
         let target = std::env::var("MK_CLIP_TARGET").unwrap().parse().unwrap();
-        let sent = send_text(target, "hello", Instant::now());
+        let sent = send_text_to(target, "hello", Instant::now(), &AtomicBool::new(false));
         println!("SENT {sent:?}");
         assert_eq!(sent, Sent::NoAnswer);
     }

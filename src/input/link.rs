@@ -2,7 +2,7 @@
 //! the link is doing, and what to put in its own heartbeat. Pure, so that both backends share it.
 //! Time comes in as `now_ms`, on the same clock the router gets.
 
-use crate::protocol::{HeldInput, LinkState, Packet, Payload, PressEvent, FIRST_BUTTON, LINK_PROTOCOL};
+use crate::protocol::{HeldInput, LinkState, Packet, Payload, PressEvent, LINK_PROTOCOL};
 use crate::router::{Event, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -28,10 +28,20 @@ const ANSWER_FOR_MS: u64 = 2500;
 const HISTORY: usize = 8;
 /// Presses older than this aren't repeated. They would land too late to be what was meant.
 const HISTORY_MS: u64 = 1000;
+/// How many times each `LinkState` goes. Answers depend on one getting through each way, and with
+/// one copy at 30% loss that fails for 2.5 seconds in a row about once a minute.
+pub const REPORT_COPIES: usize = 2;
 /// The longest a press waits for one before it. Long enough for a copy that's a little behind,
 /// short enough not to be felt, and a clean link never waits at all.
 const HOLD_MS: u64 = 30;
 const MAX_WAITING: usize = 64;
+/// A press this far behind the sender's clock happened before a stall, and the person has gone on
+/// to other things. A release always gets through, as it can only let something go.
+const STALE_PRESS_MS: u64 = 1000;
+/// Clocks drift, so the fastest delivery seen is forgotten at 1 ms per second.
+const OFFSET_AGES_PER_MS: u64 = 1000;
+/// Keys and buttons share these numbers in `PacketOrder`, buttons after the keys.
+const FIRST_BUTTON: u16 = 1024;
 
 /// True when `seq` came after `other`. Half the number space each way, so that a wrap counts as
 /// going forward.
@@ -207,7 +217,7 @@ impl PressLog {
             return None;
         }
         self.newest = self.newest.wrapping_add(1);
-        self.recent.push_back((event, now_ms));
+        self.recent.push_back((PressEvent { at_ms: now_ms, ..event }, now_ms));
         if self.recent.len() > HISTORY {
             self.recent.pop_front();
         }
@@ -224,7 +234,7 @@ impl PressLog {
             self.recent.pop_front();
         }
         let events: Vec<PressEvent> = self.recent.iter().map(|(event, _)| *event).collect();
-        (!events.is_empty()).then_some(Payload::Presses { newest: self.newest, events })
+        (!events.is_empty()).then_some(Payload::Presses { newest: self.newest, sent_ms: now_ms, events })
     }
 
     /// Typing from before a dropout must not turn up after it.
@@ -236,11 +246,15 @@ impl PressLog {
 /// Puts numbered presses back in order, without repeats. Nothing waits unless there's a gap.
 #[derive(Default)]
 struct PressQueue {
-    /// The number due next. `None` until one is heard.
+    /// The number due next. `None` until a report says where the numbers have got to. Starting
+    /// from what a packet happens to carry could repeat it: a click on Restart in the app reaches
+    /// the restarted service again with the next heartbeat.
     next: Option<u32>,
     /// Each with its number, and when it came.
     waiting: Vec<(u32, PressEvent, u64)>,
     gap_since: Option<u64>,
+    /// How far the sender's clock is behind this one on the fastest delivery seen, and when.
+    offset: Option<(i64, u64)>,
     stats: PressStats,
 }
 
@@ -253,13 +267,15 @@ pub struct PressStats {
     pub total_ms: u64,
     /// Gaps given up on after the cap.
     pub skipped: u64,
+    /// Presses dropped for being too old.
+    pub stale: u64,
 }
 
 impl PressQueue {
-    fn take(&mut self, newest: u32, events: &[PressEvent], now_ms: u64) -> Vec<PressEvent> {
-        // The first ones heard start where the packet does: a packet carries nothing old.
+    fn take(&mut self, newest: u32, sent_ms: u64, events: &[PressEvent], now_ms: u64) -> Vec<PressEvent> {
+        self.note_clock(sent_ms, now_ms);
+        let Some(next) = self.next else { return Vec::new() };
         let first = newest.wrapping_sub((events.len() as u32).saturating_sub(1));
-        let next = *self.next.get_or_insert(first);
         for (at, event) in events.iter().enumerate() {
             let order = first.wrapping_add(at as u32);
             let due = (order.wrapping_sub(next) as i32) >= 0;
@@ -275,14 +291,34 @@ impl PressQueue {
         ready
     }
 
+    /// Takes in a report of how far the presses have got, on a device with nothing to go on.
+    fn start_at(&mut self, press_order: u32) {
+        self.next.get_or_insert(press_order.wrapping_add(1));
+    }
+
+    fn note_clock(&mut self, sent_ms: u64, now_ms: u64) {
+        let seen = now_ms as i64 - sent_ms as i64;
+        let aged = self.offset.map(|(offset, at)| offset + (now_ms.saturating_sub(at) / OFFSET_AGES_PER_MS) as i64);
+        self.offset = Some((aged.map_or(seen, |aged| aged.min(seen)), now_ms));
+    }
+
+    fn too_old(&self, event: PressEvent, now_ms: u64) -> bool {
+        let Some((offset, _)) = self.offset else { return false };
+        event.pressed && now_ms as i64 - event.at_ms as i64 - offset >= STALE_PRESS_MS as i64
+    }
+
     /// Takes off everything that's next in line.
     fn drain(&mut self, now_ms: u64) -> Vec<PressEvent> {
         let mut ready = Vec::new();
         let Some(mut next) = self.next else { return ready };
         while let Some(at) = self.waiting.iter().position(|(order, ..)| *order == next) {
             let (_, event, came) = self.waiting.swap_remove(at);
-            ready.push(event);
             next = next.wrapping_add(1);
+            if self.too_old(event, now_ms) {
+                self.stats.stale += 1;
+                continue;
+            }
+            ready.push(event);
             let waited = now_ms.saturating_sub(came);
             if waited > 0 {
                 self.stats.held += 1;
@@ -316,6 +352,13 @@ impl PressQueue {
         self.next.map(|next| next.wrapping_sub(1))
     }
 
+    /// The link dropped. What was waiting has had its chance, and the numbers carry on.
+    fn pause(&mut self) {
+        self.waiting.clear();
+        self.gap_since = None;
+    }
+
+    /// The peer restarted, so its numbers start again.
     fn forget(&mut self) {
         *self = PressQueue { stats: self.stats, ..PressQueue::default() };
     }
@@ -323,9 +366,10 @@ impl PressQueue {
 
 /// The router event for a press from the peer.
 pub fn press_event(event: PressEvent) -> Event {
-    match event.input.checked_sub(FIRST_BUTTON) {
-        Some(button) => Event::PeerButton { button: button as u8, pressed: event.pressed },
-        None => Event::PeerKey { scancode: event.input, pressed: event.pressed },
+    if event.button {
+        Event::PeerButton { button: event.input as u8, pressed: event.pressed }
+    } else {
+        Event::PeerKey { scancode: event.input, pressed: event.pressed }
     }
 }
 
@@ -389,6 +433,7 @@ impl PeerLink {
     pub fn arrived(&mut self, packet: &Packet, now_ms: u64) -> bool {
         if self.order.note(packet.seq, now_ms) {
             self.forget();
+            self.presses.forget();
         }
         self.first_packet.get_or_insert(now_ms);
         self.loss.count(packet.seq, now_ms);
@@ -396,8 +441,8 @@ impl PeerLink {
     }
 
     /// Takes in a `Presses` packet, and returns what's ready to act on, in order.
-    pub fn take_presses(&mut self, newest: u32, events: &[PressEvent], now_ms: u64) -> Vec<PressEvent> {
-        self.presses.take(newest, events, now_ms)
+    pub fn take_presses(&mut self, newest: u32, sent_ms: u64, events: &[PressEvent], now_ms: u64) -> Vec<PressEvent> {
+        self.presses.take(newest, sent_ms, events, now_ms)
     }
 
     /// Presses that have waited long enough for one that isn't coming.
@@ -421,11 +466,18 @@ impl PeerLink {
         if state.protocol != LINK_PROTOCOL {
             return Vec::new();
         }
-        self.heard = Some((state.beat, now_ms));
+        self.presses.note_clock(state.sent_ms, now_ms);
+        self.presses.start_at(state.press_order);
         self.loss_out = Some(f32::from(state.loss_tenths) / 10.0);
-        let mut events = Vec::new();
+        // A report goes twice, and a copy must not pass for the second report in a row.
+        let copy = self.heard.is_some_and(|(beat, _)| beat == state.beat);
+        if !copy {
+            self.heard = Some((state.beat, now_ms));
+        }
+        let mut events = vec![Event::LinkLoss(self.worst_loss())];
         // Behind what's been acted on, it knows less than this device does.
-        if self.presses.applied().is_none_or(|applied| (state.press_order.wrapping_sub(applied) as i32) >= 0) {
+        let current = self.presses.applied().is_none_or(|applied| (state.press_order.wrapping_sub(applied) as i32) >= 0);
+        if current && !copy {
             events.push(Event::PeerHeld(state.held));
         }
         if let Some((_, sent_ms)) = self.sent.iter().find(|(beat, _)| *beat == state.echo).copied() {
@@ -434,14 +486,21 @@ impl PeerLink {
                 self.answer = Some((state.echo, now_ms));
                 let took = now_ms.saturating_sub(sent_ms).saturating_sub(u64::from(state.echo_age_ms)) as f32;
                 self.round_trip_ms = Some(self.round_trip_ms.map_or(took, |was| was + (took - was) * SMOOTHING));
+                if state.main {
+                    events.push(Event::MainAnswered);
+                }
             }
             events.push(Event::PeerHeard { sent_ms, panicked: state.panicked });
         }
         events
     }
 
-    /// This device's next heartbeat.
-    pub fn next_state(&mut self, held: HeldInput, panicked: bool, press_order: u32, now_ms: u64) -> LinkState {
+    fn worst_loss(&self) -> u8 {
+        self.loss.percent.unwrap_or(0.0).max(self.loss_out.unwrap_or(0.0)).clamp(0.0, 100.0) as u8
+    }
+
+    /// This device's next heartbeat, to be sent `REPORT_COPIES` times.
+    pub fn next_state(&mut self, held: HeldInput, panicked: bool, main: bool, press_order: u32, now_ms: u64) -> LinkState {
         self.beat = self.beat.wrapping_add(1).max(1);
         self.sent.push_back((self.beat, now_ms));
         if self.sent.len() > BEATS_KEPT {
@@ -456,6 +515,8 @@ impl PeerLink {
             loss_tenths: (self.loss.percent.unwrap_or(0.0) * 10.0).round().clamp(0.0, 1000.0) as u16,
             panicked,
             press_order,
+            main,
+            sent_ms: now_ms,
             held,
         }
     }
@@ -465,6 +526,7 @@ impl PeerLink {
     pub fn set_online(&mut self, online: bool) {
         if self.online && !online {
             self.forget();
+            self.presses.pause();
         }
         self.online = online;
     }
@@ -474,7 +536,6 @@ impl PeerLink {
         self.heard = None;
         self.round_trip_ms = None;
         self.answer = None;
-        self.presses.forget();
         self.loss_out = None;
         self.protocol = None;
         self.first_packet = None;
@@ -533,11 +594,16 @@ mod tests {
         Packet::new(seq, NodeId::Debian, Payload::Heartbeat)
     }
     fn state(link: &mut PeerLink, seq: u64, held: HeldInput, now_ms: u64) -> Packet {
-        Packet::new(seq, NodeId::Debian, Payload::LinkState(link.next_state(held, false, 0, now_ms)))
+        Packet::new(seq, NodeId::Debian, Payload::LinkState(link.next_state(held, false, false, 0, now_ms)))
     }
 
     fn tap(input: u16, pressed: bool) -> PressEvent {
-        PressEvent { input, pressed }
+        PressEvent::key(input, pressed)
+    }
+
+    /// What a press looks like once it's been sent at `at_ms`.
+    fn at(event: PressEvent, at_ms: u64) -> PressEvent {
+        PressEvent { at_ms, ..event }
     }
 
     /// A log that has heard the other device is on this version.
@@ -549,7 +615,7 @@ mod tests {
 
     fn parts(payload: Option<Payload>) -> (u32, Vec<PressEvent>) {
         match payload {
-            Some(Payload::Presses { newest, events }) => (newest, events),
+            Some(Payload::Presses { newest, events, .. }) => (newest, events),
             other => panic!("expected presses: {other:?}"),
         }
     }
@@ -562,8 +628,8 @@ mod tests {
     #[test]
     fn each_press_carries_the_ones_just_before_it() {
         let mut log = reliable_log();
-        assert_eq!(parts(log.record(tap(29, true), 0)), (1, vec![tap(29, true)]));
-        assert_eq!(parts(log.record(tap(46, true), 5)), (2, vec![tap(29, true), tap(46, true)]));
+        assert_eq!(parts(log.record(tap(29, true), 0)), (1, vec![at(tap(29, true), 0)]));
+        assert_eq!(parts(log.record(tap(46, true), 5)), (2, vec![at(tap(29, true), 0), at(tap(46, true), 5)]));
         assert_eq!(log.newest(), 2);
     }
 
@@ -577,7 +643,7 @@ mod tests {
         assert_eq!((newest, events.len()), (21, HISTORY));
         log.record(tap(32, true), 20 + HISTORY_MS);
         let (_, events) = parts(log.record(tap(33, true), 21 + HISTORY_MS));
-        assert_eq!(events, vec![tap(32, true), tap(33, true)], "typing from a stall ago is left out");
+        assert_eq!(events.len(), 2, "typing from a stall ago is left out");
     }
 
     #[test]
@@ -586,7 +652,7 @@ mod tests {
         assert!(log.tail(0).is_none());
         log.record(tap(30, true), 100);
         log.record(tap(30, false), 150);
-        assert_eq!(parts(log.tail(400)), (2, vec![tap(30, true), tap(30, false)]));
+        assert_eq!(parts(log.tail(400)), (2, vec![at(tap(30, true), 100), at(tap(30, false), 150)]));
         assert!(log.tail(150 + HISTORY_MS).is_none());
     }
 
@@ -596,21 +662,22 @@ mod tests {
         log.record(tap(30, true), 0);
         log.forget();
         assert!(log.tail(1).is_none());
-        assert_eq!(parts(log.record(tap(31, true), 2)), (2, vec![tap(31, true)]));
+        assert_eq!(parts(log.record(tap(31, true), 2)), (2, vec![at(tap(31, true), 2)]));
     }
 
     /// A link that has seen press 1, so that gaps after it count.
     fn pressed_link() -> PeerLink {
         let mut link = PeerLink::default();
-        assert_eq!(link.take_presses(1, &[tap(1, true)], 0), vec![tap(1, true)]);
+        link.presses.start_at(0);
+        assert_eq!(link.take_presses(1, 0, &[tap(1, true)], 0), vec![tap(1, true)]);
         link
     }
 
     #[test]
     fn presses_on_a_clean_link_go_straight_through() {
         let mut link = pressed_link();
-        assert_eq!(link.take_presses(2, &[tap(1, true), tap(2, true)], 0), vec![tap(2, true)]);
-        assert_eq!(link.take_presses(3, &[tap(1, true), tap(2, true), tap(3, true)], 0), vec![tap(3, true)]);
+        assert_eq!(link.take_presses(2, 0, &[tap(1, true), tap(2, true)], 0), vec![tap(2, true)]);
+        assert_eq!(link.take_presses(3, 0, &[tap(1, true), tap(2, true), tap(3, true)], 0), vec![tap(3, true)]);
         assert_eq!(link.due_presses(1000), vec![]);
         assert_eq!(link.press_stats().held, 0);
     }
@@ -618,25 +685,25 @@ mod tests {
     #[test]
     fn copies_count_once() {
         let mut link = pressed_link();
-        assert_eq!(link.take_presses(2, &[tap(2, true)], 0).len(), 1);
-        assert!(link.take_presses(2, &[tap(2, true)], 0).is_empty());
-        assert!(link.take_presses(1, &[tap(1, true)], 0).is_empty(), "a straggler");
+        assert_eq!(link.take_presses(2, 0, &[tap(2, true)], 0).len(), 1);
+        assert!(link.take_presses(2, 0, &[tap(2, true)], 0).is_empty());
+        assert!(link.take_presses(1, 0, &[tap(1, true)], 0).is_empty(), "a straggler");
     }
 
     #[test]
     fn a_packet_after_a_loss_brings_what_was_lost_in_order() {
         let mut link = pressed_link();
         // Ctrl's packets never came, and C's carries it.
-        let got = link.take_presses(3, &[tap(29, true), tap(46, true)], 0);
+        let got = link.take_presses(3, 0, &[tap(29, true), tap(46, true)], 0);
         assert_eq!(got, vec![tap(29, true), tap(46, true)]);
     }
 
     #[test]
     fn a_gap_holds_later_presses_until_the_missing_one_comes() {
         let mut link = pressed_link();
-        assert!(link.take_presses(3, &[tap(46, true)], 0).is_empty());
+        assert!(link.take_presses(3, 0, &[tap(46, true)], 0).is_empty());
         assert_eq!(link.due_presses(HOLD_MS - 1), vec![]);
-        let got = link.take_presses(2, &[tap(29, true)], 10);
+        let got = link.take_presses(2, 0, &[tap(29, true)], 10);
         assert_eq!(got, vec![tap(29, true), tap(46, true)]);
         assert_eq!(link.press_stats().held, 1);
     }
@@ -644,48 +711,150 @@ mod tests {
     #[test]
     fn a_gap_that_stays_gives_way_after_the_cap() {
         let mut link = pressed_link();
-        assert!(link.take_presses(3, &[tap(46, true)], 100).is_empty());
-        assert!(link.take_presses(4, &[tap(46, false)], 105).len() == 0);
+        assert!(link.take_presses(3, 0, &[tap(46, true)], 100).is_empty());
+        assert!(link.take_presses(4, 0, &[tap(46, false)], 105).len() == 0);
         assert_eq!(link.due_presses(100 + HOLD_MS), vec![tap(46, true), tap(46, false)]);
-        assert!(link.take_presses(2, &[tap(29, true)], 200).is_empty(), "too late now");
-        assert_eq!(link.take_presses(5, &[tap(30, true)], 201), vec![tap(30, true)]);
+        assert!(link.take_presses(2, 0, &[tap(29, true)], 200).is_empty(), "too late now");
+        assert_eq!(link.take_presses(5, 0, &[tap(30, true)], 201), vec![tap(30, true)]);
     }
 
     #[test]
-    fn the_first_presses_heard_are_all_kept() {
-        // The very first press can be overtaken by the second, which carries it.
-        let mut link = PeerLink::default();
-        let got = link.take_presses(50, &[tap(1, true), tap(1, false), tap(2, true)], 0);
-        assert_eq!(got, vec![tap(1, true), tap(1, false), tap(2, true)]);
+    fn nothing_is_taken_until_a_report_says_where_the_numbers_are() {
+        // This device has just started, and a click from before that is still being repeated.
+        let (mut link, mut sender) = (PeerLink::default(), PeerLink::default());
+        assert!(link.take_presses(7, 0, &[tap(1, true), tap(1, false)], 0).is_empty());
+        link.heard_state(&sender.next_state(HeldInput::default(), false, false, 7, 0), 0);
+        assert!(link.take_presses(7, 0, &[tap(1, true), tap(1, false)], 0).is_empty(), "a heartbeat's repeat");
+        assert_eq!(link.take_presses(8, 0, &[tap(2, true)], 0), vec![tap(2, true)]);
     }
 
     #[test]
     fn press_numbers_wrap() {
         let mut link = PeerLink::default();
-        link.take_presses(u32::MAX, &[tap(1, true)], 0);
-        assert_eq!(link.take_presses(0, &[tap(2, true)], 0), vec![tap(2, true)]);
-        assert_eq!(link.take_presses(1, &[tap(3, true)], 0), vec![tap(3, true)]);
-        assert!(link.take_presses(u32::MAX, &[tap(1, true)], 0).is_empty());
+        link.presses.start_at(u32::MAX - 1);
+        link.take_presses(u32::MAX, 0, &[tap(1, true)], 0);
+        assert_eq!(link.take_presses(0, 0, &[tap(2, true)], 0), vec![tap(2, true)]);
+        assert_eq!(link.take_presses(1, 0, &[tap(3, true)], 0), vec![tap(3, true)]);
+        assert!(link.take_presses(u32::MAX, 0, &[tap(1, true)], 0).is_empty());
     }
 
     #[test]
-    fn a_dropout_or_restart_starts_the_numbers_over() {
+    fn numbers_carry_on_through_a_dropout_so_nothing_is_typed_twice() {
         let mut link = pressed_link();
         link.set_online(true);
+        assert_eq!(link.take_presses(2, 0, &[tap(1, true), tap(2, true)], 0), vec![tap(2, true)]);
         link.set_online(false);
         link.set_online(true);
-        assert_eq!(link.take_presses(9, &[tap(9, true)], 0), vec![tap(9, true)]);
-        // A restart shows in the packet numbers.
+        // The same packet again, come out of a queue.
+        assert!(link.take_presses(2, 0, &[tap(1, true), tap(2, true)], 0).is_empty());
+        assert_eq!(link.take_presses(3, 0, &[tap(1, true), tap(2, true), tap(3, true)], 0), vec![tap(3, true)]);
+    }
+
+    #[test]
+    fn a_gap_left_by_a_dropout_is_forgotten_with_it() {
+        let mut link = pressed_link();
+        link.set_online(true);
+        assert!(link.take_presses(4, 0, &[tap(4, true)], 0).is_empty());
+        link.set_online(false);
+        assert_eq!(link.due_presses(1000), vec![]);
+    }
+
+    #[test]
+    fn a_restart_starts_the_numbers_over_once_a_report_comes() {
+        let (mut link, mut sender) = (pressed_link(), PeerLink::default());
         link.arrived(&heartbeat(1 << 40), 0);
         link.arrived(&heartbeat(1), 1);
-        assert_eq!(link.take_presses(1, &[tap(5, true)], 2), vec![tap(5, true)]);
+        assert!(link.take_presses(1, 0, &[tap(5, true)], 2).is_empty());
+        link.heard_state(&sender.next_state(HeldInput::default(), false, false, 0, 2), 2);
+        assert_eq!(link.take_presses(1, 0, &[tap(5, true)], 3), vec![tap(5, true)]);
+    }
+
+    /// A link that knows the sender's clock runs `offset` behind this one.
+    fn clocked_link(offset: u64) -> PeerLink {
+        let mut link = pressed_link();
+        link.presses.offset = Some((offset as i64, 1000 + offset));
+        link
+    }
+
+    #[test]
+    fn a_press_from_before_a_stall_is_dropped_and_its_release_is_not() {
+        let mut link = clocked_link(500);
+        let press = at(tap(30, true), 1000);
+        let release = at(tap(30, false), 1000);
+        let now = 1510 + STALE_PRESS_MS;
+        assert_eq!(link.take_presses(3, 1000, &[press, release], now), vec![release]);
+        assert_eq!(link.press_stats().stale, 1);
+    }
+
+    #[test]
+    fn a_press_just_inside_the_limit_gets_through() {
+        let mut link = clocked_link(500);
+        let press = at(tap(30, true), 1000);
+        assert_eq!(link.take_presses(2, 1000, &[press], 1490 + STALE_PRESS_MS), vec![press]);
+    }
+
+    #[test]
+    fn a_steady_delay_is_not_lateness() {
+        let mut link = clocked_link(3000);
+        let press = at(tap(30, true), 5000);
+        assert_eq!(link.take_presses(2, 5000, &[press], 8100), vec![press]);
+    }
+
+    #[test]
+    fn drifting_clocks_do_not_end_up_dropping_everything() {
+        let mut link = clocked_link(0);
+        // The sender loses 200 ms an hour, for a day.
+        let mut order = 1;
+        for hour in 1..=24u64 {
+            let now = 1000 + hour * 3_600_000;
+            let sent = now - hour * 200;
+            link.presses.note_clock(sent, now);
+            order += 1;
+            let press = at(tap(30, hour % 2 == 0), sent);
+            assert_eq!(link.take_presses(order, sent, &[press], now), vec![press]);
+        }
+    }
+
+    #[test]
+    fn a_key_with_a_high_number_can_never_click() {
+        assert!(matches!(press_event(tap(272, true)), Event::PeerKey { scancode: 272, pressed: true }));
+        assert!(matches!(press_event(PressEvent::button(1, true)), Event::PeerButton { button: 1, pressed: true }));
+    }
+
+    #[test]
+    fn a_copy_of_a_report_is_not_a_second_report() {
+        let (mut link, mut sender) = (PeerLink::default(), PeerLink::default());
+        let state = sender.next_state(HeldInput::default(), false, false, 0, 0);
+        assert!(link.heard_state(&state, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
+        assert!(!link.heard_state(&state, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
+    }
+
+    #[test]
+    fn only_a_new_answer_from_main_counts_as_hearing_it() {
+        let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
+        let beat = a.next_state(HeldInput::default(), false, false, 0, 0);
+        b.heard_state(&beat, 5);
+        let answer = b.next_state(HeldInput::default(), false, true, 0, 5);
+        assert!(a.heard_state(&answer, 10).contains(&Event::MainAnswered));
+        let again = b.next_state(HeldInput::default(), false, true, 0, 405);
+        assert!(!a.heard_state(&again, 410).contains(&Event::MainAnswered), "it hasn't heard anything since");
+        let not_main = LinkState { main: false, echo: a.next_state(HeldInput::default(), false, false, 0, 500).beat, beat: 99, ..again };
+        assert!(!a.heard_state(&not_main, 510).contains(&Event::MainAnswered));
+    }
+
+    #[test]
+    fn the_router_hears_how_much_is_being_lost() {
+        let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
+        a.loss.percent = Some(12.5);
+        let state = b.next_state(HeldInput::default(), false, false, 0, 0);
+        assert!(a.heard_state(&state, 0).contains(&Event::LinkLoss(12)));
     }
 
     #[test]
     fn an_endless_gap_cannot_pile_up() {
         let mut link = pressed_link();
         for order in 3..200u32 {
-            link.take_presses(order, &[tap(30, order % 2 == 0)], 0);
+            link.take_presses(order, 0, &[tap(30, order % 2 == 0)], 0);
         }
         assert!(link.presses.waiting.len() <= MAX_WAITING);
     }
@@ -693,13 +862,13 @@ mod tests {
     #[test]
     fn a_report_older_than_the_presses_acted_on_says_nothing_of_what_is_held() {
         let (mut link, mut sender) = (pressed_link(), PeerLink::default());
-        link.take_presses(2, &[tap(2, true)], 0);
-        let old = sender.next_state(HeldInput::default(), false, 1, 0);
+        link.take_presses(2, 0, &[tap(2, true)], 0);
+        let old = sender.next_state(HeldInput::default(), false, false, 1, 0);
         assert!(!link.heard_state(&old, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
-        let current = sender.next_state(HeldInput::default(), false, 2, 0);
+        let current = sender.next_state(HeldInput::default(), false, false, 2, 0);
         assert!(link.heard_state(&current, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
         // One that's ahead means presses went missing, which is what it's for.
-        let ahead = sender.next_state(HeldInput::default(), false, 7, 0);
+        let ahead = sender.next_state(HeldInput::default(), false, false, 7, 0);
         assert!(link.heard_state(&ahead, 0).iter().any(|e| matches!(e, Event::PeerHeld(_))));
     }
 
@@ -722,8 +891,8 @@ mod tests {
             answered(&mut a, &mut b, 0, 5, 5);
         }
         for now_ms in (400..=4000).step_by(400) {
-            a.next_state(HeldInput::default(), false, 0, now_ms);
-            let report = b.next_state(HeldInput::default(), false, 0, now_ms);
+            a.next_state(HeldInput::default(), false, false, 0, now_ms);
+            let report = b.next_state(HeldInput::default(), false, false, 0, now_ms);
             a.heard_state(&report, now_ms);
         }
         (a, b)
@@ -750,7 +919,7 @@ mod tests {
         let mut b = PeerLink::default();
         a.set_online(true);
         a.arrived(&heartbeat(1), 0);
-        a.heard_state(&b.next_state(HeldInput::default(), false, 0, 0), 0);
+        a.heard_state(&b.next_state(HeldInput::default(), false, false, 0, 0), 0);
         assert!(!a.quality(&router(), ANSWER_FOR_MS - 1).one_way);
     }
 
@@ -769,7 +938,7 @@ mod tests {
     fn the_loss_reported_always_fits() {
         let mut a = PeerLink::default();
         a.loss.percent = Some(1e9);
-        assert_eq!(a.next_state(HeldInput::default(), false, 0, 0).loss_tenths, 1000);
+        assert_eq!(a.next_state(HeldInput::default(), false, false, 0, 0).loss_tenths, 1000);
     }
 
     #[test]
@@ -993,9 +1162,9 @@ mod tests {
 
     /// Two ends, with `one_way_ms` each way, swapping heartbeats so that `a` gets an answer.
     fn answered(a: &mut PeerLink, b: &mut PeerLink, sent_ms: u64, one_way_ms: u64, held_ms: u64) -> Vec<Event> {
-        let from_a = a.next_state(HeldInput::default(), false, 0, sent_ms);
+        let from_a = a.next_state(HeldInput::default(), false, false, 0, sent_ms);
         b.heard_state(&from_a, sent_ms + one_way_ms);
-        let from_b = b.next_state(HeldInput::default(), false, 0, sent_ms + one_way_ms + held_ms);
+        let from_b = b.next_state(HeldInput::default(), false, false, 0, sent_ms + one_way_ms + held_ms);
         a.heard_state(&from_b, sent_ms + 2 * one_way_ms + held_ms)
     }
 
@@ -1031,8 +1200,8 @@ mod tests {
         let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
         let mut held = HeldInput::default();
         held.set_key(30, true);
-        let report = b.next_state(held, false, 0, 0);
-        assert_eq!(a.heard_state(&report, 0), vec![Event::PeerHeld(held)]);
+        let report = b.next_state(held, false, false, 0, 0);
+        assert!(a.heard_state(&report, 0).contains(&Event::PeerHeld(held)));
     }
 
     #[test]
@@ -1062,7 +1231,7 @@ mod tests {
     #[test]
     fn a_peer_on_this_version_is_known_from_one_report() {
         let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
-        let report = b.next_state(HeldInput::default(), false, 0, 0);
+        let report = b.next_state(HeldInput::default(), false, false, 0, 0);
         a.heard_state(&report, 0);
         assert_eq!(a.peer_version(60_000), PeerVersion::Same);
     }
@@ -1070,7 +1239,7 @@ mod tests {
     #[test]
     fn another_protocol_is_said_and_not_acted_on() {
         let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
-        let mut report = b.next_state(HeldInput::default(), false, 0, 0);
+        let mut report = b.next_state(HeldInput::default(), false, false, 0, 0);
         report.protocol = LINK_PROTOCOL + 1;
         assert!(a.heard_state(&report, 0).is_empty());
         assert_eq!(a.peer_version(0), PeerVersion::Other);
@@ -1087,7 +1256,7 @@ mod tests {
     #[test]
     fn a_peer_that_restarts_older_is_judged_afresh() {
         let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
-        let report = b.next_state(HeldInput::default(), false, 0, 0);
+        let report = b.next_state(HeldInput::default(), false, false, 0, 0);
         a.arrived(&state(&mut b, 1 << 50, HeldInput::default(), 0), 0);
         a.heard_state(&report, 0);
         assert_eq!(a.peer_version(0), PeerVersion::Same);
