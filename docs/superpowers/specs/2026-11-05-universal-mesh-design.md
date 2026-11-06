@@ -1,7 +1,7 @@
 # mesh-kvm: two-way input, native app, and role toggles
 
 Date: 2026-11-05
-Status: awaiting review
+Status: awaiting review. Updated for equal devices: see [Equal devices](#equal-devices).
 
 ## Goal
 
@@ -23,7 +23,9 @@ In scope: two devices, with data structures and routing written around generic
 device IDs so more can be added later.
 
 Not in scope for this version: a third device, automatic discovery (peer address
-is entered by hand), macOS, and control of the Windows lock screen or UAC prompts.
+is entered by hand), and control of the Windows lock screen or UAC prompts. A Mac
+version is planned but not shipped: the OS-specific parts sit behind `platform`
+traits ready for it, and there is no Mac build.
 
 ## Current problems this fixes
 
@@ -58,8 +60,48 @@ One `mesh-kvm` program per device, run in two modes:
 and returns actions (block input, forward, inject, switch, release held input). It
 performs no I/O, so all focus behaviour can be unit tested on Linux.
 
-`spatial.rs` is split into `config.rs` and `router.rs`. `webui.rs`, `src/ui/`, and
-`mesh-kvm-ui.py` are removed in the final stage.
+`spatial.rs` holds the layout and the API both services serve. It builds on every
+OS. `platform/` holds what the service needs from each OS: monitors, autostart and
+device details. `webui.rs` stays until `api.rs` replaces it in the secure stage.
+
+## Equal devices
+
+Every device is both client and host. No device owns anything the other needs.
+
+- **Start:** `--app` and `--tray` check `/api/local`, and start the service if
+  nothing answers. Linux uses the systemd user unit if there is one, and otherwise
+  a detached process, as Windows does. This runs off the UI thread, and a failure
+  shows in the app. The service takes the API port before anything else, so a
+  second one stops there.
+- **Peer:** `peer_ip`, `device_name` and `switch_edge` are saved settings. `--peer`
+  and `--switch-edge` override them, and a `--peer` that was given is saved, so
+  existing launchers carry over. With no address the service runs unpaired: it
+  serves the API, captures nothing, and waits. The app asks for the address, the
+  service checks it, saves it and restarts itself. Only the app on the same device
+  can do that, and not while `--peer` is in use. Otherwise anyone on the network
+  could pair the device with themselves. Windows login scripts no longer hold an
+  address, so a change in the app survives the next login.
+- **Layout:** `layout.json` is in the config folder and holds a list of devices,
+  each with its origin and its own monitors, which can have negative coordinates.
+  Old files are imported on first run and never deleted.
+- **Sync:** each device keeps a copy. Every edit raises `revision`, and heartbeats
+  carry the revision. A device that hears of a newer one fetches it with
+  `GET /api/state`, so sync adds no way to write to a device. The higher revision
+  wins, and on a tie the higher device id does, so both devices always agree. An
+  edit made with the other device away stays on disk and travels on reconnect.
+  Monitors are reports rather than edits, and never raise the revision. Pointer
+  speed and game locks stay with their device.
+- **API:** `/api/state`, `/api/layout` and `/api/action` are on both services, and
+  the app only ever talks to its own device for these.
+- **Packets:** both devices send `PeerDisplayInfo` with every monitor, `EdgeMap`,
+  `GameLock` and `LayoutRevision` with each heartbeat. An `EdgeMap` tells the
+  receiver which of its own edges touches the sender, in the receiver's own
+  coordinates, and no edge can be crossed until one arrives. `FocusSwitchAt` carries
+  coordinates in the target's desktop: the sender converts, and the receiver keeps
+  the point on a monitor. Both devices update together.
+- **Still two devices:** `NodeId` and the router are unchanged. The tie-break and
+  `attach_side` still name the two devices, but neither gives one of them any say
+  over the other.
 
 ## Input routing
 
@@ -113,21 +155,22 @@ Stored per device:
 - `mouse_sharing`, `keyboard_sharing`
 - `audio_send`, `audio_receive`
 - `clipboard_send`, `clipboard_receive`
-- `pointer_speed`, `autostart`
+- `pointer_speed`, `autostart`, `auto_game_lock`, the manual game lock
+- `peer_ip`, `device_name`, `switch_edge`
 
-Stored once, shared by both devices:
+Kept on both devices, with the newest edit winning:
+
+- Layout: each device's displays in one coordinate space, and `edge_resistance`
+
+Set on both devices at once:
 
 - `main_device`
-- Layout: each device's displays in one coordinate space, and `edge_resistance`
-- `auto_game_lock`
 
 Main device behaviour:
 
-- It holds the authoritative shared settings. Changes made on the other device are
-  sent to it and returned to both.
 - When the link comes up, the main device becomes active.
-- If it is offline, the other device runs from its last copy. Shared changes are
-  disabled in the app until the link returns. Per-device toggles still work.
+- It owns nothing else. If the other device is offline, either one can still edit
+  its copy of the layout, and per-device toggles still work.
 - Changing the main device applies to both devices immediately and needs the link
   to be up.
 
@@ -235,8 +278,8 @@ ahead of encryption at the user's request on 2026-11-05.
 2. **Native app and toggles.** Add `app/`, the tray, and every toggle above, then
    remove the web UI page and `mesh-kvm-ui.py`. The app uses the existing API on
    port 24880 and its peer proxy, so that port and its unauthenticated access stay
-   until stage 3. The main device toggle sets who gets control on link-up. Layout
-   stays stored on Debian until stage 3.
+   until stage 3. The main device toggle sets who gets control on link-up. The layout
+   is kept on both devices, as [Equal devices](#equal-devices) describes.
 3. **Secure link and settings.** Add `link.rs`, `config.rs`, and `api.rs`, with
-   pairing in the app. Move shared settings to the main device, and close port
-   24880 to the network. Both devices update together.
+   pairing in the app, and close port 24880 to the network. Both devices update
+   together.
