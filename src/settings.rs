@@ -502,10 +502,12 @@ pub fn link_status_json(quality: &LinkQuality) -> serde_json::Value {
 pub fn add_toggle_status(status: &mut serde_json::Value, main_conflict: bool) {
     let sharing = sharing();
     status["sharing"] = serde_json::json!({ "mouse": sharing.mouse, "keyboard": sharing.keyboard });
+    let (note, note_failed) = clipboard_note();
     status["clipboard"] = serde_json::json!({
         "send": CLIPBOARD_SEND.load(Ordering::SeqCst),
         "receive": CLIPBOARD_RECEIVE.load(Ordering::SeqCst),
-        "note": clipboard_note(),
+        "note": note,
+        "note_failed": note_failed,
     });
     status["pointer_speed"] = serde_json::json!(pointer_speed());
     status["main_device"] = serde_json::json!(main_device());

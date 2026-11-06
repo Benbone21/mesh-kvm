@@ -10,7 +10,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// This device's clipboard goes to the peer.
 pub static CLIPBOARD_SEND: AtomicBool = AtomicBool::new(true);
@@ -28,24 +28,44 @@ const CHUNK_BYTES: usize = 256 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(350);
 const CLIPBOARD_RETRY: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Long enough for a lost connection request to be sent again on a poor link.
+const CONNECT_WAIT: Duration = Duration::from_secs(2);
+const ANSWER_WAIT: Duration = Duration::from_secs(5);
+const RETRY_EVERY: Duration = Duration::from_secs(1);
+/// Text that couldn't be sent for this long is left behind. It won't be what anyone is waiting for.
+const RETRY_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// What the receiver answers with, in one byte. A device from before these closes without a word.
+const ANSWER_TAKEN: u8 = 1;
+const ANSWER_NEWER_HERE: u8 = 2;
+const ANSWER_NOT_RECEIVING: u8 = 3;
 
 /// The newest copy wins: an older file transfer stops when either count moves on.
 static NEWEST_SEND: AtomicU64 = AtomicU64::new(0);
 static NEWEST_RECEIVE: AtomicU64 = AtomicU64::new(0);
 static BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
-static NOTE: Mutex<String> = Mutex::new(String::new());
+/// The note, and whether it says something went wrong.
+static NOTE: Mutex<(String, bool)> = Mutex::new((String::new(), false));
+static OUTBOX: Mutex<Outbox> = Mutex::new(Outbox { waiting: None });
 
-/// What the clipboard last did, for the app to show.
-pub fn clipboard_note() -> String {
+/// What the clipboard last did, for the app to show, and whether that was a failure.
+pub fn clipboard_note() -> (String, bool) {
     NOTE.lock().map(|n| n.clone()).unwrap_or_default()
 }
 
-fn set_note(note: impl Into<String>) {
-    let note = note.into();
+fn store_note(note: String, failed: bool) {
     println!("[Clipboard] {note}");
     if let Ok(mut current) = NOTE.lock() {
-        *current = note;
+        *current = (note, failed);
     }
+}
+
+fn set_note(note: impl Into<String>) {
+    store_note(note.into(), false);
+}
+
+fn set_failure(note: impl Into<String>) {
+    store_note(note.into(), true);
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +86,9 @@ pub enum ClipboardPayload {
     },
     /// The contents of each file follow the frame, in order.
     Files(Vec<FileEntry>),
+    /// Comes first, and says how long ago the copy that follows was made. An age needs no clocks
+    /// to agree. A device from before this can't read it, and closes the connection.
+    Stamp { age_ms: u64 },
 }
 
 fn hash_bytes(data: &[u8]) -> u64 {
@@ -93,18 +116,92 @@ fn hash_files(paths: &[PathBuf]) -> u64 {
 #[derive(Default)]
 struct Tracker {
     last: Option<u64>,
+    /// When the newest copy known here was made, on either device.
+    newest_copy: Option<Instant>,
 }
 
 impl Tracker {
-    fn is_new(&mut self, fingerprint: u64) -> bool {
+    fn is_new(&mut self, fingerprint: u64, now: Instant) -> bool {
         let new = self.last.is_some_and(|last| last != fingerprint);
         self.last = Some(fingerprint);
+        if new {
+            self.newest_copy = Some(now);
+        }
         new
     }
 
     fn mark(&mut self, fingerprint: u64) {
         self.last = Some(fingerprint);
     }
+
+    /// Takes a copy from the peer unless something newer has been copied since. Both devices can
+    /// have text waiting through a dropout, and each must end up with the later of the two.
+    fn take_from_peer(&mut self, copied_at: Instant) -> bool {
+        let newer = self.newest_copy.is_none_or(|newest| copied_at >= newest);
+        if newer {
+            self.newest_copy = Some(copied_at);
+        }
+        newer
+    }
+}
+
+/// Text that couldn't be sent yet. Only the newest copy ever waits here, and only while it is the
+/// newest: anything copied or received since, of any kind, takes its turn away.
+struct WaitingText {
+    turn: u64,
+    text: String,
+    copied_at: Instant,
+}
+
+struct Outbox {
+    waiting: Option<WaitingText>,
+}
+
+impl Outbox {
+    fn hold(&mut self, turn: u64, text: String, copied_at: Instant) {
+        if self.waiting.as_ref().is_none_or(|waiting| waiting.turn <= turn) {
+            self.waiting = Some(WaitingText { turn, text, copied_at });
+        }
+    }
+
+    fn clear(&mut self, turn: u64) {
+        if self.waiting.as_ref().is_some_and(|waiting| waiting.turn <= turn) {
+            self.waiting = None;
+        }
+    }
+
+    /// What to try next. `gave_up` says it just ran out of time.
+    fn due(&mut self, newest_turn: u64, sending: bool, now: Instant) -> Due {
+        let Some(waiting) = &self.waiting else { return Due::Nothing };
+        if waiting.turn != newest_turn || !sending {
+            self.waiting = None;
+            return Due::Nothing;
+        }
+        if now.duration_since(waiting.copied_at) >= RETRY_FOR {
+            self.waiting = None;
+            return Due::GaveUp;
+        }
+        Due::Send { turn: waiting.turn, text: waiting.text.clone(), copied_at: waiting.copied_at }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Due {
+    Nothing,
+    GaveUp,
+    Send { turn: u64, text: String, copied_at: Instant },
+}
+
+/// How a sending ended.
+#[derive(Debug, PartialEq)]
+enum Sent {
+    Taken,
+    NewerThere,
+    NotReceiving,
+    /// It closed without a word, as a device from before the answers does.
+    NoAnswer,
+    /// It couldn't be reached, or stopped answering. The link may yet come back.
+    Unreachable(String),
 }
 
 enum Snapshot {
@@ -353,15 +450,41 @@ fn with_retries(mut attempt: impl FnMut(&mut Clipboard) -> Result<(), arboard::E
     Err(last)
 }
 
+/// The moment `age_ms` before `now`.
+fn made_at(now: Instant, age_ms: u64) -> Instant {
+    now.checked_sub(Duration::from_millis(age_ms)).unwrap_or(now)
+}
+
+fn age_ms(copied_at: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(copied_at).as_millis() as u64
+}
+
+/// Reads what starts a copy. One with no stamp comes from an older device, and counts as just made.
+fn read_copy<R: Read>(reader: &mut R) -> Result<(u64, ClipboardPayload), String> {
+    match read_frame(reader)? {
+        ClipboardPayload::Stamp { age_ms } => Ok((age_ms, read_frame(reader)?)),
+        payload => Ok((0, payload)),
+    }
+}
+
 fn receive(mut stream: TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let (age, payload) = read_copy(&mut stream)?;
+    let newest = tracker.lock().map(|mut t| t.take_from_peer(made_at(Instant::now(), age))).unwrap_or(true);
+    if !newest {
+        let _ = stream.write_all(&[ANSWER_NEWER_HERE]);
+        return Ok(());
+    }
+    // Whatever is on its way out from here is older than this now.
+    NEWEST_SEND.fetch_add(1, Ordering::SeqCst);
     let turn = NEWEST_RECEIVE.fetch_add(1, Ordering::SeqCst) + 1;
     let mark = |fingerprint: u64| {
         if let Ok(mut guard) = tracker.lock() {
             guard.mark(fingerprint);
         }
     };
-    match read_frame(&mut stream)? {
+    match payload {
+        ClipboardPayload::Stamp { .. } => return Err("Got two stamps in a row".to_string()),
         ClipboardPayload::Text(text) => {
             mark(hash_bytes(text.as_bytes()));
             with_retries(|cb| cb.set_text(text.as_str()))?;
@@ -383,7 +506,7 @@ fn receive(mut stream: TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Res
                 Ok(top) => top,
                 Err(e) => {
                     let _ = fs::remove_dir_all(&batch);
-                    return Err(e);
+                    return Err(format!("{count} didn't all arrive. Copy them again on the other device. {e}"));
                 }
             };
             mark(hash_files(&top));
@@ -392,6 +515,7 @@ fn receive(mut stream: TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Res
             set_note(format!("Received {count}"));
         }
     }
+    let _ = stream.write_all(&[ANSWER_TAKEN]);
     Ok(())
 }
 
@@ -416,11 +540,13 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
 
             let inbox = inbox_dir();
             for stream in listener.incoming().flatten() {
-                if !CLIPBOARD_RECEIVE.load(Ordering::SeqCst) {
-                    continue;
-                }
                 // Files land on disk, so only the peer gets to write here.
                 if stream.peer_addr().map(|a| a.ip()).ok() != Some(peer) {
+                    continue;
+                }
+                if !CLIPBOARD_RECEIVE.load(Ordering::SeqCst) {
+                    let mut stream = stream;
+                    let _ = stream.write_all(&[ANSWER_NOT_RECEIVING]);
                     continue;
                 }
                 // Each on its own thread: text copied during a long transfer must not wait for it.
@@ -429,7 +555,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
                 let _ = std::thread::Builder::new().name("mesh-kvm-clip-in".to_string()).spawn(
                     move || {
                         if let Err(e) = receive(stream, &tracker, &inbox) {
-                            set_note(format!("Couldn't receive the clipboard: {e}"));
+                            set_failure(format!("Couldn't receive the clipboard: {e}"));
                         }
                     },
                 );
@@ -437,7 +563,20 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
 
-    // 2. Spawn clipboard watcher and TCP sender
+    // 2. Spawn the retrying of text that couldn't be sent. Its own thread, as waiting on a poor
+    // link must not hold up noticing the next copy.
+    let retry_addr = SocketAddr::new(peer, port);
+    std::thread::Builder::new()
+        .name("mesh-kvm-clip-retry".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(RETRY_EVERY);
+            let newest = NEWEST_SEND.load(Ordering::SeqCst);
+            let sending = CLIPBOARD_SEND.load(Ordering::SeqCst);
+            retry_waiting(retry_addr, &OUTBOX, newest, sending);
+        })
+        .map_err(|e| e.to_string())?;
+
+    // 3. Spawn clipboard watcher and TCP sender
     std::thread::Builder::new()
         .name("mesh-kvm-clip-tx".to_string())
         .spawn(move || {
@@ -460,12 +599,13 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
 
                 let Some(snapshot) = read_snapshot(&mut cb) else { continue };
                 let fingerprint = snapshot.fingerprint();
-                let changed = tracker.lock().map(|mut t| t.is_new(fingerprint)).unwrap_or(false);
+                let now = Instant::now();
+                let changed = tracker.lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
 
                 // Tracked even with sending off, so that what was copied meanwhile does not go out
                 // the moment sending comes back on.
                 if changed && CLIPBOARD_SEND.load(Ordering::SeqCst) {
-                    send_snapshot(target_addr, snapshot, &inbox);
+                    send_snapshot(target_addr, snapshot, &inbox, now);
                 }
             }
         })
@@ -475,7 +615,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
 }
 
 /// Sends off the watching thread, so that a long transfer doesn't hide the next copy.
-fn send_snapshot(target_addr: SocketAddr, snapshot: Snapshot, inbox: &Path) {
+fn send_snapshot(target_addr: SocketAddr, snapshot: Snapshot, inbox: &Path, copied_at: Instant) {
     // Files that came from the peer stay put, or a copy would bounce between the devices.
     if let Snapshot::Files(paths) = &snapshot {
         if paths.iter().all(|p| p.starts_with(inbox)) {
@@ -484,46 +624,143 @@ fn send_snapshot(target_addr: SocketAddr, snapshot: Snapshot, inbox: &Path) {
     }
     let turn = NEWEST_SEND.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = std::thread::Builder::new().name("mesh-kvm-clip-out".to_string()).spawn(move || {
-        if let Err(e) = send(target_addr, snapshot, turn) {
-            if NEWEST_SEND.load(Ordering::SeqCst) == turn {
-                set_note(format!("Couldn't send the clipboard: {e}"));
+        match snapshot {
+            Snapshot::Text(text) => {
+                let sent = send_text(target_addr, &text, copied_at);
+                if NEWEST_SEND.load(Ordering::SeqCst) == turn {
+                    settle_text(sent, turn, text, copied_at, &OUTBOX);
+                }
+            }
+            snapshot => {
+                let failure = send_whole(target_addr, snapshot, copied_at, turn);
+                if let (Err(e), true) = (failure, NEWEST_SEND.load(Ordering::SeqCst) == turn) {
+                    set_failure(e);
+                }
             }
         }
     });
 }
 
+/// What to say and do about how sending text went. Only the newest text gets here.
+fn settle_text(sent: Sent, turn: u64, text: String, copied_at: Instant, outbox: &Mutex<Outbox>) {
+    let mut outbox = outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Sent::Unreachable(reason) = sent {
+        println!("[Clipboard] Couldn't send text: {reason}");
+        outbox.hold(turn, text, copied_at);
+        set_note("Text is waiting to go to the other device. It goes as soon as the link is back.");
+        return;
+    }
+    outbox.clear(turn);
+    match sent {
+        Sent::Taken => set_note("Sent text"),
+        Sent::NewerThere => set_note("The other device has something newer on its clipboard, so it kept that."),
+        Sent::NotReceiving => set_note("The other device isn't taking the clipboard right now."),
+        _ => set_failure(TOO_OLD),
+    }
+}
+
+const TOO_OLD: &str = "The other device didn't take the clipboard. Update both devices to the same version.";
+
+/// One try at the text that's waiting, if there is any and it is still wanted.
+fn retry_waiting(target_addr: SocketAddr, outbox: &Mutex<Outbox>, newest_turn: u64, sending: bool) {
+    let due = outbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner).due(newest_turn, sending, Instant::now());
+    match due {
+        Due::Nothing => {}
+        Due::GaveUp => set_failure("Text waiting to go to the other device was dropped, as the link stayed down. Copy it again."),
+        Due::Send { turn, text, copied_at } => {
+            let sent = send_text(target_addr, &text, copied_at);
+            // A copy made during the try has taken over, and saying more would only confuse.
+            if NEWEST_SEND.load(Ordering::SeqCst) == turn {
+                settle_text(sent, turn, text, copied_at, outbox);
+            }
+        }
+    }
+}
+
 fn connect(target_addr: SocketAddr) -> Result<TcpStream, String> {
-    let stream = TcpStream::connect_timeout(&target_addr, Duration::from_millis(500))
-        .map_err(|e| e.to_string())?;
+    let stream = TcpStream::connect_timeout(&target_addr, CONNECT_WAIT).map_err(|e| e.to_string())?;
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(ANSWER_WAIT));
     Ok(stream)
 }
 
-fn send(target_addr: SocketAddr, snapshot: Snapshot, turn: u64) -> Result<(), String> {
+fn read_answer(stream: &mut TcpStream) -> Sent {
+    let mut answer = [0u8; 1];
+    match stream.read(&mut answer) {
+        Ok(0) => Sent::NoAnswer,
+        Ok(_) => match answer[0] {
+            ANSWER_TAKEN => Sent::Taken,
+            ANSWER_NEWER_HERE => Sent::NewerThere,
+            ANSWER_NOT_RECEIVING => Sent::NotReceiving,
+            _ => Sent::NoAnswer,
+        },
+        Err(e) => Sent::Unreachable(e.to_string()),
+    }
+}
+
+/// A write that succeeded only means the text left this device, so the answer is what counts.
+fn send_text(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent {
+    let mut stream = match connect(target_addr) {
+        Ok(stream) => stream,
+        Err(e) => return Sent::Unreachable(e),
+    };
+    let age_ms = age_ms(copied_at, Instant::now());
+    let written = write_frame(&mut stream, &ClipboardPayload::Stamp { age_ms })
+        .and_then(|()| write_frame(&mut stream, &ClipboardPayload::Text(text.to_string())));
+    match written {
+        Ok(()) => read_answer(&mut stream),
+        // It may have closed on seeing a stamp it can't read, and an answer tells the two apart.
+        Err(e) => match read_answer(&mut stream) {
+            Sent::Unreachable(_) => Sent::Unreachable(e),
+            sent => sent,
+        },
+    }
+}
+
+fn unsent(what: &str, reason: &str) -> String {
+    format!("Couldn't send {what}, so it stayed here. Copy it again once the link is back. {reason}")
+}
+
+/// Images and files aren't kept to retry: they can be large, and the file may be gone by then. The
+/// note says so. A file transfer may take long enough for a newer copy to stop it.
+fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, turn: u64) -> Result<(), String> {
+    let stamp = ClipboardPayload::Stamp { age_ms: age_ms(copied_at, Instant::now()) };
     match snapshot {
-        Snapshot::Text(text) => {
-            write_frame(&mut connect(target_addr)?, &ClipboardPayload::Text(text))?;
-            set_note("Sent text");
-        }
+        Snapshot::Text(_) => Ok(()),
         Snapshot::Image(image) => {
             let payload = ClipboardPayload::Image {
                 width: image.width,
                 height: image.height,
                 bytes: image.bytes.into_owned(),
             };
-            write_frame(&mut connect(target_addr)?, &payload)?;
-            set_note("Sent an image");
+            let what = "the image";
+            let mut stream = connect(target_addr).map_err(|e| unsent(what, &e))?;
+            write_frame(&mut stream, &stamp).map_err(|e| unsent(what, &e))?;
+            write_frame(&mut stream, &payload).map_err(|e| unsent(what, &e))?;
+            answer_note(read_answer(&mut stream), what, "Sent an image")
         }
         Snapshot::Files(paths) => {
-            let sources = collect_entries(&paths)?;
+            let sources = collect_entries(&paths).map_err(|e| unsent("the files", &e))?;
             let entries: Vec<FileEntry> = sources.iter().map(|(_, e)| e.clone()).collect();
             let count = file_count(&entries);
             set_note(format!("Sending {count}\u{2026}"));
-            let mut stream = connect(target_addr)?;
-            write_frame(&mut stream, &ClipboardPayload::Files(entries))?;
-            write_contents(&mut stream, &sources, || NEWEST_SEND.load(Ordering::SeqCst) != turn)?;
-            set_note(format!("Sent {count}"));
+            let mut stream = connect(target_addr).map_err(|e| unsent(&count, &e))?;
+            write_frame(&mut stream, &stamp).map_err(|e| unsent(&count, &e))?;
+            write_frame(&mut stream, &ClipboardPayload::Files(entries)).map_err(|e| unsent(&count, &e))?;
+            write_contents(&mut stream, &sources, || NEWEST_SEND.load(Ordering::SeqCst) != turn)
+                .map_err(|e| unsent(&count, &e))?;
+            answer_note(read_answer(&mut stream), &count, &format!("Sent {count}"))
         }
+    }
+}
+
+fn answer_note(sent: Sent, what: &str, done: &str) -> Result<(), String> {
+    match sent {
+        Sent::Taken => set_note(done),
+        Sent::NewerThere => set_note("The other device has something newer on its clipboard, so it kept that."),
+        Sent::NotReceiving => set_note("The other device isn't taking the clipboard right now."),
+        Sent::NoAnswer => return Err(TOO_OLD.to_string()),
+        Sent::Unreachable(reason) => return Err(unsent(what, &reason)),
     }
     Ok(())
 }
@@ -543,16 +780,189 @@ mod tests {
     #[test]
     fn what_is_on_the_clipboard_at_startup_is_not_a_copy() {
         let mut tracker = Tracker::default();
-        assert!(!tracker.is_new(1));
-        assert!(!tracker.is_new(1));
-        assert!(tracker.is_new(2));
+        assert!(!tracker.is_new(1, Instant::now()));
+        assert!(!tracker.is_new(1, Instant::now()));
+        assert!(tracker.is_new(2, Instant::now()));
     }
 
     #[test]
     fn what_came_from_the_peer_is_not_sent_back() {
         let mut tracker = Tracker::default();
         tracker.mark(7);
-        assert!(!tracker.is_new(7));
+        assert!(!tracker.is_new(7, Instant::now()));
+    }
+
+    #[test]
+    fn only_the_newer_of_two_copies_is_taken_from_the_peer() {
+        let start = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.is_new(1, start);
+        tracker.is_new(2, start + Duration::from_secs(10));
+        assert!(!tracker.take_from_peer(start + Duration::from_secs(5)), "copied here since");
+        assert!(tracker.take_from_peer(start + Duration::from_secs(20)));
+        assert!(!tracker.take_from_peer(start + Duration::from_secs(15)), "older than the last one taken");
+    }
+
+    #[test]
+    fn with_nothing_copied_here_anything_from_the_peer_is_taken() {
+        let mut tracker = Tracker::default();
+        tracker.is_new(1, Instant::now());
+        assert!(tracker.take_from_peer(Instant::now()), "what was there at startup isn't a copy");
+    }
+
+    #[test]
+    fn two_devices_with_text_waiting_settle_on_the_later_copy() {
+        let start = Instant::now();
+        let (mut first, mut second) = (Tracker::default(), Tracker::default());
+        first.is_new(0, start);
+        second.is_new(0, start);
+        first.is_new(1, start + Duration::from_secs(1));
+        second.is_new(2, start + Duration::from_secs(2));
+        // The link returns, and each sends what it has.
+        assert!(!second.take_from_peer(start + Duration::from_secs(1)));
+        assert!(first.take_from_peer(start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_copy_without_a_stamp_counts_as_just_made() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &ClipboardPayload::Text("old device".into())).unwrap();
+        let (age, payload) = read_copy(&mut Cursor::new(wire)).unwrap();
+        assert_eq!(age, 0);
+        assert!(matches!(payload, ClipboardPayload::Text(text) if text == "old device"));
+    }
+
+    #[test]
+    fn a_stamp_says_how_old_the_copy_behind_it_is() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &ClipboardPayload::Stamp { age_ms: 4000 }).unwrap();
+        write_frame(&mut wire, &ClipboardPayload::Text("waited".into())).unwrap();
+        let (age, payload) = read_copy(&mut Cursor::new(wire)).unwrap();
+        assert_eq!(age, 4000);
+        assert!(matches!(payload, ClipboardPayload::Text(text) if text == "waited"));
+    }
+
+    fn outbox_with(turn: u64, text: &str, copied_at: Instant) -> Mutex<Outbox> {
+        let mut outbox = Outbox { waiting: None };
+        outbox.hold(turn, text.to_string(), copied_at);
+        Mutex::new(outbox)
+    }
+
+    #[test]
+    fn only_the_newest_text_ever_waits() {
+        let now = Instant::now();
+        let mut outbox = Outbox { waiting: None };
+        outbox.hold(3, "newer".into(), now);
+        outbox.hold(2, "older, from a slow failure".into(), now);
+        assert!(matches!(outbox.due(3, true, now), Due::Send { text, .. } if text == "newer"));
+        outbox.hold(4, "newest".into(), now);
+        assert!(matches!(outbox.due(4, true, now), Due::Send { text, .. } if text == "newest"));
+    }
+
+    #[test]
+    fn anything_copied_since_takes_the_place_of_waiting_text() {
+        let now = Instant::now();
+        let mut outbox = Outbox { waiting: None };
+        outbox.hold(3, "old".into(), now);
+        // Turn 4 could be an image, or a copy from the other device.
+        assert_eq!(outbox.due(4, true, now), Due::Nothing);
+        assert_eq!(outbox.due(3, true, now), Due::Nothing, "and it doesn't come back");
+    }
+
+    #[test]
+    fn turning_sending_off_drops_what_waits() {
+        let now = Instant::now();
+        let mut outbox = Outbox { waiting: None };
+        outbox.hold(3, "secret".into(), now);
+        assert_eq!(outbox.due(3, false, now), Due::Nothing);
+        assert_eq!(outbox.due(3, true, now), Due::Nothing);
+    }
+
+    #[test]
+    fn text_is_given_up_on_in_the_end() {
+        let now = Instant::now();
+        let mut outbox = Outbox { waiting: None };
+        outbox.hold(3, "old".into(), now);
+        assert_eq!(outbox.due(3, true, now + RETRY_FOR), Due::GaveUp);
+        assert_eq!(outbox.due(3, true, now + RETRY_FOR), Due::Nothing);
+    }
+
+    /// A pretend device on `listener`: takes one copy and gives `answer`, if any.
+    fn take_one(listener: TcpListener, answer: Option<u8>) -> std::thread::JoinHandle<(u64, String)> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (age, payload) = read_copy(&mut stream).unwrap();
+            if let Some(answer) = answer {
+                stream.write_all(&[answer]).unwrap();
+            }
+            let ClipboardPayload::Text(text) = payload else { panic!("expected text") };
+            (age, text)
+        })
+    }
+
+    #[test]
+    fn text_goes_once_the_other_device_is_back_and_stops_being_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        drop(listener);
+        let copied_at = Instant::now() - Duration::from_secs(3);
+        assert!(matches!(send_text(target, "hello", copied_at), Sent::Unreachable(_)));
+
+        let outbox = outbox_with(7, "hello", copied_at);
+        let listener = TcpListener::bind(target).unwrap();
+        let other = take_one(listener, Some(ANSWER_TAKEN));
+        // Stands in for the retry thread, without touching the service's own counters.
+        let Due::Send { text, .. } = outbox.lock().unwrap().due(7, true, Instant::now()) else { panic!("nothing due") };
+        assert_eq!(send_text(target, &text, copied_at), Sent::Taken);
+        outbox.lock().unwrap().clear(7);
+        let (age, text) = other.join().unwrap();
+        assert_eq!(text, "hello");
+        assert!(age >= 3000, "{age}");
+        assert_eq!(outbox.lock().unwrap().due(7, true, Instant::now()), Due::Nothing);
+    }
+
+    #[test]
+    fn a_device_from_before_the_answers_is_told_apart_from_a_dead_link() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let other = take_one(listener, None);
+        assert_eq!(send_text(target, "hello", Instant::now()), Sent::NoAnswer);
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn the_receivers_answer_comes_back() {
+        for (answer, sent) in [(ANSWER_NEWER_HERE, Sent::NewerThere), (ANSWER_NOT_RECEIVING, Sent::NotReceiving)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = listener.local_addr().unwrap();
+            let other = take_one(listener, Some(answer));
+            assert_eq!(send_text(target, "hello", Instant::now()), sent);
+            other.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn text_that_cannot_go_waits_and_says_so_while_files_fail_with_a_note() {
+        let outbox = Mutex::new(Outbox { waiting: None });
+        settle_text(Sent::Unreachable("no route".into()), 9, "hello".into(), Instant::now(), &outbox);
+        assert!(matches!(outbox.lock().unwrap().due(9, true, Instant::now()), Due::Send { .. }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        drop(listener);
+        let root = scratch("unsent");
+        fs::write(root.join("f"), b"data").unwrap();
+        let snapshot = Snapshot::Files(vec![root.join("f")]);
+        let note = send_whole(target, snapshot, Instant::now(), 0).unwrap_err();
+        assert!(note.starts_with("Couldn't send 1 file, so it stayed here. Copy it again once the link is back."), "{note}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_reply_of_no_answer_is_an_update_note_not_a_retry() {
+        let outbox = outbox_with(9, "hello", Instant::now());
+        settle_text(Sent::NoAnswer, 9, "hello".into(), Instant::now(), &outbox);
+        assert_eq!(outbox.lock().unwrap().due(9, true, Instant::now()), Due::Nothing);
     }
 
     #[test]
