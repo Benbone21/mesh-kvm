@@ -100,6 +100,8 @@ struct PeerPrompt {
     error: Option<String>,
 }
 
+const LICENCES_WIDTH: f32 = 600.0;
+
 struct Window {
     client: Arc<Client>,
     starter: ServiceStarter,
@@ -521,7 +523,9 @@ impl Window {
     }
 
     fn licences_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Licences").open(&mut self.show_licences).collapsible(false).show(ctx, |ui| {
+        // Wide enough for the licence's own line breaks, as long as the window allows it.
+        let width = LICENCES_WIDTH.min(ctx.screen_rect().width() - 2.0 * theme::MARGIN as f32);
+        egui::Window::new("Licences").open(&mut self.show_licences).collapsible(false).default_width(width).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() * 0.7).show(ui, |ui| {
                 ui.label(small(crate::licenses::TEXT));
             });

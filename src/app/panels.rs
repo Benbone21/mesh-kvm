@@ -313,16 +313,20 @@ impl DevicePanel<'_, '_> {
 
     fn audio(&mut self, ui: &mut Ui) {
         subheading(ui, "Audio");
-        ui.add_enabled_ui(self.status.audio.play_only_on_other.is_some(), |ui| {
+        // Up top and in colour: these say something isn't working as chosen.
+        for note in &self.status.audio.notes {
+            ui.label(small(note).color(AMBER));
+        }
+        if self.status.audio.rx_other_version {
+            ui.label(small("Audio from the other device is being ignored. Update both devices to the same version.").color(AMBER));
+        }
+        if self.status.audio.play_only_on_other.is_some() {
             self.audio_sent(ui);
             ui.add_space(theme::HEADING_GAP);
             self.audio_received(ui);
-        });
-        for note in &self.status.audio.notes {
-            ui.label(small(note));
-        }
-        if self.status.audio.rx_other_version {
-            ui.label(small("Audio from the other device is being ignored. Update both devices to the same version."));
+        } else {
+            // Its status has none of this, and anything shown would be made up.
+            ui.label(small("This device needs updating before its audio can be changed here."));
         }
         let label = format!("Play a test sound on {}", self.other_name());
         let can_test = self.shared.on.test_sound;
@@ -372,9 +376,12 @@ impl DevicePanel<'_, '_> {
         let current = held.map_or(polled.to_string(), |(id, _)| id.clone());
         ui.label(label);
         let mut chosen = None;
+        let shown = model::device_label(&current, devices);
+        // Cut to fit: a long name would otherwise widen the whole column.
         egui::ComboBox::from_id_salt((self.device, label))
-            .selected_text(model::device_label(&current, devices))
+            .selected_text(shown.as_str())
             .width(ui.available_width())
+            .truncate()
             .show_ui(ui, |ui| {
                 let options = role.fixed_options().iter().map(|(id, name)| (*id, *name));
                 let options = options.chain(devices.iter().map(|d| (d.id.as_str(), d.name.as_str())));
@@ -383,7 +390,9 @@ impl DevicePanel<'_, '_> {
                         chosen = Some(id.to_string());
                     }
                 }
-            });
+            })
+            .response
+            .on_hover_text(shown.as_str());
         if let Some(id) = chosen {
             self.requests.actions.push((self.device, json!({ "action": "set_audio_device", "role": role.name(), "id": id })));
             self.picks.insert(key, (id, self.shared.now));

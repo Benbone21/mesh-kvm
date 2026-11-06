@@ -210,12 +210,12 @@ pub fn device_label(id: &str, devices: &[AudioDevice]) -> String {
     if id == SYSTEM_DEFAULT.0 {
         return SYSTEM_DEFAULT.1.into();
     }
-    devices.iter().find(|device| device.id == id).map_or("Not connected".into(), |device| device.name.clone())
+    devices.iter().find(|device| device.id == id).map_or("Not connected, using the default".into(), |device| device.name.clone())
 }
 
 pub fn bitrate_label(kbps: u32) -> String {
     match kbps {
-        0 => "Uncompressed".into(),
+        0 => "Uncompressed, about 1.6 Mbit/s".into(),
         kbps => format!("{kbps} kbit/s"),
     }
 }
@@ -2083,7 +2083,7 @@ mod tests {
         assert_eq!(Control::AudioBitrate.read(&d), 128.0);
         assert_eq!(Control::AudioBitrate.action(0.0), json!({"action": "set_audio_bitrate", "kbps": 0}));
         assert_eq!(bitrate_label(64), "64 kbit/s");
-        assert_eq!(bitrate_label(0), "Uncompressed");
+        assert_eq!(bitrate_label(0), "Uncompressed, about 1.6 Mbit/s");
     }
 
     #[test]
@@ -2097,7 +2097,7 @@ mod tests {
         assert_eq!(d.audio.notes, ["Hello"]);
         assert_eq!(device_label("", &d.audio.outputs), "None");
         assert_eq!(device_label("default", &d.audio.outputs), "System default");
-        assert_eq!(device_label("usb-2", &d.audio.outputs), "Not connected");
+        assert_eq!(device_label("usb-2", &d.audio.outputs), "Not connected, using the default");
     }
 
     #[test]

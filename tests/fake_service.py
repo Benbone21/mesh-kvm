@@ -7,7 +7,9 @@ the mode change countdown the way the real service does. Run it where that port 
     unshare -rn bash -c 'ip link set lo up && python3 -I tests/fake_service.py --monitors 5 & \
         target/release/mesh-kvm --app'
 
---name-style long tries names that don't fit.
+--name-style long tries names that don't fit. --audio picks how the audio section starts: idle,
+sending, failure, echo, missing or old. POST {"state": ...} to /fake/audio to change it while running,
+and GET /fake/requests for the audio actions the app has sent.
 """
 
 import argparse
@@ -61,6 +63,7 @@ class World:
         self.change = {"Debian": None, "Windows": None}
         self.note = {"Debian": None, "Windows": None}
         self.settings = {"Debian": default_settings(), "Windows": default_settings()}
+        self.requests = []
 
     def rects(self, node):
         if not self.screens[node]:
@@ -105,12 +108,68 @@ def default_settings():
         "sharing": {"mouse": True, "keyboard": True},
         "clipboard": {"send": True, "receive": True, "note": "Copied 12 characters from the other device."},
         "pointer_speed": 0.75,
-        "audio": {"tx_enabled": False, "tx_volume": 100, "tx_peak": 0, "play_only_on_other": True,
-                  "input": "", "output": "", "play": "default", "bitrate": 96, "echo_safe": True, "notes": [],
-                  "inputs": [{"id": "usb-mic", "name": "USB microphone"}],
-                  "outputs": [{"id": "speakers", "name": "Speakers"}, {"id": "headset", "name": "Headset"}],
-                  "rx_muted": False, "rx_volume": 100, "rx_peak": 45},
+        "audio": audio_idle(),
     }
+
+
+DEBIAN_DEVICES = {
+    "inputs": [{"id": "alsa_input.mic", "name": "USB Audio Microphone"},
+               {"id": "alsa_input.line", "name": "USB Audio Line Input"},
+               {"id": "alsa_input.brio", "name": "Logitech BRIO 4K Stream Edition Webcam Analog Stereo Microphone Input"}],
+    "outputs": [{"id": "alsa_output.front", "name": "USB Audio Front Headphones"},
+                {"id": "alsa_output.spdif", "name": "USB Audio S/PDIF Output"},
+                {"id": "alsa_output.speaker", "name": "USB Audio Speakers"},
+                {"id": "bluez_output.sony", "name": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones"},
+                {"id": "alsa_output.hdmi", "name": "HDMI / DisplayPort 2 Output (Alienware AW2725DF)"}],
+}
+WINDOWS_DEVICES = {
+    "inputs": [{"id": "{0.0.1.a}", "name": "Microphone Array (Realtek(R) Audio)"},
+               {"id": "{0.0.1.b}", "name": "Microphone (USB Audio Device) (1)"},
+               {"id": "{0.0.1.c}", "name": "Microphone (USB Audio Device) (2)"}],
+    "outputs": [{"id": "{0.0.0.a}", "name": "Speakers (Realtek(R) Audio)"},
+                {"id": "{0.0.0.b}", "name": "Headphones (USB Audio Device) (1)"},
+                {"id": "{0.0.0.c}", "name": "Headphones (USB Audio Device) (2)"},
+                {"id": "{0.0.0.d}", "name": "Digital Audio (HDMI) (NVIDIA High Definition Audio)"}],
+}
+
+
+def audio_idle():
+    return {"tx_enabled": False, "input": "", "output": "", "play": "default", "notes": [], "echo_safe": True,
+            "bitrate": 96, "tx_volume": 100, "tx_peak": 0, "tx_reaching": False, "tx_connected": False, "tx_loss": 0,
+            "play_only_on_other": True, "rx_muted": False, "rx_volume": 100, "rx_peak": 0, "rx_packets": 0,
+            "rx_live": False, "rx_loss": 0.0, "rx_unrepaired": 0.0, "rx_buffer_ms": 0, "rx_other_version": False}
+
+
+def audio_states():
+    """What each device's audio says in each state, on top of `audio_idle`."""
+    sending = {"tx_enabled": True, "output": "default", "tx_peak": 62, "tx_reaching": True, "tx_connected": True, "tx_loss": 3,
+               "bitrate": 128}
+    receiving = {"rx_peak": 58, "rx_packets": 91200, "rx_live": True, "rx_loss": 2.6, "rx_unrepaired": 0.3, "rx_buffer_ms": 30}
+    return {
+        "idle": ({}, {}),
+        "sending": (sending | {"input": "alsa_input.brio", "output": "bluez_output.sony"}, receiving),
+        "failure": ({"tx_enabled": True, "input": "alsa_input.mic", "tx_connected": True},
+                    {"tx_enabled": True, "input": "{0.0.1.a}", "tx_connected": True,
+                     "notes": ["The microphone or line-in couldn't be opened. Check that Microphone access is on in Windows privacy settings."]}),
+        "echo": (sending | receiving, sending | receiving | {"echo_safe": False}),
+        "missing": ({"tx_enabled": True, "input": "alsa_input.gone", "output": "bluez_output.gone", "play": "bluez_output.gone",
+                     "tx_connected": True,
+                     "notes": ["The chosen microphone or line-in isn't connected, so the system default is being used.",
+                               "The chosen output to send isn't connected, so the system default is being used.",
+                               "The chosen output to play on isn't connected, so the system default is being used."]}, {}),
+        "old": ({"rx_other_version": True}, None),
+    }
+
+
+def set_audio_state(world, name):
+    debian, windows = audio_states()[name]
+    world.settings["Debian"]["audio"] = audio_idle() | DEBIAN_DEVICES | debian
+    if windows is None:
+        # A service from before the choice of devices. Its status has none of the new fields.
+        world.settings["Windows"]["audio"] = {"tx_enabled": True, "tx_volume": 100, "tx_peak": 30, "tx_source": None,
+                                              "mute_while_sending": True, "rx_muted": False, "rx_volume": 100, "rx_peak": 0}
+    else:
+        world.settings["Windows"]["audio"] = audio_idle() | WINDOWS_DEVICES | windows
 
 
 def serve(world):
@@ -132,6 +191,8 @@ def serve(world):
                 path = self.path.removeprefix("/api/peer")
                 if path == "/api/local":
                     self.reply(world.local(self.node()))
+                elif path == "/fake/requests":
+                    self.reply(world.requests)
                 elif path == "/api/state":
                     self.reply(world.state())
                 elif path == "/api/displays":
@@ -146,7 +207,11 @@ def serve(world):
                     apply_edit(world, body)
                 elif self.path == "/api/action" and body.get("action") == "toggle_focus":
                     world.active = "Windows" if world.active == "Debian" else "Debian"
+                elif self.path == "/fake/audio":
+                    set_audio_state(world, body["state"])
                 elif self.path.endswith("/api/local/action"):
+                    if "audio" in body.get("action", "") or "play_only" in body.get("action", ""):
+                        world.requests.append({"device": self.node()} | body)
                     act(world, self.node(), body)
                 self.reply({"ok": True})
 
@@ -188,6 +253,16 @@ def act(world, node, body):
         expire(world)
     elif action == "set_sharing":
         world.settings[node]["sharing"].update({k: v for k, v in body.items() if k != "action"})
+    elif action == "set_audio_device":
+        audio = world.settings[node]["audio"]
+        audio[body["role"]] = body["id"]
+        audio["tx_enabled"] = audio["input"] != "" or audio["output"] != ""
+    elif action == "set_audio_bitrate":
+        world.settings[node]["audio"]["bitrate"] = body["kbps"]
+    elif action == "set_play_only_on_other":
+        world.settings[node]["audio"]["play_only_on_other"] = body["enabled"]
+    elif action == "set_audio_rx_muted":
+        world.settings[node]["audio"]["rx_muted"] = body["muted"]
 
 
 def expire(world):
@@ -204,5 +279,8 @@ if __name__ == "__main__":
     parser.add_argument("--monitors", type=int, default=2, help="under 5 gives 3 screens, 5 or more gives 6")
     parser.add_argument("--name-style", default="short")
     parser.add_argument("--no-modes", action="store_true", help="this device's desktop isn't answering about modes")
+    parser.add_argument("--audio", default="idle", choices=list(audio_states()))
     options = parser.parse_args()
-    serve(World(options.monitors, options.name_style == "long", options.no_modes))
+    world = World(options.monitors, options.name_style == "long", options.no_modes)
+    set_audio_state(world, options.audio)
+    serve(world)
