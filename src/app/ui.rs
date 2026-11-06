@@ -262,8 +262,8 @@ impl Window {
         for ((device, control), value) in self.edits.take_due(now) {
             self.client.local_action(device, control.action(value));
         }
-        if let Some(layout) = self.layout.take_due(now) {
-            self.client.save_layout(layout.to_save_json());
+        if let Some(edit) = self.layout.take_due(now) {
+            self.client.save_layout(edit);
         }
     }
 

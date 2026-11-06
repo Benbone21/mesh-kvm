@@ -300,8 +300,6 @@ pub struct Telemetry {
 pub struct LayoutState {
     pub config: LayoutConfig,
     pub telemetry: Telemetry,
-    /// The config exactly as the service sent it, so saving keeps fields this app doesn't know.
-    raw_config: Value,
 }
 
 impl LayoutState {
@@ -315,31 +313,29 @@ impl LayoutState {
         }
         let state: State = serde_json::from_str(text).ok()?;
         state.config.get("devices")?;
-        let config = serde_json::from_value(state.config.clone()).ok()?;
-        Some(Self { config, telemetry: state.telemetry, raw_config: state.config })
+        let config = serde_json::from_value(state.config).ok()?;
+        Some(Self { config, telemetry: state.telemetry })
     }
+}
 
-    /// The body for `POST /api/layout`: every field the service sent, with the ones the app
-    /// edits replaced by their current values.
-    pub fn to_save_json(&self) -> Value {
-        let mut out = self.raw_config.clone();
-        if !out.is_object() {
-            out = Value::Object(Default::default());
-        }
-        let c = &self.config;
-        if let Some(devices) = out["devices"].as_array_mut() {
-            for (saved, device) in devices.iter_mut().zip(&c.devices) {
-                saved["x"] = device.x.into();
-                saved["y"] = device.y.into();
-                saved["custom_size"] = json!(device.custom_size);
-            }
-        }
-        out["attach_side"] = c.attach_side.clone().into();
-        out["edge_resistance"] = c.edge_resistance.into();
-        out["auto_game_lock"] = c.auto_game_lock.into();
-        out["manual_game_lock"] = c.manual_game_lock.into();
-        out
+/// The body for `POST /api/layout`: what differs between `was` and `now`, and nothing else, so
+/// that saving can't undo a newer edit from the other device. `None` if nothing does.
+pub fn layout_edit(was: &LayoutConfig, now: &LayoutConfig) -> Option<Value> {
+    let place = |d: &LayoutDevice| (d.node.clone(), d.x, d.y, d.custom_size);
+    let arrangement = |c: &LayoutConfig| (c.devices.iter().map(place).collect::<Vec<_>>(), c.attach_side.clone());
+    let mut edit = serde_json::Map::new();
+    if arrangement(was) != arrangement(now) {
+        let devices: Vec<Value> = now
+            .devices
+            .iter()
+            .map(|d| json!({ "node": d.node, "x": d.x, "y": d.y, "custom_size": d.custom_size }))
+            .collect();
+        edit.insert("arrangement".into(), json!({ "devices": devices, "attach_side": now.attach_side }));
     }
+    if was.edge_resistance != now.edge_resistance {
+        edit.insert("edge_resistance".into(), now.edge_resistance.into());
+    }
+    (!edit.is_empty()).then_some(Value::Object(edit))
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -632,6 +628,8 @@ impl Edits {
 #[derive(Debug, Default)]
 pub struct LayoutDraft {
     pub state: Option<LayoutState>,
+    /// The layout as the service last knew it, which edits are measured from.
+    base: Option<LayoutConfig>,
     held_until: Option<Instant>,
     unsaved: bool,
     saved_at: Option<Instant>,
@@ -640,6 +638,9 @@ pub struct LayoutDraft {
 impl LayoutDraft {
     pub fn follow(&mut self, polled: Option<LayoutState>, dragging: bool, now: Instant) {
         let held = dragging || self.unsaved || self.held_until.is_some_and(|t| now < t);
+        if !held || self.state.is_none() {
+            self.base = polled.as_ref().map(|p| p.config.clone());
+        }
         self.state = merge_poll(self.state.take(), polled, held);
     }
 
@@ -661,15 +662,19 @@ impl LayoutDraft {
         self.hold(now);
     }
 
-    /// The layout to save now, if an edit is waiting and the last save was long enough ago.
-    pub fn take_due(&mut self, now: Instant) -> Option<&LayoutState> {
+    /// The edit to save now, if one is waiting and the last save was long enough ago. It holds
+    /// only what changed, so an edit that reached this copy while the draft was held stays.
+    pub fn take_due(&mut self, now: Instant) -> Option<Value> {
         if !self.unsaved || self.saved_at.is_some_and(|at| now < at + SAVE_GAP) {
             return None;
         }
         self.unsaved = false;
         self.saved_at = Some(now);
         self.hold(now);
-        self.state.as_ref()
+        let config = &self.state.as_ref()?.config;
+        let edit = layout_edit(self.base.as_ref()?, config);
+        self.base = Some(config.clone());
+        edit
     }
 
     pub fn next_wake(&self, now: Instant) -> Option<Duration> {
@@ -1032,17 +1037,53 @@ mod tests {
     }
 
     #[test]
-    fn saving_keeps_fields_the_app_does_not_know() {
-        let mut l = LayoutState::parse(STATE_JSON).unwrap();
-        l.config.move_laptop(5, 1440);
-        l.config.attach_side = "Right".into();
-        let out = l.to_save_json();
-        assert_eq!(out["devices"][1]["x"], 5);
-        assert_eq!(out["attach_side"], "Right");
-        assert_eq!(out["future_field"]["a"], 1);
-        assert_eq!(out["devices"][1]["future_device_field"], 5);
-        assert_eq!(out["devices"][0]["monitors"][1]["name"], "DP-2 (360Hz Native)");
-        assert_eq!(out["revision"], 3);
+    fn an_edit_holds_only_what_changed() {
+        let was = cfg();
+        assert_eq!(layout_edit(&was, &was), None);
+        let mut now = was.clone();
+        now.edge_resistance = 90;
+        assert_eq!(layout_edit(&was, &now), Some(json!({ "edge_resistance": 90 })));
+        let mut now = was.clone();
+        now.move_laptop(5, 1440);
+        now.attach_side = "Right".into();
+        let edit = layout_edit(&was, &now).unwrap();
+        assert_eq!(edit["arrangement"]["attach_side"], "Right");
+        assert_eq!(edit["arrangement"]["devices"][1]["node"], "Windows");
+        assert_eq!(edit["arrangement"]["devices"][1]["x"], 5);
+        assert!(edit.get("edge_resistance").is_none());
+        assert!(edit["arrangement"]["devices"][1].get("monitors").is_none());
+    }
+
+    #[test]
+    fn a_held_draft_does_not_send_back_what_the_other_device_just_changed() {
+        let (mut draft, t) = (LayoutDraft::default(), Instant::now());
+        draft.follow(layout_at(1), false, t);
+        // The person moves the slider here, and the draft holds while that saves.
+        draft.state.as_mut().unwrap().config.edge_resistance = 90;
+        draft.edited(t);
+        assert_eq!(draft.take_due(t), Some(json!({ "edge_resistance": 90 })));
+        // The other device moves the laptop, which arrives as a poll the draft doesn't take yet.
+        draft.follow(layout_at(9), false, t + HOLD / 2);
+        // A second edit here still says nothing about where the laptop is.
+        draft.state.as_mut().unwrap().config.edge_resistance = 95;
+        draft.edited(t + HOLD / 2);
+        assert_eq!(draft.take_due(t + HOLD / 2), Some(json!({ "edge_resistance": 95 })));
+        // Once it settles the draft shows the other device's move.
+        draft.follow(layout_at(9), false, t + HOLD * 2);
+        assert_eq!(drafted_x(&draft), 9);
+    }
+
+    #[test]
+    fn going_back_to_the_first_value_while_held_is_still_saved() {
+        let (mut draft, t) = (LayoutDraft::default(), Instant::now());
+        draft.follow(layout_at(1), false, t);
+        let first = draft.state.as_ref().unwrap().config.edge_resistance;
+        draft.state.as_mut().unwrap().config.edge_resistance = first + 10;
+        draft.edited(t);
+        assert!(draft.take_due(t).is_some());
+        draft.state.as_mut().unwrap().config.edge_resistance = first;
+        draft.edited(t + SAVE_GAP);
+        assert_eq!(draft.take_due(t + SAVE_GAP), Some(json!({ "edge_resistance": first })));
     }
 
     #[test]
@@ -1492,7 +1533,7 @@ mod tests {
         draft.follow(layout_at(1), false, t);
         draft.state.as_mut().unwrap().config.move_laptop(5, 1440);
         draft.edited(t);
-        assert_eq!(draft.take_due(t).unwrap().config.laptop_box().0, 5);
+        assert_eq!(draft.take_due(t).unwrap()["arrangement"]["devices"][1]["x"], 5);
         draft.follow(layout_at(1), false, t + HOLD / 2);
         assert_eq!(drafted_x(&draft), 5);
         draft.follow(layout_at(5), false, t + HOLD);
@@ -1506,8 +1547,11 @@ mod tests {
         let (mut draft, t) = (LayoutDraft::default(), Instant::now());
         draft.follow(layout_at(1), false, t);
         assert!(draft.take_due(t).is_none());
+        let resist = |d: &mut LayoutDraft, value| d.state.as_mut().unwrap().config.edge_resistance = value;
+        resist(&mut draft, 70);
         draft.edited(t);
         assert!(draft.take_due(t).is_some());
+        resist(&mut draft, 80);
         draft.edited(t);
         assert!(draft.take_due(t).is_none());
         assert_eq!(draft.next_wake(t), Some(SAVE_GAP));

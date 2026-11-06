@@ -1,8 +1,10 @@
 //! The screen layout, which every device keeps its own copy of, and the API both services serve.
 //!
 //! Positions and shared settings are edited on either device. Each edit raises `revision`, and
-//! the heartbeats tell the other device, which fetches the newer copy. Monitors are facts rather
-//! than edits: each device reports its own, and they never raise the revision.
+//! the heartbeats tell the other device, which fetches the newer copy. An edit names only the
+//! parts it changes, and each part keeps the stamp of its own last edit, so edits to different
+//! parts never undo each other, on either device. Monitors are facts rather than edits: each
+//! device reports its own, and they never raise the revision.
 
 use crate::platform::Platform;
 pub use crate::protocol::MonitorRect;
@@ -62,6 +64,11 @@ fn default_editor() -> NodeId {
     NodeId::Debian
 }
 
+/// What a part's stamp is before anything has edited it.
+fn no_stamp() -> (u64, NodeId) {
+    (0, NodeId::Debian)
+}
+
 /// One device in the layout: where its desktop sits, and the monitors on it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceLayout {
@@ -119,6 +126,12 @@ pub struct SpatialConfig {
     /// The device that made the edit at `revision`.
     #[serde(default = "default_editor")]
     pub editor: NodeId,
+    /// The edit that last moved a device or changed its size: revision and device.
+    #[serde(default = "no_stamp")]
+    arrangement_stamp: (u64, NodeId),
+    /// The edit that last changed `edge_resistance`.
+    #[serde(default = "no_stamp")]
+    resistance_stamp: (u64, NodeId),
     pub devices: Vec<DeviceLayout>,
     /// Which side of Debian the Windows screen is attached to
     pub attach_side: TouchSide,
@@ -132,6 +145,33 @@ pub struct SpatialConfig {
     /// This device's own choice: it doesn't travel with the layout.
     #[serde(default)]
     pub manual_game_lock: bool,
+}
+
+/// Where one device goes in an edit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DevicePlace {
+    pub node: NodeId,
+    pub x: i32,
+    pub y: i32,
+    #[serde(default)]
+    pub custom_size: Option<(i32, i32)>,
+}
+
+/// How the devices meet. It changes as a whole: half of one arrangement and half of another
+/// isn't an arrangement anyone chose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Arrangement {
+    pub devices: Vec<DevicePlace>,
+    pub attach_side: TouchSide,
+}
+
+/// The body of `POST /api/layout`: only the parts that changed. Whatever is left out stays as it
+/// is here, so an edit made from an old view of the layout can't undo a newer edit to anything else.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutEdit {
+    pub arrangement: Option<Arrangement>,
+    pub edge_resistance: Option<i32>,
 }
 
 /// The layout file's fields from before devices were equal.
@@ -163,6 +203,8 @@ impl LegacyLayout {
             // Above a device that has never had a layout, so that this arrangement is the one kept.
             revision: 1,
             editor: NodeId::Debian,
+            arrangement_stamp: no_stamp(),
+            resistance_stamp: no_stamp(),
             devices: vec![
                 DeviceLayout {
                     node: NodeId::Debian,
@@ -228,6 +270,10 @@ pub fn clean_monitors(monitors: Vec<MonitorRect>) -> Vec<MonitorRect> {
         .collect()
 }
 
+fn clean_size(size: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    size.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| (w.min(MAX_MONITOR_SIZE), h.min(MAX_MONITOR_SIZE)))
+}
+
 impl SpatialConfig {
     /// The layout of a device that has never had one. `edge` is the side of this device the other
     /// one sits on, and `None` puts the laptop to the right of the desktop.
@@ -246,6 +292,8 @@ impl SpatialConfig {
         let mut config = Self {
             revision: 0,
             editor: me,
+            arrangement_stamp: no_stamp(),
+            resistance_stamp: no_stamp(),
             devices: vec![DeviceLayout::placeholder(NodeId::Debian), DeviceLayout::placeholder(NodeId::Windows)],
             attach_side,
             edge_resistance: 55,
@@ -268,14 +316,19 @@ impl SpatialConfig {
             device.x = device.x.clamp(-MAX_COORDINATE, MAX_COORDINATE);
             device.y = device.y.clamp(-MAX_COORDINATE, MAX_COORDINATE);
             device.monitors = clean_monitors(std::mem::take(&mut device.monitors));
-            device.custom_size = device.custom_size.filter(|&(w, h)| w > 0 && h > 0).map(|(w, h)| {
-                (w.min(MAX_MONITOR_SIZE), h.min(MAX_MONITOR_SIZE))
-            });
+            device.custom_size = clean_size(device.custom_size);
         }
         self.devices = devices;
         self.edge_resistance = self.edge_resistance.clamp(0, MAX_EDGE_RESISTANCE);
         if self.revision > MAX_REVISION {
             self.revision = 0;
+        }
+        // A copy from before parts had stamps, or with a bad one: all of it dates from its revision.
+        let whole_copy = self.stamp();
+        for stamp in [&mut self.arrangement_stamp, &mut self.resistance_stamp] {
+            if stamp.0 == 0 || stamp.0 > whole_copy.0 {
+                *stamp = whole_copy;
+            }
         }
     }
 
@@ -423,20 +476,16 @@ impl SpatialConfig {
         inset_on_monitor(monitors, clamp_to_monitors(monitors, (x, y)))
     }
 
-    /// This copy with the positions and shared settings of `other`. Monitors stay as reported to
-    /// this device, and the game locks stay this device's own.
-    fn with_shared_settings_of(&self, other: &SpatialConfig) -> SpatialConfig {
-        let mut merged = self.clone();
-        for device in &mut merged.devices {
+    fn take_arrangement_of(&mut self, other: &SpatialConfig) {
+        for device in &mut self.devices {
             if let Some(theirs) = other.device(device.node) {
                 device.x = theirs.x;
                 device.y = theirs.y;
                 device.custom_size = theirs.custom_size;
             }
         }
-        merged.attach_side = other.attach_side;
-        merged.edge_resistance = other.edge_resistance;
-        merged
+        self.attach_side = other.attach_side;
+        self.arrangement_stamp = other.arrangement_stamp;
     }
 
     /// True if a copy with this stamp should replace this one.
@@ -444,20 +493,56 @@ impl SpatialConfig {
         is_newer(stamp, self.stamp()) && stamp.0 <= self.revision.saturating_add(MAX_REVISION_JUMP)
     }
 
-    /// Takes a copy from the other device if it is the newer one. True if it was.
+    /// Takes what is newer in a copy from the other device, if that copy is the newer one. True if
+    /// it was. Monitors stay as reported to this device, and the game locks stay its own.
+    ///
+    /// A part edited here more recently than in that copy stays, and this copy then moves one
+    /// past it, so that the other device comes and fetches that part in turn.
     pub fn adopt(&mut self, theirs: &SpatialConfig) -> bool {
         if !self.should_take(theirs.stamp()) {
             return false;
         }
-        *self = SpatialConfig { revision: theirs.revision, editor: theirs.editor, ..self.with_shared_settings_of(theirs) };
+        let mut kept = false;
+        match (is_newer(theirs.arrangement_stamp, self.arrangement_stamp), is_newer(self.arrangement_stamp, theirs.arrangement_stamp)) {
+            (true, _) => self.take_arrangement_of(theirs),
+            (_, keep) => kept |= keep,
+        }
+        match (is_newer(theirs.resistance_stamp, self.resistance_stamp), is_newer(self.resistance_stamp, theirs.resistance_stamp)) {
+            (true, _) => {
+                self.edge_resistance = theirs.edge_resistance;
+                self.resistance_stamp = theirs.resistance_stamp;
+            }
+            (_, keep) => kept |= keep,
+        }
+        self.revision = theirs.revision.saturating_add(u64::from(kept));
+        self.editor = theirs.editor;
         true
     }
 
-    /// Applies an edit made on `me`, one past this copy. The revision in the edit means nothing:
-    /// it comes from whoever sent it.
-    pub fn apply_edit(&mut self, edit: &SpatialConfig, me: NodeId) {
-        let revision = self.revision.saturating_add(1);
-        *self = SpatialConfig { revision, editor: me, ..self.with_shared_settings_of(edit) };
+    /// Applies an edit made on `me`, one past this copy, and only to the parts it names. True if
+    /// it named any. An edit carries no revision of its own: it comes from whoever sent it.
+    pub fn apply_edit(&mut self, edit: &LayoutEdit, me: NodeId) -> bool {
+        let stamp = (self.revision.saturating_add(1), me);
+        if let Some(arrangement) = &edit.arrangement {
+            for place in &arrangement.devices {
+                if let Some(device) = self.device_mut(place.node) {
+                    device.x = place.x.clamp(-MAX_COORDINATE, MAX_COORDINATE);
+                    device.y = place.y.clamp(-MAX_COORDINATE, MAX_COORDINATE);
+                    device.custom_size = clean_size(place.custom_size);
+                }
+            }
+            self.attach_side = arrangement.attach_side;
+            self.arrangement_stamp = stamp;
+        }
+        if let Some(resistance) = edit.edge_resistance {
+            self.edge_resistance = resistance.clamp(0, MAX_EDGE_RESISTANCE);
+            self.resistance_stamp = stamp;
+        }
+        let edited = edit.arrangement.is_some() || edit.edge_resistance.is_some();
+        if edited {
+            (self.revision, self.editor) = stamp;
+        }
+        edited
     }
 
     /// Drops any custom size, as an edit: the screens go back to what the devices report.
@@ -468,6 +553,7 @@ impl SpatialConfig {
         self.resnap();
         self.revision = self.revision.saturating_add(1);
         self.editor = me;
+        self.arrangement_stamp = self.stamp();
     }
 }
 
@@ -826,12 +912,13 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn 
                 Some(crate::settings::OK_RESPONSE.to_string())
             }
             ("POST", "/api/layout") => {
-                let Some(edit) = parse_layout(&req.body) else {
-                    return Some(r#"{"ok":false,"error":"That isn't a layout."}"#.to_string());
-                };
+                let refused = || Some(r#"{"ok":false,"error":"That isn't a layout change."}"#.to_string());
+                let Ok(edit) = serde_json::from_str::<LayoutEdit>(&req.body) else { return refused() };
                 let mut g = state.write().ok()?;
                 let me = g.me;
-                g.config.apply_edit(&edit.config, me);
+                if !g.config.apply_edit(&edit, me) {
+                    return refused();
+                }
                 g.save();
                 Some(crate::settings::OK_RESPONSE.to_string())
             }
@@ -966,6 +1053,8 @@ mod tests {
         SpatialConfig {
             revision: 0,
             editor: NodeId::Debian,
+            arrangement_stamp: no_stamp(),
+            resistance_stamp: no_stamp(),
             devices: vec![
                 DeviceLayout {
                     node: NodeId::Debian,
@@ -1179,10 +1268,14 @@ mod tests {
         (layout(TouchSide::Bottom, 2240, 1440), layout(TouchSide::Bottom, 2240, 1440))
     }
 
-    fn moved_to(c: &SpatialConfig, x: i32) -> SpatialConfig {
-        let mut edit = c.clone();
-        laptop_mut(&mut edit).x = x;
-        edit
+    /// Moves the laptop to `x`, on the bottom edge.
+    fn moved_to(x: i32) -> LayoutEdit {
+        let place = DevicePlace { node: NodeId::Windows, x, y: 1440, custom_size: None };
+        LayoutEdit { arrangement: Some(Arrangement { devices: vec![place], attach_side: TouchSide::Bottom }), edge_resistance: None }
+    }
+
+    fn resistance_of(value: i32) -> LayoutEdit {
+        LayoutEdit { edge_resistance: Some(value), ..Default::default() }
     }
 
     fn laptop_x(c: &SpatialConfig) -> i32 {
@@ -1192,8 +1285,7 @@ mod tests {
     #[test]
     fn an_edit_raises_the_revision_and_reaches_the_other_copy() {
         let (mut debian, mut laptop) = pair();
-        let edit = moved_to(&laptop, 100);
-        laptop.apply_edit(&edit, NodeId::Windows);
+        assert!(laptop.apply_edit(&moved_to(100), NodeId::Windows));
         assert_eq!(laptop.stamp(), (1, NodeId::Windows));
         assert!(debian.adopt(&laptop));
         assert_eq!(laptop_x(&debian), 100);
@@ -1208,8 +1300,7 @@ mod tests {
         let (mut debian, mut laptop) = pair();
         // Two edits on one side, and nothing on the other until the link comes back.
         for x in [100, 200] {
-            let edit = moved_to(&debian, x);
-            debian.apply_edit(&edit, NodeId::Debian);
+            debian.apply_edit(&moved_to(x), NodeId::Debian);
         }
         assert!(!debian.adopt(&laptop), "the stale copy must not undo the edits");
         assert!(laptop.adopt(&debian));
@@ -1219,9 +1310,8 @@ mod tests {
     #[test]
     fn edits_on_both_sides_settle_on_one_copy() {
         let (mut debian, mut laptop) = pair();
-        let (a, b) = (moved_to(&debian, 111), moved_to(&laptop, 222));
-        debian.apply_edit(&a, NodeId::Debian);
-        laptop.apply_edit(&b, NodeId::Windows);
+        debian.apply_edit(&moved_to(111), NodeId::Debian);
+        laptop.apply_edit(&moved_to(222), NodeId::Windows);
         // Both are at revision 1, and each sees the other's copy.
         let (d, l) = (debian.clone(), laptop.clone());
         let took = (debian.adopt(&l), laptop.adopt(&d));
@@ -1231,29 +1321,97 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_on_a_stale_body_still_becomes_the_newest() {
+    fn an_edit_changes_only_the_parts_it_names() {
         let (mut debian, _) = pair();
         debian.revision = 9;
-        let stale = moved_to(&layout(TouchSide::Bottom, 0, 0), 5);
-        debian.apply_edit(&stale, NodeId::Debian);
+        debian.apply_edit(&moved_to(5), NodeId::Debian);
         assert_eq!(debian.revision, 10);
-        assert_eq!(laptop_x(&debian), 5);
+        // This one came from a window that hasn't seen the move, and it doesn't undo it.
+        debian.apply_edit(&resistance_of(80), NodeId::Windows);
+        assert_eq!((laptop_x(&debian), debian.edge_resistance), (5, 80));
+        assert_eq!(debian.stamp(), (11, NodeId::Windows));
+    }
+
+    #[test]
+    fn an_edit_with_nothing_in_it_changes_nothing() {
+        let (mut debian, _) = pair();
+        assert!(!debian.apply_edit(&LayoutEdit::default(), NodeId::Windows));
+        assert_eq!(debian.stamp(), (0, NodeId::Debian));
+    }
+
+    #[test]
+    fn values_in_an_edit_are_held_to_the_same_limits_as_a_file() {
+        let (mut debian, _) = pair();
+        let mut edit = moved_to(i32::MAX);
+        edit.edge_resistance = Some(i32::MAX);
+        edit.arrangement.as_mut().unwrap().devices[0].custom_size = Some((-1, 5));
+        debian.apply_edit(&edit, NodeId::Debian);
+        assert_eq!(laptop_x(&debian), MAX_COORDINATE);
+        assert_eq!(debian.edge_resistance, MAX_EDGE_RESISTANCE);
+        assert_eq!(debian.device(NodeId::Windows).unwrap().custom_size, None);
     }
 
     #[test]
     fn the_revision_in_an_edit_is_ignored() {
+        let edit: LayoutEdit = serde_json::from_str(&format!(r#"{{"revision":{},"edge_resistance":60}}"#, u64::MAX)).unwrap();
         let (mut debian, _) = pair();
         debian.revision = 9;
-        let mut hostile = moved_to(&debian, 5);
-        hostile.revision = u64::MAX;
-        debian.apply_edit(&hostile, NodeId::Debian);
+        debian.apply_edit(&edit, NodeId::Debian);
         assert_eq!(debian.revision, 10);
+    }
+
+    /// Runs each copy's sync against the other until neither takes anything more.
+    fn settle(debian: &mut SpatialConfig, laptop: &mut SpatialConfig) {
+        for _ in 0..4 {
+            let (d, l) = (debian.clone(), laptop.clone());
+            debian.adopt(&l);
+            laptop.adopt(&d);
+        }
+    }
+
+    fn assert_settled_on(debian: &SpatialConfig, laptop: &SpatialConfig, x: i32, resistance: i32) {
+        assert_eq!((laptop_x(debian), debian.edge_resistance), (x, resistance), "Debian's copy");
+        assert_eq!((laptop_x(laptop), laptop.edge_resistance), (x, resistance), "the laptop's copy");
+        assert_eq!(debian.stamp(), laptop.stamp());
+    }
+
+    #[test]
+    fn edits_to_different_parts_on_both_devices_both_survive() {
+        let (mut debian, mut laptop) = pair();
+        debian.apply_edit(&resistance_of(90), NodeId::Debian);
+        laptop.apply_edit(&moved_to(300), NodeId::Windows);
+        settle(&mut debian, &mut laptop);
+        assert_settled_on(&debian, &laptop, 300, 90);
+    }
+
+    #[test]
+    fn an_edit_behind_the_other_copys_revision_is_not_lost() {
+        let (mut debian, mut laptop) = pair();
+        // The laptop is two edits ahead, and Debian's one edit has a lower revision than either.
+        laptop.apply_edit(&moved_to(100), NodeId::Windows);
+        laptop.apply_edit(&moved_to(200), NodeId::Windows);
+        debian.apply_edit(&resistance_of(90), NodeId::Debian);
+        settle(&mut debian, &mut laptop);
+        assert_settled_on(&debian, &laptop, 200, 90);
+    }
+
+    #[test]
+    fn a_copy_from_before_parts_had_stamps_counts_as_edited_at_its_revision() {
+        let mut c = layout(TouchSide::Bottom, 0, 1440);
+        c.revision = 7;
+        c.editor = NodeId::Windows;
+        let mut text: serde_json::Value = serde_json::to_value(&c).unwrap();
+        text.as_object_mut().unwrap().retain(|k, _| !k.ends_with("_stamp"));
+        let back = parse_layout(&text.to_string()).unwrap().config;
+        assert_eq!(back.arrangement_stamp, (7, NodeId::Windows));
+        assert_eq!(back.resistance_stamp, (7, NodeId::Windows));
     }
 
     #[test]
     fn a_huge_revision_from_the_other_device_is_not_believed() {
         let (mut debian, laptop) = pair();
-        let mut theirs = moved_to(&laptop, 5);
+        let mut theirs = laptop.clone();
+        theirs.apply_edit(&moved_to(5), NodeId::Windows);
         for revision in [u64::MAX, debian.revision + MAX_REVISION_JUMP + 1] {
             theirs.revision = revision;
             assert!(!debian.adopt(&theirs), "{revision}");
@@ -1273,8 +1431,7 @@ mod tests {
         c.revision = u64::MAX;
         let mut back = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
         assert_eq!(back.revision, 0);
-        let edit = back.clone();
-        back.apply_edit(&edit, NodeId::Debian);
+        back.apply_edit(&moved_to(5), NodeId::Debian);
         assert_eq!(back.revision, 1);
     }
 
@@ -1288,6 +1445,8 @@ mod tests {
         // The laptop's copy of Debian's monitors is out of date.
         debian_mut(&mut laptop).monitors = vec![rect("Old", 0, 0, 10, 10)];
         laptop.revision = 3;
+        laptop.arrangement_stamp = (3, NodeId::Debian);
+        laptop.resistance_stamp = (3, NodeId::Debian);
         assert!(debian.adopt(&laptop));
         assert_eq!((debian.edge_resistance, debian.attach_side), (90, TouchSide::Right));
         assert_eq!(debian.monitors(NodeId::Debian), &[dp3(), dp2()]);
@@ -1470,8 +1629,7 @@ mod tests {
             let (from, to) = if editor == NodeId::Debian { (&debian, &laptop) } else { (&laptop, &debian) };
             {
                 let mut g = from.state.write().unwrap();
-                let edit = moved_to(&g.config, 2300);
-                g.config.apply_edit(&edit, editor);
+                g.config.apply_edit(&moved_to(2300), editor);
             }
             let body = state_body(&from.config());
             let to_state = &to.state;

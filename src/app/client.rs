@@ -157,8 +157,7 @@ impl Client {
         }
     }
 
-    /// Saves a layout on this device, which passes it on. `body` is what
-    /// `LayoutState::to_save_json` made.
+    /// Saves a layout edit on this device, which passes it on. `body` is what `layout_edit` made.
     pub fn save_layout(&self, body: serde_json::Value) {
         self.send_here("/api/layout", body);
     }
@@ -425,9 +424,7 @@ mod tests {
         client.local_action(Device::Debian, serde_json::json!({"action": "set_autostart"}));
         client.local_action(Device::Windows, serde_json::json!({"action": "panic"}));
         client.master_action("toggle_focus");
-        let mut layout = client.snapshot().layout.unwrap();
-        layout.config.attach_side = "Right".into();
-        client.save_layout(layout.to_save_json());
+        client.save_layout(serde_json::json!({ "edge_resistance": 60 }));
         wait_for("four posts", || posts(&log).len() == 4);
         let p = posts(&log);
         assert_eq!(p[0].0, "/api/peer/api/local/action");
@@ -437,8 +434,7 @@ mod tests {
         assert!(p[2].1.contains("toggle_focus"));
         assert_eq!(p[3].0, "/api/layout");
         let saved: serde_json::Value = serde_json::from_str(&p[3].1).unwrap();
-        assert_eq!(saved["attach_side"], "Right");
-        assert_eq!(saved["future_field"], 7);
+        assert_eq!(saved["edge_resistance"], 60);
     }
 
     #[test]
@@ -448,7 +444,7 @@ mod tests {
             let (client, _rx) = start(port);
             ready(&client);
             client.master_action("panic");
-            client.save_layout(client.snapshot().layout.unwrap().to_save_json());
+            client.save_layout(serde_json::json!({ "edge_resistance": 60 }));
             wait_for("the posts", || posts(&log).len() == 2);
             assert_eq!(posts(&log)[0].0, "/api/action", "{node}");
             assert_eq!(posts(&log)[1].0, "/api/layout", "{node}");
@@ -621,7 +617,7 @@ mod tests {
         });
         let client = start_holding(port, Duration::from_millis(100));
         ready(&client);
-        client.save_layout(client.snapshot().layout.unwrap().to_save_json());
+        client.save_layout(serde_json::json!({ "edge_resistance": 60 }));
         wait_for("the error", || client.last_error().is_some());
         std::thread::sleep(Duration::from_millis(150));
         client.master_action("panic");
@@ -639,7 +635,7 @@ mod tests {
         });
         let client = start_holding(port, Duration::from_secs(60));
         ready(&client);
-        client.save_layout(client.snapshot().layout.unwrap().to_save_json());
+        client.save_layout(serde_json::json!({ "edge_resistance": 60 }));
         wait_for("the error", || client.last_error().is_some());
         let before = client.last_error();
         client.master_action("panic");

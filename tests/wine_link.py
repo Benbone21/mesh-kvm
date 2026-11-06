@@ -530,10 +530,8 @@ def layout_checks(peer, inbox, holder):
     # n. An edit on the laptop raises the revision, and Debian hears of it.
     config = state()["config"]
     before = config["revision"]
-    edit = json.loads(json.dumps(config))
-    laptop = next(d for d in edit["devices"] if d["node"] == "Windows")
-    laptop["y"] = 123
-    reply = call("/api/layout", edit)
+    places = [{"node": d["node"], "x": d["x"], "y": 123 if d["node"] == "Windows" else d["y"]} for d in config["devices"]]
+    reply = call("/api/layout", {"arrangement": {"devices": places, "attach_side": config["attach_side"]}})
     now = state()["config"]
     check("POST /api/layout on the laptop is taken, as a new revision by the laptop",
           reply.get("ok") and now["revision"] == before + 1 and now["editor"] == "Windows", str(reply))
@@ -547,6 +545,7 @@ def layout_checks(peer, inbox, holder):
     theirs["revision"] = now["revision"] + 5
     theirs["editor"] = "Debian"
     theirs["attach_side"] = "Top"
+    theirs["arrangement_stamp"] = [theirs["revision"], "Debian"]
     next(d for d in theirs["devices"] if d["node"] == "Windows")["y"] = -456
     holder["state"] = {"config": theirs, "telemetry": {}}
     deadline = time.time() + 4
@@ -580,8 +579,7 @@ def security_checks(pinned_peer):
 
     # r. Changes come from this device or the other one, and from no one else.
     before = state()["config"]
-    hostile = json.loads(json.dumps(before))
-    hostile["revision"] = 2 ** 64 - 1
+    hostile = {"revision": 2 ** 64 - 1, "edge_resistance": before["edge_resistance"] + 5}
     for path, body in (("/api/layout", hostile), ("/api/action", {"action": "panic"}),
                        ("/api/local/action", {"action": "set_sharing", "mouse": False}),
                        ("/api/peer/api/action", {"action": "panic"})):
