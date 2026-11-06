@@ -965,6 +965,9 @@ pub fn studio_handler(
                 if act == "set_device_name" {
                     return Some(set_device_name(&state, &val));
                 }
+                if act == "set_audio_device" {
+                    return Some(crate::settings::set_audio_device(&val, req.from_app_here));
+                }
                 // These reach the operating system, under the same rule as every other change:
                 // `webui` has already turned away anything but the app here and the other device.
                 match act {
@@ -1658,6 +1661,16 @@ mod tests {
         assert!(handler(&from_peer).unwrap().contains("only be kept on the device"));
         let here = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "127.0.0.1");
         assert_eq!(handler(&here).unwrap(), crate::settings::OK_RESPONSE);
+    }
+
+    #[test]
+    fn the_service_refuses_a_microphone_chosen_from_the_other_device() {
+        let state = Arc::new(shared_at(0, NodeId::Debian, None));
+        let platform: Arc<dyn Platform> = Arc::new(NoScreens);
+        let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change());
+        let body = serde_json::json!({ "action": "set_audio_device", "role": "input", "id": "mic" }).to_string();
+        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "192.168.8.241");
+        assert!(handler(&from_peer).unwrap().contains("device it belongs to"));
     }
 
     #[test]

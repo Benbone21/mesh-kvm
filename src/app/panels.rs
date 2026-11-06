@@ -335,7 +335,14 @@ impl DevicePanel<'_, '_> {
         let audio = &self.status.audio;
         let (inputs, outputs) = (audio.inputs.clone(), audio.outputs.clone());
         let (input, output) = (audio.input.clone(), audio.output.clone());
-        self.device_picker(ui, DeviceRole::Input, "Microphone or line-in to send", &inputs, &input);
+        // A microphone is only ever switched on from its own device, as it could be listened in on.
+        let here = self.shared.snapshot.is_here(self.device);
+        ui.add_enabled_ui(here, |ui| {
+            self.device_picker(ui, DeviceRole::Input, "Microphone or line-in to send", &inputs, &input);
+        });
+        if !here {
+            ui.label(small("This can only be changed on that device."));
+        }
         self.device_picker(ui, DeviceRole::Output, "Output to send", &outputs, &output);
         meter(ui, self.status.audio.tx_peak);
         self.toggle(ui, Control::PlayOnlyOnOther, "Play only on the other device");

@@ -548,19 +548,38 @@ fn change_main_device(val: &serde_json::Value, link_up: bool, save: impl FnOnce(
     OK_RESPONSE.to_string()
 }
 
-/// Applies a device choice. Returns false for an unknown role or a choice that can't be right:
-/// received audio always plays somewhere, so `play` can't be nothing.
-fn change_audio_device(role: Option<&str>, id: &str) -> bool {
+/// Longer than any id PipeWire or Windows gives a device.
+const MAX_AUDIO_DEVICE_ID: usize = 512;
+
+/// Handles `set_audio_device` and returns the response body. Not a common action, as it has to
+/// know who is asking: the other device must not be able to switch on this one's microphone.
+pub fn set_audio_device(val: &serde_json::Value, from_this_device: bool) -> String {
+    change_audio_device(val, from_this_device, save_current)
+}
+
+fn change_audio_device(val: &serde_json::Value, from_this_device: bool, save: impl FnOnce()) -> String {
+    let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
+    let Some(id) = val.get("id").and_then(|v| v.as_str()) else {
+        return refuse("That isn't a device.");
+    };
+    if id.len() > MAX_AUDIO_DEVICE_ID || id.chars().any(char::is_control) {
+        return refuse("That isn't a device.");
+    }
     let mut choice = devices::choice();
-    match role {
+    match val.get("role").and_then(|v| v.as_str()) {
+        Some("input") if id != devices::NONE && !from_this_device => {
+            return refuse("A microphone can only be chosen on the device it belongs to.");
+        }
         Some("input") => choice.input = id.to_string(),
         Some("output") => choice.output = id.to_string(),
-        Some("play") if id != devices::NONE => choice.play = id.to_string(),
-        _ => return false,
+        Some("play") if id == devices::NONE => return refuse("Received audio has to play somewhere."),
+        Some("play") => choice.play = id.to_string(),
+        _ => return refuse("That isn't one of the audio choices."),
     }
     devices::set_choice(choice);
     crate::audio::choices_changed();
-    true
+    save();
+    OK_RESPONSE.to_string()
 }
 
 fn change_bitrate(kbps: Option<u64>) {
@@ -578,12 +597,6 @@ pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
     let num = |k: &str| val.get(k).and_then(|v| v.as_u64());
     let flag = |k: &str| val.get(k).and_then(|v| v.as_bool());
     match act {
-        "set_audio_device" => {
-            let id = val.get("id").and_then(|v| v.as_str()).unwrap_or(devices::NONE);
-            if !change_audio_device(val.get("role").and_then(|v| v.as_str()), id) {
-                return true;
-            }
-        }
         "set_audio_bitrate" => {
             change_bitrate(num("kbps"));
         }
@@ -1018,17 +1031,22 @@ mod tests {
     fn device_choices_and_the_bitrate_change_through_actions() {
         let _guard = live_toggles();
         let before = devices::choice();
-        assert!(change_audio_device(Some("input"), "usb-mic"));
-        assert!(change_audio_device(Some("output"), "speakers"));
-        assert!(change_audio_device(Some("play"), "headset"));
+        let set = |role: &str, id: &str| {
+            let saves = std::cell::Cell::new(0);
+            let reply = change_audio_device(&json!({ "role": role, "id": id }), true, || saves.set(saves.get() + 1));
+            assert_eq!(saves.get(), u32::from(reply == OK_RESPONSE), "saved only if changed: {reply}");
+            reply
+        };
+        assert_eq!(set("input", "usb-mic"), OK_RESPONSE);
+        assert_eq!(set("output", "speakers"), OK_RESPONSE);
+        assert_eq!(set("play", "headset"), OK_RESPONSE);
         assert_eq!(audio_status_json()["input"], "usb-mic");
         assert_eq!(audio_status_json()["tx_enabled"], true, "choosing anything starts sending");
-        assert!(!change_audio_device(Some("play"), devices::NONE), "it always plays somewhere");
+        assert!(set("play", devices::NONE).contains("has to play somewhere"));
         assert_eq!(devices::choice().play, "headset");
-        assert!(!change_audio_device(Some("nonsense"), "x"));
-        assert!(!change_audio_device(None, "x"));
+        assert!(set("nonsense", "x").contains("audio choices"));
         for role in ["input", "output"] {
-            change_audio_device(Some(role), devices::NONE);
+            set(role, devices::NONE);
         }
         assert_eq!(audio_status_json()["tx_enabled"], false);
         devices::set_choice(before);
@@ -1039,6 +1057,42 @@ mod tests {
         change_bitrate(Some(5));
         assert_eq!(audio_status_json()["bitrate"], 256, "not on offer");
         AUDIO_BITRATE_KBPS.store(kbps, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_device_id_has_to_be_one() {
+        let _guard = live_toggles();
+        let before = devices::choice();
+        let try_it = |val: serde_json::Value| change_audio_device(&val, true, || panic!("nothing to save"));
+        for refused in [
+            json!({ "role": "output" }),
+            json!({ "role": "output", "id": 5 }),
+            json!({ "role": "output", "id": null }),
+            json!({ "role": "output", "id": "x".repeat(MAX_AUDIO_DEVICE_ID + 1) }),
+            json!({ "role": "output", "id": "two\nlines" }),
+            json!({ "role": "output", "id": "bell\u{7}" }),
+            json!({ "id": "speakers" }),
+        ] {
+            assert!(try_it(refused.clone()).contains("\"ok\":false"), "{refused}");
+        }
+        assert_eq!(devices::choice(), before, "a bad id isn't taken to mean None");
+    }
+
+    #[test]
+    fn the_other_device_can_t_switch_on_this_one_s_microphone() {
+        let _guard = live_toggles();
+        let before = devices::choice();
+        let asked = |role: &str, id: &str, here: bool| {
+            let val = json!({ "role": role, "id": id });
+            change_audio_device(&val, here, || {})
+        };
+        assert!(asked("input", "usb-mic", false).contains("device it belongs to"));
+        assert!(asked("input", devices::DEFAULT, false).contains("device it belongs to"));
+        assert_eq!(devices::choice(), before);
+        assert_eq!(asked("output", "speakers", false), OK_RESPONSE, "an output is fair game");
+        assert_eq!(asked("input", "usb-mic", true), OK_RESPONSE);
+        assert_eq!(asked("input", devices::NONE, false), OK_RESPONSE, "and it can be switched off from there");
+        devices::set_choice(before);
     }
 
     #[test]

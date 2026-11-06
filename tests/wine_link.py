@@ -550,6 +550,9 @@ def audio_checks():
     ours.sendto(garbage, (LAPTOP, AUDIO_PORT))
     check("a later version is left alone too", local()["audio"]["rx_packets"] == 0)
 
+    chosen = {"action": "set_audio_device", "role": "input", "id": "default"}
+    post_from(PEER, "/api/local/action", chosen)
+    check("the other device can't switch on this one's microphone", local()["audio"]["input"] == "")
     reply = call("/api/local/action", {"action": "set_audio_device", "role": "output", "id": "default"})
     check("choosing an output is accepted", reply.get("ok") is True, str(reply))
     audio = wait_for(lambda s: s["audio"]["tx_enabled"], 5)
