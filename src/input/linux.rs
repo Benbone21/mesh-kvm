@@ -8,7 +8,7 @@ use crate::protocol::{
     NodeId, Packet, Payload, SwitchEdge, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
-use crate::router::{Action, DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
+use crate::router::{Action, DeviceId, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{studio_handler, take_studio_requests, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -1157,8 +1157,8 @@ pub fn run_debian_node(
         router: Router::new(RouterConfig {
             me: DEBIAN,
             peer: WINDOWS,
-            main: DEBIAN,
-            sharing: Sharing { mouse: true, keyboard: true },
+            main: crate::settings::main_device(),
+            sharing: crate::settings::sharing(),
             pointer_speed: cfg_snapshot.mouse_speed,
         }),
         backend: LinuxBackend {
@@ -1201,12 +1201,15 @@ pub fn run_debian_node(
         "[Debian] Spatial Studio UI ready at: http://localhost:24880 (or http://192.168.8.241:24880)"
     );
 
-    // A laptop that outlived a Debian restart may still think it is active.
-    apply(
-        &[Action::SendFocus { target: DEBIAN, x: KEEP_CURSOR, y: KEEP_CURSOR }],
-        &mut core.backend,
-        &mut core.peer,
-    );
+    // A laptop that outlived a Debian restart may still think it is active. A main laptop must
+    // not hear this: it would take it as a claim and forward to a Debian it may not reach.
+    if core.router.main() == DEBIAN {
+        apply(
+            &[Action::SendFocus { target: DEBIAN, x: KEEP_CURSOR, y: KEEP_CURSOR }],
+            &mut core.backend,
+            &mut core.peer,
+        );
+    }
 
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -1236,6 +1239,11 @@ pub fn run_debian_node(
             manual_toggle = requests.manual_switch;
             web_panic = requests.panic;
             cfg_snapshot = requests.config;
+        }
+
+        // Outside the Studio lock, so a busy lock cannot hold up a toggle that frees input.
+        for event in crate::settings::take_router_events() {
+            core.route(event);
         }
 
         core.router.set_pointer_speed(cfg_snapshot.mouse_speed);
@@ -1284,6 +1292,9 @@ pub fn run_debian_node(
                         let (x, y) = cfg_snapshot.laptop_to_debian(x, y);
                         core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
                     }
+                }
+                Payload::ActiveView { active_node } => {
+                    core.route(Event::PeerActiveView { active: active_node as DeviceId });
                 }
                 Payload::PanicRelease => {
                     println!("[PANIC] Received PanicRelease from Windows!");

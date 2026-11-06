@@ -8,6 +8,7 @@ use crate::keymap::{
 use crate::protocol::{
     MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
+use crate::router::{DeviceId, Router};
 use std::sync::{Mutex, MutexGuard};
 
 // Win32 values, restated so this file builds on Linux. `windows.rs` asserts they match.
@@ -51,6 +52,26 @@ pub fn hook_gate(router_poisoned: bool) -> HookGate {
 /// Locks `mutex`, or `None` once a panic has poisoned it.
 pub fn lock_live<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
     mutex.lock().ok()
+}
+
+/// Where input should stand given the router's state. The default suits a poisoned router:
+/// nothing blocked, and nothing injected.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SettledInput {
+    pub block_mouse: bool,
+    pub block_keyboard: bool,
+    pub injecting: bool,
+}
+
+pub fn settled_input(router: &Router, me: DeviceId) -> SettledInput {
+    let live = router.online() && !router.panicked();
+    let remote = live && router.active() != me;
+    let sharing = router.sharing();
+    SettledInput {
+        block_mouse: remote && sharing.mouse,
+        block_keyboard: remote && sharing.keyboard,
+        injecting: live && router.active() == me,
+    }
 }
 
 /// Movement carried by one mouse-hook event at `pt`, or `None` for an event that is only our
@@ -285,6 +306,7 @@ impl HotkeyFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::{Event, RouterConfig, Sharing};
     use crate::keymap::{evdev_to_win_scan, KEY_A, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL};
     use crate::keymap::{KEY_F11, KEY_F12, KEY_G, KEY_SCROLLLOCK};
     use crate::protocol::{
@@ -606,6 +628,47 @@ mod tests {
         f.note_swallowed(KEY_A);
         f.feed(KEY_LEFTALT, true, true, OS_UP);
         assert_eq!(f.feed(KEY_F12, true, true, OS_UP), KeyRoute::Route);
+    }
+
+    /// The laptop online, following Debian's view that Debian is active.
+    fn forwarding_laptop() -> Router {
+        let mut router = Router::new(RouterConfig {
+            me: 1,
+            peer: 0,
+            main: 0,
+            sharing: Sharing { mouse: true, keyboard: true },
+            pointer_speed: 1.0,
+        });
+        router.handle(Event::PeerAlive { now_ms: 1000 });
+        router.handle(Event::PeerActiveView { active: 0 });
+        router
+    }
+
+    #[test]
+    fn settling_blocks_what_is_shared_while_the_peer_is_active() {
+        let want = SettledInput { block_mouse: true, block_keyboard: true, injecting: false };
+        assert_eq!(settled_input(&forwarding_laptop(), 1), want);
+    }
+
+    #[test]
+    fn settling_follows_each_sharing_toggle() {
+        for (mouse, keyboard) in [(false, true), (true, false), (false, false)] {
+            let mut router = forwarding_laptop();
+            router.handle(Event::SetSharing(Sharing { mouse, keyboard }));
+            let want = SettledInput { block_mouse: mouse, block_keyboard: keyboard, injecting: false };
+            assert_eq!(settled_input(&router, 1), want);
+        }
+    }
+
+    #[test]
+    fn settling_blocks_nothing_while_local_or_panicked() {
+        let mut router = forwarding_laptop();
+        router.handle(Event::Panic);
+        assert_eq!(settled_input(&router, 1), SettledInput::default());
+        let mut router = forwarding_laptop();
+        router.handle(Event::PeerFocus { target: 1, x: 0, y: 0 });
+        let want = SettledInput { block_mouse: false, block_keyboard: false, injecting: true };
+        assert_eq!(settled_input(&router, 1), want);
     }
 
     #[test]

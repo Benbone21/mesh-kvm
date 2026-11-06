@@ -8,8 +8,7 @@ use crate::protocol::{
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{
-    Action, DeviceId, EdgeSpan, EdgeTracker, Event, Routed, Router, RouterConfig, Sharing,
-    KEEP_CURSOR,
+    Action, DeviceId, EdgeSpan, EdgeTracker, Event, Routed, Router, RouterConfig, KEEP_CURSOR,
 };
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
@@ -116,9 +115,9 @@ fn router_lock() -> &'static Mutex<Router> {
         Mutex::new(Router::new(RouterConfig {
             me: ME,
             peer: PEER,
-            main: PEER,
-            sharing: Sharing { mouse: true, keyboard: true },
-            pointer_speed: 1.0,
+            main: crate::settings::main_device(),
+            sharing: crate::settings::sharing(),
+            pointer_speed: crate::settings::pointer_speed(),
         }))
     })
 }
@@ -185,16 +184,11 @@ fn route_local(event: Event) -> Routed {
 /// and a stale `SetBlocking` would leave the pin wrong. Whoever applies last corrects it here
 /// against the router, and the watchdog does so every tick. A poisoned router counts as neither.
 fn settle_races() {
-    let (remote, pin_mouse, injecting) = match win_logic::lock_live(router_lock()) {
-        Some(router) => {
-            let live = router.online() && !router.panicked();
-            let remote = live && router.active() != ME;
-            (remote, remote && router.shares_mouse(), live && router.active() == ME)
-        }
-        None => (false, false, false),
-    };
-    WindowsBackend.set_blocking(pin_mouse, remote);
-    if !injecting {
+    let settled = win_logic::lock_live(router_lock())
+        .map(|router| win_logic::settled_input(&router, ME))
+        .unwrap_or_default();
+    WindowsBackend.set_blocking(settled.block_mouse, settled.block_keyboard);
+    if !settled.injecting {
         WindowsBackend.release_held();
     }
 }
@@ -404,28 +398,27 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
                     ""
                 };
                 let (w, h) = screen_size();
-                Some(
-                    serde_json::json!({
-                        "node": "windows",
-                        "label": "Windows Laptop",
-                        "hostname": crate::webui::hostname(),
-                        "ip": crate::webui::local_ip_toward(&peer_ip),
-                        "peer_ip": peer_ip,
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "os": "Windows 11",
-                        "peer_online": peer_online,
-                        "active_node": active,
-                        "panic_mode": panic_mode,
-                        "game_lock": captive,
-                        "game_reason": reason,
-                        "displays": [{ "name": "Laptop display", "x": 0, "y": 0, "w": w, "h": h }],
-                        "cursor": [pt.x, pt.y],
-                        "autostart": startup_vbs_path().is_some_and(|p| p.exists()),
-                        "input_devices": ["Laptop keyboard", "Laptop trackpad"],
-                        "audio": crate::settings::audio_status_json(false),
-                    })
-                    .to_string(),
-                )
+                let mut status = serde_json::json!({
+                    "node": "windows",
+                    "label": "Windows Laptop",
+                    "hostname": crate::webui::hostname(),
+                    "ip": crate::webui::local_ip_toward(&peer_ip),
+                    "peer_ip": peer_ip,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "os": "Windows 11",
+                    "peer_online": peer_online,
+                    "active_node": active,
+                    "panic_mode": panic_mode,
+                    "game_lock": captive,
+                    "game_reason": reason,
+                    "displays": [{ "name": "Laptop display", "x": 0, "y": 0, "w": w, "h": h }],
+                    "cursor": [pt.x, pt.y],
+                    "autostart": startup_vbs_path().is_some_and(|p| p.exists()),
+                    "input_devices": ["Laptop keyboard", "Laptop trackpad"],
+                    "audio": crate::settings::audio_status_json(false),
+                });
+                crate::settings::add_toggle_status(&mut status, crate::settings::pointer_speed());
+                Some(status.to_string())
             }
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
@@ -902,6 +895,12 @@ pub fn run_windows_node(
             let mut ticks = 0u32;
             loop {
                 std::thread::sleep(TICK_INTERVAL);
+                if let Some(mut router) = win_logic::lock_live(router_lock()) {
+                    router.set_pointer_speed(crate::settings::pointer_speed());
+                }
+                for event in crate::settings::take_router_events() {
+                    route(event);
+                }
                 route(Event::Tick { now_ms: now_ms() });
                 settle_races();
 
@@ -913,16 +912,18 @@ pub fn run_windows_node(
 
                 let status = {
                     let router = router();
-                    (router.online(), router.active(), router.panicked(), router.captive())
+                    let main = router.main();
+                    (router.online(), router.active(), router.panicked(), router.captive(), main)
                 };
                 if logged != Some(status) {
                     logged = Some(status);
-                    let (online, active, panicked, captive) = status;
-                    let active = if active == PEER { "DEBIAN" } else { "WINDOWS" };
+                    let (online, active, panicked, captive, main) = status;
+                    let name = |device| if device == PEER { "DEBIAN" } else { "WINDOWS" };
                     println!(
-                        "[Windows] Link {}, active {}, panic {}, game lock {}",
+                        "[Windows] Link {}, active {}, main {}, panic {}, game lock {}",
                         if online { "up" } else { "down" },
-                        active,
+                        name(active),
+                        name(main),
                         panicked,
                         captive
                     );

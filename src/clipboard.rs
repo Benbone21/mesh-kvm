@@ -5,8 +5,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// This device's clipboard goes to the peer.
+pub static CLIPBOARD_SEND: AtomicBool = AtomicBool::new(true);
+/// The peer's clipboard is taken in here.
+pub static CLIPBOARD_RECEIVE: AtomicBool = AtomicBool::new(true);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClipboardPayload {
@@ -43,6 +49,9 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
             println!("[Clipboard] Unified clipboard sync listening on TCP {}", bind_addr);
 
             for stream in listener.incoming().flatten() {
+                if !CLIPBOARD_RECEIVE.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let mut stream = stream;
                 let mut len_buf = [0u8; 4];
                 if stream.read_exact(&mut len_buf).is_ok() {
@@ -116,8 +125,12 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
                             false
                         };
 
+                        // Hashed even with sending off, so that what was copied meanwhile
+                        // does not go out the moment sending comes back on.
                         if changed {
-                            send_clipboard_payload(target_addr, &ClipboardPayload::Text(text));
+                            if CLIPBOARD_SEND.load(Ordering::SeqCst) {
+                                send_clipboard_payload(target_addr, &ClipboardPayload::Text(text));
+                            }
                             continue;
                         }
                     }
@@ -137,7 +150,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
                             false
                         };
 
-                        if changed {
+                        if changed && CLIPBOARD_SEND.load(Ordering::SeqCst) {
                             send_clipboard_payload(
                                 target_addr,
                                 &ClipboardPayload::Image {

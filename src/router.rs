@@ -51,7 +51,6 @@ pub enum Event {
     PeerAlive { now_ms: u64 },
     PeerFocus { target: DeviceId, x: i32, y: i32 },
     /// The main device's view of the active device. Repairs a desync, so it never warps.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PeerActiveView { active: DeviceId },
     /// The peer's manual game lock: refuses crossings like `SetCaptive`, tracked separately.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -64,10 +63,8 @@ pub enum Event {
     EdgeCrossed { x: i32, y: i32 },
     /// Live change of what this device shares. Focus stays put, and panic and link rules still
     /// win. Input of a kind turned off is let go on the peer and stays local from then on.
-    #[allow(dead_code)]
     SetSharing(Sharing),
     /// Live change of the main device. An unknown device is ignored.
-    #[allow(dead_code)]
     SetMain(DeviceId),
 }
 
@@ -157,21 +154,15 @@ impl Router {
         self.panicked
     }
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub fn shares_mouse(&self) -> bool {
-        self.cfg.sharing.mouse
-    }
-    #[allow(dead_code)]
     pub fn sharing(&self) -> Sharing {
         self.cfg.sharing
     }
-    #[allow(dead_code)]
     pub fn main(&self) -> DeviceId {
         self.cfg.main
     }
     pub fn captive(&self) -> bool {
         self.captive
     }
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn set_pointer_speed(&mut self, speed: f32) {
         self.cfg.pointer_speed = speed;
     }

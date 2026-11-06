@@ -573,33 +573,32 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
                     .next()
                     .unwrap_or("")
                     .to_string();
-                Some(
-                    serde_json::json!({
-                        "node": "debian",
-                        "label": "Debian Desktop",
-                        "hostname": crate::webui::hostname(),
-                        "ip": crate::webui::local_ip_toward(&peer_ip),
-                        "peer_ip": peer_ip,
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "os": "Debian 13 (KDE Plasma 6 Wayland)",
-                        "peer_online": g.telemetry.peer_online,
-                        "active_node": g.telemetry.active_node,
-                        "panic_mode": g.telemetry.panic_mode,
-                        "game_lock": g.telemetry.game_captive_active,
-                        "game_reason": g.telemetry.game_reason,
-                        "displays": g.config.debian_monitors,
-                        "cursor": [g.telemetry.deb_cursor_x, g.telemetry.deb_cursor_y],
-                        "autostart": debian_autostart_enabled(),
-                        "input_devices": ["Physical mouse (evdev)", "Desk keyboard (evdev)"],
-                        "audio": crate::settings::audio_status_json(true),
-                    })
-                    .to_string(),
-                )
+                let mut status = serde_json::json!({
+                    "node": "debian",
+                    "label": "Debian Desktop",
+                    "hostname": crate::webui::hostname(),
+                    "ip": crate::webui::local_ip_toward(&peer_ip),
+                    "peer_ip": peer_ip,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "os": "Debian 13 (KDE Plasma 6 Wayland)",
+                    "peer_online": g.telemetry.peer_online,
+                    "active_node": g.telemetry.active_node,
+                    "panic_mode": g.telemetry.panic_mode,
+                    "game_lock": g.telemetry.game_captive_active,
+                    "game_reason": g.telemetry.game_reason,
+                    "displays": g.config.debian_monitors,
+                    "cursor": [g.telemetry.deb_cursor_x, g.telemetry.deb_cursor_y],
+                    "autostart": debian_autostart_enabled(),
+                    "input_devices": ["Physical mouse (evdev)", "Desk keyboard (evdev)"],
+                    "audio": crate::settings::audio_status_json(true),
+                });
+                crate::settings::add_toggle_status(&mut status, g.config.mouse_speed);
+                Some(status.to_string())
             }
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
                 let act = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                if !crate::settings::handle_common_action(act, &val) {
+                if !handle_local_action(&state, act, &val) {
                     match act {
                         "set_autostart" => set_debian_autostart(
                             val.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -665,7 +664,7 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
                     "set_audio_volume" => {
                         crate::settings::handle_common_action("set_audio_rx_volume", &val)
                     }
-                    other => crate::settings::handle_common_action(other, &val),
+                    other => handle_local_action(&state, other, &val),
                 };
                 if !handled_audio {
                     apply_master_action(&state, &act, &val);
@@ -675,6 +674,25 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>) -> crate::webui::H
             _ => None,
         }
     })
+}
+
+/// `settings::handle_common_action`, except that Debian's pointer speed is the layout's
+/// `mouse_speed`, which the input loop picks up from its next config snapshot.
+fn handle_local_action(
+    state: &Arc<RwLock<SharedSpatialState>>,
+    act: &str,
+    val: &serde_json::Value,
+) -> bool {
+    if act != "set_pointer_speed" {
+        return crate::settings::handle_common_action(act, val);
+    }
+    if let Some(speed) = crate::settings::requested_pointer_speed(val) {
+        if let Ok(mut g) = state.write() {
+            g.config.mouse_speed = speed;
+            g.save();
+        }
+    }
+    true
 }
 
 fn apply_master_action(state: &Arc<RwLock<SharedSpatialState>>, act: &str, _val: &serde_json::Value) {
