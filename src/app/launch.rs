@@ -4,12 +4,14 @@ use super::model::ServiceStart;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How often the service is looked for while it starts, and for how many tries: 15 seconds, as the
-/// first start under Windows' scanning or a busy login can take a while.
+/// How often the service is looked for while it starts, and for how long: the first start under
+/// Windows' scanning or a busy login can take a while. A look at a port that accepts and never
+/// answers takes over a second by itself, so the tries alone don't set the time.
 const START_POLL: Duration = Duration::from_millis(250);
 const START_POLLS: u32 = 60;
+const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a service that has answered must keep answering. Under systemd, one that can't reach
 /// its input devices answers for a moment before it stops.
 const START_SETTLE: Duration = Duration::from_millis(600);
@@ -289,6 +291,7 @@ fn ensure_service(host: &dyn ServiceHost, log: &Path) -> Result<(), String> {
         }
         StartPlan::Detached => host.start_detached().map_err(failed)?,
     }
+    let started = Instant::now();
     for _ in 0..START_POLLS {
         host.wait(START_POLL);
         if host.answers() {
@@ -296,6 +299,9 @@ fn ensure_service(host: &dyn ServiceHost, log: &Path) -> Result<(), String> {
             if host.answers() {
                 return Ok(());
             }
+        }
+        if started.elapsed() >= START_TIMEOUT {
+            break;
         }
     }
     Err(format!("mesh-kvm didn't start on this device. The reason may be in the log: {}", log.display()))
@@ -549,6 +555,35 @@ mod tests {
         let host = FakeHost::default();
         let error = ensure(&host).unwrap_err();
         assert!(error.contains("didn't start") && error.contains("/tmp/mesh-kvm.log"), "{error}");
+    }
+
+    /// A port that accepts and never answers: every look takes a long time.
+    struct SilentPort(FakeHost);
+
+    impl super::ServiceHost for SilentPort {
+        fn answers(&self) -> bool {
+            std::thread::sleep(Duration::from_millis(300));
+            false
+        }
+        fn unit_exists(&self) -> bool {
+            false
+        }
+        fn start_unit(&self) -> Result<(), String> {
+            self.0.start_unit()
+        }
+        fn start_detached(&self) -> Result<(), String> {
+            self.0.start_detached()
+        }
+        fn wait(&self, _time: Duration) {}
+    }
+
+    #[test]
+    fn slow_looks_at_the_service_still_end_on_time() {
+        let started = std::time::Instant::now();
+        let host = SilentPort(FakeHost::default());
+        assert!(super::ensure_service(&host, Path::new("/tmp/mesh-kvm.log")).is_err());
+        // 60 looks at 300 ms would be 18 seconds.
+        assert!(started.elapsed() < super::START_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]
