@@ -1,14 +1,23 @@
 //! The Windows laptop.
 
-use super::Platform;
+use super::{DisplayInfo, DisplayMode, Platform};
 use crate::protocol::{MonitorRect, NodeId};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+use windows_sys::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
+use windows_sys::Win32::Foundation::{BOOL, ERROR_SUCCESS, LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
+    CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_BADMODE,
+    DISP_CHANGE_RESTART, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_INTERLACED, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
 
@@ -46,6 +55,19 @@ impl Platform for WindowsPlatform {
             Some(size) => super::single_monitor(size),
             None => enum_monitors(),
         }
+    }
+
+    fn displays(&self) -> Vec<DisplayInfo> {
+        match self.size {
+            Some(size) => super::single_display(size),
+            None => enum_displays(),
+        }
+    }
+
+    fn set_display_mode(&self, output: &str, mode: &DisplayMode) -> Result<(), String> {
+        let device = attached_devices().into_iter().find(|device| display_name(device) == output);
+        let device = device.ok_or_else(|| "That screen isn't connected any more.".to_string())?;
+        change_mode(&device, mode)
     }
 
     fn autostart_enabled(&self) -> bool {
@@ -110,6 +132,156 @@ fn enum_monitors() -> Vec<MonitorRect> {
     }
     found.sort_by_key(|m| (m.x, m.y));
     found
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn from_wide(text: &[u16]) -> String {
+    let end = text.iter().position(|c| *c == 0).unwrap_or(text.len());
+    String::from_utf16_lossy(&text[..end])
+}
+
+fn empty_devmode() -> DEVMODEW {
+    let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+    mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    mode
+}
+
+/// The names of the display devices that are part of the desktop, like `\\.\DISPLAY1`.
+fn attached_devices() -> Vec<String> {
+    let mut found = Vec::new();
+    for index in 0.. {
+        let mut device: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        if unsafe { EnumDisplayDevicesW(ptr::null(), index, &mut device, 0) } == 0 {
+            break;
+        }
+        if device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0 {
+            found.push(from_wide(&device.DeviceName));
+        }
+    }
+    found
+}
+
+/// A mode as Windows lists it, unless it is interlaced or its colour depth isn't the one in use.
+fn listed_mode(mode: &DEVMODEW, bits_in_use: u32) -> Option<DisplayMode> {
+    let interlaced = unsafe { mode.Anonymous2.dmDisplayFlags } & DM_INTERLACED != 0;
+    (!interlaced && mode.dmBitsPerPel == bits_in_use && mode.dmDisplayFrequency > 1).then(|| DisplayMode {
+        width: mode.dmPelsWidth as i32,
+        height: mode.dmPelsHeight as i32,
+        millihertz: mode.dmDisplayFrequency * 1000,
+        id: String::new(),
+    })
+}
+
+fn describe(device: &str, names: &HashMap<String, String>) -> Option<DisplayInfo> {
+    let name = wide(device);
+    let mut current = empty_devmode();
+    if unsafe { EnumDisplaySettingsW(name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut current) } == 0 {
+        return None;
+    }
+    let mut modes = Vec::new();
+    for index in 0.. {
+        let mut mode = empty_devmode();
+        if unsafe { EnumDisplaySettingsW(name.as_ptr(), index, &mut mode) } == 0 {
+            break;
+        }
+        modes.extend(listed_mode(&mode, current.dmBitsPerPel));
+    }
+    super::sort_modes(&mut modes);
+    let position = unsafe { current.Anonymous1.Anonymous2.dmPosition };
+    let id = display_name(device);
+    Some(DisplayInfo {
+        name: names.get(device).cloned().unwrap_or_else(|| id.clone()),
+        id,
+        x: position.x,
+        y: position.y,
+        current: listed_mode(&current, current.dmBitsPerPel),
+        modes,
+        can_change: true,
+    })
+}
+
+fn enum_displays() -> Vec<DisplayInfo> {
+    let names = monitor_names();
+    let mut found: Vec<DisplayInfo> = attached_devices().iter().filter_map(|device| describe(device, &names)).collect();
+    found.sort_by_key(|d| (d.x, d.y));
+    found
+}
+
+/// What a device's mode looks like to `ChangeDisplaySettingsExW`: only size and rate are set.
+fn mode_request(mode: &DisplayMode) -> DEVMODEW {
+    let mut request = empty_devmode();
+    request.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    request.dmPelsWidth = mode.width as u32;
+    request.dmPelsHeight = mode.height as u32;
+    request.dmDisplayFrequency = mode.whole_hertz();
+    request
+}
+
+/// Tries the mode first, as a mode the driver refuses should change nothing. It goes in the
+/// registry so that a kept mode lasts, and going back writes the old one over it.
+fn change_mode(device: &str, mode: &DisplayMode) -> Result<(), String> {
+    let name = wide(device);
+    let request = mode_request(mode);
+    let change = |flags| unsafe { ChangeDisplaySettingsExW(name.as_ptr(), &request, ptr::null_mut(), flags, ptr::null()) };
+    match change(CDS_TEST) {
+        DISP_CHANGE_SUCCESSFUL => {}
+        DISP_CHANGE_BADMODE => return Err("Windows says this screen can't use that mode.".to_string()),
+        _ => return Err("Windows didn't accept that mode.".to_string()),
+    }
+    match change(CDS_UPDATEREGISTRY) {
+        DISP_CHANGE_SUCCESSFUL => Ok(()),
+        DISP_CHANGE_RESTART => Err("Windows needs to restart to use that mode.".to_string()),
+        _ => Err("Windows didn't accept that mode.".to_string()),
+    }
+}
+
+/// The model each display device shows, by device name. A laptop's own panel usually has none.
+fn monitor_names() -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let (mut path_count, mut mode_count) = (0u32, 0u32);
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) } != ERROR_SUCCESS {
+        return names;
+    }
+    let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![unsafe { std::mem::zeroed() }; path_count as usize];
+    let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![unsafe { std::mem::zeroed() }; mode_count as usize];
+    let queried = unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            ptr::null_mut(),
+        )
+    };
+    if queried != ERROR_SUCCESS {
+        return names;
+    }
+    for path in &paths[..path_count as usize] {
+        let mut source: DISPLAYCONFIG_SOURCE_DEVICE_NAME = unsafe { std::mem::zeroed() };
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        let mut target: DISPLAYCONFIG_TARGET_DEVICE_NAME = unsafe { std::mem::zeroed() };
+        target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+        target.header.adapterId = path.targetInfo.adapterId;
+        target.header.id = path.targetInfo.id;
+        let answered = unsafe {
+            DisplayConfigGetDeviceInfo(&mut source.header) == ERROR_SUCCESS as i32
+                && DisplayConfigGetDeviceInfo(&mut target.header) == ERROR_SUCCESS as i32
+        };
+        let model = from_wide(&target.monitorFriendlyDeviceName);
+        if answered && !model.is_empty() {
+            names.insert(from_wide(&source.viewGdiDeviceName), model);
+        }
+    }
+    names
 }
 
 fn startup_vbs_path() -> Option<PathBuf> {
@@ -218,6 +390,50 @@ mod tests {
         assert_eq!(display_name(r"\\.\DISPLAY1"), "Display 1");
         assert_eq!(display_name(r"\\.\DISPLAY12"), "Display 12");
         assert_eq!(display_name("WinDisc"), "Display");
+    }
+
+    #[test]
+    fn a_mode_change_asks_for_size_and_rate_and_nothing_else() {
+        let mode = DisplayMode { width: 2560, height: 1600, millihertz: 165_000, id: String::new() };
+        let request = mode_request(&mode);
+        assert_eq!(request.dmFields, DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY);
+        assert_eq!((request.dmPelsWidth, request.dmPelsHeight, request.dmDisplayFrequency), (2560, 1600, 165));
+        assert_eq!(request.dmSize as usize, std::mem::size_of::<DEVMODEW>());
+    }
+
+    fn devmode(width: u32, bits: u32, hz: u32, flags: u32) -> DEVMODEW {
+        let mut mode = empty_devmode();
+        mode.dmPelsWidth = width;
+        mode.dmPelsHeight = 1080;
+        mode.dmBitsPerPel = bits;
+        mode.dmDisplayFrequency = hz;
+        mode.Anonymous2.dmDisplayFlags = flags;
+        mode
+    }
+
+    #[test]
+    fn only_progressive_modes_at_the_depth_in_use_are_offered() {
+        assert_eq!(listed_mode(&devmode(1920, 32, 60, 0), 32).unwrap().millihertz, 60_000);
+        assert!(listed_mode(&devmode(1920, 16, 60, 0), 32).is_none());
+        assert!(listed_mode(&devmode(1920, 32, 60, DM_INTERLACED), 32).is_none());
+        // Windows says 1 for "the hardware's default rate".
+        assert!(listed_mode(&devmode(1920, 32, 1, 0), 32).is_none());
+    }
+
+    #[test]
+    fn every_listed_display_can_be_found_again_by_its_id() {
+        for display in enum_displays() {
+            assert!(attached_devices().iter().any(|device| display_name(device) == display.id), "{}", display.id);
+            assert!(display.current.is_some());
+        }
+    }
+
+    #[test]
+    fn a_screen_that_has_gone_says_so() {
+        let platform = crate::platform::current(None);
+        let mode = DisplayMode { width: 1920, height: 1080, millihertz: 60_000, id: String::new() };
+        let error = platform.set_display_mode("Display 99", &mode).unwrap_err();
+        assert!(error.contains("isn't connected"), "{error}");
     }
 
     #[test]

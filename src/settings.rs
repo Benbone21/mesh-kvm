@@ -21,6 +21,8 @@ const DEFAULT_POINTER_SPEED: f32 = 1.0;
 const DEFAULT_MAIN_DEVICE: DeviceId = NodeId::Debian as DeviceId;
 const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 pub const OK_RESPONSE: &str = r#"{"ok":true}"#;
+/// The longest device name. The layout holds names to the same length.
+pub const MAX_DEVICE_NAME: usize = 32;
 
 static MOUSE_SHARING: AtomicBool = AtomicBool::new(true);
 static KEYBOARD_SHARING: AtomicBool = AtomicBool::new(true);
@@ -224,6 +226,27 @@ pub fn device_name() -> String {
     } else {
         name
     }
+}
+
+/// Handles `set_device_name` and returns the response body. A blank name means the hostname.
+pub fn set_device_name(val: &serde_json::Value) -> String {
+    change_device_name(val, save_current)
+}
+
+fn change_device_name(val: &serde_json::Value, save: impl FnOnce()) -> String {
+    let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
+    let Some(name) = val.get("name").and_then(|v| v.as_str()).map(str::trim) else {
+        return refuse("That isn't a name.");
+    };
+    if name.chars().count() > MAX_DEVICE_NAME {
+        return refuse("That name is too long. Use 32 characters or fewer.");
+    }
+    if name.chars().any(char::is_control) {
+        return refuse("A name can't have line breaks or tabs in it.");
+    }
+    *DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner) = name.to_string();
+    save();
+    OK_RESPONSE.to_string()
 }
 
 /// The side of this device the other one sits on, if one was ever given.
@@ -457,7 +480,7 @@ pub fn set_main_device(val: &serde_json::Value, link_up: bool) -> String {
 fn change_main_device(val: &serde_json::Value, link_up: bool, save: impl FnOnce()) -> String {
     let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
     let Some(device) = requested_main_device(val) else {
-        return refuse("Unknown device. Choose 0 for Debian or 1 for the laptop.");
+        return refuse("Unknown device. Choose one of the two devices.");
     };
     if !link_up {
         return refuse("The devices aren't linked. Reconnect them, then change the main device.");
@@ -518,6 +541,26 @@ pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::router::{Router, RouterConfig};
+
+    #[test]
+    fn a_device_name_is_trimmed_and_a_bad_one_changes_nothing() {
+        let _guard = lock_names();
+        let set = |name: serde_json::Value| change_device_name(&serde_json::json!({ "name": name }), || {});
+        let saved = || DEVICE_NAME.lock().unwrap().clone();
+        assert_eq!(set("  Desk PC ".into()), OK_RESPONSE);
+        assert_eq!(saved(), "Desk PC");
+        assert!(set("x".repeat(33).into()).contains("too long"));
+        assert!(set("two\nlines".into()).contains("line breaks"));
+        assert!(set(5.into()).contains("isn't a name"));
+        assert_eq!(saved(), "Desk PC");
+        assert_eq!(set("".into()), OK_RESPONSE);
+        assert_eq!(device_name(), crate::webui::hostname(), "blank goes back to the hostname");
+    }
+
+    fn lock_names() -> std::sync::MutexGuard<'static, ()> {
+        static NAMES: Mutex<()> = Mutex::new(());
+        NAMES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     use serde_json::json;
     use std::sync::{Mutex, MutexGuard, PoisonError};
 

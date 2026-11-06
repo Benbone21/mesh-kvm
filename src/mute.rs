@@ -488,7 +488,7 @@ pub fn start_service_watch() {
 }
 
 #[cfg(target_os = "linux")]
-mod platform {
+pub mod platform {
     use super::MuteBackend;
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant};
@@ -506,7 +506,7 @@ mod platform {
 
     /// Runs a command, killing it at the deadline: a stuck sound server must not stop the polling
     /// thread, which has to unmute when the link drops.
-    pub(super) fn run_with_deadline(mut command: Command, deadline: Duration) -> Option<Output> {
+    pub fn run_with_deadline(mut command: Command, deadline: Duration) -> Option<Output> {
         let mut child =
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
         let end = Instant::now() + deadline;

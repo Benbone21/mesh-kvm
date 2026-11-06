@@ -6,6 +6,7 @@
 //! parts never undo each other, on either device. Monitors are facts rather than edits: each
 //! device reports its own, and they never raise the revision.
 
+use crate::displays::DisplayManager;
 use crate::platform::Platform;
 pub use crate::protocol::MonitorRect;
 use crate::protocol::{NodeId, Payload, SwitchEdge};
@@ -841,6 +842,15 @@ fn pull_layout(state: &RwLock<SharedSpatialState>, fetch: impl FnOnce() -> Optio
     }
 }
 
+/// Starts watching this device's monitors. The layout follows a mode change at once, rather than
+/// at the next look at the monitors.
+pub fn start_displays(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>) -> Arc<DisplayManager> {
+    let source = platform.clone();
+    let displays = DisplayManager::new(platform, Box::new(move || refresh_own_monitors(&state, source.as_ref())));
+    displays.start();
+    displays
+}
+
 const SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 /// How many sync passes between looks at this device's monitors. `xrandr` isn't free.
 const PASSES_PER_MONITOR_CHECK: u32 = 10;
@@ -876,7 +886,11 @@ fn action_of(val: &serde_json::Value) -> &str {
 }
 
 /// Builds the API handler (plugged into the shared `webui` server).
-pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>) -> crate::webui::Handler {
+pub fn studio_handler(
+    state: Arc<RwLock<SharedSpatialState>>,
+    platform: Arc<dyn Platform>,
+    displays: Arc<DisplayManager>,
+) -> crate::webui::Handler {
     Arc::new(move |req: &crate::webui::HttpRequest| -> Option<String> {
         let path = req.path.split('?').next().unwrap_or("");
         match (req.method.as_str(), path) {
@@ -886,8 +900,9 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn 
             }
             ("GET", "/api/local") => {
                 let g = state.read().ok()?;
-                Some(local_status(&g, platform.as_ref()).to_string())
+                Some(local_status(&g, platform.as_ref(), &displays).to_string())
             }
+            ("GET", "/api/displays") => Some(displays.list_json()),
             ("POST", "/api/local/action") => {
                 let val: serde_json::Value = serde_json::from_str(&req.body).ok()?;
                 let act = action_of(&val);
@@ -896,6 +911,17 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn 
                 }
                 if act == "set_peer" {
                     return Some(set_peer(&state, &val, req.from_app_here));
+                }
+                if act == "set_device_name" {
+                    return Some(set_device_name(&state, &val));
+                }
+                // These reach the operating system, under the same rule as every other change:
+                // `webui` has already turned away anything but the app here and the other device.
+                match act {
+                    "set_display_mode" => return Some(displays.request(&val)),
+                    "keep_display_mode" => return Some(displays.decide(true)),
+                    "undo_display_mode" => return Some(displays.decide(false)),
+                    _ => {}
                 }
                 if !crate::settings::handle_common_action(act, &val) {
                     match act {
@@ -953,7 +979,7 @@ pub fn studio_handler(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn 
 }
 
 /// This device's `/api/local`.
-fn local_status(g: &SharedSpatialState, platform: &dyn Platform) -> serde_json::Value {
+fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &DisplayManager) -> serde_json::Value {
     let peer_ip = g.telemetry.peer_addr.split(':').next().unwrap_or("").to_string();
     // With no peer yet, the address other devices would use is the one on the default route.
     let toward = if peer_ip.is_empty() { ANY_ROUTED_ADDRESS } else { peer_ip.as_str() };
@@ -978,6 +1004,7 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform) -> serde_json::
         "autostart": platform.autostart_enabled(),
         "input_devices": platform.input_devices(),
         "audio": crate::settings::audio_status_json(platform.can_pick_audio_source()),
+        "display_change": displays.status_json(),
     });
     crate::settings::add_toggle_status(&mut status, g.telemetry.main_conflict);
     status
@@ -986,6 +1013,19 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform) -> serde_json::
 fn set_main_device(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value) -> String {
     let link_up = state.read().is_ok_and(|g| g.telemetry.peer_online);
     crate::settings::set_main_device(val, link_up)
+}
+
+/// Renames this device, and puts the name in the layout at once, so the app sees it on its next
+/// poll. The other device hears of it with the next heartbeat.
+fn set_device_name(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value) -> String {
+    let reply = crate::settings::set_device_name(val);
+    if let Ok(mut g) = state.write() {
+        let me = g.me;
+        if g.config.report_monitors(me, &crate::settings::device_name(), Vec::new()) {
+            g.save();
+        }
+    }
+    reply
 }
 
 fn set_peer(state: &Arc<RwLock<SharedSpatialState>>, val: &serde_json::Value, from_this_device: bool) -> String {

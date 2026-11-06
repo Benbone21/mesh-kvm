@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod clipboard;
+mod displays;
 mod keymap;
 mod input;
 mod mute;
@@ -320,7 +321,8 @@ fn run_service(cli: Cli) {
     let platform = platform::current(cli.width.zip(cli.height));
     let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
-    let handler = spatial::studio_handler(state.clone(), platform.clone());
+    let displays = spatial::start_displays(state.clone(), platform.clone());
+    let handler = spatial::studio_handler(state.clone(), platform.clone(), displays);
     if let Err(e) = webui::start(listener, peer_ip.clone(), handler) {
         fail(&e);
     }

@@ -40,7 +40,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: bread <jj1nfz2nb@mozmail.com>
 Installed-Size: $size
-Depends: libc6 (>= 2.39), libgcc-s1, pipewire-bin, wireplumber, x11-xserver-utils, qdbus-qt6, dbus-bin, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6
+Depends: libc6 (>= 2.39), libgcc-s1, pipewire-bin, wireplumber, x11-xserver-utils, libkscreen-bin, qdbus-qt6, dbus-bin, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6
 Recommends: libgl1
 Description: Share one mouse, keyboard, clipboard and audio between devices
  mesh-kvm moves the pointer between a Debian desktop and a Windows laptop
