@@ -3,10 +3,11 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
+use super::link::PeerLink;
+use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
     NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
-    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
+    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
@@ -1044,7 +1045,7 @@ struct UdpPeer<'a> {
 impl PeerSender for UdpPeer<'_> {
     fn send(&mut self, payload: Payload) {
         let pkt = Packet::new(self.seq, NodeId::Debian, payload);
-        self.seq += 1;
+        self.seq = self.seq.wrapping_add(1);
         if let Ok(bytes) = pkt.encode() {
             let _ = self.socket.send_to(&bytes, self.addr);
         }
@@ -1137,8 +1138,8 @@ pub fn run_debian_node(
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set UDP socket nonblocking: {}", e))?;
 
-    // Initialize sequence counter with current Unix timestamp in microseconds so that
-    // across daemon restarts `pkt.seq` is always strictly greater than `last_rx_focus_seq` on the peer.
+    // Initialize sequence counter with current Unix timestamp in microseconds, so that a restart
+    // normally carries on upward. `PeerLink` copes when the clock has gone back instead.
     let init_seq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1182,7 +1183,7 @@ pub fn run_debian_node(
     let mut hotkeys = HotkeyFilter::default();
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry_sync = Instant::now();
-    let mut last_rx_focus_seq = 0u64;
+    let mut link = PeerLink::default();
 
     let mut udp_buf = [0u8; MAX_PACKET_SIZE];
     let mut ev_buf = [InputEvent::default(); 64];
@@ -1227,6 +1228,7 @@ pub fn run_debian_node(
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
         crate::audio::AUDIO_PEER_ONLINE.store(core.router.online(), Ordering::Relaxed);
+        link.set_online(core.router.online());
 
         // Check WebUI actions (manual toggle / panic). If the lock is busy they wait for the next
         // iteration and the last config stands.
@@ -1265,9 +1267,15 @@ pub fn run_debian_node(
                 continue;
             }
             let Ok(pkt) = Packet::decode(&udp_buf[..len]) else {
+                if udp_buf[..len].starts_with(&PACKET_MAGIC) {
+                    link.unreadable(now_ms());
+                }
                 continue;
             };
             core.route(Event::PeerAlive { now_ms: now_ms() });
+            if !link.arrived(&pkt, now_ms()) {
+                continue;
+            }
             match pkt.payload {
                 Payload::KeyEvent { scancode, pressed } => {
                     core.route(Event::PeerKey { scancode, pressed });
@@ -1285,10 +1293,8 @@ pub fn run_debian_node(
                     core.route(Event::PeerWheel { dx: delta_x, dy: delta_y });
                 }
                 Payload::FocusSwitchAt { target_node, x, y } => {
-                    if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
-                        let (x, y) = cfg_snapshot.place_on_own(NodeId::Debian, x, y);
-                        core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
-                    }
+                    let (x, y) = cfg_snapshot.place_on_own(NodeId::Debian, x, y);
+                    core.route(Event::PeerFocus { target: target_node as DeviceId, x, y });
                 }
                 Payload::ActiveView { active_node } => {
                     core.route(Event::PeerActiveView { active: active_node as DeviceId });
@@ -1308,6 +1314,11 @@ pub fn run_debian_node(
                 }
                 Payload::LayoutRevision { revision, editor } => {
                     crate::spatial::note_peer_revision(&spatial_state, revision, editor);
+                }
+                Payload::LinkState(state) => {
+                    for event in link.heard_state(&state, now_ms()) {
+                        core.route(event);
+                    }
                 }
                 _ => {}
             }
@@ -1443,6 +1454,7 @@ pub fn run_debian_node(
                 };
                 guard.telemetry.peer_online = core.router.online();
                 guard.telemetry.main_conflict = core.router.main_conflict();
+                guard.telemetry.link = link.quality(core.router.returning(), now_ms());
             }
         }
 
@@ -1453,6 +1465,8 @@ pub fn run_debian_node(
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);
             }
+            let state = link.next_state(core.router.held_forwarded(), core.router.panicked(), now_ms());
+            core.peer.send(Payload::LinkState(state));
         }
 
         std::thread::sleep(Duration::from_micros(500));

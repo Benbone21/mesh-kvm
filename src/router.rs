@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use crate::protocol::SwitchEdge;
+use crate::protocol::{HeldInput, SwitchEdge};
 
 pub type DeviceId = u8;
 pub const LINK_TIMEOUT_MS: u64 = 1350;
@@ -25,6 +25,9 @@ pub const VIEW_TIMEOUT_MS: u64 = 2500;
 pub const SPLIT_GRACE_MS: u64 = 3000;
 /// Coordinate sentinel in `SendFocus`/`PeerFocus`: the receiver must not move its cursor.
 pub const KEEP_CURSOR: i32 = i32::MIN;
+/// How long after a dropout control still goes back to the device that had it. Past this the
+/// person will have settled on the device in front of them.
+pub const RESUME_WINDOW_MS: u64 = 15_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sharing {
@@ -52,6 +55,12 @@ pub enum Event {
     PeerWheel { dx: i32, dy: i32 },
     PeerKey { scancode: u16, pressed: bool },
     PeerAlive { now_ms: u64 },
+    /// What the peer says it has forwarded and not released. Corrects a press or release that got
+    /// lost. Must be newer than any key or button event already handled.
+    PeerHeld(HeldInput),
+    /// The peer answered a heartbeat of ours sent at `sent_ms`, so it hears us. Sent only by a
+    /// peer that can, and `panicked` says it has released all input.
+    PeerHeard { sent_ms: u64, panicked: bool },
     PeerFocus { target: DeviceId, x: i32, y: i32 },
     /// The main device's view of the active device. Repairs a desync, so it never warps.
     PeerActiveView { active: DeviceId },
@@ -127,6 +136,17 @@ pub struct Router {
     /// Keys pressed while input was local; their repeats and release stay local.
     local_keys: HashSet<u16>,
     fwd_buttons: HashSet<u8>,
+    /// What the peer's input has pressed here, as far as it's still down.
+    injected: HeldInput,
+    /// What the peer's last report held that isn't down here yet.
+    unconfirmed: HeldInput,
+    /// A dropout took control from the peer, and it goes back up to this time.
+    resume_until: Option<u64>,
+    /// Only an answer to a heartbeat sent after this time proves the way back works.
+    proof_after: u64,
+    /// When the newest heartbeat the peer has answered was sent. `None` for a peer that doesn't
+    /// answer, or hasn't since the link came up.
+    answered: Option<u64>,
     carry_x: f64,
     carry_y: f64,
 }
@@ -152,6 +172,11 @@ impl Router {
             fwd_keys: HashSet::new(),
             local_keys: HashSet::new(),
             fwd_buttons: HashSet::new(),
+            injected: HeldInput::default(),
+            unconfirmed: HeldInput::default(),
+            resume_until: None,
+            proof_after: 0,
+            answered: None,
             carry_x: 0.0,
             carry_y: 0.0,
         }
@@ -178,6 +203,17 @@ impl Router {
     }
     pub fn captive(&self) -> bool {
         self.captive
+    }
+    /// What has been forwarded and not released, for the peer to check against.
+    pub fn held_forwarded(&self) -> HeldInput {
+        let mut held = HeldInput::default();
+        self.fwd_keys.iter().for_each(|key| held.set_key(*key, true));
+        self.fwd_buttons.iter().for_each(|button| held.set_button(*button, true));
+        held
+    }
+    /// Control went to this device with a dropout, and goes back when the link returns.
+    pub fn returning(&self) -> bool {
+        self.resume_until.is_some()
     }
     pub fn set_pointer_speed(&mut self, speed: f32) {
         self.cfg.pointer_speed = speed;
@@ -244,6 +280,7 @@ impl Router {
             }
             Event::PeerMove { dx, dy } => {
                 if self.injecting() {
+                    self.unconfirmed = self.unconfirmed.without_buttons();
                     out.actions.push(Action::InjectMove { dx, dy });
                 }
             }
@@ -254,11 +291,15 @@ impl Router {
             }
             Event::PeerButton { button, pressed } => {
                 if self.injecting() {
+                    self.injected.set_button(button, pressed);
+                    self.unconfirmed.set_button(button, false);
                     out.actions.push(Action::InjectButton { button, pressed });
                 }
             }
             Event::PeerKey { scancode, pressed } => {
                 if self.injecting() {
+                    self.injected.set_key(scancode, pressed);
+                    self.unconfirmed.set_key(scancode, false);
                     out.actions.push(Action::InjectKey { scancode, pressed });
                 }
             }
@@ -271,9 +312,23 @@ impl Router {
                 self.last_alive = self.last_alive.max(now_ms);
                 if !self.online {
                     self.online = true;
+                    self.proof_after = now_ms;
                     // A non-main device stays active for itself until main's first view
                     // proves main hears it.
                     if !self.panicked {
+                        self.send_view(&mut out.actions);
+                    }
+                }
+            }
+            Event::PeerHeld(held) => self.check_held(held, &mut out.actions),
+            Event::PeerHeard { sent_ms, panicked } => {
+                if self.online {
+                    self.answered = self.answered.max(Some(sent_ms));
+                    if panicked {
+                        self.resume_until = None;
+                    } else if self.resume_until.is_some() && me == self.cfg.main && sent_ms > self.proof_after {
+                        self.resume_until = None;
+                        self.set_active(peer, &mut out.actions);
                         self.send_view(&mut out.actions);
                     }
                 }
@@ -285,6 +340,14 @@ impl Router {
                 }
                 if self.active != me && !self.view_fresh() {
                     self.control_lost(&mut out.actions);
+                }
+                if self.online && self.active != me && self.unanswered() {
+                    self.resume_until = Some(self.now + RESUME_WINDOW_MS);
+                    self.proof_after = self.answered.unwrap_or(self.now);
+                    self.control_lost(&mut out.actions);
+                }
+                if self.resume_until.is_some_and(|until| self.now > until) {
+                    self.resume_until = None;
                 }
                 // Longer than a link timeout, so that one lost view does not end the conflict.
                 let stopped = self.peer_views.is_none_or(|(_, last)| {
@@ -308,6 +371,7 @@ impl Router {
                     self.peer_view_heard(&mut out.actions);
                 } else if self.online && known {
                     self.view_heard = Some(self.now);
+                    self.resume_until = None;
                     // A view that crossed our own fresh switch on the wire is stale, not a desync.
                     if !self.panicked && !self.conflicts(active) {
                         self.set_active(active, &mut out.actions);
@@ -328,6 +392,7 @@ impl Router {
                 {
                     self.panicked = false;
                     self.last_switch = None;
+                    self.resume_until = None;
                     // Main only claims focus while it hears us, so this counts like a view.
                     self.view_heard = Some(self.now);
                     self.set_active(target, &mut out.actions);
@@ -386,6 +451,7 @@ impl Router {
             Event::SetMain(device) => {
                 if (device == me || device == peer) && device != self.cfg.main {
                     self.cfg.main = device;
+                    self.resume_until = None;
                     // That the old main heard us says nothing about the new one.
                     self.view_heard = None;
                     self.end_main_conflict();
@@ -434,7 +500,7 @@ impl Router {
         }
         if self.active == self.cfg.me {
             // Losing focus: whatever the peer injected here must be let go.
-            actions.push(Action::ReleaseHeld);
+            self.release_injected(actions);
         }
         self.active = target;
         self.carry_x = 0.0;
@@ -442,16 +508,74 @@ impl Router {
     }
 
     fn own_switch(&mut self, target: DeviceId, x: i32, y: i32, actions: &mut Vec<Action>) {
+        self.resume_until = None;
         self.set_active(target, actions);
         self.last_switch = Some((self.now, target));
         actions.push(Action::SendFocus { target, x, y });
     }
 
-    /// Tells the peer who is active. Only the main device's view counts.
+    /// Tells the peer who is active. Only the main device's view counts. While control waits to
+    /// go back there is nothing to tell: the peer stays active for itself, and adopting this
+    /// device instead would swallow its keyboard for no reason.
     fn send_view(&mut self, actions: &mut Vec<Action>) {
-        if self.cfg.me == self.cfg.main {
+        if self.cfg.me == self.cfg.main && self.resume_until.is_none() {
             self.last_view = self.now;
             actions.push(Action::SendActiveView { active: self.active });
+        }
+    }
+
+    /// Puts what's down here for the peer in line with its report. A key it no longer holds is
+    /// let go at once, as that can't hurt. A key it holds that isn't down here takes a second
+    /// report in a row. A report can be on its way as the key comes up, and a tap ends before
+    /// the next one, so a key that's seen twice really is being held. Pressing that late is only
+    /// fine for a key: a button lands wherever the pointer is by then, so it waits for a pointer
+    /// that hasn't moved. Auto-repeat needs nothing from here. Its presses come in as `PeerKey`,
+    /// repair a missed press by themselves, and take the key off the unconfirmed list.
+    fn check_held(&mut self, held: HeldInput, actions: &mut Vec<Action>) {
+        if !self.injecting() {
+            self.unconfirmed = HeldInput::default();
+            return;
+        }
+        let gone = self.injected.without(&held);
+        let missing = held.without(&self.injected);
+        let confirmed = missing.and(&self.unconfirmed);
+        for scancode in gone.keys() {
+            actions.push(Action::InjectKey { scancode, pressed: false });
+        }
+        for button in gone.buttons() {
+            actions.push(Action::InjectButton { button, pressed: false });
+        }
+        for scancode in confirmed.keys() {
+            actions.push(Action::InjectKey { scancode, pressed: true });
+        }
+        for button in confirmed.buttons() {
+            actions.push(Action::InjectButton { button, pressed: true });
+        }
+        self.injected = self.injected.without(&gone).or(&confirmed);
+        self.unconfirmed = missing.without(&confirmed);
+    }
+
+    fn release_injected(&mut self, actions: &mut Vec<Action>) {
+        self.injected = HeldInput::default();
+        self.unconfirmed = HeldInput::default();
+        actions.push(Action::ReleaseHeld);
+    }
+
+    /// A peer that answers heartbeats has stopped answering this device's, so what's forwarded
+    /// goes nowhere while the keyboard here is swallowed. Main has no views to tell it this.
+    fn unanswered(&self) -> bool {
+        self.cfg.me == self.cfg.main
+            && self.answered.is_some_and(|sent| self.now.saturating_sub(sent) > VIEW_TIMEOUT_MS)
+    }
+
+    /// Remembers to hand control back, unless a dropout already has, or no way of knowing the
+    /// peer hears this device exists. A device that isn't main gets it back from main's view,
+    /// and only says so.
+    fn note_lost_control(&mut self) {
+        let me = self.cfg.me;
+        let can_prove = me != self.cfg.main || self.answered.is_some();
+        if self.active != me && !self.panicked && !self.main_conflict && can_prove {
+            self.resume_until = Some(self.now + RESUME_WINDOW_MS);
         }
     }
 
@@ -494,7 +618,7 @@ impl Router {
         self.release_forwarded_keys(actions);
         self.release_forwarded_buttons(actions);
         self.reset_held();
-        actions.push(Action::ReleaseHeld);
+        self.release_injected(actions);
     }
 
     /// Lets go on the peer of every key it holds for us. Their physical releases are then local.
@@ -512,22 +636,25 @@ impl Router {
     }
 
     fn link_lost(&mut self, actions: &mut Vec<Action>) {
+        self.note_lost_control();
         self.online = false;
+        self.answered = None;
         self.end_main_conflict();
         self.active = self.cfg.me;
         self.last_switch = None;
         self.view_heard = None;
         self.peer_game_lock = false;
         self.reset_held();
-        actions.push(Action::ReleaseHeld);
+        self.release_injected(actions);
     }
 
     fn enter_panic(&mut self, actions: &mut Vec<Action>) {
         self.panicked = true;
         self.active = self.cfg.me;
         self.last_switch = None;
+        self.resume_until = None;
         self.reset_held();
-        actions.push(Action::ReleaseHeld);
+        self.release_injected(actions);
     }
 
     fn reset_held(&mut self) {
@@ -2018,6 +2145,353 @@ mod tests {
         let out = laptop.handle(Event::EdgeCrossed { x: 0, y: 9, from_peer: true });
         assert!(out.actions.contains(&Action::SendFocus { target: 0, x: 0, y: 9 }));
         assert_eq!(laptop.active(), 0);
+    }
+
+    fn held(keys: &[u16], buttons: &[u8]) -> HeldInput {
+        let mut held = HeldInput::default();
+        keys.iter().for_each(|key| held.set_key(*key, true));
+        buttons.iter().for_each(|button| held.set_button(*button, true));
+        held
+    }
+    /// A local router with the peer's input coming in.
+    fn injecting_router() -> Router {
+        let mut r = router(0);
+        online(&mut r);
+        r
+    }
+    fn peer_key(r: &mut Router, scancode: u16, pressed: bool) -> Routed {
+        r.handle(Event::PeerKey { scancode, pressed })
+    }
+
+    #[test]
+    fn what_is_forwarded_is_reported_until_it_is_released() {
+        let mut r = forwarding_router();
+        assert_eq!(r.held_forwarded(), HeldInput::default());
+        key(&mut r, 30, true);
+        r.handle(Event::LocalButton { button: 1, pressed: true });
+        assert_eq!(r.held_forwarded(), held(&[30], &[1]));
+        key(&mut r, 30, false);
+        r.handle(Event::LocalButton { button: 1, pressed: false });
+        assert_eq!(r.held_forwarded(), HeldInput::default());
+    }
+
+    #[test]
+    fn a_key_the_peer_no_longer_holds_is_released() {
+        let mut r = injecting_router();
+        peer_key(&mut r, 30, true);
+        r.handle(Event::PeerButton { button: 1, pressed: true });
+        // Every copy of the releases was lost, and the heartbeat says nothing is held.
+        let out = r.handle(Event::PeerHeld(HeldInput::default()));
+        assert!(out.actions.contains(&Action::InjectKey { scancode: 30, pressed: false }));
+        assert!(out.actions.contains(&Action::InjectButton { button: 1, pressed: false }));
+        // And only once.
+        assert!(r.handle(Event::PeerHeld(HeldInput::default())).actions.is_empty());
+    }
+
+    #[test]
+    fn a_key_the_peer_still_holds_is_left_alone() {
+        let mut r = injecting_router();
+        peer_key(&mut r, 30, true);
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+    }
+
+    #[test]
+    fn a_missed_press_waits_for_a_second_report() {
+        let mut r = injecting_router();
+        // One report could be about to be overtaken by a release, or be a tap that's already over.
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+        let out = r.handle(Event::PeerHeld(held(&[30], &[])));
+        assert_eq!(out.actions, vec![Action::InjectKey { scancode: 30, pressed: true }]);
+        // It counts as held from now on, so that it's let go like any other.
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+        let out = r.handle(Event::PeerHeld(HeldInput::default()));
+        assert_eq!(out.actions, vec![Action::InjectKey { scancode: 30, pressed: false }]);
+    }
+
+    #[test]
+    fn a_report_in_between_says_the_key_was_let_go() {
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[30], &[])));
+        r.handle(Event::PeerHeld(HeldInput::default()));
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+    }
+
+    #[test]
+    fn a_release_seen_between_reports_cancels_the_press() {
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[30], &[])));
+        peer_key(&mut r, 30, false);
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+    }
+
+    #[test]
+    fn auto_repeat_presses_are_not_doubled_by_a_report() {
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[30], &[])));
+        // A repeat is the same as a press on the wire, and proves the key is down.
+        peer_key(&mut r, 30, true);
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+    }
+
+    #[test]
+    fn a_missed_button_is_pressed_only_where_the_pointer_was() {
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[], &[1])));
+        let out = r.handle(Event::PeerHeld(held(&[], &[1])));
+        assert_eq!(out.actions, vec![Action::InjectButton { button: 1, pressed: true }]);
+
+        // Once the pointer has moved, a press would land on something else.
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[], &[1])));
+        r.handle(Event::PeerMove { dx: 40, dy: 0 });
+        assert!(r.handle(Event::PeerHeld(held(&[], &[1]))).actions.is_empty());
+    }
+
+    #[test]
+    fn reports_do_nothing_while_this_device_is_not_being_driven() {
+        let mut r = forwarding_router();
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+        // Nor does a half-seen key carry over to when it is.
+        let mut r = injecting_router();
+        r.handle(Event::PeerHeld(held(&[30], &[])));
+        r.handle(Event::Panic);
+        r.handle(Event::ManualSwitch);
+        r.handle(Event::ManualSwitch);
+        r.handle(Event::Tick { now_ms: 1000 + SWITCH_RACE_MS + 1 });
+        assert_eq!(r.active(), 0);
+        assert!(r.handle(Event::PeerHeld(held(&[30], &[]))).actions.is_empty());
+    }
+
+    #[test]
+    fn nothing_carries_over_a_release_of_everything() {
+        for lose in [Event::Panic, Event::PeerPanic, Event::Tick { now_ms: 1000 + LINK_TIMEOUT_MS + 1 }] {
+            let mut r = injecting_router();
+            peer_key(&mut r, 30, true);
+            let out = r.handle(lose);
+            assert!(out.actions.contains(&Action::ReleaseHeld));
+            r.handle(Event::ManualSwitch);
+            r.handle(Event::PeerAlive { now_ms: 5000 });
+            // The key was let go with everything else, so no report has anything to release.
+            let out = r.handle(Event::PeerHeld(HeldInput::default()));
+            assert!(!out.actions.iter().any(|a| matches!(a, Action::InjectKey { .. })), "{lose:?}");
+        }
+    }
+
+    /// Router 0 (main) forwarding to device 1, which has been answering its heartbeats.
+    fn answered_router() -> Router {
+        let mut r = forwarding_router();
+        r.handle(Event::PeerHeard { sent_ms: 1000, panicked: false });
+        r
+    }
+
+    #[test]
+    fn control_goes_back_after_a_dropout() {
+        let mut r = answered_router();
+        let at = 1000 + LINK_TIMEOUT_MS + 1;
+        r.handle(Event::Tick { now_ms: at });
+        assert!(!r.online());
+        assert_eq!(r.active(), 0);
+        assert!(r.returning());
+        // Nothing is blocked or forwarded while it lasts.
+        assert!(!key(&mut r, 30, true).swallow);
+        key(&mut r, 30, false);
+
+        // The link is back, but only an answer proves that the peer can hear this device.
+        let out = r.handle(Event::PeerAlive { now_ms: 3000 });
+        assert!(r.online());
+        assert_eq!(r.active(), 0);
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::SendActiveView { .. } | Action::SetBlocking { .. })));
+        assert!(!key(&mut r, 31, true).swallow);
+        key(&mut r, 31, false);
+        // An answer to a heartbeat from before it returned proves nothing.
+        r.handle(Event::PeerHeard { sent_ms: 2900, panicked: false });
+        assert_eq!(r.active(), 0);
+
+        let out = r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 1);
+        assert!(!r.returning());
+        assert!(out.actions.contains(&Action::SendActiveView { active: 1 }));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: true, keyboard: true }));
+        assert!(key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn a_gap_seen_only_when_the_link_returns_is_a_dropout_too() {
+        let mut r = answered_router();
+        r.handle(Event::PeerAlive { now_ms: 1000 + LINK_TIMEOUT_MS + 1 });
+        assert!(r.online());
+        assert_eq!(r.active(), 0);
+        assert!(r.returning());
+        r.handle(Event::PeerHeard { sent_ms: 2500, panicked: false });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn a_second_dropout_before_the_proof_keeps_control_returning() {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::Tick { now_ms: 3000 + LINK_TIMEOUT_MS + 1 });
+        assert!(!r.online());
+        assert!(r.returning());
+    }
+
+    #[test]
+    fn a_long_dropout_leaves_control_where_it_is() {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::Tick { now_ms: 2400 + RESUME_WINDOW_MS });
+        assert!(r.returning());
+        r.handle(Event::Tick { now_ms: 2401 + RESUME_WINDOW_MS });
+        assert!(!r.returning());
+        let now_ms = 2500 + RESUME_WINDOW_MS;
+        let out = r.handle(Event::PeerAlive { now_ms });
+        assert!(out.actions.contains(&Action::SendActiveView { active: 0 }));
+        r.handle(Event::PeerHeard { sent_ms: now_ms + 100, panicked: false });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn release_all_input_during_a_dropout_keeps_control_here() {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::Panic);
+        assert!(!r.returning());
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+        assert!(!key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn a_peer_that_released_all_input_is_not_given_control_back() {
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: true });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+        // Views carry on, now that nothing is waiting.
+        let out = r.handle(Event::Tick { now_ms: 3000 + ACTIVE_VIEW_INTERVAL_MS });
+        assert!(out.actions.contains(&Action::SendActiveView { active: 0 }));
+    }
+
+    #[test]
+    fn a_choice_made_after_the_link_returns_stands() {
+        // Pushing across here sends control over anyway, and needs no proof.
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::EdgeCrossed { x: 1, y: 1, from_peer: false });
+        assert_eq!(r.active(), 1);
+        assert!(!r.returning());
+        // The peer asking for control back is a choice too.
+        let mut r = answered_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        r.handle(Event::PeerFocus { target: 0, x: KEEP_CURSOR, y: KEEP_CURSOR });
+        assert!(!r.returning());
+        r.handle(Event::PeerHeard { sent_ms: 3100, panicked: false });
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn an_older_peer_gets_the_old_behaviour() {
+        let mut r = forwarding_router();
+        r.handle(Event::Tick { now_ms: 2400 });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+        let out = r.handle(Event::PeerAlive { now_ms: 3000 });
+        assert!(out.actions.contains(&Action::SendActiveView { active: 0 }));
+    }
+
+    #[test]
+    fn control_on_this_device_stays_here_after_a_dropout() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::PeerHeard { sent_ms: 1000, panicked: false });
+        r.handle(Event::Tick { now_ms: 2400 });
+        assert!(!r.returning());
+        let out = r.handle(Event::PeerAlive { now_ms: 3000 });
+        assert!(out.actions.contains(&Action::SendActiveView { active: 0 }));
+    }
+
+    #[test]
+    fn a_non_main_device_hands_back_on_main_view_and_waits_for_nothing_else() {
+        let mut r = adopted_router(cfg(1));
+        r.handle(Event::Tick { now_ms: 2400 });
+        assert_eq!(r.active(), 1);
+        assert!(r.returning());
+        r.handle(Event::PeerAlive { now_ms: 3000 });
+        assert_eq!(r.active(), 1);
+        assert!(!key(&mut r, 30, true).swallow);
+        key(&mut r, 30, false);
+        r.handle(Event::PeerActiveView { active: 0 });
+        assert_eq!(r.active(), 0);
+        assert!(!r.returning());
+        assert!(key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn a_pair_finds_its_way_back_after_a_dropout() {
+        let (mut main, mut other) = (router(0), router(1));
+        online(&mut main);
+        online(&mut other);
+        main.handle(Event::PeerHeard { sent_ms: 1000, panicked: false });
+        let view = view_of(&main.handle(Event::EdgeCrossed { x: 0, y: 0, from_peer: false }));
+        assert_eq!(view, None);
+        other.handle(Event::PeerFocus { target: 1, x: 0, y: 0 });
+        assert_eq!((main.active(), other.active()), (1, 1));
+
+        main.handle(Event::Tick { now_ms: 2400 });
+        other.handle(Event::Tick { now_ms: 2400 });
+        assert_eq!((main.active(), other.active()), (0, 1));
+        assert!(!main.online() && !other.online());
+        main.handle(Event::PeerAlive { now_ms: 4400 });
+        other.handle(Event::PeerAlive { now_ms: 4400 });
+        // Each on its own until main knows it's heard, so no key goes astray on either.
+        assert_eq!((main.active(), other.active()), (0, 1));
+        let out = main.handle(Event::PeerHeard { sent_ms: 4500, panicked: false });
+        other.handle(view_of(&out).unwrap());
+        assert_eq!((main.active(), other.active()), (1, 1));
+        assert!(key(&mut main, 30, true).swallow);
+        assert!(!key(&mut other, 30, true).swallow);
+    }
+
+    #[test]
+    fn a_peer_that_stops_hearing_this_device_loses_its_input() {
+        let mut r = answered_router();
+        // Its heartbeats keep arriving, but none answers one of ours.
+        for now_ms in [2000, 3000] {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(Event::Tick { now_ms });
+        }
+        assert_eq!(r.active(), 1);
+        r.handle(Event::PeerAlive { now_ms: 3500 });
+        let out = r.handle(Event::Tick { now_ms: 1000 + VIEW_TIMEOUT_MS + 1 });
+        assert!(r.online());
+        assert_eq!(r.active(), 0);
+        assert!(r.returning());
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(!key(&mut r, 30, true).swallow);
+        key(&mut r, 30, false);
+        // Only a newer answer brings it back.
+        r.handle(Event::PeerHeard { sent_ms: 1000, panicked: false });
+        assert_eq!(r.active(), 0);
+        r.handle(Event::PeerHeard { sent_ms: 3600, panicked: false });
+        assert_eq!(r.active(), 1);
+    }
+
+    #[test]
+    fn answers_keep_control_with_the_peer() {
+        let mut r = answered_router();
+        for now_ms in (2000..10_000).step_by(1000) {
+            r.handle(Event::PeerAlive { now_ms });
+            r.handle(Event::PeerHeard { sent_ms: now_ms - 100, panicked: false });
+            r.handle(Event::Tick { now_ms });
+        }
+        assert_eq!(r.active(), 1);
     }
 
     fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {

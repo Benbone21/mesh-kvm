@@ -1,6 +1,7 @@
 //! Platform input backend layer: traits the OS code implements, and `apply`, which turns
 //! router `Action`s into backend calls and peer packets.
 
+pub mod link;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -32,15 +33,6 @@ pub trait PeerSender {
 /// True for a packet from the configured peer's IP. Its source port may vary.
 pub fn from_peer(src: SocketAddr, peer: SocketAddr) -> bool {
     src.ip() == peer.ip()
-}
-
-/// False for a focus packet older than one already handled. UDP can reorder a burst.
-pub fn fresh_focus_seq(last: &mut u64, seq: u64) -> bool {
-    if seq <= *last && seq != 0 {
-        return false;
-    }
-    *last = seq;
-    true
 }
 
 /// Runs router actions against the local backend and the peer link. `x`/`y` on a focus
@@ -141,16 +133,6 @@ mod tests {
         assert!(from_peer("192.168.8.210:24850".parse().unwrap(), peer));
         assert!(from_peer("192.168.8.210:50000".parse().unwrap(), peer));
         assert!(!from_peer("192.168.8.211:24850".parse().unwrap(), peer));
-    }
-
-    #[test]
-    fn focus_seq_rejects_replays_but_not_seq_zero() {
-        let mut last = 0;
-        assert!(fresh_focus_seq(&mut last, 10));
-        assert!(!fresh_focus_seq(&mut last, 10));
-        assert!(!fresh_focus_seq(&mut last, 9));
-        assert!(fresh_focus_seq(&mut last, 11));
-        assert!(fresh_focus_seq(&mut last, 0));
     }
 
     #[test]

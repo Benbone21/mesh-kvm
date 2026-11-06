@@ -8,6 +8,7 @@
 
 use crate::displays::{DisplayManager, LayoutNews};
 use crate::platform::Platform;
+use crate::input::link::LinkQuality;
 pub use crate::protocol::MonitorRect;
 use crate::protocol::{NodeId, Payload, SwitchEdge};
 use crate::router::{EdgeSpan, EdgeTracker, KEEP_CURSOR};
@@ -698,6 +699,8 @@ pub struct LiveTelemetry {
     #[serde(default)]
     pub peer_online: bool,
     pub main_conflict: bool,
+    #[serde(default)]
+    pub link: LinkQuality,
 }
 
 impl LiveTelemetry {
@@ -712,6 +715,7 @@ impl LiveTelemetry {
             game_reason: String::new(),
             peer_online: false,
             main_conflict: false,
+            link: LinkQuality::default(),
         }
     }
 }
@@ -1055,6 +1059,7 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "input_devices": platform.input_devices(),
         "audio": crate::settings::audio_status_json(),
         "display_change": displays.status_json(),
+        "link": crate::settings::link_status_json(&g.telemetry.link),
     });
     crate::settings::add_toggle_status(&mut status, g.telemetry.main_conflict);
     status

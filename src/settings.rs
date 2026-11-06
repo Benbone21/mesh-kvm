@@ -7,6 +7,7 @@ use crate::audio::{
     AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_VOLUME_PCT, BITRATES, DEFAULT_BITRATE,
 };
 use crate::clipboard::{clipboard_note, CLIPBOARD_RECEIVE, CLIPBOARD_SEND};
+use crate::input::link::LinkQuality;
 use crate::protocol::{NodeId, SwitchEdge};
 use crate::router::{DeviceId, Event, Sharing};
 use serde::{Deserialize, Serialize};
@@ -482,6 +483,19 @@ pub fn audio_status_json() -> serde_json::Value {
         "rx_live": AUDIO_RX_LIVE.load(Ordering::Relaxed),
         "rx_other_version": other_version_arriving(now),
     })
+}
+
+/// The link's own figures, with what audio has to say about the same network. Audio sends far more
+/// packets than heartbeats do, and it counts what arrived too late to play as well as what never
+/// arrived at all. Each direction only counts while it's actually in use.
+pub fn link_status_json(quality: &LinkQuality) -> serde_json::Value {
+    let now = std::time::Instant::now();
+    let audio_in = AUDIO_RX_LIVE.load(Ordering::Relaxed).then(|| f64::from(AUDIO_RX_LOSS.load(Ordering::Relaxed)) / 10.0);
+    let audio_out = peer_listening(now, std::time::Duration::from_secs(2)).then(|| f64::from(AUDIO_TX_LOSS.load(Ordering::Relaxed)));
+    let mut status = serde_json::json!(quality);
+    status["audio_loss_in"] = serde_json::json!(audio_in.filter(|_| quality.measured));
+    status["audio_loss_out"] = serde_json::json!(audio_out.filter(|_| quality.measured));
+    status
 }
 
 /// Adds the toggles to a `/api/local` status, along with whether the router has a main conflict.

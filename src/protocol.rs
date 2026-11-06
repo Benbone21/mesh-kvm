@@ -7,6 +7,9 @@ pub const DEFAULT_CLIPBOARD_PORT: u16 = 24852;
 pub const PACKET_MAGIC: [u8; 4] = *b"MKVM";
 /// The most a packet can be: 16 monitors with long names, under one Ethernet frame.
 pub const MAX_PACKET_SIZE: usize = 1400;
+/// What `LinkState` carries is understood by devices on the same number. Changes when packets
+/// change in a way both devices must update together for.
+pub const LINK_PROTOCOL: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -107,6 +110,83 @@ pub struct MonitorRect {
     pub h: i32,
 }
 
+/// Keys and mouse buttons that are down: evdev scancodes below 256, and buttons from 1. Nothing
+/// above those can be injected on either device. A fixed size, so that it can ride in router events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HeldInput {
+    keys: [u64; 4],
+    buttons: u8,
+}
+
+impl HeldInput {
+    pub fn set_key(&mut self, scancode: u16, held: bool) {
+        if let Some(word) = self.keys.get_mut(usize::from(scancode) / 64) {
+            let bit = 1u64 << (scancode % 64);
+            *word = if held { *word | bit } else { *word & !bit };
+        }
+    }
+
+    pub fn set_button(&mut self, button: u8, held: bool) {
+        if (1..=8).contains(&button) {
+            let bit = 1u8 << (button - 1);
+            self.buttons = if held { self.buttons | bit } else { self.buttons & !bit };
+        }
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..256u16).filter(|code| self.keys[usize::from(*code) / 64] & (1u64 << (code % 64)) != 0)
+    }
+
+    pub fn buttons(&self) -> impl Iterator<Item = u8> + '_ {
+        (1..=8u8).filter(|button| self.buttons & (1u8 << (button - 1)) != 0)
+    }
+
+    /// What's held here and not in `other`.
+    pub fn without(&self, other: &HeldInput) -> HeldInput {
+        let mut keys = self.keys;
+        for (word, theirs) in keys.iter_mut().zip(other.keys) {
+            *word &= !theirs;
+        }
+        HeldInput { keys, buttons: self.buttons & !other.buttons }
+    }
+
+    /// What's held in both.
+    pub fn and(&self, other: &HeldInput) -> HeldInput {
+        self.without(&self.without(other))
+    }
+
+    /// What's held in either.
+    pub fn or(&self, other: &HeldInput) -> HeldInput {
+        let mut keys = self.keys;
+        for (word, theirs) in keys.iter_mut().zip(other.keys) {
+            *word |= theirs;
+        }
+        HeldInput { keys, buttons: self.buttons | other.buttons }
+    }
+
+    pub fn without_buttons(&self) -> HeldInput {
+        HeldInput { keys: self.keys, buttons: 0 }
+    }
+}
+
+/// How the link looks from one end, and what that end is holding down on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkState {
+    pub protocol: u16,
+    /// This heartbeat's number, from 1.
+    pub beat: u32,
+    /// The newest of the other device's heartbeats heard here, or 0 for none yet.
+    pub echo: u32,
+    /// How long ago that one was heard, so that the other device can work out the round trip.
+    pub echo_age_ms: u32,
+    /// The share of the other device's packets that aren't arriving here, in tenths of a percent.
+    pub loss_tenths: u16,
+    /// Released with panic, so this device has refused to be driven until someone says otherwise.
+    pub panicked: bool,
+    /// What this device has forwarded and not yet released.
+    pub held: HeldInput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
     pub magic: [u8; 4],
@@ -139,6 +219,9 @@ pub enum Payload {
     /// Each way with every heartbeat: the layout the sender holds. A device that sees a newer
     /// one than its own fetches it.
     LayoutRevision { revision: u64, editor: NodeId },
+    /// Each way with every heartbeat. Older devices can't read this and drop it, so it never
+    /// arriving is how they are told apart.
+    LinkState(LinkState),
 }
 
 impl Packet {
@@ -207,6 +290,53 @@ mod tests {
             Payload::LayoutRevision { revision, editor } => assert_eq!((revision, editor), (u64::MAX, NodeId::Windows)),
             other => panic!("wrong payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn link_state_round_trips_with_what_is_held() {
+        let mut held = HeldInput::default();
+        held.set_key(30, true);
+        held.set_key(255, true);
+        held.set_button(MOUSE_BTN_EXTRA, true);
+        let state = LinkState { protocol: LINK_PROTOCOL, beat: 7, echo: 6, echo_age_ms: 120, loss_tenths: 25, panicked: true, held };
+        match round_trip(Payload::LinkState(state)) {
+            Payload::LinkState(back) => {
+                assert_eq!(back, state);
+                assert_eq!(back.held.keys().collect::<Vec<_>>(), vec![30, 255]);
+                assert_eq!(back.held.buttons().collect::<Vec<_>>(), vec![MOUSE_BTN_EXTRA]);
+            }
+            other => panic!("wrong payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn held_input_compares_and_ignores_what_it_cannot_hold() {
+        let (mut a, mut b) = (HeldInput::default(), HeldInput::default());
+        a.set_key(1, true);
+        a.set_key(100, true);
+        a.set_button(MOUSE_BTN_LEFT, true);
+        b.set_key(100, true);
+        b.set_button(MOUSE_BTN_LEFT, true);
+        assert_eq!(a.without(&b).keys().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(a.without(&b).buttons().count(), 0);
+        assert_eq!(a.and(&b), b);
+        assert_eq!(a.without_buttons().buttons().count(), 0);
+        a.set_key(100, false);
+        assert_eq!(a.keys().collect::<Vec<_>>(), vec![1]);
+        let before = a;
+        a.set_key(300, true);
+        a.set_button(0, true);
+        a.set_button(9, true);
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn a_device_without_link_state_fails_to_read_it_and_nothing_else() {
+        // An older build has one variant fewer, which bincode refuses. This is the index it sees.
+        let state = LinkState { protocol: LINK_PROTOCOL, beat: 1, echo: 0, echo_age_ms: 0, loss_tenths: 0, panicked: false, held: HeldInput::default() };
+        let bytes = Packet::new(0, NodeId::Debian, Payload::LinkState(state)).encode().unwrap();
+        assert_eq!(bytes[16..20], 14u32.to_le_bytes());
+        assert!(bytes.len() < MAX_PACKET_SIZE);
     }
 
     fn display_info(count: usize) -> Payload {

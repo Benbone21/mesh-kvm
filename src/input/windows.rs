@@ -1,18 +1,19 @@
 #![cfg(target_os = "windows")]
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
-use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
+use super::link::PeerLink;
+use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
     NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
-    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
+    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -90,6 +91,8 @@ static AUTO_GAME_LOCK: AtomicBool = AtomicBool::new(true);
 /// The hotkey was pressed. The watchdog changes the layout, as the hook must not wait for it.
 static GAME_LOCK_HOTKEY: AtomicBool = AtomicBool::new(false);
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Shared by the UDP and watchdog threads. The hooks never touch it.
+static LINK: LazyLock<Mutex<PeerLink>> = LazyLock::new(Mutex::default);
 /// Buttons injected for the peer and not yet released.
 static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
 /// Keys injected for the peer and not yet released, by evdev code.
@@ -139,6 +142,10 @@ fn router_lock() -> &'static Mutex<Router> {
 /// for this lock.
 fn router() -> MutexGuard<'static, Router> {
     router_lock().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn link() -> MutexGuard<'static, PeerLink> {
+    LINK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn edge_state() -> MutexGuard<'static, EdgeWatch> {
@@ -258,19 +265,32 @@ fn is_windows_game_captive() -> bool {
 /// that Debian's link timeout takes its input back rather than forwarding to a frozen laptop.
 #[inline]
 fn send_udp_payload(payload: Payload) {
+    send_numbered(SEQ_COUNTER.fetch_add(1, Ordering::Relaxed), payload);
+}
+
+fn send_numbered(seq: u64, payload: Payload) {
     if router_lock().is_poisoned() {
         return;
     }
     if let Some(net) = NET_STATE.get() {
-        let pkt = Packet::new(
-            SEQ_COUNTER.fetch_add(1, Ordering::Relaxed),
-            NodeId::Windows,
-            payload,
-        );
+        let pkt = Packet::new(seq, NodeId::Windows, payload);
         if let Ok(bytes) = pkt.encode() {
             let _ = net.socket.send_to(&bytes, net.peer_addr);
         }
     }
+}
+
+/// The hooks forward input while this runs. The number is taken before the router is read, so a
+/// press that this report can't know of is always newer than the report, and Debian won't take the
+/// report's word over it. Reading first would let a press slip in between and be let go again.
+fn send_link_state() {
+    let seq = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let (held, panicked) = {
+        let router = router();
+        (router.held_forwarded(), router.panicked())
+    };
+    let state = link().next_state(held, panicked, now_ms());
+    send_numbered(seq, Payload::LinkState(state));
 }
 
 struct UdpPeer;
@@ -879,6 +899,7 @@ pub fn run_windows_node(
                     (router.online(), router.active(), router.panicked(), router.captive(), main)
                 };
                 crate::audio::AUDIO_PEER_ONLINE.store(status.0, Ordering::Relaxed);
+                link().set_online(status.0);
                 if logged != Some(status) {
                     logged = Some(status);
                     let (online, active, panicked, captive, main) = status;
@@ -900,7 +921,12 @@ pub fn run_windows_node(
                     telemetry.active_node = if active == PEER { "Debian" } else { "Windows" }.to_string();
                     telemetry.panic_mode = panicked;
                     telemetry.peer_online = online;
-                    telemetry.main_conflict = router().main_conflict();
+                    let (conflict, returning) = {
+                        let router = router();
+                        (router.main_conflict(), router.returning())
+                    };
+                    telemetry.main_conflict = conflict;
+                    telemetry.link = link().quality(returning, now_ms());
                     telemetry.game_captive_active = captive;
                     telemetry.game_reason = match (manual, captive) {
                         (true, _) => "Manual lock",
@@ -925,6 +951,7 @@ pub fn run_windows_node(
                         }
                         None => send_udp_payload(Payload::Heartbeat),
                     }
+                    send_link_state();
                 }
             }
         })
@@ -935,7 +962,6 @@ pub fn run_windows_node(
         .name("mesh-kvm-win-udp".to_string())
         .spawn(move || {
             let mut buf = [0u8; MAX_PACKET_SIZE];
-            let mut last_rx_focus_seq = 0u64;
 
             loop {
                 match rx_socket.recv_from(&mut buf) {
@@ -944,9 +970,15 @@ pub fn run_windows_node(
                             continue;
                         }
                         let Ok(pkt) = Packet::decode(&buf[..len]) else {
+                            if buf[..len].starts_with(&PACKET_MAGIC) {
+                                link().unreadable(now_ms());
+                            }
                             continue;
                         };
                         route(Event::PeerAlive { now_ms: now_ms() });
+                        if !link().arrived(&pkt, now_ms()) {
+                            continue;
+                        }
                         match pkt.payload {
                             Payload::MouseMoveDelta { dx, dy } => {
                                 let routed = route(Event::PeerMove { dx, dy });
@@ -970,16 +1002,14 @@ pub fn run_windows_node(
                                 route(Event::PeerKey { scancode, pressed });
                             }
                             Payload::FocusSwitchAt { target_node, x, y } => {
-                                if fresh_focus_seq(&mut last_rx_focus_seq, pkt.seq) {
-                                    let (x, y) = spatial_state
-                                        .read()
-                                        .map_or((x, y), |s| s.config.place_on_own(NodeId::Windows, x, y));
-                                    route(Event::PeerFocus {
-                                        target: target_node as DeviceId,
-                                        x,
-                                        y,
-                                    });
-                                }
+                                let (x, y) = spatial_state
+                                    .read()
+                                    .map_or((x, y), |s| s.config.place_on_own(NodeId::Windows, x, y));
+                                route(Event::PeerFocus {
+                                    target: target_node as DeviceId,
+                                    x,
+                                    y,
+                                });
                             }
                             Payload::ActiveView { active_node } => {
                                 route(Event::PeerActiveView { active: active_node as DeviceId });
@@ -995,6 +1025,10 @@ pub fn run_windows_node(
                             }
                             Payload::LayoutRevision { revision, editor } => {
                                 crate::spatial::note_peer_revision(&spatial_state, revision, editor);
+                            }
+                            Payload::LinkState(state) => {
+                                let events = link().heard_state(&state, now_ms());
+                                route_events(&events);
                             }
                             Payload::PanicRelease => {
                                 println!(
