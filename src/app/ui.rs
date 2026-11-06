@@ -104,6 +104,7 @@ struct Window {
     client: Arc<Client>,
     starter: ServiceStarter,
     peer_prompt: PeerPrompt,
+    show_licences: bool,
     edits: Edits,
     layout: LayoutDraft,
     canvas: Canvas,
@@ -142,6 +143,7 @@ impl Window {
             client: Arc::new(client),
             starter,
             peer_prompt: PeerPrompt::default(),
+            show_licences: false,
             edits: Edits::default(),
             layout: LayoutDraft::default(),
             canvas: Canvas::default(),
@@ -248,6 +250,7 @@ impl Window {
             .show(ctx, |ui| self.canvas.show(ui, &mut self.layout, snapshot, now));
 
         let first_run = model::needs_peer(snapshot);
+        self.licences_window(ctx);
         if first_run || self.peer_prompt.open {
             self.peer_window(ctx, snapshot, first_run);
         }
@@ -510,6 +513,19 @@ impl Window {
                 ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
             }
         }
+        ui.add_space(8.0);
+        if ui.button("Licences").clicked() {
+            self.show_licences = true;
+            ui.close_menu();
+        }
+    }
+
+    fn licences_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Licences").open(&mut self.show_licences).collapsible(false).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() * 0.7).show(ui, |ui| {
+                ui.label(small(crate::licenses::TEXT));
+            });
+        });
     }
 
     /// Where the devices sit and which leads, under the map they belong to.

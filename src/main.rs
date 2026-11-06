@@ -6,6 +6,7 @@ mod clipboard;
 mod displays;
 mod keymap;
 mod input;
+mod licenses;
 mod mute;
 mod platform;
 mod protocol;
@@ -87,6 +88,10 @@ struct Cli {
     #[arg(long)]
     tray: bool,
 
+    /// Show the licences of what's built into this program, then exit
+    #[arg(long, alias = "licences")]
+    licenses: bool,
+
     /// Write the menu and login launchers for this exe (Linux), then exit
     #[cfg(target_os = "linux")]
     #[arg(long)]
@@ -160,9 +165,14 @@ fn window_failed_text(log: &std::path::Path) -> String {
 
 #[cfg(target_os = "windows")]
 fn show_message_box(text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    show_box(text, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR);
+}
+
+#[cfg(target_os = "windows")]
+fn show_box(text: &str, icon: windows_sys::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK};
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("mesh-kvm").as_ptr(), MB_OK | MB_ICONERROR) };
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("mesh-kvm").as_ptr(), MB_OK | icon) };
 }
 
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
@@ -200,6 +210,14 @@ fn run_tray_icon() {
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.licenses {
+        println!("{}", licenses::TEXT);
+        // A Windows program with a window has nowhere to print, unless its output is redirected.
+        #[cfg(target_os = "windows")]
+        show_box(licenses::TEXT, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION);
+        return;
+    }
 
     // Double-clicking the Windows exe passes no arguments. It opens the tray and the window, and
     // becomes the service unless one is already running; the login launcher always passes arguments.
