@@ -708,6 +708,17 @@ unsafe extern "system" fn session_window_proc(
     }
 }
 
+/// Lets go of everything, then replaces this process with a fresh service, which reads the saved
+/// address. Ending the process also removes the hooks.
+fn restart_service() -> ! {
+    WindowsBackend.set_blocking(false, false);
+    WindowsBackend.release_held();
+    crate::mute::shutdown();
+    let problem = crate::app::launch::restart_service();
+    crate::settings::log_fatal(&format!("mesh-kvm couldn't start itself again: {problem}"));
+    std::process::exit(1);
+}
+
 /// Runs on the thread with the message loop. Failing only loses the unmute at logoff and sleep.
 fn create_session_window() {
     let name: Vec<u16> = "mesh-kvm-session\0".encode_utf16().collect();
@@ -827,6 +838,9 @@ pub fn run_windows_node(
             let mut config = None;
             loop {
                 std::thread::sleep(TICK_INTERVAL);
+                if crate::settings::restart_requested() {
+                    restart_service();
+                }
                 if let Some(mut router) = win_logic::lock_live(router_lock()) {
                     router.set_pointer_speed(crate::settings::pointer_speed());
                 }
