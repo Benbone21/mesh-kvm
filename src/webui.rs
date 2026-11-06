@@ -152,7 +152,18 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
 
 /// Minimal blocking HTTP/1.1 client used for the peer proxy.
 pub fn http_call(host: &str, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    let addr: SocketAddr = format!("{}:{}", host, UI_PORT)
+    http_call_port(host, UI_PORT, method, path, body)
+}
+
+/// `http_call` to a port other than the Studio's.
+pub fn http_call_port(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<(u16, String), String> {
+    let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| format!("bad peer address: {}", e))?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(350))
