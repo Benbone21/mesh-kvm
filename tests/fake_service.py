@@ -46,9 +46,11 @@ def screens(count):
 
 
 class World:
-    def __init__(self, count, long_names):
+    def __init__(self, count, long_names, read_only=False):
         self.lock = threading.Lock()
         self.screens = screens(count)
+        if read_only:
+            self.screens["Debian"] = []
         self.revision = 3
         self.attach_side = "Bottom"
         self.resistance = 55
@@ -61,6 +63,10 @@ class World:
         self.settings = {"Debian": default_settings(), "Windows": default_settings()}
 
     def rects(self, node):
+        if not self.screens[node]:
+            # The desktop isn't answering about modes, and the layout still knows these.
+            return [{"name": "DP-3 (240Hz Native)", "x": 0, "y": 360, "w": 1920, "h": 1080},
+                    {"name": "DP-2 (360Hz Native)", "x": 1920, "y": 0, "w": 2560, "h": 1440}]
         out = []
         for s in self.screens[node]:
             m = s["current"]
@@ -90,7 +96,7 @@ class World:
         status.update(self.settings[node])
         if change:
             left = max(0, int((change["until"] - time.time()) * 1000))
-            status["display_change"]["change"] = {k: change[k] for k in ("output", "name", "from", "to")} | {"stage": "waiting", "ms_left": left}
+            status["display_change"]["change"] = {k: change[k] for k in ("id", "output", "name", "from", "to")} | {"stage": "waiting", "ms_left": left}
         return status
 
 
@@ -170,9 +176,9 @@ def act(world, node, body):
     elif action == "set_display_mode":
         s = next(s for s in world.screens[node] if s["id"] == body["output"])
         mode = next(m for m in s["modes"] if (m["width"], m["height"], m["millihertz"]) == (body["width"], body["height"], body["millihertz"]))
-        world.change[node] = {"output": s["id"], "name": s["name"], "from": s["current"], "to": mode, "until": time.time() + REVERT_AFTER}
+        world.change[node] = {"output": s["id"], "name": s["name"], "from": s["current"], "to": mode, "until": time.time() + REVERT_AFTER, "id": int(time.time() * 1000)}
         s["current"] = mode
-    elif action == "keep_display_mode":
+    elif action == "keep_display_mode" and node == "Debian":
         world.change[node] = None
     elif action == "undo_display_mode" and world.change[node]:
         world.change[node]["until"] = 0
@@ -194,5 +200,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--monitors", type=int, default=2, help="under 5 gives 3 screens, 5 or more gives 6")
     parser.add_argument("--name-style", default="short")
+    parser.add_argument("--no-modes", action="store_true", help="this device's desktop isn't answering about modes")
     options = parser.parse_args()
-    serve(World(options.monitors, options.name_style == "long"))
+    serve(World(options.monitors, options.name_style == "long", options.no_modes))

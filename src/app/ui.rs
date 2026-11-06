@@ -116,8 +116,8 @@ struct Window {
     /// The person's choice of app size, and what the window's size adds to it.
     ui_scale: f32,
     window_zoom: f32,
-    /// The zoom the window's smallest size was last worked out for.
-    min_size_zoom: f32,
+    /// The smallest size last given to the window.
+    smallest_sent: Option<(f32, f32)>,
     settings_height: f32,
 }
 
@@ -152,7 +152,7 @@ impl Window {
             main_link_was_down: false,
             ui_scale: DEFAULT_UI_SCALE,
             window_zoom: 1.0,
-            min_size_zoom: 0.0,
+            smallest_sent: None,
             settings_height: 0.0,
         }
     }
@@ -178,10 +178,11 @@ impl Window {
         }
         let zoom = self.ui_scale * self.window_zoom;
         ctx.set_zoom_factor(zoom);
-        if zoom != self.min_size_zoom {
-            self.min_size_zoom = zoom;
-            let smallest = vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]) * self.ui_scale / zoom;
-            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(smallest));
+        let monitor = ctx.input(|i| i.viewport().monitor_size).map(|size| (size.x, size.y));
+        let smallest = model::smallest_window(MIN_WINDOW_SIZE.into(), self.ui_scale, zoom, monitor);
+        if Some(smallest) != self.smallest_sent {
+            self.smallest_sent = Some(smallest);
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(smallest.into()));
         }
     }
 
@@ -265,8 +266,10 @@ impl Window {
         }
     }
 
-    /// Asks whether to keep a new mode. It works from either device, and the service undoes the
-    /// change by itself if nobody answers, so closing this window can't leave a blank screen.
+    /// Asks whether to keep a new mode. Only the device with the screen can keep it, as only
+    /// someone there can see it worked. The other device's window can still send it back. The
+    /// service undoes the change by itself if nobody answers, so closing this window can't leave
+    /// a blank screen.
     fn mode_prompt(&mut self, ctx: &egui::Context, snapshot: &Snapshot, device: Device, change: &ModeChange) {
         let (mut keep, mut undo) = (false, false);
         let waiting = change.is_waiting();
@@ -274,6 +277,8 @@ impl Window {
         let target = change.to.as_ref().map_or_else(String::new, |m| m.label());
         let going_back = change.from.as_ref().map_or_else(String::new, |m| m.label());
         let screen = format!("{} on {}", change.name, snapshot.name(device));
+        let here = snapshot.is_here(device);
+        let elsewhere = format!("It can only be kept from {}.", snapshot.name(device));
         let frame = Frame::popup(&ctx.style()).inner_margin(Margin::same(18));
         egui::Window::new("Keep these screen settings?")
             .id(egui::Id::new("mode prompt"))
@@ -298,16 +303,20 @@ impl Window {
                     let left = Rect::from_min_size(bar.min, vec2(bar.width() * share.clamp(0.0, 1.0), bar.height()));
                     ui.painter().rect_filled(left, 2.0, AMBER);
                     ui.add_space(4.0);
+                    if !here {
+                        ui.label(small(elsewhere));
+                    }
                     ui.horizontal(|ui| {
-                        let text = RichText::new("Keep this").color(DEEP);
-                        keep = ui.add(egui::Button::new(text).fill(AMBER).stroke(Stroke::NONE)).clicked();
+                        if here {
+                            let text = RichText::new("Keep this").color(DEEP);
+                            keep = ui.add(egui::Button::new(text).fill(AMBER).stroke(Stroke::NONE)).clicked();
+                        }
                         undo = ui.button("Go back now").clicked();
                     });
                 }
             });
         if waiting && (keep || undo) {
-            let action = if keep { "keep_display_mode" } else { "undo_display_mode" };
-            self.client.local_action(device, serde_json::json!({ "action": action }));
+            self.client.local_action(device, model::mode_answer(change, keep));
         }
     }
 
@@ -742,6 +751,7 @@ mod tests {
 
     fn waiting_change() -> ModeChange {
         ModeChange {
+            id: 7,
             output: "DP-2".into(),
             name: "Big".into(),
             from: Some(mode(2560, 1440, 144_000)),
@@ -857,6 +867,51 @@ mod tests {
             frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
             assert!(ctx.memory(|m| m.area_rect(egui::Id::new("mode prompt"))).is_some());
         }
+    }
+
+    /// The text of every shape drawn this frame.
+    fn drawn_text(output: &egui::FullOutput) -> String {
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(shape) = &clipped.shape {
+                text.push_str(shape.galley.text());
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn keep_is_offered_only_on_the_device_with_the_screen() {
+        for (here, keeps) in [(true, true), (false, false)] {
+            let (ctx, mut window) = (context(), window());
+            let mut snapshot = linked();
+            let target = if here { snapshot.local.as_mut() } else { snapshot.peer.as_mut() };
+            target.unwrap().display_change.change = Some(waiting_change());
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+            let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+            assert_eq!(text.contains("Keep this"), keeps, "{text}");
+            assert!(text.contains("Go back now"), "{text}");
+            assert_eq!(text.contains("can only be kept from"), !keeps, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_screen_with_no_working_mode_list_shows_its_mode_and_says_so() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        // The desktop answered nothing, so only the layout's own numbers are left.
+        snapshot.local_displays.clear();
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("2560 \u{d7} 1440 at 360 Hz"), "{text}");
+        assert!(text.contains("can't be changed from here right now"), "{text}");
+        // Listed, but only for reading.
+        let mut listed = display("DP-3");
+        listed.can_change = false;
+        snapshot.local_displays = vec![listed];
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("can't be changed from here right now"), "{text}");
     }
 
     fn unpaired() -> Snapshot {

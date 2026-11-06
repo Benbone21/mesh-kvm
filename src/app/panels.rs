@@ -20,6 +20,8 @@ const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 const NAME_HOLD: Duration = Duration::from_secs(3);
 const NAME_BOX_ROOM: f32 = 2.0;
 
+const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
+
 /// A device's name while it is being changed.
 #[derive(Default)]
 struct NameEdit {
@@ -211,12 +213,12 @@ impl DevicePanel<'_, '_> {
             ui.add(egui::Label::new(text).truncate());
             match display {
                 Some(display) if display.can_change && !display.modes.is_empty() => self.mode_menus(ui, display),
-                Some(_) => {
+                _ => {
+                    // The desktop isn't answering about modes, so nothing is offered that
+                    // couldn't be undone. What's known of the screen still shows.
                     let rate = rate.map_or_else(String::new, |rate| format!(" at {rate}"));
-                    ui.label(small(format!("{size}{rate}. mesh-kvm can't change this screen's mode.")));
-                }
-                None => {
-                    ui.label(small(size));
+                    ui.label(small(format!("{size}{rate}")));
+                    ui.label(small(CANT_CHANGE));
                 }
             }
         });

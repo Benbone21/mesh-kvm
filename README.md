@@ -73,9 +73,11 @@ The layout is saved as `layout.json` beside the settings: `~/.config/mesh-kvm` o
 
 Each screen has a resolution and a refresh rate menu, which list what that monitor offers. Click a screen on the map to find its menus. Changing one applies on the device the monitor belongs to, from either device's app.
 
-The app then asks whether to keep the change. If nobody answers within 15 seconds, the screen goes back by itself. The service does that, so it still happens if the app closes or the screen goes blank. If the service itself is stopped during those 15 seconds, it goes back the next time the service starts. Only one change can be waiting at a time.
+The app then asks whether to keep the change. Keep this only appears on the device with that screen, since that's where you can see it worked. The other device's app can only send it back. If nobody answers within 15 seconds, the screen goes back by itself. The service does that, so it still happens if the app closes or the screen goes blank, and the devices return to where they sat in the arrangement.
 
-Debian uses `kscreen-doctor`, from the `libkscreen-bin` package, and Windows uses its own display settings. A monitor mesh-kvm can only list says so in place of its menus. That happens on Debian if `kscreen-doctor` can't reach the desktop.
+A screen counts as back only once mesh-kvm has seen it on its old mode. Until then it keeps trying, including after the service restarts or a monitor comes back, and no new change can start. Only one change can be waiting at a time.
+
+Debian uses `kscreen-doctor`, from the `libkscreen-bin` package, and Windows uses its own display settings. On Windows a new mode is only saved once you keep it. mesh-kvm offers the menus only while the desktop answers about its monitors. If it doesn't, the screen shows its current resolution and refresh rate and says they can't be changed for now. On KDE this happens when KWin has no outputs, such as with every monitor off or unplugged. `kscreen-doctor` then never exits, so mesh-kvm stops it after 5 seconds.
 
 ## Updating
 

@@ -19,6 +19,8 @@ const DESIGN_WINDOW: (f32, f32) = (1280.0, 800.0);
 const WINDOW_GROWTH: f32 = 0.5;
 const MOST_WINDOW_ZOOM: f32 = 1.75;
 const ZOOM_STEP: f32 = 0.05;
+/// The share of a monitor the smallest window may take, leaving room for its frame and a panel.
+const MOST_OF_MONITOR: f32 = 0.9;
 /// Below this width the two device columns would be too narrow.
 const TWO_COLUMNS_FROM: f32 = 1360.0;
 /// How far the snap keeps a device on the edge it's dragged along: enough of it to cross at.
@@ -180,6 +182,8 @@ pub struct DeviceStatus {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ModeChange {
+    /// Which change an answer is for.
+    pub id: u64,
     pub output: String,
     pub name: String,
     pub from: Option<DisplayMode>,
@@ -1005,7 +1009,25 @@ pub fn monitor_label(rect: &Display, display: Option<&DisplayInfo>) -> (String, 
     let mode = display.and_then(|d| d.current.as_ref());
     let size = mode.map_or((rect.w, rect.h), |m| (m.width, m.height));
     let rate = mode.filter(|m| m.millihertz > 0).map(|m| format!("{} Hz", m.whole_hertz()));
-    (name, size_label(size), rate)
+    (name, size_label(size), rate.or_else(|| rate_in_layout_name(&rect.name)))
+}
+
+/// The rate in a layout name like `DP-2 (360Hz Native)`, which is known even when the desktop
+/// isn't answering about modes.
+fn rate_in_layout_name(name: &str) -> Option<String> {
+    let inside = name.split_once(" (")?.1;
+    let hertz = inside.split_once("Hz")?.0;
+    hertz.parse::<u32>().ok().map(|hz| format!("{hz} Hz"))
+}
+
+/// The smallest the window may be, in points at `zoom`. It grows with the person's app size, but
+/// never past what the monitor can show, or the window couldn't fit on it.
+pub fn smallest_window(base: (f32, f32), ui_scale: f32, zoom: f32, monitor: Option<(f32, f32)>) -> (f32, f32) {
+    let (width, height) = (base.0 * ui_scale / zoom, base.1 * ui_scale / zoom);
+    match monitor {
+        Some((w, h)) => (width.min(w * MOST_OF_MONITOR), height.min(h * MOST_OF_MONITOR)),
+        None => (width, height),
+    }
 }
 
 /// The sizes a monitor offers, largest first.
@@ -1039,6 +1061,12 @@ pub fn mode_for_size<'a>(display: &'a DisplayInfo, size: (i32, i32)) -> Option<&
     let at_size = rates(display, size);
     let in_use = display.current.as_ref().map(DisplayMode::whole_hertz);
     at_size.iter().find(|m| Some(m.whole_hertz()) == in_use).or(at_size.first()).copied()
+}
+
+/// The action that answers a mode change, naming it so a late answer can't reach the next one.
+pub fn mode_answer(change: &ModeChange, keep: bool) -> Value {
+    let action = if keep { "keep_display_mode" } else { "undo_display_mode" };
+    json!({ "action": action, "change_id": change.id })
 }
 
 /// The action that asks a device to switch a monitor to `mode`.
@@ -1548,9 +1576,36 @@ mod tests {
     #[test]
     fn a_label_comes_from_the_monitor_or_failing_that_the_layout() {
         let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
-        assert_eq!(monitor_label(&rect, None), ("DP-2".into(), "2560 \u{d7} 1440".into(), None));
+        assert_eq!(monitor_label(&rect, None), ("DP-2".into(), "2560 \u{d7} 1440".into(), Some("360 Hz".into())));
         let d = display(&[(1920, 1080, 143_912)], 0);
         assert_eq!(monitor_label(&rect, Some(&d)), ("Big".into(), "1920 \u{d7} 1080".into(), Some("144 Hz".into())));
+    }
+
+    #[test]
+    fn a_rate_still_shows_when_the_desktop_isnt_answering_about_modes() {
+        let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
+        assert_eq!(monitor_label(&rect, None).2.as_deref(), Some("360 Hz"));
+        assert_eq!(rate_in_layout_name("DP-2 (Primary Native)"), None);
+        assert_eq!(rate_in_layout_name("Display 1"), None);
+    }
+
+    #[test]
+    fn the_smallest_window_grows_with_app_size_but_fits_the_monitor() {
+        let base = (760.0, 560.0);
+        assert_eq!(smallest_window(base, 1.0, 1.0, Some((1920.0, 1080.0))), base);
+        assert_eq!(smallest_window(base, 1.5, 1.5, None), base);
+        // At 150% on a small laptop screen, in points at that zoom: 1366x768 is 910x512.
+        let (w, h) = smallest_window(base, 1.5, 1.5, Some((1366.0 / 1.5, 768.0 / 1.5)));
+        assert_eq!(w, 760.0);
+        assert!(h <= 768.0 / 1.5 * 0.9 + 0.01, "{h}");
+        assert_eq!(smallest_window((1000.0, 800.0), 1.0, 1.0, Some((800.0, 600.0))), (720.0, 540.0));
+    }
+
+    #[test]
+    fn an_answer_names_the_change_it_is_for() {
+        let change = ModeChange { id: 42, ..Default::default() };
+        assert_eq!(mode_answer(&change, true), json!({ "action": "keep_display_mode", "change_id": 42 }));
+        assert_eq!(mode_answer(&change, false), json!({ "action": "undo_display_mode", "change_id": 42 }));
     }
 
     #[test]
