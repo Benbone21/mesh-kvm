@@ -115,6 +115,7 @@ impl Resolved {
     }
 
     /// The name to ask for, with `None` meaning the system's choice.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn target(&self) -> Option<String> {
         match self {
             Resolved::Device(id) => Some(id.clone()),
