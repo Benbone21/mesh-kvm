@@ -504,15 +504,23 @@ pub mod platform {
         Wpctl
     }
 
-    /// Runs a command, killing it at the deadline: a stuck sound server must not stop the polling
-    /// thread, which has to unmute when the link drops.
+    /// Runs a command, killing it at the deadline: a stuck sound server or desktop must not stop
+    /// the thread calling this. Its output is read as it comes, so a long listing can't fill the
+    /// pipe and stall it, and something else holding the pipe open can't stall this.
     pub fn run_with_deadline(mut command: Command, deadline: Duration) -> Option<Output> {
         let mut child =
             command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+        let mut stdout = child.stdout.take()?;
+        let (done, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut text);
+            let _ = done.send(text);
+        });
         let end = Instant::now() + deadline;
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(5)),
                 _ => {
                     let _ = child.kill();
@@ -520,7 +528,10 @@ pub mod platform {
                     return None;
                 }
             }
-        }
+        };
+        let left = end.saturating_duration_since(Instant::now()).max(Duration::from_millis(100));
+        let stdout = read.recv_timeout(left).ok()?;
+        Some(Output { status, stdout, stderr: Vec::new() })
     }
 
     fn wpctl(args: &[&str]) -> Option<String> {
@@ -777,6 +788,27 @@ mod tests {
         echo.arg("hello");
         let output = platform::run_with_deadline(echo, Duration::from_secs(2)).unwrap();
         assert_eq!(output.stdout, b"hello\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listing_longer_than_the_pipe_still_comes_back_whole() {
+        use std::process::Command;
+        let mut long = Command::new("head");
+        long.args(["-c", "300000", "/dev/zero"]);
+        let output = platform::run_with_deadline(long, Duration::from_secs(5)).unwrap();
+        assert_eq!(output.stdout.len(), 300_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn something_left_holding_the_pipe_does_not_stall_the_caller() {
+        use std::process::Command;
+        let mut leaves_a_holder = Command::new("sh");
+        leaves_a_holder.args(["-c", "sleep 3 & exit 0"]);
+        let started = Instant::now();
+        assert!(platform::run_with_deadline(leaves_a_holder, Duration::from_millis(150)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use windows_sys::Win32::Devices::Display::{
 use windows_sys::Win32::Foundation::{BOOL, ERROR_SUCCESS, LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
-    CDS_TEST, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_BADMODE,
+    CDS_TEST, CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISP_CHANGE_BADMODE,
     DISP_CHANGE_RESTART, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_INTERLACED, DM_PELSHEIGHT, DM_PELSWIDTH,
     ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
@@ -65,9 +65,11 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_display_mode(&self, output: &str, mode: &DisplayMode) -> Result<(), String> {
-        let device = attached_devices().into_iter().find(|device| display_name(device) == output);
-        let device = device.ok_or_else(|| "That screen isn't connected any more.".to_string())?;
-        change_mode(&device, mode)
+        change_mode(&device_called(output)?, mode, TRIAL_FLAGS)
+    }
+
+    fn keep_display_mode(&self, output: &str, mode: &DisplayMode) -> Result<(), String> {
+        change_mode(&device_called(output)?, mode, KEEP_FLAGS)
     }
 
     fn autostart_enabled(&self) -> bool {
@@ -221,9 +223,19 @@ fn mode_request(mode: &DisplayMode) -> DEVMODEW {
     request
 }
 
-/// Tries the mode first, as a mode the driver refuses should change nothing. It goes in the
-/// registry so that a kept mode lasts, and going back writes the old one over it.
-fn change_mode(device: &str, mode: &DisplayMode) -> Result<(), String> {
+/// A trial lasts only until it is undone or Windows restarts: nothing is written, so a crash
+/// mid-trial can't leave a blank screen waiting at the next login.
+const TRIAL_FLAGS: CDS_TYPE = 0;
+/// Keeping a mode is what writes it to the registry.
+const KEEP_FLAGS: CDS_TYPE = CDS_UPDATEREGISTRY;
+
+fn device_called(output: &str) -> Result<String, String> {
+    let device = attached_devices().into_iter().find(|device| display_name(device) == output);
+    device.ok_or_else(|| "That screen isn't connected any more.".to_string())
+}
+
+/// Tries the mode first, as a mode the driver refuses should change nothing.
+fn change_mode(device: &str, mode: &DisplayMode, flags: CDS_TYPE) -> Result<(), String> {
     let name = wide(device);
     let request = mode_request(mode);
     let change = |flags| unsafe { ChangeDisplaySettingsExW(name.as_ptr(), &request, ptr::null_mut(), flags, ptr::null()) };
@@ -232,7 +244,7 @@ fn change_mode(device: &str, mode: &DisplayMode) -> Result<(), String> {
         DISP_CHANGE_BADMODE => return Err("Windows says this screen can't use that mode.".to_string()),
         _ => return Err("Windows didn't accept that mode.".to_string()),
     }
-    match change(CDS_UPDATEREGISTRY) {
+    match change(flags) {
         DISP_CHANGE_SUCCESSFUL => Ok(()),
         DISP_CHANGE_RESTART => Err("Windows needs to restart to use that mode.".to_string()),
         _ => Err("Windows didn't accept that mode.".to_string()),
@@ -399,6 +411,12 @@ mod tests {
         assert_eq!(request.dmFields, DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY);
         assert_eq!((request.dmPelsWidth, request.dmPelsHeight, request.dmDisplayFrequency), (2560, 1600, 165));
         assert_eq!(request.dmSize as usize, std::mem::size_of::<DEVMODEW>());
+    }
+
+    #[test]
+    fn a_trial_writes_nothing_and_only_keeping_writes_the_registry() {
+        assert_eq!(TRIAL_FLAGS, 0);
+        assert_eq!(KEEP_FLAGS, CDS_UPDATEREGISTRY);
     }
 
     fn devmode(width: u32, bits: u32, hz: u32, flags: u32) -> DEVMODEW {

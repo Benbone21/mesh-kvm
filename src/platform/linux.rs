@@ -20,6 +20,7 @@ const KSCREEN: &str = "kscreen-doctor";
 const KSCREEN_LIST_DEADLINE: Duration = Duration::from_secs(5);
 /// A monitor can take a few seconds to come back on a new mode.
 const KSCREEN_CHANGE_DEADLINE: Duration = Duration::from_secs(10);
+const XRANDR_DEADLINE: Duration = Duration::from_secs(2);
 const DRM_DIR: &str = "/sys/class/drm";
 
 pub struct LinuxPlatform {
@@ -43,11 +44,7 @@ impl Platform for LinuxPlatform {
         if let Some(size) = self.size {
             return super::single_monitor(size);
         }
-        Command::new("xrandr")
-            .arg("--current")
-            .output()
-            .map(|output| parse_xrandr(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default()
+        parse_xrandr(&xrandr_text())
     }
 
     fn displays(&self) -> Vec<DisplayInfo> {
@@ -75,7 +72,7 @@ impl Platform for LinuxPlatform {
         match run_with_deadline(command, KSCREEN_CHANGE_DEADLINE) {
             Some(result) if result.status.success() => Ok(()),
             Some(_) => Err("The desktop didn't accept that mode.".to_string()),
-            None => Err("The desktop didn't answer. Check that kscreen-doctor is installed.".to_string()),
+            None => Err("The desktop didn't answer.".to_string()),
         }
     }
 
@@ -125,12 +122,15 @@ impl Platform for LinuxPlatform {
 impl LinuxPlatform {
     /// What `xrandr` says, for a desktop `kscreen-doctor` can't talk to. It can list, but not change.
     fn listed_by_xrandr(&self) -> Vec<DisplayInfo> {
-        Command::new("xrandr")
-            .arg("--current")
-            .output()
-            .map(|output| parse_xrandr_displays(&String::from_utf8_lossy(&output.stdout)))
-            .unwrap_or_default()
+        parse_xrandr_displays(&xrandr_text())
     }
+}
+
+/// What `xrandr --current` prints, or nothing if it doesn't answer in time.
+fn xrandr_text() -> String {
+    let mut command = Command::new("xrandr");
+    command.arg("--current");
+    run_with_deadline(command, XRANDR_DEADLINE).map_or_else(String::new, |output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// `kscreen-doctor`'s setting for `mode` on `output`. Both come from its own listing.

@@ -38,6 +38,12 @@ impl DisplayMode {
         (self.width, self.height, self.millihertz) == (other.width, other.height, other.millihertz)
     }
 
+    /// True for the same mode as told apart by a looser source: `xrandr` rounds rates that
+    /// `kscreen-doctor` gives in full.
+    pub fn close_to(&self, other: &DisplayMode) -> bool {
+        (self.width, self.height) == (other.width, other.height) && self.millihertz.abs_diff(other.millihertz) < 500
+    }
+
     /// The rate to the nearest hertz, which is what monitors are sold by.
     pub fn whole_hertz(&self) -> u32 {
         (self.millihertz + 500) / 1000
@@ -87,6 +93,11 @@ pub trait Platform: Send + Sync {
     /// Switches `output`, a `DisplayInfo::id`, to `mode`. `Err` is worded for the person to read.
     fn set_display_mode(&self, _output: &str, _mode: &DisplayMode) -> Result<(), String> {
         Err("This device can't change its screens yet.".to_string())
+    }
+    /// Makes a mode set by `set_display_mode` last, once the person has kept it. A trial isn't
+    /// written anywhere that outlives it.
+    fn keep_display_mode(&self, _output: &str, _mode: &DisplayMode) -> Result<(), String> {
+        Ok(())
     }
     fn autostart_enabled(&self) -> bool;
     fn set_autostart(&self, enabled: bool);

@@ -48,6 +48,22 @@ impl HttpRequest {
     }
 }
 
+#[cfg(test)]
+impl HttpRequest {
+    /// A request as it would arrive from `source`.
+    pub fn for_test(method: &str, path: &str, body: &str, source: &str) -> Self {
+        let source: IpAddr = source.parse().unwrap();
+        Self {
+            method: method.into(),
+            path: path.into(),
+            body: body.into(),
+            from_app_here: source.is_loopback(),
+            source: Some(source),
+            from_browser: false,
+        }
+    }
+}
+
 /// Node-specific API handler. Returns `Some(json_body)` if the route was handled.
 pub type Handler = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>;
 

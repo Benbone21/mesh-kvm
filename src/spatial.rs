@@ -6,7 +6,7 @@
 //! parts never undo each other, on either device. Monitors are facts rather than edits: each
 //! device reports its own, and they never raise the revision.
 
-use crate::displays::DisplayManager;
+use crate::displays::{DisplayManager, LayoutNews};
 use crate::platform::Platform;
 pub use crate::protocol::MonitorRect;
 use crate::protocol::{NodeId, Payload, SwitchEdge};
@@ -173,6 +173,13 @@ pub struct Arrangement {
 pub struct LayoutEdit {
     pub arrangement: Option<Arrangement>,
     pub edge_resistance: Option<i32>,
+}
+
+/// Where the devices sat before a trial of a new screen mode.
+#[derive(Debug, Clone, PartialEq)]
+struct HeldPlace {
+    arrangement: Arrangement,
+    stamp: (u64, NodeId),
 }
 
 /// The layout file's fields from before devices were equal.
@@ -546,6 +553,26 @@ impl SpatialConfig {
         edited
     }
 
+    fn arrangement(&self) -> Arrangement {
+        let place = |d: &DeviceLayout| DevicePlace { node: d.node, x: d.x, y: d.y, custom_size: d.custom_size };
+        Arrangement { devices: self.devices.iter().map(place).collect(), attach_side: self.attach_side }
+    }
+
+    /// Where the devices sit, to come back to after a trial of a new screen mode.
+    fn held_place(&self) -> HeldPlace {
+        HeldPlace { arrangement: self.arrangement(), stamp: self.arrangement_stamp }
+    }
+
+    /// Puts the devices back after a trial was undone: a size that changed for a moment moved them
+    /// to keep them on their edge, and it moved them on both devices, so this goes out as an edit.
+    /// An arrangement someone edited during the trial stands. True if anything moved.
+    fn return_to(&mut self, held: &HeldPlace, me: NodeId) -> bool {
+        if self.arrangement_stamp != held.stamp || self.arrangement() == held.arrangement {
+            return false;
+        }
+        self.apply_edit(&LayoutEdit { arrangement: Some(held.arrangement.clone()), edge_resistance: None }, me)
+    }
+
     /// Drops any custom size, as an edit: the screens go back to what the devices report.
     pub fn reset_sizes(&mut self, me: NodeId) {
         for device in &mut self.devices {
@@ -843,12 +870,35 @@ fn pull_layout(state: &RwLock<SharedSpatialState>, fetch: impl FnOnce() -> Optio
 }
 
 /// Starts watching this device's monitors. The layout follows a mode change at once, rather than
-/// at the next look at the monitors.
+/// at the next look at the monitors, and a trial that is undone leaves the devices where they sat.
 pub fn start_displays(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>) -> Arc<DisplayManager> {
     let source = platform.clone();
-    let displays = DisplayManager::new(platform, Box::new(move || refresh_own_monitors(&state, source.as_ref())));
+    let mut held: Option<HeldPlace> = None;
+    let displays = DisplayManager::new(platform, Box::new(move |news| follow_display_news(&state, source.as_ref(), &mut held, news)));
     displays.start();
     displays
+}
+
+fn follow_display_news(
+    state: &RwLock<SharedSpatialState>,
+    platform: &dyn Platform,
+    held: &mut Option<HeldPlace>,
+    news: LayoutNews,
+) {
+    match news {
+        LayoutNews::TrialStarting => *held = state.read().ok().map(|g| g.config.held_place()),
+        LayoutNews::MonitorsChanged => refresh_own_monitors(state, platform),
+        LayoutNews::TrialOver => *held = None,
+        LayoutNews::TrialUndone => {
+            let Some(place) = held.take() else { return };
+            if let Ok(mut g) = state.write() {
+                let me = g.me;
+                if g.config.return_to(&place, me) {
+                    g.save();
+                }
+            }
+        }
+    }
 }
 
 const SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -919,8 +969,8 @@ pub fn studio_handler(
                 // `webui` has already turned away anything but the app here and the other device.
                 match act {
                     "set_display_mode" => return Some(displays.request(&val)),
-                    "keep_display_mode" => return Some(displays.decide(true)),
-                    "undo_display_mode" => return Some(displays.decide(false)),
+                    "keep_display_mode" => return Some(displays.decide(&val, true, req.from_app_here)),
+                    "undo_display_mode" => return Some(displays.decide(&val, false, req.from_app_here)),
                     _ => {}
                 }
                 if !crate::settings::handle_common_action(act, &val) {
@@ -1491,6 +1541,129 @@ mod tests {
         assert_eq!((debian.edge_resistance, debian.attach_side), (90, TouchSide::Right));
         assert_eq!(debian.monitors(NodeId::Debian), &[dp3(), dp2()]);
         assert!(!debian.auto_game_lock && debian.manual_game_lock);
+    }
+
+    /// A laptop on the right edge, low down against Debian's bottom corner.
+    fn laptop_low_on_the_right() -> SpatialConfig {
+        layout(TouchSide::Right, 4480, 1150)
+    }
+
+    /// What a resolution trial does to Debian: the tall monitor shrinks, then comes back.
+    fn trial_shrinks_debian(c: &mut SpatialConfig) {
+        c.report_monitors(NodeId::Debian, "", vec![rect("DP-2", 0, 0, 1280, 720)]);
+    }
+
+    fn debian_back_to_normal(c: &mut SpatialConfig) {
+        c.report_monitors(NodeId::Debian, "", vec![dp3(), dp2()]);
+    }
+
+    #[test]
+    fn an_undone_trial_leaves_the_devices_where_they_sat_and_tells_the_other_copy() {
+        let mut c = laptop_low_on_the_right();
+        let mut other = c.clone();
+        let before = (laptop_x(&c), c.device(NodeId::Windows).unwrap().y);
+        let held = c.held_place();
+        trial_shrinks_debian(&mut c);
+        trial_shrinks_debian(&mut other);
+        assert_ne!((laptop_x(&c), c.device(NodeId::Windows).unwrap().y), before, "the trial moved it");
+        debian_back_to_normal(&mut c);
+        debian_back_to_normal(&mut other);
+        assert_ne!((laptop_x(&c), c.device(NodeId::Windows).unwrap().y), before, "and going back alone doesn't undo that");
+        assert!(c.return_to(&held, NodeId::Debian));
+        assert_eq!((laptop_x(&c), c.device(NodeId::Windows).unwrap().y), before);
+        assert!(other.adopt(&c));
+        assert_eq!((laptop_x(&other), other.device(NodeId::Windows).unwrap().y), before);
+    }
+
+    #[test]
+    fn a_trial_that_moved_nothing_is_no_edit() {
+        let mut c = laptop_low_on_the_right();
+        let held = c.held_place();
+        assert!(!c.return_to(&held, NodeId::Debian));
+        assert_eq!(c.revision, 0);
+    }
+
+    #[test]
+    fn an_arrangement_edited_during_a_trial_stands() {
+        let mut c = laptop_low_on_the_right();
+        let held = c.held_place();
+        trial_shrinks_debian(&mut c);
+        c.apply_edit(&moved_to(777), NodeId::Windows);
+        debian_back_to_normal(&mut c);
+        let after = laptop_x(&c);
+        assert!(!c.return_to(&held, NodeId::Debian));
+        assert_eq!(laptop_x(&c), after);
+    }
+
+    #[test]
+    fn the_layout_follows_a_trial_from_start_to_undone() {
+        let state = shared_at(0, NodeId::Debian, None);
+        state.write().unwrap().config = laptop_low_on_the_right();
+        let (platform, mut held) = (NoScreens, None);
+        let before = laptop_x(&state.read().unwrap().config);
+        let y_before = state.read().unwrap().config.device(NodeId::Windows).unwrap().y;
+        follow_display_news(&state, &platform, &mut held, LayoutNews::TrialStarting);
+        trial_shrinks_debian(&mut state.write().unwrap().config);
+        debian_back_to_normal(&mut state.write().unwrap().config);
+        follow_display_news(&state, &platform, &mut held, LayoutNews::TrialUndone);
+        let g = state.read().unwrap();
+        assert_eq!((laptop_x(&g.config), g.config.device(NodeId::Windows).unwrap().y), (before, y_before));
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn a_kept_trial_is_not_undone_by_old_news() {
+        let state = shared_at(0, NodeId::Debian, None);
+        state.write().unwrap().config = laptop_low_on_the_right();
+        let (platform, mut held) = (NoScreens, None);
+        follow_display_news(&state, &platform, &mut held, LayoutNews::TrialStarting);
+        trial_shrinks_debian(&mut state.write().unwrap().config);
+        let moved = laptop_x(&state.read().unwrap().config);
+        follow_display_news(&state, &platform, &mut held, LayoutNews::TrialOver);
+        follow_display_news(&state, &platform, &mut held, LayoutNews::TrialUndone);
+        assert_eq!(laptop_x(&state.read().unwrap().config), moved);
+    }
+
+    /// A device reporting no monitors, which leaves the last known ones in the layout.
+    struct NoScreens;
+
+    impl Platform for NoScreens {
+        fn node(&self) -> NodeId {
+            NodeId::Debian
+        }
+        fn label(&self) -> &'static str {
+            ""
+        }
+        fn os_name(&self) -> &'static str {
+            ""
+        }
+        fn monitors(&self) -> Vec<MonitorRect> {
+            Vec::new()
+        }
+        fn autostart_enabled(&self) -> bool {
+            false
+        }
+        fn set_autostart(&self, _: bool) {}
+        fn input_devices(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn can_pick_audio_source(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn the_service_refuses_a_keep_from_the_other_device() {
+        let state = Arc::new(shared_at(0, NodeId::Debian, None));
+        let platform: Arc<dyn Platform> = Arc::new(NoScreens);
+        let displays = DisplayManager::for_test_with_waiting_change();
+        let handler = studio_handler(state, platform, displays.clone());
+        let id = displays.status_json()["change"]["id"].clone();
+        let body = serde_json::json!({ "action": "keep_display_mode", "change_id": id }).to_string();
+        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "192.168.8.241");
+        assert!(handler(&from_peer).unwrap().contains("only be kept on the device"));
+        let here = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "127.0.0.1");
+        assert_eq!(handler(&here).unwrap(), crate::settings::OK_RESPONSE);
     }
 
     #[test]
