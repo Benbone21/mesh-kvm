@@ -3,11 +3,11 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::link::PeerLink;
+use super::link::{press_event, PeerLink, PeerVersion, PressLog};
 use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
-    NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
-    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
+    NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
+    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
@@ -1040,6 +1040,8 @@ struct UdpPeer<'a> {
     socket: &'a UdpSocket,
     addr: SocketAddr,
     seq: u64,
+    presses: PressLog,
+    clock: Instant,
 }
 
 impl PeerSender for UdpPeer<'_> {
@@ -1049,6 +1051,10 @@ impl PeerSender for UdpPeer<'_> {
         if let Ok(bytes) = pkt.encode() {
             let _ = self.socket.send_to(&bytes, self.addr);
         }
+    }
+
+    fn number_press(&mut self, event: PressEvent) -> Option<Payload> {
+        self.presses.record(event, self.clock.elapsed().as_millis() as u64)
     }
 }
 
@@ -1145,6 +1151,9 @@ pub fn run_debian_node(
         .unwrap_or_default()
         .as_micros() as u64;
 
+    let clock = Instant::now();
+    let now_ms = || clock.elapsed().as_millis() as u64;
+
     let mut cfg_snapshot = spatial_state
         .read()
         .map(|guard| guard.config.clone())
@@ -1172,13 +1181,12 @@ pub fn run_debian_node(
             socket: &socket,
             addr: peer_addr,
             seq: init_seq,
+            presses: PressLog::default(),
+            clock,
         },
         last_focus_change: Instant::now() - EDGE_SETTLE,
         edge: EdgeWatch::new(),
     };
-
-    let clock = Instant::now();
-    let now_ms = || clock.elapsed().as_millis() as u64;
 
     let mut hotkeys = HotkeyFilter::default();
     let mut last_heartbeat = Instant::now();
@@ -1229,6 +1237,10 @@ pub fn run_debian_node(
         core.route(Event::Tick { now_ms: now_ms() });
         crate::audio::AUDIO_PEER_ONLINE.store(core.router.online(), Ordering::Relaxed);
         link.set_online(core.router.online());
+        core.peer.presses.set_reliable(link.peer_version(now_ms()) == PeerVersion::Same);
+        if !core.router.online() {
+            core.peer.presses.forget();
+        }
 
         // Check WebUI actions (manual toggle / panic). If the lock is busy they wait for the next
         // iteration and the last config stands.
@@ -1320,8 +1332,16 @@ pub fn run_debian_node(
                         core.route(event);
                     }
                 }
+                Payload::Presses { newest, events } => {
+                    for event in link.take_presses(newest, &events, now_ms()) {
+                        core.route(press_event(event));
+                    }
+                }
                 _ => {}
             }
+        }
+        for event in link.due_presses(now_ms()) {
+            core.route(press_event(event));
         }
 
         // 2. Read local keyboards. Grabbing only hides events from the desktop, so hotkeys are
@@ -1465,7 +1485,11 @@ pub fn run_debian_node(
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);
             }
-            let state = link.next_state(core.router.held_forwarded(), core.router.panicked(), now_ms());
+            if let Some(tail) = core.peer.presses.tail(now_ms()) {
+                core.peer.send(tail);
+            }
+            let order = core.peer.presses.newest();
+            let state = link.next_state(core.router.held_forwarded(), core.router.panicked(), order, now_ms());
             core.peer.send(Payload::LinkState(state));
         }
 

@@ -255,6 +255,9 @@ pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
         };
         return Some((text, true));
     }
+    if link.one_way {
+        return Some((format!("Link is one way: {other} can't hear this device."), true));
+    }
     if link.returning {
         return Some((format!("Link is back. Control is on its way to {other}."), false));
     }
@@ -262,20 +265,24 @@ pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
         return Some(("Link is up, and being measured.".to_string(), false));
     }
     let loss = link.loss();
-    let poor = loss >= POOR_LOSS_PERCENT || link.round_trip_ms.is_some_and(|ms| ms >= POOR_ROUND_TRIP_MS);
-    let text = match link.round_trip_ms {
-        Some(ms) => format!("Link: {loss:.1}% lost, {ms} ms round trip."),
-        None => format!("Link: {loss:.1}% lost."),
+    let poor = loss.is_some_and(|loss| loss >= POOR_LOSS_PERCENT) || link.round_trip_ms.is_some_and(|ms| ms >= POOR_ROUND_TRIP_MS);
+    let text = match (loss, link.round_trip_ms) {
+        (Some(loss), Some(ms)) => format!("Link: {loss:.1}% lost, {ms} ms round trip."),
+        (Some(loss), None) => format!("Link: {loss:.1}% lost."),
+        (None, Some(ms)) => format!("Link: {ms} ms round trip."),
+        (None, None) => "Link is up, and being measured.".to_string(),
     };
     Some((text, poor))
 }
 
 /// What's behind the figure in the link line.
 pub fn link_detail(link: &LinkStatus) -> String {
-    let mut detail = format!("Input: {:.1}% lost on the way here, {:.1}% on the way there.", link.loss_in, link.loss_out);
+    let figure = |loss: Option<f32>| loss.map_or("not known".to_string(), |loss| format!("{loss:.1}%"));
+    let line = |what: &str, here, there| format!("{what}: {} lost on the way here, {} on the way there.", figure(here), figure(there));
+    let mut detail = line("Input", link.loss_in, link.loss_out);
     if link.audio_loss_in.is_some() || link.audio_loss_out.is_some() {
-        let (here, there) = (link.audio_loss_in.unwrap_or(0.0), link.audio_loss_out.unwrap_or(0.0));
-        detail.push_str(&format!("\nAudio: {here:.1}% lost on the way here, {there:.1}% on the way there."));
+        detail.push('\n');
+        detail.push_str(&line("Audio", link.audio_loss_in, link.audio_loss_out));
     }
     detail
 }
@@ -328,11 +335,14 @@ pub struct DeviceStatus {
 pub struct LinkStatus {
     /// False until there is a figure to show, and whenever the link is down.
     pub measured: bool,
-    pub loss_in: f32,
-    pub loss_out: f32,
+    /// Missing until there's something to go on.
+    pub loss_in: Option<f32>,
+    pub loss_out: Option<f32>,
     pub audio_loss_in: Option<f32>,
     pub audio_loss_out: Option<f32>,
     pub round_trip_ms: Option<u32>,
+    /// The other device can be heard, and can't hear this one.
+    pub one_way: bool,
     /// A dropout took control from the other device, and it's waiting to go back.
     pub returning: bool,
     /// "same", "older", "other", or "unknown" while it can't tell.
@@ -346,9 +356,8 @@ const POOR_ROUND_TRIP_MS: u32 = 150;
 impl LinkStatus {
     /// The worst loss either way, from the link's own packets and from audio, which sends far more
     /// of them and also counts what came too late to play.
-    fn loss(&self) -> f32 {
-        let audio = [self.audio_loss_in, self.audio_loss_out].into_iter().flatten();
-        audio.fold(self.loss_in.max(self.loss_out), f32::max)
+    fn loss(&self) -> Option<f32> {
+        [self.loss_in, self.loss_out, self.audio_loss_in, self.audio_loss_out].into_iter().flatten().reduce(f32::max)
     }
 }
 
@@ -1327,6 +1336,11 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
             "{other} is found but not linked yet, so each device is working on its own. Wait a few seconds, or restart mesh-kvm on both devices."
         ));
     }
+    if local.peer_online && link.is_some_and(|l| l.one_way) {
+        return Some(format!(
+            "{other} can't hear this device, though this device hears it. A firewall on {other} is the usual reason. Each device stays on its own keyboard and mouse until that's fixed."
+        ));
+    }
     match link.map(|l| l.peer_version.as_str()) {
         Some("older") => {
             return Some(format!(
@@ -2233,13 +2247,13 @@ mod tests {
 
     #[test]
     fn the_link_line_gives_the_worst_loss_and_the_round_trip() {
-        let link = LinkStatus { measured: true, loss_in: 1.2, loss_out: 0.4, round_trip_ms: Some(23), ..LinkStatus::default() };
+        let link = LinkStatus { measured: true, loss_in: Some(1.2), loss_out: Some(0.4), round_trip_ms: Some(23), ..LinkStatus::default() };
         assert_eq!(link_line(&linked_status(link), "Laptop"), Some(("Link: 1.2% lost, 23 ms round trip.".to_string(), false)));
     }
 
     #[test]
     fn audio_loss_counts_towards_the_link_line() {
-        let link = LinkStatus { measured: true, loss_in: 0.5, audio_loss_in: Some(2.5), audio_loss_out: Some(7.0), round_trip_ms: Some(40), ..LinkStatus::default() };
+        let link = LinkStatus { measured: true, loss_in: Some(0.5), audio_loss_in: Some(2.5), audio_loss_out: Some(7.0), round_trip_ms: Some(40), ..LinkStatus::default() };
         assert_eq!(link_line(&linked_status(link.clone()), "Laptop"), Some(("Link: 7.0% lost, 40 ms round trip.".to_string(), true)));
         let detail = link_detail(&link);
         assert!(detail.contains("Audio: 2.5% lost on the way here, 7.0% on the way there."), "{detail}");
@@ -2255,13 +2269,13 @@ mod tests {
     fn the_link_line_says_when_it_has_nothing_to_go_on() {
         let line = link_line(&linked_status(LinkStatus::default()), "Laptop");
         assert_eq!(line, Some(("Link is up, and being measured.".to_string(), false)));
-        let link = LinkStatus { measured: true, loss_in: 1.0, ..LinkStatus::default() };
+        let link = LinkStatus { measured: true, loss_in: Some(1.0), ..LinkStatus::default() };
         assert_eq!(link_line(&linked_status(link), "Laptop"), Some(("Link: 1.0% lost.".to_string(), false)));
     }
 
     #[test]
     fn a_link_that_is_down_shows_no_figures() {
-        let link = LinkStatus { measured: true, loss_in: 3.0, round_trip_ms: Some(23), ..LinkStatus::default() };
+        let link = LinkStatus { measured: true, loss_in: Some(3.0), round_trip_ms: Some(23), ..LinkStatus::default() };
         let status = DeviceStatus { peer_online: false, link: Some(link), ..DeviceStatus::default() };
         assert_eq!(link_line(&status, "Laptop"), Some(("Link is down, so each device is using its own keyboard and mouse.".to_string(), true)));
     }
@@ -2272,6 +2286,21 @@ mod tests {
         let status = DeviceStatus { peer_online: false, link: Some(link.clone()), ..DeviceStatus::default() };
         assert_eq!(link_line(&status, "Laptop").unwrap().0, "Link is down. Control goes back to Laptop when it returns.");
         assert_eq!(link_line(&linked_status(link), "Laptop").unwrap().0, "Link is back. Control is on its way to Laptop.");
+    }
+
+    #[test]
+    fn a_one_way_link_says_so_with_no_figures() {
+        let link = LinkStatus { measured: true, loss_in: Some(0.0), one_way: true, ..LinkStatus::default() };
+        assert_eq!(link_line(&linked_status(link.clone()), "Laptop"), Some(("Link is one way: Laptop can't hear this device.".to_string(), true)));
+        let message = status_message(&link_snapshot(true, link, true)).unwrap();
+        assert!(message.contains("can't hear this device"), "{message}");
+    }
+
+    #[test]
+    fn a_loss_that_is_not_known_yet_is_not_shown_as_none() {
+        let link = LinkStatus { measured: true, round_trip_ms: Some(23), ..LinkStatus::default() };
+        assert_eq!(link_line(&linked_status(link.clone()), "Laptop").unwrap().0, "Link: 23 ms round trip.");
+        assert!(link_detail(&link).contains("not known"), "{}", link_detail(&link));
     }
 
     #[test]
@@ -2326,7 +2355,7 @@ mod tests {
     fn link_status_reads_from_the_service() {
         let d: DeviceStatus = serde_json::from_str(r#"{"link":{"measured":true,"loss_in":1.5,"loss_out":0.5,"round_trip_ms":12,"returning":false,"peer_version":"same","audio_loss_in":null,"audio_loss_out":2.0}}"#).unwrap();
         let link = d.link.unwrap();
-        assert_eq!((link.loss_in, link.round_trip_ms, link.audio_loss_in, link.audio_loss_out), (1.5, Some(12), None, Some(2.0)));
+        assert_eq!((link.loss_in, link.round_trip_ms, link.audio_loss_in, link.audio_loss_out), (Some(1.5), Some(12), None, Some(2.0)));
         assert_eq!(link.peer_version, "same");
     }
 

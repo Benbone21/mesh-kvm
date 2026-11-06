@@ -1,12 +1,12 @@
 #![cfg(target_os = "windows")]
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
-use super::link::PeerLink;
+use super::link::{press_event, PeerLink, PeerVersion, PressLog};
 use super::{apply, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
-    NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
-    MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
+    NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
+    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, SharedSpatialState};
@@ -93,6 +93,8 @@ static GAME_LOCK_HOTKEY: AtomicBool = AtomicBool::new(false);
 static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Shared by the UDP and watchdog threads. The hooks never touch it.
 static LINK: LazyLock<Mutex<PeerLink>> = LazyLock::new(Mutex::default);
+/// The hooks number their presses here, so it is only ever held to do that.
+static PRESSES: LazyLock<Mutex<PressLog>> = LazyLock::new(Mutex::default);
 /// Buttons injected for the peer and not yet released.
 static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
 /// Keys injected for the peer and not yet released, by evdev code.
@@ -146,6 +148,10 @@ fn router() -> MutexGuard<'static, Router> {
 
 fn link() -> MutexGuard<'static, PeerLink> {
     LINK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn presses() -> MutexGuard<'static, PressLog> {
+    PRESSES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn edge_state() -> MutexGuard<'static, EdgeWatch> {
@@ -219,6 +225,11 @@ fn route(event: Event) -> Routed {
     route_events(&[event])
 }
 
+fn route_presses(presses: &[PressEvent]) {
+    let events: Vec<Event> = presses.iter().map(|event| press_event(*event)).collect();
+    route_events(&events);
+}
+
 /// For the hooks. The extra tick means a press finds out about a dead link by itself, so the
 /// laptop's own keyboard does not depend on the watchdog thread still running.
 fn route_local(event: Event) -> Routed {
@@ -280,16 +291,21 @@ fn send_numbered(seq: u64, payload: Payload) {
     }
 }
 
-/// The hooks forward input while this runs. The number is taken before the router is read, so a
+/// The hooks forward input while this runs. The numbers are taken before the router is read, so a
 /// press that this report can't know of is always newer than the report, and Debian won't take the
 /// report's word over it. Reading first would let a press slip in between and be let go again.
 fn send_link_state() {
+    let tail = presses().tail(now_ms());
+    if let Some(tail) = tail {
+        send_udp_payload(tail);
+    }
+    let order = presses().newest();
     let seq = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed);
     let (held, panicked) = {
         let router = router();
         (router.held_forwarded(), router.panicked())
     };
-    let state = link().next_state(held, panicked, now_ms());
+    let state = link().next_state(held, panicked, order, now_ms());
     send_numbered(seq, Payload::LinkState(state));
 }
 
@@ -298,6 +314,10 @@ struct UdpPeer;
 impl PeerSender for UdpPeer {
     fn send(&mut self, payload: Payload) {
         send_udp_payload(payload);
+    }
+
+    fn number_press(&mut self, event: PressEvent) -> Option<Payload> {
+        presses().record(event, now_ms())
     }
 }
 
@@ -900,6 +920,13 @@ pub fn run_windows_node(
                 };
                 crate::audio::AUDIO_PEER_ONLINE.store(status.0, Ordering::Relaxed);
                 link().set_online(status.0);
+                let version = link().peer_version(now_ms());
+                let mut log = presses();
+                log.set_reliable(version == PeerVersion::Same);
+                if !status.0 {
+                    log.forget();
+                }
+                drop(log);
                 if logged != Some(status) {
                     logged = Some(status);
                     let (online, active, panicked, captive, main) = status;
@@ -1029,6 +1056,10 @@ pub fn run_windows_node(
                                 let events = link().heard_state(&state, now_ms());
                                 route_events(&events);
                             }
+                            Payload::Presses { newest, events } => {
+                                let ready = link().take_presses(newest, &events, now_ms());
+                                route_presses(&ready);
+                            }
                             Payload::PanicRelease => {
                                 println!(
                                     "[PANIC] Received PanicRelease from the peer! Local keyboard unlocked."
@@ -1039,6 +1070,8 @@ pub fn run_windows_node(
                         }
                     }
                     Err(_) => {
+                        let ready = link().due_presses(now_ms());
+                        route_presses(&ready);
                         let linked = router().online();
                         std::thread::sleep(if linked { RX_IDLE_LINKED } else { RX_IDLE_ALONE });
                     }

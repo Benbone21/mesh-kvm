@@ -3,9 +3,9 @@
 //! thing, and only the keyboard and mouse are pretend: this records what would have been injected,
 //! so the test can't reach the real desktop.
 
-use super::link::PeerLink;
+use super::link::{press_event, PeerLink, PeerVersion, PressLog};
 use super::{apply, from_peer, InputBackend, PeerSender};
-use crate::protocol::{NodeId, Packet, Payload, MAX_PACKET_SIZE, PACKET_MAGIC};
+use crate::protocol::{NodeId, Packet, Payload, PressEvent, FIRST_BUTTON, MAX_PACKET_SIZE, PACKET_MAGIC};
 use crate::router::{DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -17,6 +17,15 @@ const STATUS_EVERY: Duration = Duration::from_millis(20);
 
 fn number(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Every key and button as it happens, for the test to check their order and how long they took.
+fn log_injected(input: u16, pressed: bool) {
+    println!("INJECT {}", serde_json::json!({ "ms": wall_ms(), "input": input, "pressed": pressed }));
 }
 
 #[derive(Default)]
@@ -36,6 +45,7 @@ impl InputBackend for Recorder {
         self.moves += 1;
     }
     fn inject_button(&mut self, button: u8, pressed: bool) {
+        log_injected(FIRST_BUTTON + u16::from(button), pressed);
         if pressed {
             self.buttons.insert(button);
         } else {
@@ -44,6 +54,7 @@ impl InputBackend for Recorder {
     }
     fn inject_wheel(&mut self, _dx: i32, _dy: i32) {}
     fn inject_key(&mut self, scancode: u16, pressed: bool) {
+        log_injected(scancode, pressed);
         if pressed {
             self.presses += u64::from(self.keys.insert(scancode));
         } else {
@@ -62,6 +73,8 @@ struct Udp {
     peer: SocketAddr,
     node: NodeId,
     seq: u64,
+    presses: PressLog,
+    start: Instant,
 }
 
 impl PeerSender for Udp {
@@ -71,6 +84,10 @@ impl PeerSender for Udp {
         if let Ok(bytes) = packet.encode() {
             let _ = self.socket.send_to(&bytes, self.peer);
         }
+    }
+
+    fn number_press(&mut self, event: PressEvent) -> Option<Payload> {
+        self.presses.record(event, self.start.elapsed().as_millis() as u64 + 1)
     }
 }
 
@@ -117,6 +134,11 @@ impl Device {
                     self.route(event);
                 }
             }
+            Payload::Presses { newest, events } => {
+                for event in self.link.take_presses(newest, &events, now_ms) {
+                    self.route(press_event(event));
+                }
+            }
             _ => {}
         }
     }
@@ -142,7 +164,8 @@ impl Device {
 
     fn status(&self) -> serde_json::Value {
         serde_json::json!({
-            "ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+            "ms": wall_ms(),
+            "waits": self.link.press_stats(),
             "online": self.router.online(),
             "active": self.router.active(),
             "blocking": [self.recorder.blocking.0, self.recorder.blocking.1],
@@ -165,6 +188,7 @@ fn whole_device() {
     let peer = SocketAddr::from(([127, 0, 0, 1], number("MK_PEER", 24962) as u16));
     let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
     let node = if me == 0 { NodeId::Debian } else { NodeId::Windows };
+    let start = Instant::now();
     let mut device = Device {
         router: Router::new(RouterConfig {
             me,
@@ -174,9 +198,9 @@ fn whole_device() {
             pointer_speed: 1.0,
         }),
         recorder: Recorder::default(),
-        udp: Udp { socket: socket.try_clone().unwrap(), peer, node, seq: number("MK_SEQ", now_us) },
+        udp: Udp { socket: socket.try_clone().unwrap(), peer, node, seq: number("MK_SEQ", now_us), presses: PressLog::default(), start },
         link: PeerLink::default(),
-        start: Instant::now(),
+        start,
     };
     if device.router.main() == me {
         device.udp.send(Payload::FocusSwitchAt { target_node: node, x: KEEP_CURSOR, y: KEEP_CURSOR });
@@ -196,10 +220,17 @@ fn whole_device() {
         let now_ms = device.now_ms();
         device.route(Event::Tick { now_ms });
         device.link.set_online(device.router.online());
+        device.udp.presses.set_reliable(device.link.peer_version(now_ms) == PeerVersion::Same);
+        if !device.router.online() {
+            device.udp.presses.forget();
+        }
         while let Ok((len, from)) = socket.recv_from(&mut buf) {
             if from_peer(from, peer) {
                 device.receive(&buf[..len]);
             }
+        }
+        for event in device.link.due_presses(device.now_ms()) {
+            device.route(press_event(event));
         }
         while let Ok(line) = read.try_recv() {
             device.act(&line);
@@ -208,7 +239,12 @@ fn whole_device() {
         if now >= next_beat {
             next_beat = now + HEARTBEAT;
             device.udp.send(Payload::Heartbeat);
-            let state = device.link.next_state(device.router.held_forwarded(), device.router.panicked(), device.now_ms());
+            let now_ms = device.now_ms();
+            if let Some(tail) = device.udp.presses.tail(now_ms) {
+                device.udp.send(tail);
+            }
+            let order = device.udp.presses.newest();
+            let state = device.link.next_state(device.router.held_forwarded(), device.router.panicked(), order, now_ms);
             device.udp.send(Payload::LinkState(state));
         }
         if now >= next_status {

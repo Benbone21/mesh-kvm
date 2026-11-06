@@ -590,13 +590,15 @@ impl Router {
         }
     }
 
-    /// Puts what's down here for the peer in line with its report. A key it no longer holds is
-    /// let go at once, as that can't hurt. A key it holds that isn't down here takes a second
-    /// report in a row. A report can be on its way as the key comes up, and a tap ends before
-    /// the next one, so a key that's seen twice really is being held. Pressing that late is only
-    /// fine for a key: a button lands wherever the pointer is by then, so it waits for a pointer
-    /// that hasn't moved. Auto-repeat needs nothing from here. Its presses come in as `PeerKey`,
-    /// repair a missed press by themselves, and take the key off the unconfirmed list.
+    /// Puts what's down here for the peer in line with its report. Numbered presses get through
+    /// by themselves nearly always, so this is the backstop for what they can't reach: a long
+    /// stall, or a peer that sends plain ones. A key it no longer holds is let go at once, as that
+    /// can't hurt. A key it holds that isn't down here takes a second report in a row. A report
+    /// can be on its way as the key comes up, so a key that's seen twice really is being held.
+    /// Pressing that late is only fine for a key: a button lands wherever the pointer is by then,
+    /// so it waits for a pointer that hasn't moved. Auto-repeat needs nothing from here. Its
+    /// presses come in as `PeerKey`, repair a missed press by themselves, and take the key off the
+    /// unconfirmed list.
     fn check_held(&mut self, held: HeldInput, actions: &mut Vec<Action>) {
         if !self.injecting() {
             self.unconfirmed = HeldInput::default();
