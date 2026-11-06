@@ -452,7 +452,7 @@ fn studio_handler(peer_addr: SocketAddr, switch_edge: SwitchEdge) -> crate::webu
 }
 
 /// Installs `mesh-kvm.exe` into `%LOCALAPPDATA%\mesh-kvm\mesh-kvm.exe` and creates a silent
-/// windowless Startup launcher in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
+/// windowless Startup launcher (service and tray) in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
 /// so the Windows 11 laptop automatically starts `mesh-kvm` in the background on every boot/login.
 fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEdge) {
     let Ok(appdata) = std::env::var("APPDATA") else {
@@ -483,38 +483,19 @@ fn ensure_windows_autorun_installed(peer_addr: SocketAddr, switch_edge: SwitchEd
         .join("Start Menu")
         .join("Programs");
 
-    // Start Menu entry for the Studio UI (the daemon itself runs windowless)
-    let _ = fs::write(
-        programs_dir.join("mesh-kvm Studio.vbs"),
-        format!(
-            "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
-             WshShell.Run \"\"\"{}\"\" --studio\", 0, False\r\n",
-            exe_to_run.to_string_lossy()
-        ),
+    // When auto-boot is turned off in the app, no Startup script is written at all.
+    let login_script = crate::app::launch::install_windows_launchers(
+        &programs_dir,
+        &exe_to_run.to_string_lossy(),
+        &peer_addr.ip().to_string(),
+        &switch_edge.to_string(),
+        !autostart_disabled_marker().exists(),
     );
-
-    if autostart_disabled_marker().exists() {
-        return;
-    }
-
-    let startup_dir = programs_dir.join("Startup");
-    if startup_dir.exists() {
-        let vbs_path = startup_dir.join("mesh-kvm-autostart.vbs");
-        let peer_ip = peer_addr.ip();
-        let vbs_content = format!(
-            "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
-             WshShell.Run \"\"\"{}\"\" --role windows --peer {} --switch-edge {}\", 0, False\r\n",
-            exe_to_run.to_string_lossy(),
-            peer_ip,
-            switch_edge
+    if let Some(vbs_path) = login_script {
+        println!(
+            "[Windows] Auto-Boot installed: '{}' -> starts the service and tray silently at login.",
+            vbs_path.to_string_lossy(),
         );
-        if fs::write(&vbs_path, vbs_content).is_ok() {
-            println!(
-                "[Windows] Auto-Boot installed: '{}' -> launches '{}' silently at login.",
-                vbs_path.to_string_lossy(),
-                exe_to_run.to_string_lossy()
-            );
-        }
     }
 }
 

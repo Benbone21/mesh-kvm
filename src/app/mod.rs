@@ -1,6 +1,6 @@
 pub mod client;
 mod icon;
-mod launch;
+pub mod launch;
 pub mod model;
 pub mod single;
 mod theme;

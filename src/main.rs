@@ -95,6 +95,11 @@ struct Cli {
     /// Show the tray icon for the service on this device, and exit when Quit is chosen
     #[arg(long)]
     tray: bool,
+
+    /// Write the menu and login launchers for this exe (Linux), then exit
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    install_launchers: bool,
 }
 
 fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, SocketAddr), String> {
@@ -111,22 +116,8 @@ fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, Sock
 
 /// True when the program was started with no arguments.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn should_open_studio(arg_count: usize) -> bool {
+fn is_bare_launch(arg_count: usize) -> bool {
     arg_count <= 1
-}
-
-/// Opens the Studio once this process's web server is answering.
-#[cfg(target_os = "windows")]
-fn open_studio_when_ready() {
-    std::thread::spawn(|| {
-        for _ in 0..40 {
-            if webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok() {
-                webui::open_app_window();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-    });
 }
 
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
@@ -157,14 +148,19 @@ fn run_tray_icon() {
 fn main() {
     let cli = Cli::parse();
 
-    // Double-clicking the Windows exe passes no arguments; the login launcher always does.
+    // Double-clicking the Windows exe passes no arguments. It opens the tray and the window, and
+    // becomes the service unless one is already running; the login launcher always passes arguments.
     #[cfg(target_os = "windows")]
-    if should_open_studio(std::env::args_os().len()) {
-        if webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok() {
-            webui::open_app_window();
+    if is_bare_launch(std::env::args_os().len()) {
+        let service_running = webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok();
+        for flag in ["--tray", "--app"] {
+            if let Err(e) = app::launch::spawn_self(flag) {
+                settings::log_fatal(&format!("Couldn't start mesh-kvm {flag}: {e}"));
+            }
+        }
+        if service_running {
             return;
         }
-        open_studio_when_ready();
     }
 
     if cli.app {
@@ -173,6 +169,14 @@ fn main() {
     }
     if cli.tray {
         run_tray_icon();
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if cli.install_launchers {
+        if let Err(e) = app::launch::install_linux_launchers() {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -267,12 +271,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_open_studio, Cli};
+    use super::{is_bare_launch, Cli};
     use clap::Parser;
 
     #[test]
     fn bare_launch_has_no_arguments() {
-        assert!(should_open_studio(1));
+        assert!(is_bare_launch(1));
     }
 
     #[test]
@@ -290,6 +294,6 @@ mod tests {
 
     #[test]
     fn login_launcher_stays_silent() {
-        assert!(!should_open_studio(7));
+        assert!(!is_bare_launch(7));
     }
 }
