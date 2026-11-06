@@ -4,7 +4,7 @@ use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifie
 use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
-    NodeId, Packet, Payload, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
+    NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
@@ -810,11 +810,6 @@ pub fn run_windows_node(
     // a process that loses the race to another service doesn't rewrite the launchers.
     crate::platform::windows::ensure_autorun_installed();
 
-    // Report true native Windows display resolution to Debian peer immediately
-    for _ in 0..3 {
-        send_udp_payload(Payload::PeerDisplayInfo { width, height });
-    }
-
     println!("[Windows] Native display resolution: {}x{}, peer: {}", width, height, peer_addr);
     println!(
         "[Windows] On-The-Go Watchdog enabled: If Debian peer is unreachable (>1.3s), laptop operates 100% standalone."
@@ -829,6 +824,7 @@ pub fn run_windows_node(
             let mut captive = false;
             let mut logged = None;
             let mut ticks = 0u32;
+            let mut config = None;
             loop {
                 std::thread::sleep(TICK_INTERVAL);
                 if let Some(mut router) = win_logic::lock_live(router_lock()) {
@@ -857,6 +853,7 @@ pub fn run_windows_node(
                     MANUAL_GAME_LOCK.store(requests.config.manual_game_lock, Ordering::SeqCst);
                     AUTO_GAME_LOCK.store(requests.config.auto_game_lock, Ordering::SeqCst);
                     sync_monitors(requests.config.monitors(NodeId::Windows));
+                    config = Some(requests.config);
                 }
 
                 let now_captive = is_windows_game_captive();
@@ -908,8 +905,14 @@ pub fn run_windows_node(
 
                 ticks = ticks.wrapping_add(1);
                 if ticks.is_multiple_of(TICKS_PER_HEARTBEAT) {
-                    send_udp_payload(Payload::Heartbeat);
-                    send_udp_payload(Payload::PeerDisplayInfo { width, height });
+                    match &config {
+                        Some(config) => {
+                            for payload in crate::spatial::heartbeat_payloads(config, NodeId::Windows) {
+                                send_udp_payload(payload);
+                            }
+                        }
+                        None => send_udp_payload(Payload::Heartbeat),
+                    }
                 }
             }
         })
@@ -919,7 +922,7 @@ pub fn run_windows_node(
     std::thread::Builder::new()
         .name("mesh-kvm-win-udp".to_string())
         .spawn(move || {
-            let mut buf = [0u8; 512];
+            let mut buf = [0u8; MAX_PACKET_SIZE];
             let mut last_rx_focus_seq = 0u64;
 
             loop {
@@ -975,12 +978,15 @@ pub fn run_windows_node(
                             Payload::EdgeMap { edge, start, end, resistance } => {
                                 edge_state().set_span(EdgeSpan { edge, start, end }, resistance);
                             }
-                            Payload::Heartbeat => {
-                                send_udp_payload(Payload::PeerDisplayInfo { width, height });
+                            Payload::PeerDisplayInfo { name, monitors } => {
+                                crate::spatial::note_peer_displays(&spatial_state, &name, monitors);
+                            }
+                            Payload::LayoutRevision { revision, editor } => {
+                                crate::spatial::note_peer_revision(&spatial_state, revision, editor);
                             }
                             Payload::PanicRelease => {
                                 println!(
-                                    "[PANIC] Received PanicRelease from Debian! Local keyboard unlocked."
+                                    "[PANIC] Received PanicRelease from the peer! Local keyboard unlocked."
                                 );
                                 route(Event::PeerPanic);
                             }

@@ -5,10 +5,10 @@ use crate::keymap::{
 };
 use super::{apply, fresh_focus_seq, from_peer, InputBackend, PeerSender};
 use crate::protocol::{
-    MonitorRect, NodeId, Packet, Payload, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
+    NodeId, Packet, Payload, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE,
     MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
-use crate::router::{Action, DeviceId, Event, Router, RouterConfig, KEEP_CURSOR};
+use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -1184,7 +1184,7 @@ pub fn run_debian_node(
     let mut last_telemetry_sync = Instant::now();
     let mut last_rx_focus_seq = 0u64;
 
-    let mut udp_buf = [0u8; 512];
+    let mut udp_buf = [0u8; MAX_PACKET_SIZE];
     let mut ev_buf = [InputEvent::default(); 64];
 
     unsafe {
@@ -1244,7 +1244,6 @@ pub fn run_debian_node(
         }
 
         core.router.set_pointer_speed(crate::settings::pointer_speed());
-        core.edge.set_span(cfg_snapshot.edge_span(NodeId::Debian), cfg_snapshot.edge_resistance);
         let is_game_captive = cfg_snapshot.manual_game_lock
             || (cfg_snapshot.auto_game_lock && kwin_game_active.load(Ordering::Relaxed));
         if core.router.captive() != is_game_captive {
@@ -1298,11 +1297,17 @@ pub fn run_debian_node(
                     println!("[PANIC] Received PanicRelease from Windows!");
                     core.route(Event::PeerPanic);
                 }
-                Payload::PeerDisplayInfo { width, height } => {
-                    if width >= 640 && height >= 480 {
-                        let screen = MonitorRect { name: "Laptop display".to_string(), x: 0, y: 0, w: width, h: height };
-                        crate::spatial::note_peer_displays(&spatial_state, "", vec![screen]);
-                    }
+                Payload::PeerDisplayInfo { name, monitors } => {
+                    crate::spatial::note_peer_displays(&spatial_state, &name, monitors);
+                }
+                Payload::EdgeMap { edge, start, end, resistance } => {
+                    core.edge.set_span(EdgeSpan { edge, start, end }, resistance);
+                }
+                Payload::GameLock { locked } => {
+                    core.route(Event::PeerGameLock(locked));
+                }
+                Payload::LayoutRevision { revision, editor } => {
+                    crate::spatial::note_peer_revision(&spatial_state, revision, editor);
                 }
                 _ => {}
             }
@@ -1441,18 +1446,12 @@ pub fn run_debian_node(
             }
         }
 
-        // Heartbeat, with what the laptop needs to check its own edges (every 400ms)
+        // Heartbeat, with what the other device needs to check its own edges (every 400ms)
         if last_heartbeat.elapsed() >= Duration::from_millis(400) {
             last_heartbeat = Instant::now();
-            core.peer.send(Payload::Heartbeat);
-            let span = cfg_snapshot.edge_span(NodeId::Windows);
-            core.peer.send(Payload::EdgeMap {
-                edge: span.edge,
-                start: span.start,
-                end: span.end,
-                resistance: cfg_snapshot.edge_resistance,
-            });
-            core.peer.send(Payload::GameLock { locked: cfg_snapshot.manual_game_lock });
+            for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
+                core.peer.send(payload);
+            }
         }
 
         std::thread::sleep(Duration::from_micros(500));

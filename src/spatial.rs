@@ -6,7 +6,7 @@
 
 use crate::platform::Platform;
 pub use crate::protocol::MonitorRect;
-use crate::protocol::{NodeId, SwitchEdge};
+use crate::protocol::{NodeId, Payload, SwitchEdge};
 use crate::router::{EdgeSpan, EdgeTracker, KEEP_CURSOR};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -657,6 +657,22 @@ impl SharedSpatialState {
     }
 }
 
+/// What goes to the other device with each heartbeat, the same from both: this device's screens,
+/// the edge of the other device that touches them, the manual game lock, and the layout it holds.
+pub fn heartbeat_payloads(config: &SpatialConfig, me: NodeId) -> Vec<Payload> {
+    let span = config.edge_span(me.other());
+    vec![
+        Payload::Heartbeat,
+        Payload::PeerDisplayInfo {
+            name: config.device(me).map_or_else(String::new, |d| d.name.clone()),
+            monitors: config.monitors(me).to_vec(),
+        },
+        Payload::EdgeMap { edge: span.edge, start: span.start, end: span.end, resistance: config.edge_resistance },
+        Payload::GameLock { locked: config.manual_game_lock },
+        Payload::LayoutRevision { revision: config.revision, editor: config.editor },
+    ]
+}
+
 /// Records what the other device reported about its screens. Never waits for the lock: a busy
 /// lock just means the next heartbeat does this instead.
 pub fn note_peer_displays(state: &RwLock<SharedSpatialState>, name: &str, monitors: Vec<MonitorRect>) {
@@ -1245,6 +1261,134 @@ mod tests {
         let g = state.read().unwrap();
         assert_eq!(g.config.revision, 1);
         assert!(g.peer_is_newer());
+    }
+
+    // ---- Heartbeats ----
+
+    /// One device as far as the other's packets go: its layout and its edge.
+    struct Side {
+        state: RwLock<SharedSpatialState>,
+        edge: EdgeWatch,
+        locked: bool,
+    }
+
+    impl Side {
+        fn new(me: NodeId, config: SpatialConfig) -> Self {
+            let state = shared_at(0, me, None);
+            {
+                let mut g = state.write().unwrap();
+                g.me = me;
+                g.config = config;
+            }
+            Self { state, edge: EdgeWatch::new(), locked: false }
+        }
+
+        /// Does with a packet what both input loops do with it.
+        fn receive(&mut self, payload: Payload) {
+            match payload {
+                Payload::PeerDisplayInfo { name, monitors } => note_peer_displays(&self.state, &name, monitors),
+                Payload::EdgeMap { edge, start, end, resistance } => {
+                    self.edge.set_span(EdgeSpan { edge, start, end }, resistance);
+                }
+                Payload::GameLock { locked } => self.locked = locked,
+                Payload::LayoutRevision { revision, editor } => note_peer_revision(&self.state, revision, editor),
+                _ => {}
+            }
+        }
+
+        fn config(&self) -> SpatialConfig {
+            self.state.read().unwrap().config.clone()
+        }
+
+        fn heartbeat(&self) -> Vec<Payload> {
+            let g = self.state.read().unwrap();
+            heartbeat_payloads(&g.config, g.me)
+        }
+    }
+
+    fn sides() -> (Side, Side) {
+        let (d, l) = pair();
+        (Side::new(NodeId::Debian, d), Side::new(NodeId::Windows, l))
+    }
+
+    fn exchange(a: &mut Side, b: &mut Side) {
+        for p in a.heartbeat() {
+            b.receive(p);
+        }
+        for p in b.heartbeat() {
+            a.receive(p);
+        }
+    }
+
+    #[test]
+    fn both_devices_send_the_same_kinds_of_packet() {
+        let kinds = |side: &Side| {
+            side.heartbeat().iter().map(|p| std::mem::discriminant(p)).collect::<Vec<_>>()
+        };
+        let (debian, laptop) = sides();
+        assert_eq!(kinds(&debian), kinds(&laptop));
+        assert_eq!(kinds(&debian).len(), 5);
+    }
+
+    #[test]
+    fn each_device_tells_the_other_about_its_edge_and_both_can_then_cross() {
+        let (mut debian, mut laptop) = sides();
+        let (d_cfg, l_cfg) = (debian.config(), laptop.config());
+        assert!(!debian.edge.push(d_cfg.monitors(NodeId::Debian), (2340, 1439), (0, 99), false));
+        assert!(!laptop.edge.push(l_cfg.monitors(NodeId::Windows), (100, 0), (0, -99), false));
+        exchange(&mut debian, &mut laptop);
+        assert!(debian.edge.push(d_cfg.monitors(NodeId::Debian), (2340, 1439), (0, 99), false));
+        assert!(laptop.edge.push(l_cfg.monitors(NodeId::Windows), (100, 0), (0, -99), false));
+    }
+
+    #[test]
+    fn each_device_learns_the_other_devices_monitors() {
+        let (mut debian, mut laptop) = sides();
+        let two = vec![rect("Display 2", -1000, -200, 1000, 800), rect("Display 1", 0, 0, 1920, 1080)];
+        laptop.state.write().unwrap().config.report_monitors(NodeId::Windows, "Laptop", two.clone());
+        debian.state.write().unwrap().config.report_monitors(NodeId::Debian, "Desk", vec![dp2()]);
+        exchange(&mut debian, &mut laptop);
+        assert_eq!(debian.config().monitors(NodeId::Windows), two.as_slice());
+        assert_eq!(debian.config().device(NodeId::Windows).unwrap().name, "Laptop");
+        assert_eq!(laptop.config().monitors(NodeId::Debian), &[dp2()]);
+        assert_eq!(laptop.config().device(NodeId::Debian).unwrap().name, "Desk");
+        // Reports don't count as edits, and both copies have the arrangement in the same place.
+        assert_eq!(debian.config().revision, 0);
+        let positions = |c: &SpatialConfig| c.devices.iter().map(|d| (d.x, d.y)).collect::<Vec<_>>();
+        assert_eq!(positions(&debian.config()), positions(&laptop.config()));
+    }
+
+    #[test]
+    fn a_game_lock_on_either_device_reaches_the_other() {
+        let (mut debian, mut laptop) = sides();
+        laptop.state.write().unwrap().config.manual_game_lock = true;
+        exchange(&mut debian, &mut laptop);
+        assert!(debian.locked && !laptop.locked);
+        laptop.state.write().unwrap().config.manual_game_lock = false;
+        debian.state.write().unwrap().config.manual_game_lock = true;
+        exchange(&mut debian, &mut laptop);
+        assert!(!debian.locked && laptop.locked);
+    }
+
+    #[test]
+    fn an_edit_on_either_device_reaches_the_other_through_the_heartbeat() {
+        for editor in [NodeId::Debian, NodeId::Windows] {
+            let (mut debian, mut laptop) = sides();
+            let (from, to) = if editor == NodeId::Debian { (&debian, &laptop) } else { (&laptop, &debian) };
+            {
+                let mut g = from.state.write().unwrap();
+                let edit = moved_to(&g.config, 2300);
+                g.config.apply_edit(&edit, editor);
+            }
+            let body = state_body(&from.config());
+            let to_state = &to.state;
+            assert!(!to_state.read().unwrap().peer_is_newer());
+            exchange(&mut debian, &mut laptop);
+            let to = if editor == NodeId::Debian { &laptop } else { &debian };
+            pull_layout(&to.state, || body);
+            assert_eq!(laptop_x(&to.config()), 2300);
+            assert_eq!(debian.config().stamp(), laptop.config().stamp());
+        }
     }
 
     // ---- Geometry ----

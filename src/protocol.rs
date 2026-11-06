@@ -5,6 +5,8 @@ pub const DEFAULT_INPUT_PORT: u16 = 24850;
 pub const DEFAULT_AUDIO_PORT: u16 = 24851;
 pub const DEFAULT_CLIPBOARD_PORT: u16 = 24852;
 pub const PACKET_MAGIC: [u8; 4] = *b"MKVM";
+/// The most a packet can be: 16 monitors with long names, under one Ethernet frame.
+pub const MAX_PACKET_SIZE: usize = 1400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -123,15 +125,20 @@ pub enum Payload {
     FocusAck { active_node: NodeId, seq_ref: u64 },
     PanicRelease,
     Heartbeat,
-    PeerDisplayInfo { width: i32, height: i32 },
-    /// Debian to laptop with each heartbeat: which laptop edge touches Debian, and where.
+    /// Each way with every heartbeat: what the sender is called, and all its monitors.
+    PeerDisplayInfo { name: String, monitors: Vec<MonitorRect> },
+    /// Each way with every heartbeat: which of the receiver's edges touches the sender, and
+    /// where, in the receiver's desktop coordinates.
     EdgeMap { edge: SwitchEdge, start: i32, end: i32, resistance: i32 },
-    /// Replaces `FocusSwitch` for all new sends; `x`, `y` are laptop-local.
+    /// Replaces `FocusSwitch` for all new sends; `x`, `y` are in the target's desktop coordinates.
     FocusSwitchAt { target_node: NodeId, x: i32, y: i32 },
-    /// Debian to laptop with each heartbeat: the manual game lock forbids leaving the active device.
+    /// Each way with every heartbeat: the sender's manual game lock forbids leaving the active device.
     GameLock { locked: bool },
     /// Main device to the other, about once a second: which device main believes is active.
     ActiveView { active_node: NodeId },
+    /// Each way with every heartbeat: the layout the sender holds. A device that sees a newer
+    /// one than its own fetches it.
+    LayoutRevision { revision: u64, editor: NodeId },
 }
 
 impl Packet {
@@ -196,6 +203,49 @@ mod tests {
             Payload::ActiveView { active_node } => assert_eq!(active_node, NodeId::Windows),
             other => panic!("wrong payload: {other:?}"),
         }
+        match round_trip(Payload::LayoutRevision { revision: u64::MAX, editor: NodeId::Windows }) {
+            Payload::LayoutRevision { revision, editor } => assert_eq!((revision, editor), (u64::MAX, NodeId::Windows)),
+            other => panic!("wrong payload: {other:?}"),
+        }
+    }
+
+    fn display_info(count: usize) -> Payload {
+        let monitor = |i: usize| MonitorRect {
+            name: format!("Display {i} with a fairly long name"),
+            x: -2560 * i as i32,
+            y: -1440,
+            w: 2560,
+            h: 1440,
+        };
+        Payload::PeerDisplayInfo { name: "Laptop with a long name".into(), monitors: (0..count).map(monitor).collect() }
+    }
+
+    #[test]
+    fn every_monitor_travels_with_its_name_and_negative_position() {
+        match round_trip(display_info(3)) {
+            Payload::PeerDisplayInfo { name, monitors } => {
+                assert_eq!(name, "Laptop with a long name");
+                assert_eq!(monitors.len(), 3);
+                assert_eq!((monitors[2].x, monitors[2].y, monitors[2].w), (-5120, -1440, 2560));
+                assert_eq!(monitors[2].name, "Display 2 with a fairly long name");
+            }
+            other => panic!("wrong payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_most_monitors_a_device_reports_fit_the_receive_buffer() {
+        let bytes = Packet::new(1, NodeId::Windows, display_info(16)).encode().unwrap();
+        assert!(bytes.len() <= MAX_PACKET_SIZE, "{}", bytes.len());
+    }
+
+    #[test]
+    fn a_packet_claiming_more_monitors_than_it_holds_is_rejected() {
+        let mut bytes = Packet::new(1, NodeId::Windows, display_info(1)).encode().unwrap();
+        // Header (16), variant index (4), then the name's length and text, then the list's length.
+        let list = 20 + 8 + "Laptop with a long name".len();
+        bytes[list..list + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Packet::decode(&bytes).is_err());
     }
 
     #[test]
@@ -206,7 +256,7 @@ mod tests {
             bytes[16..20].to_vec()
         };
         assert_eq!(index(Payload::Heartbeat), 7u32.to_le_bytes());
-        assert_eq!(index(Payload::PeerDisplayInfo { width: 1, height: 1 }), 8u32.to_le_bytes());
+        assert_eq!(index(Payload::PeerDisplayInfo { name: String::new(), monitors: vec![] }), 8u32.to_le_bytes());
         assert_eq!(index(Payload::GameLock { locked: true }), 11u32.to_le_bytes());
         assert_eq!(index(Payload::ActiveView { active_node: NodeId::Windows }), 12u32.to_le_bytes());
     }
