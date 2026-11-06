@@ -185,6 +185,16 @@ pub fn write_linux_launchers(home: &Path, exe: &str) -> std::io::Result<Vec<Path
     Ok(written)
 }
 
+/// Writes only the tray's login entry, for this exe, when starting at boot is turned on.
+#[cfg(target_os = "linux")]
+pub fn write_tray_autostart(home: &Path) -> std::io::Result<()> {
+    let path = home.join(".config/autostart/mesh-kvm-tray.desktop");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, linux_desktop_entry(&running_exe()?.to_string_lossy(), "--tray"))
+}
+
 /// `mesh-kvm --install-launchers`: writes the launchers for this exe and says what it wrote.
 #[cfg(target_os = "linux")]
 pub fn install_linux_launchers() -> Result<(), String> {
@@ -225,7 +235,7 @@ fn without_deleted_suffix(path: PathBuf) -> PathBuf {
     }
 }
 
-fn running_exe() -> std::io::Result<PathBuf> {
+pub fn running_exe() -> std::io::Result<PathBuf> {
     std::env::current_exe().map(without_deleted_suffix)
 }
 
@@ -697,6 +707,16 @@ mod tests {
     fn desktop_entry_quotes_a_path_with_spaces() {
         let entry = linux_desktop_entry("/home/me/my apps/mesh-kvm", "--tray");
         assert!(entry.contains("\nExec=\"/home/me/my apps/mesh-kvm\" --tray\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_tray_login_entry_can_be_written_by_itself() {
+        let home = temp("tray-entry");
+        write_tray_autostart(&home).unwrap();
+        let entry = std::fs::read_to_string(home.join(".config/autostart/mesh-kvm-tray.desktop")).unwrap();
+        assert!(entry.contains("--tray"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

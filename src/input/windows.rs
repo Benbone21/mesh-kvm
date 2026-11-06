@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorInfo, GetCursorPos,
     GetMessageW, GetSystemMetrics, PostQuitMessage, RegisterClassW, SetCursorPos,
-    SetProcessDPIAware, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO,
     CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, SM_CXSCREEN,
     SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_CLOSE, WM_ENDSESSION, WM_KEYDOWN, WM_KEYUP,
@@ -76,7 +76,7 @@ struct GlobalNet {
 
 static NET_STATE: OnceLock<GlobalNet> = OnceLock::new();
 static ROUTER: OnceLock<Mutex<Router>> = OnceLock::new();
-/// Filled by `EdgeMap`. Until one arrives no edge touches Debian.
+/// Filled by `EdgeMap`, and from this laptop's layout until one arrives.
 static EDGE: Mutex<EdgeWatch> = Mutex::new(EdgeWatch::new());
 /// This device's copy of the layout. The hooks use it only through `try_read`.
 static SPATIAL: OnceLock<Arc<RwLock<SharedSpatialState>>> = OnceLock::new();
@@ -758,9 +758,6 @@ pub fn run_windows_node(
     override_width: Option<i32>,
     override_height: Option<i32>,
 ) -> Result<(), String> {
-    unsafe {
-        let _ = SetProcessDPIAware();
-    }
     let (phys_w, phys_h) = unsafe {
         let hdc = GetDC(ptr::null_mut());
         if !hdc.is_null() {
@@ -921,6 +918,7 @@ pub fn run_windows_node(
                 if ticks.is_multiple_of(TICKS_PER_HEARTBEAT) {
                     match &config {
                         Some(config) => {
+                            edge_state().use_own_layout(config, NodeId::Windows);
                             for payload in crate::spatial::heartbeat_payloads(config, NodeId::Windows) {
                                 send_udp_payload(payload);
                             }

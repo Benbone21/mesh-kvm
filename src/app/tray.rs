@@ -93,7 +93,17 @@ pub fn run_tray() -> Result<(), String> {
         super::single::Instance::Failed(e) => return Err(e),
     };
     crate::mute::start_service_watch();
-    platform::run(ServiceStarter::begin())
+    platform::run(starter_for_login(crate::settings::autostart_disabled_marker().exists()))
+}
+
+/// The tray runs at every login, so it only starts the service if that hasn't been turned off.
+/// Opening the app still starts it.
+fn starter_for_login(turned_off: bool) -> ServiceStarter {
+    if turned_off {
+        ServiceStarter::default()
+    } else {
+        ServiceStarter::begin()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -299,6 +309,11 @@ mod tests {
         notices.show("Couldn't open the window", t0);
         assert_eq!(notices.text("base".into(), t0 + Duration::from_secs(4)), "mesh-kvm: Couldn't open the window");
         assert_eq!(notices.text("base".into(), t0 + Duration::from_secs(6)), "base");
+    }
+
+    #[test]
+    fn a_tray_with_starting_at_boot_off_starts_nothing() {
+        assert_eq!(starter_for_login(true).state(), ServiceStart::Done);
     }
 
     #[test]

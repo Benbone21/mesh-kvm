@@ -47,7 +47,7 @@ Each device has its own switches in the app window.
 - Send clipboard and Receive clipboard choose which way the clipboard travels: text, images and files. Copied files move as soon as you copy them, up to 2 GB per copy, and the last two copies stay in a `received` folder beside the settings.
 - Send audio and Play audio choose whether this device sends its sound to the other, and whether it plays the other's.
 - Mute this device while sending silences this device's speakers while it sends its system sound, so you hear it on only one device. It is on by default. The speakers come back when sending stops, the link drops, or sound from the other device is playing here. Sending the microphone doesn't mute. If you had muted the speakers yourself, they stay muted, and if you unmute them by hand, mesh-kvm leaves them alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
-- Start mesh-kvm when this device boots controls starting at login or boot.
+- Start mesh-kvm when this device boots controls starting at login or boot. With it off, the tray still appears at login on Debian, but the service waits until you open the app.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.
 
@@ -61,7 +61,7 @@ The layout is saved as `layout.json` beside the settings: `~/.config/mesh-kvm` o
 
 This version changes what the devices send each other, so update both before you use them together. Until then, crossing between them won't work properly. If one device still runs an older mesh-kvm, the app says which one and turns off the controls it can't use.
 
-Your settings carry over. The first start finds the address in the `--peer` your launchers already use and saves it. On Debian, it imports `layout.json` from the folder the service runs in, along with its pointer speed, and leaves the old file where it is.
+Your settings carry over. The first start finds the address in the `--peer` your launchers already use and saves it. On Debian, it imports `layout.json` along with its pointer speed, and leaves the old file where it is. It looks in the folder the service runs in, then `~/mesh-kvm`, then the folders above the program.
 
 1. On the laptop, double-click the new `mesh-kvm.exe`. This is the normal way to install. If mesh-kvm is already running, the new copy is installed over the old one (the old one is moved aside and deleted later), the launchers are rewritten so the tray starts at login, and the new version takes effect once every `mesh-kvm.exe` is ended in Task Manager (Details tab) and started again, or at the next login.
 2. On Debian, replace the binary, restart mesh-kvm, then run `mesh-kvm --install-launchers` once to refresh the menu entry and the tray's autostart entry.
@@ -86,7 +86,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 ## Limits
 
 - The Windows lock screen and UAC prompts can't be controlled remotely. Use the laptop's own keyboard and trackpad for those.
-- The API port (24880) stays open on the network, and it and the input traffic are not encrypted until the encryption stage. Only use mesh-kvm on a network you trust. The other device's address is the exception: only the app on the same device can change it.
+- The API port (24880) stays open on the network, and it and the input traffic are not encrypted until the encryption stage. Only use mesh-kvm on a network you trust. Anyone on the network can read a device's status, but only that device and the other one can change anything, and only the app on the same device can change the other device's address.
 - Addresses are IPv4 only, and there is no automatic discovery.
 - There is no Mac build yet.
 

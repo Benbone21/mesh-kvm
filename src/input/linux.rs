@@ -1449,6 +1449,7 @@ pub fn run_debian_node(
         // Heartbeat, with what the other device needs to check its own edges (every 400ms)
         if last_heartbeat.elapsed() >= Duration::from_millis(400) {
             last_heartbeat = Instant::now();
+            core.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);
             }

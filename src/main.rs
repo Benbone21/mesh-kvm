@@ -19,6 +19,10 @@ use protocol::{
 };
 use std::net::SocketAddr;
 
+/// The exit status of a service that found another one running. The packaged unit doesn't restart
+/// on this one, or it would keep trying until systemd gave up on it.
+const ALREADY_RUNNING_STATUS: i32 = 75;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "mesh-kvm",
@@ -290,7 +294,7 @@ fn run_service(cli: Cli) {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             println!("mesh-kvm is already running on this device.");
-            std::process::exit(1);
+            std::process::exit(ALREADY_RUNNING_STATUS);
         }
         Err(e) => fail(&format!("Couldn't open port {}: {}", webui::UI_PORT, e)),
     };
@@ -421,6 +425,13 @@ mod tests {
         let text = super::window_failed_text(std::path::Path::new(r"C:\Users\me\mesh-kvm\mesh-kvm.log"));
         assert!(text.contains("window couldn't start"), "{text}");
         assert!(text.contains(r"C:\Users\me\mesh-kvm\mesh-kvm.log"), "{text}");
+    }
+
+    #[test]
+    fn the_packaged_unit_does_not_restart_a_service_that_found_another_running() {
+        let unit = include_str!("../packaging/deb/mesh-kvm.service");
+        let line = format!("RestartPreventExitStatus={}\n", super::ALREADY_RUNNING_STATUS);
+        assert!(unit.contains(&line), "{unit}");
     }
 
     #[test]

@@ -9,13 +9,14 @@
 //!   POST /api/action             -> layout-wide actions (focus, release, game lock...)
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub const UI_PORT: u16 = 24880;
 /// What `local_ip_toward` gives when there is no route to the address.
 pub const UNKNOWN_ADDRESS: &str = "unknown";
+const REFUSED: &str = r#"{"ok":false,"error":"Changes can only come from this device or the other device."}"#;
 
 pub struct HttpRequest {
     pub method: String,
@@ -24,6 +25,27 @@ pub struct HttpRequest {
     /// From a program on this device, and not from a web page in a browser here, which would
     /// send an `Origin` header.
     pub from_app_here: bool,
+    /// Where the connection came from.
+    source: Option<IpAddr>,
+    /// A browser sent this, for some web page.
+    from_browser: bool,
+}
+
+impl HttpRequest {
+    /// True if this request may change anything. Reading is open, as the layout sync needs it.
+    /// Changes come from a program on this device, or from the other device, whose proxy passes
+    /// on what its own app asks for. A web page never qualifies, wherever its browser runs.
+    fn may_change_state(&self, peer_ip: &str) -> bool {
+        let trusted = self.source.is_some_and(|ip| ip.is_loopback() || ip.to_string() == peer_ip);
+        self.method == "GET" || (trusted && !self.from_browser)
+    }
+
+    /// True if this request may go on to the other device. Unlike the other device's own proxy
+    /// asking here, it would arrive there looking like it came from this device, so a change has
+    /// to come from the app on this one.
+    fn may_use_proxy(&self) -> bool {
+        self.method == "GET" || self.from_app_here
+    }
 }
 
 /// Node-specific API handler. Returns `Some(json_body)` if the route was handled.
@@ -94,7 +116,8 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     }
     let body_end = (header_end + content_len).min(data.len());
     let body = String::from_utf8_lossy(&data[header_end..body_end]).to_string();
-    Some(HttpRequest { method, path, body, from_app_here: from_here && !from_browser })
+    let source = stream.peer_addr().ok().map(|a| a.ip());
+    Some(HttpRequest { method, path, body, from_app_here: from_here && !from_browser, source, from_browser })
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -107,8 +130,9 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         None => return,
     };
 
-    if req.method == "OPTIONS" {
-        respond(&mut stream, "204 No Content", "text/plain", "");
+    let proxied = req.path.starts_with("/api/peer");
+    if !req.may_change_state(peer_ip) || (proxied && !req.may_use_proxy()) {
+        respond(&mut stream, "403 Forbidden", "application/json", REFUSED);
         return;
     }
 
@@ -142,7 +166,7 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let resp = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         ctype,
         body.len()
@@ -240,6 +264,76 @@ mod tests {
         let browser = "POST /api/local/action HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n";
         assert!(seen_by_handler("127.0.0.1", "127.0.0.1", plain));
         assert!(!seen_by_handler("127.0.0.1", "127.0.0.1", browser));
+    }
+
+    const PEER: &str = "192.168.8.210";
+
+    fn request(method: &str, path: &str, source: &str, origin: bool) -> HttpRequest {
+        let source: IpAddr = source.parse().unwrap();
+        HttpRequest {
+            method: method.into(),
+            path: path.into(),
+            body: String::new(),
+            from_app_here: source.is_loopback() && !origin,
+            source: Some(source),
+            from_browser: origin,
+        }
+    }
+
+    #[test]
+    fn changes_come_only_from_this_device_or_the_other_one() {
+        let may = |source, origin| request("POST", "/api/layout", source, origin).may_change_state(PEER);
+        assert!(may("127.0.0.1", false));
+        assert!(may(PEER, false));
+        assert!(!may("192.168.8.77", false), "another host on the network");
+        assert!(!may("127.0.0.1", true), "a web page on this device");
+        assert!(!may(PEER, true), "a web page on the other device");
+        // With no peer yet, only this device can change anything.
+        assert!(!request("POST", "/api/layout", "192.168.8.77", false).may_change_state(""));
+    }
+
+    #[test]
+    fn anything_but_a_read_counts_as_a_change_and_reading_stays_open() {
+        for method in ["PUT", "DELETE", "PATCH", "OPTIONS"] {
+            assert!(!request(method, "/api/layout", "192.168.8.77", false).may_change_state(PEER), "{method}");
+        }
+        assert!(request("GET", "/api/state", "192.168.8.77", false).may_change_state(PEER));
+    }
+
+    #[test]
+    fn only_the_app_here_can_send_a_change_through_to_the_other_device() {
+        assert!(request("POST", "/api/peer/api/layout", "127.0.0.1", false).may_use_proxy());
+        // It would reach the other device from this one's address, and be trusted there.
+        assert!(!request("POST", "/api/peer/api/layout", PEER, false).may_use_proxy());
+        assert!(!request("POST", "/api/peer/api/layout", "127.0.0.1", true).may_use_proxy());
+        assert!(request("GET", "/api/peer/api/local", "192.168.8.77", false).may_use_proxy());
+    }
+
+    /// One request over a real socket: its status line and everything else that came back.
+    fn exchange(request: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler: Handler = Arc::new(|_| Some(r#"{"ok":true}"#.to_string()));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, PEER, handler);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        server.join().unwrap();
+        reply
+    }
+
+    #[test]
+    fn a_web_page_is_turned_away_and_gets_no_permission_to_read_either() {
+        let reply = exchange("POST /api/layout HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n".into());
+        assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+        let reply = exchange("POST /api/layout HTTP/1.1\r\nContent-Length: 0\r\n\r\n".into());
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        let reply = exchange("GET /api/state HTTP/1.1\r\nOrigin: http://evil.example\r\n\r\n".into());
+        assert!(!reply.to_lowercase().contains("access-control"), "{reply}");
     }
 
     #[test]

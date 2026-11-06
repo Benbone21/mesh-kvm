@@ -83,7 +83,9 @@ Every device is both client and host. No device owns anything the other needs.
   address, so a change in the app survives the next login.
 - **Layout:** `layout.json` is in the config folder and holds a list of devices,
   each with its origin and its own monitors, which can have negative coordinates.
-  Old files are imported on first run and never deleted.
+  Old files are imported on first run and never deleted. They are looked for in the
+  current folder, `~/mesh-kvm` and above the exe, and a saved layout nobody has
+  edited doesn't stop a later start from finding one.
 - **Sync:** each device keeps a copy. Every edit raises `revision`, and heartbeats
   carry the revision. A device that hears of a newer one fetches it with
   `GET /api/state`, so sync adds no way to write to a device. The higher revision
@@ -92,11 +94,19 @@ Every device is both client and host. No device owns anything the other needs.
   Monitors are reports rather than edits, and never raise the revision. Pointer
   speed and game locks stay with their device.
 - **API:** `/api/state`, `/api/layout` and `/api/action` are on both services, and
-  the app only ever talks to its own device for these.
+  the app only ever talks to its own device for these. Anyone can read. Changes come
+  only from a program on this device or from the other device, never from a web
+  page, and a change through the peer proxy only from the app on this device. An
+  edit's revision is this copy's plus one, whatever the sender says, and a revision
+  far ahead of this copy's isn't believed, so one bad value can't stop the sync.
+- **Start at boot:** the switch reports what the next login will do, for a unit file
+  of the person's own, the packaged unit and no unit. Off disables an own unit and
+  masks the packaged one, whose link is enabled for everyone. It also leaves a
+  marker the tray keeps to, as its login entry would start the service regardless.
 - **Packets:** both devices send `PeerDisplayInfo` with every monitor, `EdgeMap`,
   `GameLock` and `LayoutRevision` with each heartbeat. An `EdgeMap` tells the
   receiver which of its own edges touches the sender, in the receiver's own
-  coordinates, and no edge can be crossed until one arrives. `FocusSwitchAt` carries
+  coordinates. Until one arrives, a device goes by its own layout. `FocusSwitchAt` carries
   coordinates in the target's desktop: the sender converts, and the receiver keeps
   the point on a monitor. Both devices update together.
 - **Still two devices:** `NodeId` and the router are unchanged. The tie-break and

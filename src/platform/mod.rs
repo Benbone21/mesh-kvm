@@ -32,9 +32,10 @@ pub trait Platform: Send + Sync {
     fn input_devices(&self) -> &'static [&'static str];
     /// True if this device can choose between system sound and the microphone.
     fn can_pick_audio_source(&self) -> bool;
-    /// Where an install from before layouts moved to the config folder kept its `layout.json`.
-    fn old_layout_dir(&self) -> Option<PathBuf> {
-        None
+    /// Where an install from before layouts moved to the config folder may have left its
+    /// `layout.json`, best guess first.
+    fn old_layout_dirs(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 }
 
@@ -46,7 +47,7 @@ pub fn current(size: Option<(i32, i32)>) -> Arc<dyn Platform> {
     }
     #[cfg(target_os = "windows")]
     {
-        Arc::new(windows::WindowsPlatform { size })
+        Arc::new(windows::WindowsPlatform::new(size))
     }
 }
 

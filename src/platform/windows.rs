@@ -10,9 +10,22 @@ use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::SetProcessDPIAware;
 
 pub struct WindowsPlatform {
-    pub size: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+}
+
+impl WindowsPlatform {
+    /// Only the service makes one of these. Without DPI awareness, Windows scales every monitor
+    /// rectangle, so it comes before the first look at them. The app window leaves this to
+    /// eframe, which asks for better than this and would be refused after it.
+    pub fn new(size: Option<(i32, i32)>) -> Self {
+        unsafe {
+            SetProcessDPIAware();
+        }
+        Self { size }
+    }
 }
 
 impl Platform for WindowsPlatform {
@@ -40,7 +53,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_autostart(&self, enabled: bool) {
-        let marker = autostart_disabled_marker();
+        let marker = crate::settings::autostart_disabled_marker();
         if enabled {
             let _ = fs::remove_file(&marker);
             ensure_autorun_installed();
@@ -112,11 +125,6 @@ fn startup_vbs_path() -> Option<PathBuf> {
     )
 }
 
-/// Present when the user turned auto-boot off in the app, so startup doesn't reinstall it.
-fn autostart_disabled_marker() -> PathBuf {
-    crate::settings::config_dir().join("autostart-disabled")
-}
-
 /// The address an older login script passed with `--peer`, for an install that has none saved.
 pub fn old_login_script_peer() -> Option<String> {
     let script = fs::read_to_string(startup_vbs_path()?).ok()?;
@@ -182,7 +190,7 @@ fn write_launchers(installed_exe: &Path, peer: Option<&str>) {
         &programs_dir,
         &exe_to_run.to_string_lossy(),
         peer,
-        !autostart_disabled_marker().exists(),
+        !crate::settings::autostart_disabled_marker().exists(),
         &crate::app::launch::make_shortcut,
     );
     if let Some(vbs_path) = login_script {
@@ -196,6 +204,14 @@ fn write_launchers(installed_exe: &Path, peer: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn making_the_platform_turns_on_dpi_awareness_before_any_monitor_is_read() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsProcessDPIAware;
+        let platform = crate::platform::current(None);
+        assert!(unsafe { IsProcessDPIAware() } != 0);
+        let _ = platform.monitors();
+    }
 
     #[test]
     fn displays_are_named_as_windows_names_them() {

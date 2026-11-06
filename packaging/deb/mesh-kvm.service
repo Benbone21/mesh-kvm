@@ -12,6 +12,8 @@ EnvironmentFile=-%h/.config/mesh-kvm/service.env
 ExecStart=/usr/bin/mesh-kvm --role debian $MESH_KVM_ARGS
 Restart=always
 RestartSec=2
+# Another mesh-kvm already runs here, such as one the app started: leave it be.
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=graphical-session.target

@@ -17,6 +17,7 @@ xdotool can type on. Without it, that step is skipped and says so.
 """
 import contextlib
 import glob
+import http.client
 import http.server
 import json
 import os
@@ -229,8 +230,22 @@ class Inbox:
 def call(path, body=None, headers=None, base=LOCAL):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(base + path, data=data, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=3) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(request, timeout=3) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+
+
+def post_from(source, path, body):
+    """A POST to the laptop's API from `source`, on the other device's side. Returns the status."""
+    with other_device():
+        connection = http.client.HTTPConnection(LAPTOP, API_PORT, timeout=3, source_address=(source, 0))
+        connection.connect()
+    connection.request("POST", path, json.dumps(body))
+    status = connection.getresponse().status
+    connection.close()
+    return status
 
 
 def local():
@@ -452,18 +467,29 @@ def input_checks(peer, inbox):
     after = st["cursor"]
     check("a MouseMoveDelta from Debian moves the laptop's cursor", after != before, f"{before} -> {after}")
 
-    # j. With no EdgeMap yet, pushing at the edge goes nowhere. This also shows what is being
-    # tested below is the EdgeMap, and not some other way across.
+    # j. With no EdgeMap yet, the laptop goes by its own layout, which has Debian on its left.
+    peer.give_focus_to_laptop(28, 300)
+    time.sleep(0.6)
+    inbox.clear()
+    peer.pump(0.8, heartbeat, lambda: active_view(WINDOWS), lambda: mouse_move(-400, 0))
+    own = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
+    check("with no EdgeMap from Debian, the laptop crosses at the edge in its own layout", own is not None)
+
+    # An EdgeMap then wins over the layout: this one leaves nothing on the left to cross to.
+    peer.send(edge_map(RIGHT, 0, 5000, 30))
     peer.give_focus_to_laptop(28, 300)
     time.sleep(0.4)
     inbox.clear()
-    peer.pump(0.6, heartbeat, lambda: active_view(WINDOWS), lambda: mouse_move(-400, 0))
-    check("with no EdgeMap from Debian, the edge can't be crossed", not inbox.wait_for(FOCUS_SWITCH_AT, 0.3))
+    peer.pump(0.6, heartbeat, lambda: edge_map(RIGHT, 0, 5000, 30), lambda: active_view(WINDOWS),
+              lambda: mouse_move(-400, 0))
+    check("an EdgeMap from Debian replaces the laptop's own idea of the edge",
+          not inbox.wait_for(FOCUS_SWITCH_AT, 0.3))
 
     # k. The manual game lock Debian reports holds the cursor here.
     span = edge_map(LEFT, 0, 5000, 30)
     peer.send(span)
     peer.send(game_lock(True))
+    peer.give_focus_to_laptop(28, 300)
     time.sleep(0.4)
     inbox.clear()
     peer.pump(0.6, heartbeat, lambda: game_lock(True), lambda: active_view(WINDOWS), lambda: mouse_move(-400, 0))
@@ -551,6 +577,22 @@ def security_checks(pinned_peer):
     check("set_peer from the network is refused", reply.get("ok") is False, str(reply))
     reply = peer_change_refused({"peer": STRANGER}, {"Origin": "http://evil.example"})
     check("set_peer from a web page on this device is refused", reply.get("ok") is False, str(reply))
+
+    # r. Changes come from this device or the other one, and from no one else.
+    before = state()["config"]
+    hostile = json.loads(json.dumps(before))
+    hostile["revision"] = 2 ** 64 - 1
+    for path, body in (("/api/layout", hostile), ("/api/action", {"action": "panic"}),
+                       ("/api/local/action", {"action": "set_sharing", "mouse": False}),
+                       ("/api/peer/api/action", {"action": "panic"})):
+        status = post_from(STRANGER, path, body)
+        check(f"POST {path} from a stranger is refused", status == 403, str(status))
+    check("the stranger changed nothing", state()["config"] == before and local()["sharing"]["mouse"] is True)
+    check("the other device can still change the layout", post_from(PEER, "/api/layout", hostile) == 200)
+    now = state()["config"]
+    check("a huge revision in an edit is ignored", now["revision"] == before["revision"] + 1, str(now["revision"]))
+    check("the other device can't send a change back through the proxy",
+          post_from(PEER, "/api/peer/api/action", {"action": "panic"}) == 403)
     reply = peer_change_refused({"peer": ANOTHER_PEER})
     check("set_peer is refused while --peer pins the address",
           pinned_peer and reply.get("ok") is False and "--peer" in reply.get("error", ""), str(reply))
@@ -558,7 +600,7 @@ def security_checks(pinned_peer):
 
 
 def saved_peer_checks(exe):
-    # r. Started with --peer, the address was saved, so it now starts without it.
+    # s. Started with --peer, the address was saved, so it now starts without it.
     path = settings_file()
     saved = json.load(open(path)) if path else {}
     check("--peer was saved", saved.get("peer_ip") == PEER, str(saved.get("peer_ip")))
@@ -568,7 +610,7 @@ def saved_peer_checks(exe):
     check("with no flags, the saved peer is used and can be changed",
           bool(st) and st["paired"] and st["peer_ip"] == PEER and not st["peer_pinned"], str(st))
 
-    # s. Bad addresses are refused with a reason, and a good one restarts the service on it.
+    # t. Bad addresses are refused with a reason, and a good one restarts the service on it.
     for bad in ("laptop", "127.0.0.1", "0.0.0.0", LAPTOP):
         reply = peer_change_refused({"peer": bad})
         check(f"set_peer {bad} is refused", reply.get("ok") is False and reply.get("error"), str(reply))
@@ -584,7 +626,7 @@ def saved_peer_checks(exe):
 
 
 def unpaired_checks(exe):
-    # t. Knowing no address, the service waits, and takes one from the app.
+    # u. Knowing no address, the service waits, and takes one from the app.
     exe.stop()
     os.remove(settings_file())
     exe.start()
@@ -598,16 +640,16 @@ def unpaired_checks(exe):
 
 
 def second_service_check(exe):
-    # u. A second service stops at once and leaves the first alone.
+    # v. A second service stops at once and leaves the first alone.
     before = local()
     extra = subprocess.run(["wine", exe.exe, "--role", "windows"], env=exe.env, timeout=30,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    check("a second service stops by itself", extra.returncode != 0, str(extra.returncode))
+    check("a second service stops by itself, with its own status", extra.returncode == 75, str(extra.returncode))
     check("the first one still answers", local()["version"] == before["version"])
 
 
 def keyboard_checks(peer, inbox, exe):
-    # v. The laptop's own keyboard and mouse reach Debian while Debian has focus.
+    # w. The laptop's own keyboard and mouse reach Debian while Debian has focus.
     if not os.environ.get("WINE_LINK_DISPLAY"):
         print("SKIP: the laptop's own keyboard and mouse, as WINE_LINK_DISPLAY isn't set", flush=True)
         return

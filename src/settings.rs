@@ -105,6 +105,11 @@ pub fn config_dir() -> PathBuf {
     }
 }
 
+/// Present when the person turned starting at boot off, so that nothing at login undoes that.
+pub fn autostart_disabled_marker() -> PathBuf {
+    config_dir().join("autostart-disabled")
+}
+
 /// Where `log_fatal` and `log_note` write.
 pub fn log_path() -> PathBuf {
     config_dir().join("mesh-kvm.log")

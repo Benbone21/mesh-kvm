@@ -22,6 +22,12 @@ const MAX_MONITOR_SIZE: i32 = 1 << 16;
 const MAX_MONITORS: usize = 16;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_EDGE_RESISTANCE: i32 = 400;
+/// How far ahead of this copy another copy's revision can be and still be believed. No one makes
+/// this many edits, so a bigger jump is a bad value, which would otherwise win every comparison
+/// from then on and leave no edit able to beat it.
+const MAX_REVISION_JUMP: u64 = 1 << 32;
+/// A saved revision above this is a bad value too, and starts again.
+const MAX_REVISION: u64 = 1 << 48;
 /// What a device's screen is taken to be until it reports its own.
 const PLACEHOLDER_SIZE: (i32, i32) = (1920, 1080);
 /// A documentation-only address: asking for the route to it sends nothing.
@@ -268,6 +274,9 @@ impl SpatialConfig {
         }
         self.devices = devices;
         self.edge_resistance = self.edge_resistance.clamp(0, MAX_EDGE_RESISTANCE);
+        if self.revision > MAX_REVISION {
+            self.revision = 0;
+        }
     }
 
     pub fn device(&self, node: NodeId) -> Option<&DeviceLayout> {
@@ -430,18 +439,24 @@ impl SpatialConfig {
         merged
     }
 
+    /// True if a copy with this stamp should replace this one.
+    fn should_take(&self, stamp: (u64, NodeId)) -> bool {
+        is_newer(stamp, self.stamp()) && stamp.0 <= self.revision.saturating_add(MAX_REVISION_JUMP)
+    }
+
     /// Takes a copy from the other device if it is the newer one. True if it was.
     pub fn adopt(&mut self, theirs: &SpatialConfig) -> bool {
-        if !is_newer(theirs.stamp(), self.stamp()) {
+        if !self.should_take(theirs.stamp()) {
             return false;
         }
         *self = SpatialConfig { revision: theirs.revision, editor: theirs.editor, ..self.with_shared_settings_of(theirs) };
         true
     }
 
-    /// Applies an edit made on `me`, as the newest revision either device has seen.
+    /// Applies an edit made on `me`, one past this copy. The revision in the edit means nothing:
+    /// it comes from whoever sent it.
     pub fn apply_edit(&mut self, edit: &SpatialConfig, me: NodeId) {
-        let revision = self.revision.max(edit.revision).saturating_add(1);
+        let revision = self.revision.saturating_add(1);
         *self = SpatialConfig { revision, editor: me, ..self.with_shared_settings_of(edit) };
     }
 
@@ -495,18 +510,33 @@ fn contains(m: &MonitorRect, (x, y): (i32, i32)) -> bool {
 }
 
 /// The edge of this device that touches the other one, and how hard the cursor has pushed at it.
-/// The span comes from the other device's `EdgeMap`. Until one arrives, no edge can be crossed.
+/// The span comes from the other device's `EdgeMap`, and from this device's own layout until one
+/// arrives, as an other device that doesn't send them can still be crossed to.
 pub struct EdgeWatch {
     span: Option<EdgeSpan>,
     tracker: EdgeTracker,
+    heard_from_peer: bool,
 }
 
 impl EdgeWatch {
     pub const fn new() -> Self {
-        Self { span: None, tracker: EdgeTracker::new(0) }
+        Self { span: None, tracker: EdgeTracker::new(0), heard_from_peer: false }
     }
 
+    /// Takes the edge from the other device's `EdgeMap`.
     pub fn set_span(&mut self, span: EdgeSpan, resistance: i32) {
+        self.heard_from_peer = true;
+        self.apply(span, resistance);
+    }
+
+    /// Takes the edge from this device's own layout, unless the other device has said.
+    pub fn use_own_layout(&mut self, config: &SpatialConfig, me: NodeId) {
+        if !self.heard_from_peer {
+            self.apply(config.edge_span(me), config.edge_resistance);
+        }
+    }
+
+    fn apply(&mut self, span: EdgeSpan, resistance: i32) {
         self.span = Some(span);
         self.tracker.set_resistance(resistance.clamp(0, MAX_EDGE_RESISTANCE));
     }
@@ -604,11 +634,17 @@ pub fn take_studio_requests(state: &RwLock<SharedSpatialState>) -> Option<Studio
     })
 }
 
-/// The saved layout in `dir`, or else the old one in `old_dir`, which is only ever read: the old
-/// file stays where it is.
-fn load_layout(dir: &Path, old_dir: Option<&Path>) -> Option<ParsedLayout> {
+/// The saved layout in `dir`, or else the first old one in `old_dirs`, which are only ever read:
+/// an old file stays where it is. A saved layout at revision 0 was never edited, so a start that
+/// couldn't see the old file doesn't cost the arrangement in it.
+fn load_layout(dir: &Path, old_dirs: &[PathBuf]) -> Option<ParsedLayout> {
     let read = |dir: &Path| fs::read_to_string(dir.join(LAYOUT_FILE)).ok().and_then(|text| parse_layout(&text));
-    read(dir).or_else(|| old_dir.and_then(read))
+    let saved = read(dir);
+    if saved.as_ref().is_some_and(|s| s.config.revision > 0) {
+        return saved;
+    }
+    let is_old = |parsed: &ParsedLayout| parsed.old_pointer_speed.is_some() || parsed.config.revision > 0;
+    old_dirs.iter().filter(|old| old.as_path() != dir).filter_map(|old| read(old)).find(is_old).or(saved)
 }
 
 impl SharedSpatialState {
@@ -616,7 +652,7 @@ impl SharedSpatialState {
     pub fn load(platform: &dyn Platform, peer_addr: String, peer_pinned: bool) -> Self {
         let dir = crate::settings::config_dir();
         let me = platform.node();
-        let parsed = load_layout(&dir, platform.old_layout_dir().as_deref());
+        let parsed = load_layout(&dir, &platform.old_layout_dirs());
         let (mut config, old_speed) = match parsed {
             Some(p) => (p.config, p.old_pointer_speed),
             None => (SpatialConfig::fresh(me, crate::settings::switch_edge()), None),
@@ -653,7 +689,7 @@ impl SharedSpatialState {
 
     /// True when the other device has said it holds a newer layout than this one.
     fn peer_is_newer(&self) -> bool {
-        self.peer_revision.is_some_and(|theirs| is_newer(theirs, self.config.stamp()))
+        self.peer_revision.is_some_and(|theirs| self.config.should_take(theirs))
     }
 }
 
@@ -1074,7 +1110,8 @@ mod tests {
         fs::write(old.join(LAYOUT_FILE), OLD_LAYOUT).unwrap();
 
         // First run: nothing saved yet, so the old file is imported, and stays where it is.
-        let imported = load_layout(&config, Some(&old)).unwrap();
+        let olds = [old.clone()];
+        let imported = load_layout(&config, &olds).unwrap();
         assert_eq!(imported.old_pointer_speed, Some(0.35));
         assert_eq!(fs::read_to_string(old.join(LAYOUT_FILE)).unwrap(), OLD_LAYOUT);
 
@@ -1082,16 +1119,36 @@ mod tests {
         let mut saved = imported.config;
         saved.edge_resistance = 77;
         fs::write(config.join(LAYOUT_FILE), serde_json::to_string(&saved).unwrap()).unwrap();
-        let again = load_layout(&config, Some(&old)).unwrap();
+        let again = load_layout(&config, &olds).unwrap();
         assert_eq!(again.config.edge_resistance, 77);
         assert_eq!(again.old_pointer_speed, None);
 
         // Windows has no old location, and a corrupt save falls back rather than failing.
-        assert_eq!(load_layout(&old.join("nowhere"), None), None);
+        assert_eq!(load_layout(&old.join("nowhere"), &[]), None);
         fs::write(config.join(LAYOUT_FILE), "{nope").unwrap();
-        assert_eq!(load_layout(&config, Some(&old)).unwrap().config.edge_resistance, 55);
+        assert_eq!(load_layout(&config, &olds).unwrap().config.edge_resistance, 55);
         let _ = fs::remove_dir_all(config);
         let _ = fs::remove_dir_all(old);
+    }
+
+    #[test]
+    fn a_first_start_that_missed_the_old_file_does_not_lose_it_for_good() {
+        let (config, elsewhere, old) = (temp("missed-config"), temp("missed-elsewhere"), temp("missed-old"));
+        // The first start ran somewhere with no old file, and saved a layout nobody has edited.
+        let fresh = SpatialConfig::fresh(NodeId::Debian, None);
+        fs::write(config.join(LAYOUT_FILE), serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(load_layout(&config, &[elsewhere.clone()]).unwrap().config, fresh);
+        // A later start can see the old file, and takes it, looking through every folder.
+        fs::write(old.join(LAYOUT_FILE), OLD_LAYOUT).unwrap();
+        let found = load_layout(&config, &[elsewhere.clone(), old.clone()]).unwrap();
+        assert_eq!(found.old_pointer_speed, Some(0.35));
+        assert_eq!(found.config.device(NodeId::Windows).unwrap().x, 1925);
+        // An untouched layout that happens to sit in one of those folders isn't an old file.
+        fs::write(elsewhere.join(LAYOUT_FILE), serde_json::to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(load_layout(&config, &[elsewhere.clone()]).unwrap().config, fresh);
+        for dir in [config, elsewhere, old] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -1181,6 +1238,44 @@ mod tests {
         debian.apply_edit(&stale, NodeId::Debian);
         assert_eq!(debian.revision, 10);
         assert_eq!(laptop_x(&debian), 5);
+    }
+
+    #[test]
+    fn the_revision_in_an_edit_is_ignored() {
+        let (mut debian, _) = pair();
+        debian.revision = 9;
+        let mut hostile = moved_to(&debian, 5);
+        hostile.revision = u64::MAX;
+        debian.apply_edit(&hostile, NodeId::Debian);
+        assert_eq!(debian.revision, 10);
+    }
+
+    #[test]
+    fn a_huge_revision_from_the_other_device_is_not_believed() {
+        let (mut debian, laptop) = pair();
+        let mut theirs = moved_to(&laptop, 5);
+        for revision in [u64::MAX, debian.revision + MAX_REVISION_JUMP + 1] {
+            theirs.revision = revision;
+            assert!(!debian.adopt(&theirs), "{revision}");
+        }
+        assert_eq!(debian.revision, 0);
+        // Sync still works afterwards.
+        theirs.revision = 1;
+        assert!(debian.adopt(&theirs));
+        let state = shared_at(1, NodeId::Debian, None);
+        note_peer_revision(&state, u64::MAX, NodeId::Windows);
+        pull_layout(&state, || panic!("a bad revision must not even be fetched"));
+    }
+
+    #[test]
+    fn a_bad_revision_already_saved_starts_again_so_that_sync_can_run() {
+        let mut c = layout(TouchSide::Bottom, 0, 1440);
+        c.revision = u64::MAX;
+        let mut back = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert_eq!(back.revision, 0);
+        let edit = back.clone();
+        back.apply_edit(&edit, NodeId::Debian);
+        assert_eq!(back.revision, 1);
     }
 
     #[test]
@@ -1334,8 +1429,6 @@ mod tests {
     fn each_device_tells_the_other_about_its_edge_and_both_can_then_cross() {
         let (mut debian, mut laptop) = sides();
         let (d_cfg, l_cfg) = (debian.config(), laptop.config());
-        assert!(!debian.edge.push(d_cfg.monitors(NodeId::Debian), (2340, 1439), (0, 99), false));
-        assert!(!laptop.edge.push(l_cfg.monitors(NodeId::Windows), (100, 0), (0, -99), false));
         exchange(&mut debian, &mut laptop);
         assert!(debian.edge.push(d_cfg.monitors(NodeId::Debian), (2340, 1439), (0, 99), false));
         assert!(laptop.edge.push(l_cfg.monitors(NodeId::Windows), (100, 0), (0, -99), false));
@@ -1582,10 +1675,25 @@ mod tests {
     }
 
     #[test]
-    fn no_edge_can_be_crossed_before_a_span_arrives() {
+    fn no_edge_can_be_crossed_before_anything_says_where_it_is() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
         let mut edge = EdgeWatch::new();
         assert!(!edge.push(c.monitors(NodeId::Debian), (2340, 1439), (0, 999), false));
+    }
+
+    #[test]
+    fn a_device_crosses_from_its_own_layout_until_the_other_one_says_otherwise() {
+        for (node, point, push) in [(NodeId::Debian, (2340, 1439), (0, 99)), (NodeId::Windows, (100, 0), (0, -99))] {
+            let c = layout(TouchSide::Bottom, 2240, 1440);
+            let mut edge = EdgeWatch::new();
+            edge.use_own_layout(&c, node);
+            assert!(edge.push(c.monitors(node), point, push, false), "{node}");
+
+            // The other device's word wins, and the layout doesn't take it back.
+            edge.set_span(span(SwitchEdge::Left, 0, 10), 5);
+            edge.use_own_layout(&c, node);
+            assert!(!edge.push(c.monitors(node), point, push, false), "{node}");
+        }
     }
 
     #[test]
