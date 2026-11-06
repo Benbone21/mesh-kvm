@@ -211,6 +211,10 @@ impl Router {
         self.fwd_buttons.iter().for_each(|button| held.set_button(*button, true));
         held
     }
+    /// How many keys and buttons the peer's input has down here.
+    pub fn held_here(&self) -> u32 {
+        (self.injected.keys().count() + self.injected.buttons().count()) as u32
+    }
     /// Control went to this device with a dropout, and goes back when the link returns.
     pub fn returning(&self) -> bool {
         self.resume_until.is_some()

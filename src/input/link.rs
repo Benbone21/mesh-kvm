@@ -3,9 +3,9 @@
 //! Time comes in as `now_ms`, on the same clock the router gets.
 
 use crate::protocol::{HeldInput, LinkState, Packet, Payload, LINK_PROTOCOL};
-use crate::router::Event;
+use crate::router::{Event, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// More packets than could ever be in flight at once. A jump this big is a restart, not lateness.
 const MAX_LATE_PACKETS: u64 = 1 << 16;
@@ -32,19 +32,36 @@ fn is_newer(seq: u64, other: u64) -> bool {
 /// that a key isn't dropped for being overtaken by a mouse movement, which it has nothing to do with.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Stream {
-    /// Key and button events, and the held state that has to agree with them.
-    Presses,
+    /// A key or button going down. `u16` says which, with buttons after the keys.
+    Press(u16),
+    Release(u16),
+    /// The held state, which has to agree with the two above.
+    Held,
     Motion,
     Focus,
 }
 
+const FIRST_BUTTON: u16 = 256;
+
 fn stream_of(payload: &Payload) -> Option<Stream> {
-    match payload {
-        Payload::KeyEvent { .. } | Payload::MouseButton { .. } | Payload::LinkState(_) => Some(Stream::Presses),
+    let press = |input, pressed| Some(if pressed { Stream::Press(input) } else { Stream::Release(input) });
+    match *payload {
+        Payload::KeyEvent { scancode, pressed } => press(scancode, pressed),
+        Payload::MouseButton { button, pressed } => press(FIRST_BUTTON + u16::from(button), pressed),
+        Payload::LinkState(_) => Some(Stream::Held),
         Payload::MouseMoveDelta { .. } | Payload::MouseWheel { .. } => Some(Stream::Motion),
         Payload::FocusSwitchAt { .. } | Payload::ActiveView { .. } => Some(Stream::Focus),
         _ => None,
     }
+}
+
+/// Moves `newest` up to `seq`, and says if that was a move.
+fn advance(newest: &mut Option<u64>, seq: u64) -> bool {
+    let newer = newest.is_none_or(|newest| is_newer(seq, newest));
+    if newer {
+        *newest = Some(seq);
+    }
+    newer
 }
 
 /// Keeps the newest sequence number seen on each stream, and notices the peer starting again.
@@ -53,7 +70,11 @@ struct PacketOrder {
     newest: Option<u64>,
     /// Since when everything has been older than `newest`.
     behind_since: Option<u64>,
+    /// The newest key or button event, or held state.
     presses: Option<u64>,
+    /// The newest event of each key and button.
+    inputs: HashMap<u16, u64>,
+    held: Option<u64>,
     motion: Option<u64>,
     focus: Option<u64>,
 }
@@ -77,19 +98,33 @@ impl PacketOrder {
         restarted
     }
 
-    /// False for a packet that something newer on its stream has already overtaken, which is also
-    /// what a duplicate looks like.
+    /// False for a packet that something newer has already overtaken, which is also what a
+    /// duplicate looks like. A press gives way to any other press, or two keys would land the
+    /// wrong way round. A release only gives way to news of its own key: letting go is always safe,
+    /// and dropping it would leave the key down until the next heartbeat. Nothing gets past a
+    /// report that's newer, as that already says how things stand.
     fn fresh(&mut self, stream: Stream, seq: u64) -> bool {
-        let newest = match stream {
-            Stream::Presses => &mut self.presses,
-            Stream::Motion => &mut self.motion,
-            Stream::Focus => &mut self.focus,
-        };
-        let fresh = newest.is_none_or(|newest| is_newer(seq, newest));
-        if fresh {
-            *newest = Some(seq);
+        match stream {
+            Stream::Motion => advance(&mut self.motion, seq),
+            Stream::Focus => advance(&mut self.focus, seq),
+            Stream::Held => advance(&mut self.presses, seq) && advance(&mut self.held, seq),
+            Stream::Press(input) => {
+                let fresh = advance(&mut self.presses, seq);
+                if fresh {
+                    self.inputs.insert(input, seq);
+                }
+                fresh
+            }
+            Stream::Release(input) => {
+                let known = self.inputs.get(&input).copied();
+                let fresh = known.is_none_or(|newest| is_newer(seq, newest)) && self.held.is_none_or(|held| is_newer(seq, held));
+                if fresh {
+                    self.inputs.insert(input, seq);
+                    advance(&mut self.presses, seq);
+                }
+                fresh
+            }
         }
-        fresh
     }
 }
 
@@ -123,7 +158,8 @@ impl LossMeter {
                 self.percent = Some(self.percent.map_or(lost, |was| was + (lost - was) * SMOOTHING));
             }
             self.start = Some((self.newest, now_ms));
-            self.got = 0;
+            // More than was due means late ones from before, which the last window counted as lost.
+            self.got = self.got.saturating_sub(due);
         }
     }
 }
@@ -154,6 +190,8 @@ pub struct LinkQuality {
     pub round_trip_ms: Option<u32>,
     /// Control waits to go back to the other device.
     pub returning: bool,
+    /// Keys and buttons the other device has down here.
+    pub held_here: u32,
     pub peer_version: PeerVersion,
 }
 
@@ -256,14 +294,15 @@ impl PeerLink {
         }
     }
 
-    pub fn quality(&self, returning: bool, now_ms: u64) -> LinkQuality {
+    pub fn quality(&self, router: &Router, now_ms: u64) -> LinkQuality {
         let measured = self.online && (self.loss.percent.is_some() || self.round_trip_ms.is_some());
         LinkQuality {
             measured,
             loss_in: if measured { self.loss.percent.unwrap_or(0.0) } else { 0.0 },
             loss_out: if measured { self.loss_out.unwrap_or(0.0) } else { 0.0 },
             round_trip_ms: self.round_trip_ms.filter(|_| measured).map(|ms| ms.round() as u32),
-            returning,
+            returning: router.returning(),
+            held_here: router.held_here(),
             peer_version: self.peer_version(now_ms),
         }
     }
@@ -273,6 +312,12 @@ impl PeerLink {
 mod tests {
     use super::*;
     use crate::protocol::NodeId;
+    use crate::router::{RouterConfig, Sharing};
+
+    fn router() -> Router {
+        let sharing = Sharing { mouse: true, keyboard: true };
+        Router::new(RouterConfig { me: 0, peer: 1, main: 0, sharing, pointer_speed: 1.0 })
+    }
 
     fn key(seq: u64) -> Packet {
         Packet::new(seq, NodeId::Debian, Payload::KeyEvent { scancode: 30, pressed: true })
@@ -306,6 +351,60 @@ mod tests {
         let release = Packet::new(11, NodeId::Debian, Payload::KeyEvent { scancode: 30, pressed: false });
         assert!(link.arrived(&release, 0));
         assert!(!link.arrived(&key(10), 0));
+    }
+
+    fn release(seq: u64, scancode: u16) -> Packet {
+        Packet::new(seq, NodeId::Debian, Payload::KeyEvent { scancode, pressed: false })
+    }
+
+    #[test]
+    fn a_release_overtaken_by_another_key_still_counts() {
+        let mut link = PeerLink::default();
+        let other = Packet::new(12, NodeId::Debian, Payload::KeyEvent { scancode: 31, pressed: true });
+        assert!(link.arrived(&key(10), 0));
+        assert!(link.arrived(&other, 0));
+        assert!(link.arrived(&release(11, 30), 0));
+    }
+
+    #[test]
+    fn a_release_from_before_the_same_key_went_down_again_is_dropped() {
+        let mut link = PeerLink::default();
+        assert!(link.arrived(&key(12), 0));
+        assert!(!link.arrived(&release(11, 30), 0));
+        // Nor does one get past a report that's newer, which already says how things stand.
+        let mut sender = PeerLink::default();
+        assert!(link.arrived(&state(&mut sender, 20, HeldInput::default(), 0), 0));
+        assert!(!link.arrived(&release(19, 31), 0));
+    }
+
+    #[test]
+    fn a_press_overtaken_by_another_key_is_dropped() {
+        // Letting it through would type the two the wrong way round.
+        let mut link = PeerLink::default();
+        let other = Packet::new(12, NodeId::Debian, Payload::KeyEvent { scancode: 31, pressed: true });
+        assert!(link.arrived(&other, 0));
+        assert!(!link.arrived(&key(11), 0));
+    }
+
+    #[test]
+    fn a_few_packets_reordered_over_a_window_edge_are_not_loss() {
+        let mut link = PeerLink::default();
+        link.set_online(true);
+        let mut seq = 1000u64;
+        // A quiet link, where one late packet in ten would otherwise read as 10% in every other window.
+        for window in 0..10u64 {
+            for at in 0..10u64 {
+                seq += 1;
+                if at == 9 && window % 2 == 0 {
+                    link.arrived(&heartbeat(seq + 1), window * 2000 + at * 200);
+                    link.arrived(&heartbeat(seq), window * 2000 + at * 200 + 201);
+                    seq += 1;
+                } else {
+                    link.arrived(&heartbeat(seq), window * 2000 + at * 200);
+                }
+            }
+        }
+        assert!(link.quality(&router(), 20_000).loss_in < 1.0);
     }
 
     #[test]
@@ -409,7 +508,7 @@ mod tests {
         link.set_online(true);
         let mut seq = 1000;
         run(&mut link, &mut seq, 0, 12_000, |seq| seq % 5 == 0);
-        let loss = link.quality(false, 12_000).loss_in;
+        let loss = link.quality(&router(), 12_000).loss_in;
         assert!((18.0..=22.0).contains(&loss), "{loss}");
     }
 
@@ -419,7 +518,7 @@ mod tests {
         link.set_online(true);
         let mut seq = 1000;
         run(&mut link, &mut seq, 0, 6000, |_| false);
-        assert_eq!(link.quality(false, 6000).loss_in, 0.0);
+        assert_eq!(link.quality(&router(), 6000).loss_in, 0.0);
     }
 
     #[test]
@@ -430,7 +529,7 @@ mod tests {
             link.arrived(&heartbeat(pair + 1), at as u64 * 40);
             link.arrived(&heartbeat(pair), at as u64 * 40);
         }
-        assert!(link.quality(false, 8000).loss_in < 1.0);
+        assert!(link.quality(&router(), 8000).loss_in < 1.0);
     }
 
     #[test]
@@ -441,7 +540,7 @@ mod tests {
         run(&mut link, &mut seq, 0, 4000, |_| false);
         run(&mut link, &mut seq, 4000, 1000, |_| true);
         run(&mut link, &mut seq, 5000, 2000, |_| false);
-        assert!(link.quality(false, 7000).loss_in > 5.0);
+        assert!(link.quality(&router(), 7000).loss_in > 5.0);
     }
 
     #[test]
@@ -452,7 +551,7 @@ mod tests {
         run(&mut link, &mut seq, 0, 4000, |_| false);
         let mut seq = 1u64 << 50;
         run(&mut link, &mut seq, 4000, 4000, |_| false);
-        assert_eq!(link.quality(false, 8000).loss_in, 0.0);
+        assert_eq!(link.quality(&router(), 8000).loss_in, 0.0);
     }
 
     /// Two ends, with `one_way_ms` each way, swapping heartbeats so that `a` gets an answer.
@@ -468,7 +567,7 @@ mod tests {
         let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
         a.set_online(true);
         answered(&mut a, &mut b, 1000, 30, 250);
-        assert_eq!(a.quality(false, 2000).round_trip_ms, Some(60));
+        assert_eq!(a.quality(&router(), 2000).round_trip_ms, Some(60));
     }
 
     #[test]
@@ -478,7 +577,7 @@ mod tests {
         let mut seq = 1000;
         run(&mut b, &mut seq, 0, 4000, |seq| seq % 10 == 0);
         answered(&mut a, &mut b, 5000, 1, 1);
-        let loss = a.quality(false, 5100).loss_out;
+        let loss = a.quality(&router(), 5100).loss_out;
         assert!((9.0..=11.0).contains(&loss), "{loss}");
     }
 
@@ -506,13 +605,12 @@ mod tests {
         let mut seq = 1000;
         run(&mut a, &mut seq, 0, 4000, |seq| seq % 5 == 0);
         answered(&mut a, &mut b, 1000, 30, 10);
-        assert!(a.quality(false, 4000).measured);
+        assert!(a.quality(&router(), 4000).measured);
         a.set_online(false);
-        let quality = a.quality(true, 4000);
-        assert_eq!(quality, LinkQuality { returning: true, ..LinkQuality::default() });
+        assert_eq!(a.quality(&router(), 4000), LinkQuality::default());
         // Back up, it starts over rather than showing what it had.
         a.set_online(true);
-        assert!(!a.quality(false, 4100).measured);
+        assert!(!a.quality(&router(), 4100).measured);
     }
 
     #[test]

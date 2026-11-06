@@ -1454,7 +1454,7 @@ pub fn run_debian_node(
                 };
                 guard.telemetry.peer_online = core.router.online();
                 guard.telemetry.main_conflict = core.router.main_conflict();
-                guard.telemetry.link = link.quality(core.router.returning(), now_ms());
+                guard.telemetry.link = link.quality(&core.router, now_ms());
             }
         }
 

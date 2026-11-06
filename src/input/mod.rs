@@ -2,6 +2,8 @@
 //! router `Action`s into backend calls and peer packets.
 
 pub mod link;
+#[cfg(test)]
+mod live;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
