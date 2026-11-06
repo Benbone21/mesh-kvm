@@ -14,17 +14,18 @@ use super::resample::Resampler;
 use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB, RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use windows::core::{implement, Interface, Result as WinResult, BSTR, PWSTR};
+use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
+    eAll, eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
-    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    IAudioClient, IMMDevice, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
     AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
@@ -49,7 +50,11 @@ const ACTIVATE_WAIT: Duration = Duration::from_secs(3);
 /// How much the shared engine holds for process loopback, in 100 ns units: 20 ms.
 const PROCESS_BUFFER: i64 = 200_000;
 const PROCESS_WAIT_MS: u32 = 100;
+const FIRST_EXCLUSION_RETRY: Duration = Duration::from_secs(5);
+const LONGEST_EXCLUSION_RETRY: Duration = Duration::from_secs(300);
 const BITS: u16 = 16;
+/// How long a new stream waits for the old one. They notice being stopped every `STREAM_TICK`.
+const LONGEST_STOP_WAIT: Duration = Duration::from_millis(400);
 /// How long a stream failing stays in the notes.
 const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(4);
 /// What to try when a microphone gives nothing. Windows can block one for every app.
@@ -59,10 +64,11 @@ const MIC_HELP: &str = "Check that Microphone access is on in Windows privacy se
 static WAKE: LazyLock<Signal> = LazyLock::new(Signal::default);
 /// Audio is arriving, so both directions may be in use.
 static RECEIVING: AtomicBool = AtomicBool::new(false);
-/// Process loopback failed here, so it isn't tried again until the service restarts.
-static EXCLUSION_FAILED: AtomicBool = AtomicBool::new(false);
-/// The friendly name of the output to play on, with `None` meaning the default.
-static PLAY_DEVICE: Mutex<Option<String>> = Mutex::new(None);
+/// How process loopback has been getting on.
+static EXCLUSION: Mutex<Exclusion> =
+    Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None });
+/// The output to play on, with `None` meaning the default.
+static PLAY_DEVICE: Mutex<Option<Pick>> = Mutex::new(None);
 
 pub fn choices_changed() {
     WAKE.notify();
@@ -94,34 +100,88 @@ fn describe(device: &IMMDevice) -> Option<Device> {
     }
 }
 
-fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Vec<Device> {
-    let Ok(collection) = (unsafe { all.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE) }) else {
-        return Vec::new();
+/// How to find an endpoint through `cpal`, which shows nothing of a device but its name. Windows
+/// can give two the same name, so it's also which of those it is, counting in enumeration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pick {
+    name: String,
+    nth: usize,
+}
+
+/// One direction's endpoints: what to show, and how to find each one by its id.
+#[derive(Default)]
+struct Endpoints {
+    devices: Vec<Device>,
+    picks: HashMap<String, Pick>,
+}
+
+/// Takes endpoints in enumeration order. Same-named ones get told apart in the dropdown too.
+fn sort_out(found: Vec<Device>) -> Endpoints {
+    let mut totals: HashMap<&str, usize> = HashMap::new();
+    for device in &found {
+        *totals.entry(device.name.as_str()).or_default() += 1;
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut picks = HashMap::new();
+    let mut devices = Vec::with_capacity(found.len());
+    for device in &found {
+        let nth = seen.entry(device.name.as_str()).or_default();
+        picks.insert(device.id.clone(), Pick { name: device.name.clone(), nth: *nth });
+        let name = if totals[device.name.as_str()] > 1 {
+            format!("{} ({})", device.name, *nth + 1)
+        } else {
+            device.name.clone()
+        };
+        devices.push(Device { id: device.id.clone(), name });
+        *nth += 1;
+    }
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    Endpoints { devices, picks }
+}
+
+/// Goes through endpoints the way `cpal` does, so that "the second one with this name" is the same
+/// device to both.
+fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Endpoints {
+    let Ok(collection) = (unsafe { all.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }) else {
+        return Endpoints::default();
     };
     let count = unsafe { collection.GetCount() }.unwrap_or(0);
-    let mut devices: Vec<Device> =
-        (0..count).filter_map(|index| describe(&unsafe { collection.Item(index) }.ok()?)).collect();
-    devices.sort_by(|a, b| a.name.cmp(&b.name));
-    devices
+    let flows_this_way = |device: &IMMDevice| {
+        device.cast::<IMMEndpoint>().and_then(|endpoint| unsafe { endpoint.GetDataFlow() }).is_ok_and(|f| f == flow)
+    };
+    sort_out(
+        (0..count)
+            .filter_map(|index| unsafe { collection.Item(index) }.ok())
+            .filter(flows_this_way)
+            .filter_map(|device| describe(&device))
+            .collect(),
+    )
 }
 
 fn default_endpoint(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String> {
     unsafe { take_id(all.GetDefaultAudioEndpoint(flow, eConsole).ok()?.GetId().ok()?) }
 }
 
-fn read_lists() -> Option<Lists> {
-    let all = enumerator().ok()?;
-    Some(Lists {
-        inputs: endpoints(&all, eCapture),
-        outputs: endpoints(&all, eRender),
-        default_input: default_endpoint(&all, eCapture),
-        default_output: default_endpoint(&all, eRender),
-    })
+/// The lists to show, and how to find what's on them.
+struct Found {
+    lists: Lists,
+    inputs: HashMap<String, Pick>,
+    outputs: HashMap<String, Pick>,
 }
 
-/// `cpal` finds devices by name, which is all it shows of them.
-fn name_of(id: &str, devices: &[Device]) -> Option<String> {
-    devices.iter().find(|device| device.id == id).map(|device| device.name.clone())
+fn read_lists() -> Option<Found> {
+    let all = enumerator().ok()?;
+    let (inputs, outputs) = (endpoints(&all, eCapture), endpoints(&all, eRender));
+    Some(Found {
+        lists: Lists {
+            inputs: inputs.devices,
+            outputs: outputs.devices,
+            default_input: default_endpoint(&all, eCapture),
+            default_output: default_endpoint(&all, eRender),
+        },
+        inputs: inputs.picks,
+        outputs: outputs.picks,
+    })
 }
 
 // ============================================================================================
@@ -160,6 +220,18 @@ impl<K: PartialEq> Worker<K> {
         self.key = None;
     }
 
+    /// False if the old stream is still going after a fair wait. It's looked at again next time.
+    fn wait_until_finished(&self) -> bool {
+        let deadline = Instant::now() + LONGEST_STOP_WAIT;
+        while !self.finished.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
     /// How a capture on this worker is doing.
     fn health(&self, source: &Source, expected: bool, microphone: bool, now: Instant) -> CaptureHealth {
         let up_for = self.last_start.filter(|_| expected && self.alive()).map(|at| now.duration_since(at));
@@ -186,6 +258,10 @@ impl<K: PartialEq> Worker<K> {
         }
         let Some(key) = wanted else { return };
         if self.key.is_some() || self.last_start.is_some_and(|at| now.duration_since(at) < RESPAWN_GAP) {
+            return;
+        }
+        // Never two at once: the old one's last act is to clear up what the new one will use.
+        if !self.wait_until_finished() {
             return;
         }
         self.last_start = Some(now);
@@ -216,6 +292,32 @@ fn hold(stream: cpal::Stream, stop: &AtomicBool, failed: &AtomicBool) {
 // Capture
 // ============================================================================================
 
+/// How much of the centre and surround channels goes into each side of a stereo mix.
+const FOLD_DOWN: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+/// Mixes a frame down to two channels. Windows puts channels in a fixed order, so the count says
+/// which is which: front left and right, then centre, bass, back and side. Bass is left out, as
+/// that's the usual way, and it's an extra rather than a part of the mix.
+fn fold_to_stereo(channels: usize, sample: impl Fn(usize) -> f32) -> (f32, f32) {
+    let (centre, surrounds): (Option<usize>, &[(usize, usize)]) = match channels {
+        3 => (Some(2), &[]),
+        4 => (None, &[(2, 3)]),
+        5 => (Some(2), &[(3, 4)]),
+        6 => (Some(2), &[(4, 5)]),
+        8 => (Some(2), &[(4, 5), (6, 7)]),
+        _ => (None, &[]),
+    };
+    let left = sample(0);
+    let right = if channels > 1 { sample(1) } else { left };
+    let middle = centre.map_or(0.0, &sample) * FOLD_DOWN;
+    let (mut left, mut right) = (left + middle, right + middle);
+    for &(back_left, back_right) in surrounds {
+        left += sample(back_left) * FOLD_DOWN;
+        right += sample(back_right) * FOLD_DOWN;
+    }
+    (left, right)
+}
+
 /// Turns whatever a device delivers into 48 kHz stereo and hands it on.
 struct Intake {
     source: &'static Source,
@@ -239,8 +341,7 @@ impl Intake {
     fn take<T: Copy>(&mut self, data: &[T], to_f32: impl Fn(T) -> f32) {
         self.stereo.clear();
         for frame in data.chunks_exact(self.channels) {
-            let left = to_f32(frame[0]);
-            let right = frame.get(1).map_or(left, |right| to_f32(*right));
+            let (left, right) = fold_to_stereo(frame.len(), |channel| to_f32(frame[channel]));
             self.stereo.extend_from_slice(&[left, right]);
         }
         let samples = match &mut self.resampler {
@@ -302,18 +403,33 @@ fn capture_device(device: Option<cpal::Device>, loopback: bool, source: &'static
     source.clear();
 }
 
-fn find_input(name: Option<&str>) -> Option<cpal::Device> {
+/// The device a pick means. Going by the pick for the default too means a new default is noticed.
+fn the_one(mut devices: impl Iterator<Item = cpal::Device>, pick: &Pick) -> Option<cpal::Device> {
+    devices.find_map({
+        let mut left = pick.nth;
+        move |device| {
+            if !device.name().is_ok_and(|name| name == pick.name) {
+                return None;
+            }
+            let this_one = left == 0;
+            left = left.saturating_sub(1);
+            this_one.then_some(device)
+        }
+    })
+}
+
+fn find_input(pick: Option<&Pick>) -> Option<cpal::Device> {
     let host = cpal::default_host();
-    match name {
-        Some(name) => host.input_devices().ok()?.find(|device| device.name().is_ok_and(|n| n == name)),
+    match pick {
+        Some(pick) => the_one(host.input_devices().ok()?, pick),
         None => host.default_input_device(),
     }
 }
 
-fn find_output(name: Option<&str>) -> Option<cpal::Device> {
+fn find_output(pick: Option<&Pick>) -> Option<cpal::Device> {
     let host = cpal::default_host();
-    match name {
-        Some(name) => host.output_devices().ok()?.find(|device| device.name().is_ok_and(|n| n == name)),
+    match pick {
+        Some(pick) => the_one(host.output_devices().ok()?, pick),
         None => host.default_output_device(),
     }
 }
@@ -322,7 +438,7 @@ fn find_output(name: Option<&str>) -> Option<cpal::Device> {
 #[derive(Clone, PartialEq, Eq)]
 enum OutputCapture {
     /// Loopback of one endpoint, or the default with `None`.
-    Endpoint(Option<String>),
+    Endpoint(Option<Pick>),
     /// All sound on this device except this process's.
     Excluding,
 }
@@ -353,7 +469,71 @@ struct BlobVariant {
 
 const VT_BLOB: u16 = 65;
 
-fn activate_excluding_this_process() -> Result<IAudioClient, String> {
+/// Why process loopback didn't work.
+#[derive(Debug, PartialEq, Eq)]
+enum ExclusionError {
+    /// This Windows doesn't have it, so there's no use asking again.
+    Unsupported(String),
+    /// It might work next time.
+    Failed(String),
+}
+
+impl ExclusionError {
+    fn from_activation(code: HRESULT) -> Self {
+        let text = format!("activated: {code:?}");
+        // Not implemented, class not registered, and "the request is not supported".
+        const NOT_HERE: [u32; 3] = [0x8000_4001, 0x8004_0154, 0x8007_0032];
+        if NOT_HERE.contains(&(code.0 as u32)) {
+            ExclusionError::Unsupported(text)
+        } else {
+            ExclusionError::Failed(text)
+        }
+    }
+}
+
+/// How process loopback has been getting on. Trouble with it is usually passing, such as a device
+/// changing under it, so it's tried again, less and less often.
+struct Exclusion {
+    unsupported: bool,
+    /// It isn't working, so what's played is getting into what's sent.
+    failing: bool,
+    next_try: Option<Instant>,
+    backoff: Option<Duration>,
+}
+
+impl Exclusion {
+    fn may_try(&self, now: Instant) -> bool {
+        !self.unsupported && self.next_try.is_none_or(|at| now >= at)
+    }
+
+    fn failed(&mut self, error: &ExclusionError, now: Instant) {
+        self.failing = true;
+        if matches!(error, ExclusionError::Unsupported(_)) {
+            self.unsupported = true;
+            return;
+        }
+        let wait = self.backoff.unwrap_or(FIRST_EXCLUSION_RETRY);
+        self.next_try = Some(now + wait);
+        self.backoff = Some((wait * 2).min(LONGEST_EXCLUSION_RETRY));
+    }
+
+    /// Capture started. If it doesn't last, the wait carries on growing from where it was.
+    fn started(&mut self) {
+        self.failing = false;
+    }
+
+    /// It ran until told to stop.
+    fn stopped_cleanly(&mut self) {
+        self.backoff = None;
+        self.next_try = None;
+    }
+}
+
+fn exclusion() -> std::sync::MutexGuard<'static, Exclusion> {
+    EXCLUSION.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn activate_excluding_this_process() -> Result<IAudioClient, ExclusionError> {
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -378,12 +558,15 @@ fn activate_excluding_this_process() -> Result<IAudioClient, String> {
             Some(std::ptr::from_ref(&blob).cast()),
             &handler,
         )
-        .map_err(|e| format!("activation: {e}"))?;
-        wait.recv_timeout(ACTIVATE_WAIT).map_err(|_| "activation timed out".to_string())?;
-        let (mut result, mut interface) = (windows::core::HRESULT(0), None);
-        operation.GetActivateResult(&mut result, &mut interface).map_err(|e| format!("result: {e}"))?;
-        result.ok().map_err(|e| format!("activated: {e}"))?;
-        interface.ok_or("no client came back")?.cast().map_err(|e| format!("client: {e}"))
+        .map_err(|e| ExclusionError::from_activation(e.code()))?;
+        wait.recv_timeout(ACTIVATE_WAIT).map_err(|_| ExclusionError::Failed("activation timed out".to_string()))?;
+        let (mut result, mut interface) = (HRESULT(0), None);
+        operation.GetActivateResult(&mut result, &mut interface).map_err(|e| ExclusionError::Failed(format!("result: {e}")))?;
+        if result.is_err() {
+            return Err(ExclusionError::from_activation(result));
+        }
+        let client = interface.ok_or_else(|| ExclusionError::Failed("no client came back".to_string()))?;
+        client.cast().map_err(|e| ExclusionError::Failed(format!("client: {e}")))
     }
 }
 
@@ -436,6 +619,7 @@ fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Res
         client.SetEventHandle(event).map_err(|e| format!("event: {e}"))?;
         let capture: IAudioCaptureClient = client.GetService().map_err(|e| format!("service: {e}"))?;
         client.Start().map_err(|e| format!("start: {e}"))?;
+        exclusion().started();
         let mut intake = Intake::new(&HUB.output, CHANNELS, RATE);
         while !stop.load(Ordering::SeqCst) {
             if WaitForSingleObject(event, PROCESS_WAIT_MS) == WAIT_OBJECT_0 && !read_packets(&capture, &mut intake) {
@@ -449,25 +633,29 @@ fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Res
 }
 
 /// Captures all sound but this process's, until told to stop.
-fn capture_excluding(stop: &AtomicBool) -> Result<(), String> {
+fn capture_excluding(stop: &AtomicBool) -> Result<(), ExclusionError> {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let client = activate_excluding_this_process()?;
-    let event = unsafe { CreateEventW(None, false, false, None) }.map_err(|e| format!("event: {e}"))?;
+    let event = unsafe { CreateEventW(None, false, false, None) }
+        .map_err(|e| ExclusionError::Failed(format!("event: {e}")))?;
     let result = run_exclusion(&client, event, stop);
     let _ = unsafe { CloseHandle(event) };
-    result
+    result.map_err(ExclusionError::Failed)
 }
 
 fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
     match how {
-        OutputCapture::Endpoint(name) => capture_device(find_output(name.as_deref()), true, &HUB.output, &stop),
+        OutputCapture::Endpoint(pick) => capture_device(find_output(pick.as_ref()), true, &HUB.output, &stop),
         OutputCapture::Excluding => {
-            if let Err(e) = capture_excluding(&stop) {
-                crate::settings::log_note(&format!(
-                    "Couldn't leave this device's own sound out of what it sends ({e}). Using ordinary capture instead."
-                ));
-                EXCLUSION_FAILED.store(true, Ordering::SeqCst);
-                WAKE.notify();
+            match capture_excluding(&stop) {
+                Ok(()) => exclusion().stopped_cleanly(),
+                Err(e) => {
+                    crate::settings::log_note(&format!(
+                        "Couldn't leave this device's own sound out of what it sends ({e:?}). Using ordinary capture for now."
+                    ));
+                    exclusion().failed(&e, Instant::now());
+                    WAKE.notify();
+                }
             }
             HUB.output.clear();
         }
@@ -477,23 +665,23 @@ fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
 /// Whether to capture with process exclusion. An echo needs received audio playing on the same
 /// endpoint that's being captured, so for anything else, loopback of the endpoint is the better
 /// capture: it's what the dropdown asks for, and it can't echo.
-fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, failed: bool) -> bool {
-    sent.is_some() && sent == play && receiving && !failed
+fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_try: bool) -> bool {
+    sent.is_some() && sent == play && receiving && may_try
 }
 
 /// Whether what's sent can be trusted to leave out what's played, now or as soon as it matters.
-fn echo_safe(sent: Option<&str>, play: Option<&str>, failed: bool) -> bool {
-    sent != play || !failed
+fn echo_safe(sent: Option<&str>, play: Option<&str>, failing: bool) -> bool {
+    sent != play || !failing
 }
 
 fn engine() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let mut mic = Worker::<Option<String>>::default();
+    let mut mic = Worker::<Option<Pick>>::default();
     let mut output = Worker::<OutputCapture>::default();
     loop {
         WAKE.wait(LOOK_EVERY);
         let now = Instant::now();
-        let Some(lists) = read_lists() else { continue };
+        let Some(Found { lists, inputs, outputs }) = read_lists() else { continue };
         let choice = devices::choice();
         let input = devices::resolve(&choice.input, &lists.inputs);
         let sent = devices::resolve(&choice.output, &lists.outputs);
@@ -503,23 +691,26 @@ fn engine() {
         };
         let sent_id = sent.id(lists.default_output.as_ref());
         let play_id = play.id(lists.default_output.as_ref());
-        let failed = EXCLUSION_FAILED.load(Ordering::SeqCst);
+        let (may_try, failing) = {
+            let exclusion = exclusion();
+            (exclusion.may_try(now), exclusion.failing)
+        };
         let receiving = RECEIVING.load(Ordering::SeqCst);
-        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, failed);
+        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try);
 
-        let mic_name = input.target().and_then(|id| name_of(&id, &lists.inputs));
-        mic.ensure((input != Resolved::Off).then_some(mic_name), now, |name, stop| {
-            capture_device(find_input(name.as_deref()), false, &HUB.mic, &stop);
+        // By the device, even for the default, so that a change of default restarts the capture.
+        let mic_pick = input.id(lists.default_input.as_ref()).and_then(|id| inputs.get(&id).cloned());
+        mic.ensure((input != Resolved::Off).then_some(mic_pick), now, |pick, stop| {
+            capture_device(find_input(pick.as_ref()), false, &HUB.mic, &stop);
         });
 
-        // By name even for the default, so that a change of default restarts the capture.
-        let sent_name = sent_id.as_deref().and_then(|id| name_of(id, &lists.outputs));
-        let how = if excluding { OutputCapture::Excluding } else { OutputCapture::Endpoint(sent_name) };
+        let sent_pick = sent_id.as_ref().and_then(|id| outputs.get(id).cloned());
+        let how = if excluding { OutputCapture::Excluding } else { OutputCapture::Endpoint(sent_pick) };
         output.ensure((sent != Resolved::Off).then_some(how), now, run_output_capture);
         AUDIO_OUTPUT_CAPTURE_LIVE.store(output.alive(), Ordering::Relaxed);
 
         *PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner) =
-            play_id.as_deref().and_then(|id| name_of(id, &lists.outputs));
+            play_id.as_ref().and_then(|id| outputs.get(id).cloned());
 
         let whole_device = excluding && choice.output != devices::DEFAULT;
         let notes = [
@@ -538,7 +729,7 @@ fn engine() {
         devices::set_in_use(InUse {
             output: sent_id.clone(),
             play: play_id.clone(),
-            echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failed),
+            echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
             notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);
@@ -634,8 +825,8 @@ where
     )
 }
 
-fn play_on(name: Option<&str>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool) {
-    let Some(device) = find_output(name) else { return };
+fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool) {
+    let Some(device) = find_output(pick) else { return };
     let Ok(supported) = device.default_output_config() else { return };
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
@@ -660,7 +851,7 @@ fn play_on(name: Option<&str>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool) 
 }
 
 fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
-    let mut player = Worker::<Option<String>>::default();
+    let mut player = Worker::<Option<Pick>>::default();
     let mut last_alive = None;
     loop {
         let now = Instant::now();
@@ -675,7 +866,7 @@ fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
         let idle = last_alive.is_none_or(|at| now.duration_since(at) >= PLAYER_IDLE_CLOSE);
         let wanted = (!muted && !idle).then(|| PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner).clone());
         let for_player = Arc::clone(&stream);
-        player.ensure(wanted, now, move |name, stop| play_on(name.as_deref(), for_player, &stop));
+        player.ensure(wanted, now, move |pick, stop| play_on(pick.as_ref(), for_player, &stop));
         if muted && alive {
             drain_received(&stream, PLAYER_OFF_TICK, now);
         } else if muted || idle {
@@ -705,11 +896,11 @@ mod tests {
     #[test]
     fn exclusion_is_only_used_when_an_echo_could_really_happen() {
         let (a, b) = (Some("speakers"), Some("headset"));
-        assert!(needs_exclusion(a, a, true, false));
-        assert!(!needs_exclusion(a, b, true, false), "playing elsewhere: plain loopback can't echo");
-        assert!(!needs_exclusion(a, a, false, false), "nothing arriving: nothing to echo");
-        assert!(!needs_exclusion(a, a, true, true), "it failed here, so it's not tried again");
-        assert!(!needs_exclusion(None, None, true, false), "nothing being sent");
+        assert!(needs_exclusion(a, a, true, true));
+        assert!(!needs_exclusion(a, b, true, true), "playing elsewhere: plain loopback can't echo");
+        assert!(!needs_exclusion(a, a, false, true), "nothing arriving: nothing to echo");
+        assert!(!needs_exclusion(a, a, true, false), "it's waiting before trying again");
+        assert!(!needs_exclusion(None, None, true, true), "nothing being sent");
     }
 
     #[test]
@@ -720,11 +911,69 @@ mod tests {
         assert!(!echo_safe(a, a, true));
     }
 
+    fn fresh_exclusion() -> Exclusion {
+        Exclusion { unsupported: false, failing: false, next_try: None, backoff: None }
+    }
+
     #[test]
-    fn a_device_is_found_by_its_id_and_a_stranger_is_not() {
-        let list = vec![Device { id: "{1}".into(), name: "Speakers".into() }];
-        assert_eq!(name_of("{1}", &list).as_deref(), Some("Speakers"));
-        assert_eq!(name_of("{2}", &list), None);
+    fn exclusion_that_fails_is_tried_again_less_and_less_often() {
+        let (mut state, t) = (fresh_exclusion(), Instant::now());
+        let failure = ExclusionError::Failed("device changed".into());
+        assert!(state.may_try(t));
+        state.failed(&failure, t);
+        assert!(state.failing, "the warning shows while it isn't working");
+        assert!(!state.may_try(t + Duration::from_secs(4)));
+        assert!(state.may_try(t + FIRST_EXCLUSION_RETRY));
+        let later = t + FIRST_EXCLUSION_RETRY;
+        state.failed(&failure, later);
+        assert!(!state.may_try(later + FIRST_EXCLUSION_RETRY));
+        assert!(state.may_try(later + FIRST_EXCLUSION_RETRY * 2));
+        for _ in 0..20 {
+            state.failed(&failure, later);
+        }
+        assert!(state.may_try(later + LONGEST_EXCLUSION_RETRY), "the wait has a limit");
+    }
+
+    #[test]
+    fn exclusion_coming_back_clears_the_warning_and_the_wait_after_a_good_run() {
+        let (mut state, t) = (fresh_exclusion(), Instant::now());
+        state.failed(&ExclusionError::Failed("x".into()), t);
+        state.started();
+        assert!(!state.failing);
+        assert!(state.backoff.is_some(), "it has yet to prove itself");
+        state.stopped_cleanly();
+        assert!(state.backoff.is_none());
+        assert!(state.may_try(t));
+    }
+
+    #[test]
+    fn only_a_definite_no_stops_the_retries() {
+        let (mut state, t) = (fresh_exclusion(), Instant::now());
+        state.failed(&ExclusionError::from_activation(HRESULT(0x8000_4001u32 as i32)), t);
+        assert!(!state.may_try(t + LONGEST_EXCLUSION_RETRY * 10));
+        assert!(state.failing);
+        let busy = ExclusionError::from_activation(HRESULT(0x8889_0004u32 as i32));
+        assert!(matches!(busy, ExclusionError::Failed(_)), "a device that went away isn't a no");
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device { id: id.into(), name: name.into() }
+    }
+
+    #[test]
+    fn same_named_devices_stay_apart() {
+        let found = sort_out(vec![device("{1}", "Speakers"), device("{2}", "Headset"), device("{3}", "Speakers")]);
+        assert_eq!(found.picks["{1}"], Pick { name: "Speakers".into(), nth: 0 });
+        assert_eq!(found.picks["{3}"], Pick { name: "Speakers".into(), nth: 1 });
+        assert_eq!(found.picks["{2}"], Pick { name: "Headset".into(), nth: 0 });
+        let shown: Vec<&str> = found.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(shown, ["Headset", "Speakers (1)", "Speakers (2)"]);
+    }
+
+    #[test]
+    fn a_device_with_a_name_of_its_own_is_shown_as_it_is() {
+        let found = sort_out(vec![device("{1}", "Speakers")]);
+        assert_eq!(found.devices[0].name, "Speakers");
     }
 
     #[test]
@@ -775,13 +1024,75 @@ mod tests {
     }
 
     #[test]
+    fn streams_never_overlap_when_the_device_changes() {
+        // Slow to stop, as a stream on a device that's going away can be.
+        let running = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let most = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let mut worker = Worker::<u32>::default();
+        let t = Instant::now();
+        for (key, at) in [(1, 0), (2, 2), (3, 4)] {
+            let (running, most) = (Arc::clone(&running), Arc::clone(&most));
+            worker.ensure(Some(key), t + RESPAWN_GAP * at, move |_, stop| {
+                most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+                running.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        worker.ensure(None, t + RESPAWN_GAP * 6, |_, _| {});
+        assert!(worker.wait_until_finished());
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stream_that_won_t_stop_holds_up_the_new_one_and_doesn_t_hang_the_caller() {
+        let release = Arc::new(AtomicBool::new(false));
+        let mut worker = Worker::<u32>::default();
+        let t = Instant::now();
+        let held = Arc::clone(&release);
+        worker.ensure(Some(1), t, move |_, _| {
+            while !held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let started = Arc::new(AtomicBool::new(false));
+        let new = Arc::clone(&started);
+        worker.ensure(Some(2), t + RESPAWN_GAP, move |_, _| new.store(true, Ordering::SeqCst));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!started.load(Ordering::SeqCst));
+        release.store(true, Ordering::SeqCst);
+        assert!(worker.wait_until_finished());
+    }
+
+    #[test]
+    fn a_surround_mix_folds_down_to_stereo() {
+        let fold = |frame: &[f32]| fold_to_stereo(frame.len(), |channel| frame[channel]);
+        assert_eq!(fold(&[0.5]), (0.5, 0.5));
+        assert_eq!(fold(&[0.1, 0.2]), (0.1, 0.2));
+        let centre = FOLD_DOWN * 0.4;
+        let back = FOLD_DOWN * 0.2;
+        // Front left, front right, centre, bass, back left, back right.
+        let (left, right) = fold(&[0.1, 0.2, 0.4, 0.9, 0.2, 0.0]);
+        assert!((left - (0.1 + centre + back)).abs() < 1e-6, "{left}");
+        assert!((right - (0.2 + centre)).abs() < 1e-6, "{right}");
+        // And two sides on top.
+        let (left, right) = fold(&[0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.2, 0.2]);
+        assert!((left - back).abs() < 1e-6 && (right - back).abs() < 1e-6);
+        // A quad layout has no centre or bass.
+        let (left, right) = fold(&[0.0, 0.0, 0.2, 0.0]);
+        assert!((left - back).abs() < 1e-6 && right == 0.0);
+    }
+
+    #[test]
     fn mono_and_surround_devices_map_to_stereo() {
         let mut intake = Intake::new(&HUB.mic, 1, RATE);
         intake.take(&[0.5f32, 0.25], |s| s);
         assert_eq!(intake.stereo, [0.5, 0.5, 0.25, 0.25]);
         let mut intake = Intake::new(&HUB.mic, 6, RATE);
-        intake.take(&[0.1f32, 0.2, 9.0, 9.0, 9.0, 9.0], |s| s);
-        assert_eq!(intake.stereo, [0.1, 0.2]);
+        intake.take(&[0.1f32, 0.2, 0.0, 9.0, 0.0, 0.0], |s| s);
+        assert_eq!(intake.stereo, [0.1, 0.2], "bass doesn't go into the mix");
         HUB.mic.clear();
     }
 }
