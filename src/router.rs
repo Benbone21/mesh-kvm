@@ -62,6 +62,13 @@ pub enum Event {
     Panic,
     SetCaptive(bool),
     EdgeCrossed { x: i32, y: i32 },
+    /// Live change of what this device shares. Focus stays put, and panic and link rules still
+    /// win. Input of a kind turned off is let go on the peer and stays local from then on.
+    #[allow(dead_code)]
+    SetSharing(Sharing),
+    /// Live change of the main device. An unknown device is ignored.
+    #[allow(dead_code)]
+    SetMain(DeviceId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,6 +159,14 @@ impl Router {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn shares_mouse(&self) -> bool {
         self.cfg.sharing.mouse
+    }
+    #[allow(dead_code)]
+    pub fn sharing(&self) -> Sharing {
+        self.cfg.sharing
+    }
+    #[allow(dead_code)]
+    pub fn main(&self) -> DeviceId {
+        self.cfg.main
     }
     pub fn captive(&self) -> bool {
         self.captive
@@ -337,6 +352,24 @@ impl Router {
                 out.actions.push(Action::SendPanic);
             }
             Event::PeerPanic => self.enter_panic(&mut out.actions),
+            Event::SetSharing(sharing) => {
+                if !sharing.keyboard {
+                    self.release_forwarded_keys(&mut out.actions);
+                }
+                if !sharing.mouse {
+                    self.release_forwarded_buttons(&mut out.actions);
+                    self.carry_x = 0.0;
+                    self.carry_y = 0.0;
+                }
+                self.cfg.sharing = sharing;
+            }
+            Event::SetMain(device) => {
+                if (device == me || device == peer) && device != self.cfg.main {
+                    self.cfg.main = device;
+                    // That the old main heard us says nothing about the new one.
+                    self.view_heard = None;
+                }
+            }
         }
         self.sync_blocking(&mut out.actions);
         out
@@ -415,14 +448,24 @@ impl Router {
         self.active = self.cfg.me;
         self.last_switch = None;
         self.view_heard = None;
-        for &scancode in &self.fwd_keys {
-            actions.push(Action::ForwardKey { scancode, pressed: false });
-        }
-        for &button in &self.fwd_buttons {
-            actions.push(Action::ForwardButton { button, pressed: false });
-        }
+        self.release_forwarded_keys(actions);
+        self.release_forwarded_buttons(actions);
         self.reset_held();
         actions.push(Action::ReleaseHeld);
+    }
+
+    /// Lets go on the peer of every key it holds for us. Their physical releases are then local.
+    fn release_forwarded_keys(&mut self, actions: &mut Vec<Action>) {
+        for scancode in self.fwd_keys.drain() {
+            actions.push(Action::ForwardKey { scancode, pressed: false });
+        }
+    }
+
+    /// Lets go on the peer of every button it holds for us. Their physical releases are then local.
+    fn release_forwarded_buttons(&mut self, actions: &mut Vec<Action>) {
+        for button in self.fwd_buttons.drain() {
+            actions.push(Action::ForwardButton { button, pressed: false });
+        }
     }
 
     fn link_lost(&mut self, actions: &mut Vec<Action>) {
@@ -1347,6 +1390,277 @@ mod tests {
         r.handle(Event::PeerActiveView { active: 1 });
         r.handle(Event::EdgeCrossed { x: 0, y: 0 });
         assert_eq!(r.active(), 0);
+    }
+
+    const OFF: Sharing = Sharing { mouse: false, keyboard: false };
+    const ON: Sharing = Sharing { mouse: true, keyboard: true };
+
+    #[test]
+    fn turning_off_sharing_stops_blocking() {
+        let mut r = forwarding_router();
+        let out = r.handle(Event::SetSharing(OFF));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert_eq!(r.sharing(), OFF);
+        assert!(!key(&mut r, 30, true).swallow);
+        assert!(!r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+        assert!(!r.handle(Event::LocalWheel { dx: 0, dy: 1 }).swallow);
+        assert!(!r.handle(Event::LocalButton { button: 1, pressed: true }).swallow);
+    }
+
+    #[test]
+    fn sharing_off_releases_forwarded_keys() {
+        let mut r = forwarding_router();
+        assert!(key(&mut r, 30, true).swallow);
+        let out = r.handle(Event::SetSharing(OFF));
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: false }));
+        // The peer already has its release, so the physical one stays here, and only once.
+        let up = key(&mut r, 30, false);
+        assert!(!up.swallow);
+        assert!(up.actions.is_empty());
+    }
+
+    #[test]
+    fn sharing_off_releases_forwarded_buttons() {
+        let mut r = forwarding_router();
+        assert!(r.handle(Event::LocalButton { button: 1, pressed: true }).swallow);
+        let out = r.handle(Event::SetSharing(OFF));
+        assert!(out.actions.contains(&Action::ForwardButton { button: 1, pressed: false }));
+        let up = r.handle(Event::LocalButton { button: 1, pressed: false });
+        assert!(!up.swallow);
+        assert!(up.actions.is_empty());
+    }
+
+    #[test]
+    fn releases_go_out_before_blocking_ends() {
+        let mut r = forwarding_router();
+        key(&mut r, 30, true);
+        let out = r.handle(Event::SetSharing(OFF));
+        assert_eq!(
+            out.actions,
+            vec![
+                Action::ForwardKey { scancode: 30, pressed: false },
+                Action::SetBlocking { mouse: false, keyboard: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn each_toggle_only_touches_its_own_input() {
+        let mut r = forwarding_router();
+        key(&mut r, 30, true);
+        r.handle(Event::LocalButton { button: 1, pressed: true });
+
+        // Keyboard off: the key lets go, and a drag in progress carries on.
+        let out = r.handle(Event::SetSharing(Sharing { mouse: true, keyboard: false }));
+        assert_eq!(
+            out.actions,
+            vec![
+                Action::ForwardKey { scancode: 30, pressed: false },
+                Action::SetBlocking { mouse: true, keyboard: false },
+            ]
+        );
+        assert!(r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+        assert!(r.handle(Event::LocalButton { button: 1, pressed: false }).swallow);
+
+        // Mouse off instead: the button lets go, and a held key carries on.
+        let mut r = forwarding_router();
+        key(&mut r, 30, true);
+        r.handle(Event::LocalButton { button: 1, pressed: true });
+        let out = r.handle(Event::SetSharing(Sharing { mouse: false, keyboard: true }));
+        assert_eq!(
+            out.actions,
+            vec![
+                Action::ForwardButton { button: 1, pressed: false },
+                Action::SetBlocking { mouse: false, keyboard: true },
+            ]
+        );
+        assert!(key(&mut r, 30, false).swallow);
+    }
+
+    #[test]
+    fn repeat_of_a_released_key_stays_local() {
+        let mut r = forwarding_router();
+        key(&mut r, 30, true);
+        r.handle(Event::SetSharing(OFF));
+        assert!(!key(&mut r, 30, true).swallow);
+        // Sharing back on with the key still down: it is local until it comes up.
+        r.handle(Event::SetSharing(ON));
+        assert!(!key(&mut r, 30, true).swallow);
+        assert!(!key(&mut r, 30, false).swallow);
+        assert!(key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn turning_sharing_back_on_resumes() {
+        let mut r = forwarding_router();
+        r.handle(Event::SetSharing(OFF));
+        assert_eq!(r.active(), 1);
+        let out = r.handle(Event::SetSharing(ON));
+        assert_eq!(out.actions, vec![Action::SetBlocking { mouse: true, keyboard: true }]);
+        assert!(key(&mut r, 30, true).swallow);
+        assert!(r.handle(Event::LocalMove { dx: 1, dy: 1 }).swallow);
+    }
+
+    #[test]
+    fn sharing_on_while_local_blocks_nothing() {
+        let mut r = Router::new(RouterConfig { sharing: OFF, ..cfg(0) });
+        online(&mut r);
+        let out = r.handle(Event::SetSharing(ON));
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::SetBlocking { .. })));
+        assert!(!key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn sharing_on_does_not_undo_a_panic() {
+        let mut r = forwarding_router();
+        r.handle(Event::SetSharing(OFF));
+        r.handle(Event::Panic);
+        let out = r.handle(Event::SetSharing(ON));
+        assert!(r.panicked());
+        assert!(!out.actions.iter().any(|a| matches!(a, Action::SetBlocking { .. })));
+        assert!(!key(&mut r, 30, true).swallow);
+    }
+
+    #[test]
+    fn mouse_sharing_off_refuses_edge_crossing() {
+        let mut r = Router::new(cfg(0));
+        online(&mut r);
+        r.handle(Event::SetSharing(Sharing { mouse: false, keyboard: true }));
+        assert!(r.handle(Event::EdgeCrossed { x: 0, y: 0 }).actions.is_empty());
+        assert_eq!(r.active(), 0);
+    }
+
+    #[test]
+    fn sharing_off_keeps_injecting_for_the_peer() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::SetSharing(OFF));
+        let out = r.handle(Event::PeerKey { scancode: 30, pressed: true });
+        assert_eq!(out.actions, vec![Action::InjectKey { scancode: 30, pressed: true }]);
+    }
+
+    #[test]
+    fn set_main_swaps_view_duty() {
+        // Promoted: the laptop starts sending views.
+        let mut laptop = router(1);
+        online(&mut laptop);
+        laptop.handle(Event::SetMain(1));
+        assert_eq!(laptop.main(), 1);
+        let view = view_of(&laptop.handle(Event::Tick { now_ms: 1000 }));
+        assert_eq!(view, Some(Event::PeerActiveView { active: 1 }));
+
+        // Demoted: Debian goes quiet and follows the laptop's views.
+        let mut debian = router(0);
+        online(&mut debian);
+        debian.handle(Event::SetMain(1));
+        debian.handle(Event::PeerAlive { now_ms: 2000 });
+        assert_eq!(view_of(&debian.handle(Event::Tick { now_ms: 2000 })), None);
+        debian.handle(Event::PeerActiveView { active: 1 });
+        assert_eq!(debian.active(), 1);
+        assert!(key(&mut debian, 30, true).swallow);
+    }
+
+    #[test]
+    fn promoted_device_ignores_views_and_keeps_control_without_them() {
+        let mut laptop = adopted_router(cfg(1));
+        laptop.handle(Event::SetMain(1));
+        laptop.handle(Event::PeerActiveView { active: 1 });
+        assert_eq!(laptop.active(), 0);
+        alive_to_3000(&mut laptop);
+        laptop.handle(Event::Tick { now_ms: 1000 + VIEW_TIMEOUT_MS + 1 });
+        assert_eq!(laptop.active(), 0);
+    }
+
+    #[test]
+    fn demoted_device_takes_control_back_from_a_silent_main() {
+        let mut debian = forwarding_router();
+        assert!(key(&mut debian, 30, true).swallow);
+        debian.handle(Event::SetMain(1));
+        // Nothing has proved the new main hears us, so a tick is enough.
+        let out = debian.handle(Event::Tick { now_ms: 1300 });
+        assert_eq!(debian.active(), 0);
+        assert!(out.actions.contains(&Action::ForwardKey { scancode: 30, pressed: false }));
+        assert!(out.actions.contains(&Action::SetBlocking { mouse: false, keyboard: false }));
+        assert!(!key(&mut debian, 31, true).swallow);
+    }
+
+    #[test]
+    fn set_main_to_the_current_main_changes_nothing() {
+        let mut laptop = adopted_router(cfg(1));
+        assert!(key(&mut laptop, 30, true).swallow);
+        assert!(laptop.handle(Event::SetMain(0)).actions.is_empty());
+        let out = laptop.handle(Event::Tick { now_ms: 1000 });
+        assert!(out.actions.is_empty());
+        assert_eq!(laptop.active(), 0);
+    }
+
+    #[test]
+    fn set_main_ignores_an_unknown_device() {
+        let mut laptop = adopted_router(cfg(1));
+        assert!(laptop.handle(Event::SetMain(7)).actions.is_empty());
+        assert_eq!(laptop.main(), 0);
+        laptop.handle(Event::Tick { now_ms: 1000 });
+        assert_eq!(laptop.active(), 0);
+    }
+
+    /// Delivers heartbeats both ways at `now_ms`, ticks both, and hands over main's view.
+    fn exchange(a: &mut Router, b: &mut Router, now_ms: u64) {
+        a.handle(Event::PeerAlive { now_ms });
+        b.handle(Event::PeerAlive { now_ms });
+        let from_a = view_of(&a.handle(Event::Tick { now_ms }));
+        let from_b = view_of(&b.handle(Event::Tick { now_ms }));
+        if let Some(view) = from_a {
+            b.handle(view);
+        }
+        if let Some(view) = from_b {
+            a.handle(view);
+        }
+    }
+
+    /// Debian and the laptop with the link up and the laptop following Debian's first view.
+    fn linked_pair() -> (Router, Router) {
+        let mut debian = router(0);
+        let mut laptop = router(1);
+        let view = view_of(&online(&mut debian)).unwrap();
+        online(&mut laptop);
+        laptop.handle(view);
+        (debian, laptop)
+    }
+
+    #[test]
+    fn both_routers_settle_after_main_change() {
+        // Debian holds control when the laptop becomes main.
+        let (mut debian, mut laptop) = linked_pair();
+        assert_eq!((debian.active(), laptop.active()), (0, 0));
+        debian.handle(Event::SetMain(1));
+        laptop.handle(Event::SetMain(1));
+        for now_ms in [2000, 3000, 4000, 5000, 6000] {
+            exchange(&mut debian, &mut laptop, now_ms);
+            assert_eq!(debian.active(), laptop.active());
+        }
+        assert_eq!(debian.active(), 0);
+
+        // The laptop holds control when it becomes main.
+        let (mut debian, mut laptop) = linked_pair();
+        let out = debian.handle(Event::EdgeCrossed { x: 1, y: 2 });
+        assert!(out.actions.contains(&Action::SendFocus { target: 1, x: 1, y: 2 }));
+        laptop.handle(Event::PeerFocus { target: 1, x: 1, y: 2 });
+        assert_eq!((debian.active(), laptop.active()), (1, 1));
+        debian.handle(Event::SetMain(1));
+        laptop.handle(Event::SetMain(1));
+        for now_ms in [2000, 3000, 4000, 5000, 6000] {
+            exchange(&mut debian, &mut laptop, now_ms);
+        }
+        assert_eq!((debian.active(), laptop.active()), (1, 1));
+        assert!(key(&mut debian, 30, true).swallow);
+
+        // And back again.
+        debian.handle(Event::SetMain(0));
+        laptop.handle(Event::SetMain(0));
+        for now_ms in [7000, 8000, 9000, 10_000, 11_000] {
+            exchange(&mut debian, &mut laptop, now_ms);
+        }
+        assert_eq!(debian.active(), laptop.active());
     }
 
     fn span(edge: SwitchEdge, start: i32, end: i32) -> EdgeSpan {
