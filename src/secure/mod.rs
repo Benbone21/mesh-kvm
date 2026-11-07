@@ -1,4 +1,4 @@
-// Input is wired in. The audio channels, `Services::pairing`, `stream`, `pairing`, and saving and
+// Input and audio are wired in. `Services::pairing`, `stream`, `pairing`, and saving and
 // fingerprints in `keys` aren't yet, and the task that finishes them removes this.
 #![allow(dead_code)]
 

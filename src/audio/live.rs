@@ -4,7 +4,10 @@
 
 use super::jitter::RxStream;
 use super::*;
+use crate::secure::datagram::{Label, LinkSecurity, Role};
+use crate::secure::keys::{Loaded, Pairing, PeerKey};
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 fn env(name: &str) -> Option<String> {
@@ -13,6 +16,18 @@ fn env(name: &str) -> Option<String> {
 
 fn number(name: &str, default: u64) -> u64 {
     env(name).and_then(|value| value.parse().ok()).unwrap_or(default)
+}
+
+/// This device's two audio channels, from the file the script made: sending, then receiving.
+fn channels_from_test_pairing() -> (Arc<Channel>, Arc<Channel>) {
+    let path = env("MK_PAIRING").expect("MK_PAIRING names this device's pairing file");
+    match Pairing::load_from(Path::new(&path)) {
+        Loaded::Ready(pairing) => (
+            Arc::new(Channel::new(&pairing, Label::Audio, Role::Initiator)),
+            Arc::new(Channel::new(&pairing, Label::Audio, Role::Responder)),
+        ),
+        Loaded::Damaged(problem) => panic!("{problem}"),
+    }
 }
 
 fn write_samples(path: &str, samples: &[f32]) {
@@ -38,14 +53,28 @@ fn packet_path() {
     let stop: &'static AtomicBool = Box::leak(Box::default());
     let stream = Arc::new(Mutex::new(RxStream::default()));
 
+    // Both ends are here, so no file is needed for the two to know each other.
+    let (mut near, mut far) = (Pairing::fresh(), Pairing::fresh());
+    near.peer = Some(PeerKey { public: far.identity.public, name: "Far".to_string(), paired_at: 1 });
+    far.peer = Some(PeerKey { public: near.identity.public, name: "Near".to_string(), paired_at: 1 });
+    let out = Arc::new(Channel::new(&near, Label::Audio, Role::Initiator));
+    let incoming = Channel::new(&far, Label::Audio, Role::Responder);
+
     let listen = UdpSocket::bind(("127.0.0.1", port)).unwrap();
     let for_receiver = Arc::clone(&stream);
-    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, SocketAddr::from(([127, 0, 0, 1], 0)), stop));
+    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, SocketAddr::from(([127, 0, 0, 1], 0)), &incoming, stop));
     AUDIO_PLAYER_LIVE.store(true, Ordering::SeqCst);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let for_sender = Arc::clone(&out);
     let sender = std::thread::spawn(move || {
-        sender::send_loop(&socket, SocketAddr::from(([127, 0, 0, 1], port)), hub, stop);
+        sender::send_loop(&socket, SocketAddr::from(([127, 0, 0, 1], port)), &for_sender, hub, stop);
     });
+    // The measure starts with the first frame, and a real device has a session long before sound.
+    let ready_by = Instant::now() + Duration::from_secs(5);
+    while out.security() != LinkSecurity::Encrypted {
+        assert!(Instant::now() < ready_by, "no session");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let frame = OPUS_FRAME * CHANNELS;
     let start = Instant::now();
@@ -108,8 +137,9 @@ fn whole_device() {
     });
     AUDIO_PEER_ONLINE.store(true, Ordering::SeqCst);
     let peer = SocketAddr::from(([127, 0, 0, 1], peer_port));
-    start_audio_listener(listen_port, peer).unwrap();
-    start_audio_sender(peer).unwrap();
+    let (out, incoming) = channels_from_test_pairing();
+    start_audio_listener(listen_port, peer, incoming).unwrap();
+    start_audio_sender(peer, out).unwrap();
     if env("MK_MUTE").is_some() {
         crate::mute::start();
     }

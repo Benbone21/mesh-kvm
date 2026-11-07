@@ -28,6 +28,7 @@ mod wasapi;
 #[cfg(target_os = "windows")]
 use wasapi as platform;
 
+use crate::secure::datagram::{Channel, Opened};
 use jitter::RxStream;
 use packet::{Body, Refused};
 use std::net::{SocketAddr, UdpSocket};
@@ -76,7 +77,8 @@ pub static AUDIO_PEER_ONLINE: AtomicBool = AtomicBool::new(false);
 
 /// How often the receiver tells the sender how it's doing.
 const REPORT_EVERY: Duration = Duration::from_millis(250);
-/// A wait short enough to send reports on time when nothing is arriving.
+/// A wait short enough to send reports on time when nothing is arriving, and to keep `tick` far
+/// inside the 250 ms it paces handshakes by.
 const RECEIVE_WAIT: Duration = Duration::from_millis(50);
 
 /// What the sender last heard back.
@@ -226,7 +228,8 @@ fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
     report
 }
 
-/// When audio of another version last came from the other device.
+/// When audio of another version last came from the other device. A plain packet sets this and
+/// needs no key, so anyone can forge one: this is for a note in the app, and must do nothing else.
 static OTHER_VERSION_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// How long the app keeps saying so after the last of it.
 const OTHER_VERSION_FOR: Duration = Duration::from_secs(10);
@@ -235,50 +238,112 @@ fn seen_within(at: Option<Instant>, now: Instant, within: Duration) -> bool {
     at.is_some_and(|at| now.duration_since(at) < within)
 }
 
+fn note_other_version(now: Instant) {
+    *OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner) = Some(now);
+}
+
 /// True while audio from a mesh-kvm of another version is arriving, and being ignored.
 pub fn other_version_arriving(now: Instant) -> bool {
     seen_within(*OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner), now, OTHER_VERSION_FOR)
 }
 
-/// Takes the other device's packets off the socket until `stop`, and tells it how it's going.
-/// Anyone can send to a UDP port, so what comes from elsewhere is dropped before it's looked at.
-fn receive_loop(socket: &UdpSocket, stream: &Mutex<RxStream>, peer: SocketAddr, stop: &AtomicBool) {
-    let _ = socket.set_read_timeout(Some(RECEIVE_WAIT));
-    let mut buf = [0u8; 2048];
-    let mut reply_to = None;
-    let mut next_report = Instant::now();
-    let mut out = Vec::with_capacity(32);
-    while !stop.load(Ordering::Relaxed) {
-        let received = socket.recv_from(&mut buf);
-        let now = Instant::now();
-        if let Some((len, from)) = received.ok().filter(|(_, from)| crate::input::from_peer(*from, peer)) {
-            match packet::parse(&buf[..len]) {
-                Ok(packet) if !matches!(packet.body, Body::Report(_)) => {
-                    reply_to = Some((from, packet.epoch));
-                    stream.lock().unwrap_or_else(PoisonError::into_inner).push(&packet, now);
-                }
-                Err(Refused::OtherVersion) => {
-                    *OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner) = Some(now);
-                }
-                _ => {}
-            }
+/// The listening end of the link.
+struct Receiver<'a> {
+    socket: &'a UdpSocket,
+    stream: &'a Mutex<RxStream>,
+    peer: SocketAddr,
+    channel: &'a Channel,
+    /// Where the sender is. Its port can be anything, so this comes from what arrives, and only
+    /// from what checked out: anyone can forge a source address.
+    last_source: Option<SocketAddr>,
+    /// The sender's run, from its audio.
+    epoch: Option<u16>,
+    opened: Vec<u8>,
+    report: Vec<u8>,
+    sealed: Vec<u8>,
+}
+
+impl<'a> Receiver<'a> {
+    fn new(socket: &'a UdpSocket, stream: &'a Mutex<RxStream>, peer: SocketAddr, channel: &'a Channel) -> Self {
+        Self { socket, stream, peer, channel, last_source: None, epoch: None, opened: Vec::new(), report: Vec::with_capacity(32), sealed: Vec::new() }
+    }
+
+    /// Anyone can send to a UDP port, so what comes from elsewhere is dropped before it's looked at.
+    fn take(&mut self, datagram: &[u8], from: SocketAddr, now_ms: u64, now: Instant) {
+        if !crate::input::from_peer(from, self.peer) {
+            return;
         }
-        if now >= next_report {
-            next_report = now + REPORT_EVERY;
-            // The socket waits for no lock: playback takes this one on every buffer.
-            let (report, alive) = {
-                let mut stream = stream.lock().unwrap_or_else(PoisonError::into_inner);
-                (publish_received(&mut stream, now), stream.alive(now))
-            };
-            if let Some((to, epoch)) = reply_to.filter(|_| alive) {
-                packet::write_report(&mut out, epoch, report);
-                let _ = socket.send_to(&out, to);
+        match self.channel.open(datagram, now_ms, &mut self.opened) {
+            Opened::Data(plain) => {
+                self.last_source = Some(from);
+                match packet::parse(plain) {
+                    Ok(packet) if !matches!(packet.body, Body::Report(_)) => {
+                        self.epoch = Some(packet.epoch);
+                        self.stream.lock().unwrap_or_else(PoisonError::into_inner).push(&packet, now);
+                    }
+                    Err(Refused::OtherVersion) => note_other_version(now),
+                    _ => {}
+                }
+            }
+            // A responder never has a handshake going, so here this is always a keepalive, and so
+            // authentic. It says where the sender is and nothing about the stream.
+            Opened::Heard => self.last_source = Some(from),
+            Opened::Reply(reply) => {
+                let _ = self.socket.send_to(reply, from);
+            }
+            Opened::OldPeer => note_other_version(now),
+            Opened::Refused => {}
+        }
+    }
+
+    /// Sends what the channel has due. With no source yet it has nothing: only data makes it speak.
+    fn tick(&self, now_ms: u64) {
+        self.channel.tick(now_ms, &mut |packet| {
+            if let Some(to) = self.last_source {
+                let _ = self.socket.send_to(packet, to);
+            }
+        });
+    }
+
+    /// Publishes the stream's figures and tells the sender how it's going.
+    fn report(&mut self, now: Instant) {
+        // The socket waits for no lock: playback takes this one on every buffer.
+        let (report, alive) = {
+            let mut stream = self.stream.lock().unwrap_or_else(PoisonError::into_inner);
+            (publish_received(&mut stream, now), stream.alive(now))
+        };
+        if let (Some(to), Some(epoch), true) = (self.last_source, self.epoch, alive) {
+            packet::write_report(&mut self.report, epoch, report);
+            if self.channel.seal(&self.report, &mut self.sealed) {
+                let _ = self.socket.send_to(&self.sealed, to);
             }
         }
     }
 }
 
-pub fn start_audio_listener(port: u16, peer: SocketAddr) -> Result<(), String> {
+/// Takes the other device's packets off the socket until `stop`, and tells it how it's going.
+fn receive_loop(socket: &UdpSocket, stream: &Mutex<RxStream>, peer: SocketAddr, channel: &Channel, stop: &AtomicBool) {
+    let _ = socket.set_read_timeout(Some(RECEIVE_WAIT));
+    let clock = Instant::now();
+    let mut receiver = Receiver::new(socket, stream, peer, channel);
+    let mut buf = [0u8; 2048];
+    let mut next_report = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let received = socket.recv_from(&mut buf);
+        let now = Instant::now();
+        let now_ms = now.duration_since(clock).as_millis() as u64;
+        if let Ok((len, from)) = received {
+            receiver.take(&buf[..len], from, now_ms, now);
+        }
+        receiver.tick(now_ms);
+        if now >= next_report {
+            next_report = now + REPORT_EVERY;
+            receiver.report(now);
+        }
+    }
+}
+
+pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) -> Result<(), String> {
     let stream = Arc::new(Mutex::new(RxStream::default()));
     platform::start_playback(Arc::clone(&stream));
     std::thread::Builder::new()
@@ -293,13 +358,13 @@ pub fn start_audio_listener(port: u16, peer: SocketAddr) -> Result<(), String> {
                 }
             };
             println!("[Audio-RX] Listening on UDP {}", bind_addr);
-            receive_loop(&socket, &stream, peer, &AtomicBool::new(false));
+            receive_loop(&socket, &stream, peer, &channel, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn start_audio_sender(target_addr: SocketAddr) -> Result<(), String> {
+pub fn start_audio_sender(target_addr: SocketAddr, channel: Arc<Channel>) -> Result<(), String> {
     platform::start_engine();
     std::thread::Builder::new()
         .name("mesh-kvm-audio-tx".to_string())
@@ -312,7 +377,7 @@ pub fn start_audio_sender(target_addr: SocketAddr) -> Result<(), String> {
                 }
             };
             println!("[Audio-TX] Ready -> UDP {}", target_addr);
-            sender::send_loop(&socket, target_addr, &HUB, &AtomicBool::new(false));
+            sender::send_loop(&socket, target_addr, &channel, &HUB, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -321,16 +386,58 @@ pub fn start_audio_sender(target_addr: SocketAddr) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure::datagram::{Label, LinkSecurity, Role};
+    use crate::secure::keys::{Pairing, PeerKey};
+
+    static FIGURES: Mutex<()> = Mutex::new(());
+
+    /// For a test that looks at the note about another version or the bytes sent, or that changes
+    /// them, as there is one of each.
+    pub(super) fn figures_to_myself() -> std::sync::MutexGuard<'static, ()> {
+        FIGURES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A sender and a receiver that know each other, with no session yet.
+    pub(super) fn paired_channels() -> (Channel, Channel) {
+        let (mut a, mut b) = (Pairing::fresh(), Pairing::fresh());
+        a.peer = Some(PeerKey { public: b.identity.public, name: "B".to_string(), paired_at: 1 });
+        b.peer = Some(PeerKey { public: a.identity.public, name: "A".to_string(), paired_at: 1 });
+        (Channel::new(&a, Label::Audio, Role::Initiator), Channel::new(&b, Label::Audio, Role::Responder))
+    }
+
+    /// What a channel has to send at `now_ms`.
+    pub(super) fn due(channel: &Channel, now_ms: u64) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        channel.tick(now_ms, &mut |packet| packets.push(packet.to_vec()));
+        packets
+    }
+
+    pub(super) fn sealed(channel: &Channel, plain: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(channel.seal(plain, &mut out));
+        out
+    }
+
+    /// A sender and a receiver with a session, each holding it as current.
+    pub(super) fn linked_channels() -> (Channel, Channel) {
+        let (sender, receiver) = paired_channels();
+        let hello = due(&sender, 0).remove(0);
+        let (mut answer, mut keepalive) = (Vec::new(), Vec::new());
+        assert!(matches!(receiver.open(&hello, 0, &mut answer), Opened::Reply(_)));
+        assert!(matches!(sender.open(&answer, 0, &mut keepalive), Opened::Reply(_)));
+        assert_eq!(receiver.open(&keepalive, 0, &mut Vec::new()), Opened::Heard);
+        (sender, receiver)
+    }
 
     /// Runs the receive loop for a moment on a socket of its own, with `127.0.0.1` as the peer.
-    fn received_from(source: &str, data: &[u8]) -> (u64, Option<Instant>) {
+    fn received_from(source: &str, channel: &Channel, data: &[u8]) -> (u64, Option<Instant>) {
         let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
         let to = listen.local_addr().unwrap();
         let stream = Mutex::new(RxStream::default());
         let stop = AtomicBool::new(false);
         *OTHER_VERSION_AT.lock().unwrap() = None;
         std::thread::scope(|scope| {
-            scope.spawn(|| receive_loop(&listen, &stream, SocketAddr::from(([127, 0, 0, 1], 24851)), &stop));
+            scope.spawn(|| receive_loop(&listen, &stream, SocketAddr::from(([127, 0, 0, 1], 24851)), channel, &stop));
             let sender = UdpSocket::bind((source, 0)).unwrap();
             sender.send_to(data, to).unwrap();
             std::thread::sleep(Duration::from_millis(30));
@@ -348,13 +455,157 @@ mod tests {
 
     #[test]
     fn only_the_other_device_is_listened_to() {
-        // These share one test, as they share the note of another version.
-        assert_eq!(received_from("127.0.0.1", &audio_packet()).0, 1);
-        assert_eq!(received_from("127.0.0.2", &audio_packet()).0, 0, "a stranger's audio");
-        let mut old = Vec::from(*b"MKVA");
-        old.extend_from_slice(&[0; 20]);
-        assert!(received_from("127.0.0.1", &old).1.is_some());
-        assert!(received_from("127.0.0.2", &old).1.is_none(), "a stranger can't raise the note");
+        let _figures = figures_to_myself();
+        let (sender, receiver) = linked_channels();
+        assert_eq!(received_from("127.0.0.1", &receiver, &sealed(&sender, &audio_packet())).0, 1);
+        assert_eq!(received_from("127.0.0.2", &receiver, &sealed(&sender, &audio_packet())).0, 0, "a stranger's audio");
+        assert!(received_from("127.0.0.2", &receiver, &audio_packet()).1.is_none(), "a stranger can't raise the note");
+    }
+
+    #[test]
+    fn a_plain_audio_packet_is_not_played_and_says_old_version() {
+        let _figures = figures_to_myself();
+        let (_, receiver) = linked_channels();
+        let (received, note) = received_from("127.0.0.1", &receiver, &audio_packet());
+        assert_eq!(received, 0);
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn a_session_packet_of_another_version_says_so_too() {
+        let _figures = figures_to_myself();
+        let (sender, receiver) = linked_channels();
+        let mut newer = audio_packet();
+        newer[4] = packet::VERSION + 1;
+        let (received, note) = received_from("127.0.0.1", &receiver, &sealed(&sender, &newer));
+        assert_eq!(received, 0);
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn audio_with_no_session_is_not_played() {
+        let _figures = figures_to_myself();
+        let (_, stranger) = linked_channels();
+        let (other, _) = linked_channels();
+        assert_eq!(received_from("127.0.0.1", &stranger, &sealed(&other, &audio_packet())).0, 0);
+    }
+
+    fn bound() -> UdpSocket {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        socket
+    }
+
+    fn next(socket: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 2048];
+        socket.recv_from(&mut buf).ok().map(|(len, _)| buf[..len].to_vec())
+    }
+
+    /// The receive side, and two addresses on the peer's IP for packets to claim to come from.
+    struct Far {
+        socket: UdpSocket,
+        stream: Mutex<RxStream>,
+        one: UdpSocket,
+        other: UdpSocket,
+    }
+
+    impl Far {
+        fn new() -> Far {
+            Far { socket: bound(), stream: Mutex::default(), one: bound(), other: bound() }
+        }
+
+        fn receiver<'a>(&'a self, channel: &'a Channel) -> Receiver<'a> {
+            Receiver::new(&self.socket, &self.stream, SocketAddr::from(([127, 0, 0, 1], 24851)), channel)
+        }
+    }
+
+    fn from(socket: &UdpSocket) -> SocketAddr {
+        socket.local_addr().unwrap()
+    }
+
+    #[test]
+    fn a_keepalive_is_not_activity() {
+        let far = Far::new();
+        let (sender, channel) = linked_channels();
+        let mut receiver = far.receiver(&channel);
+        let keepalive = due(&sender, 1).remove(0);
+        let now = Instant::now();
+        receiver.take(&keepalive, from(&far.one), 1, now);
+        assert_eq!(far.stream.lock().unwrap().counts().received, 0);
+        assert!(!far.stream.lock().unwrap().alive(now));
+        receiver.report(now);
+        assert_eq!(next(&far.one), None, "nothing arrived to report on");
+    }
+
+    #[test]
+    fn a_handshake_is_answered_at_its_own_source_and_moves_nothing() {
+        let far = Far::new();
+        let (sender, channel) = paired_channels();
+        let mut receiver = far.receiver(&channel);
+        let hello = due(&sender, 0).remove(0);
+        let now = Instant::now();
+
+        receiver.take(&hello, from(&far.one), 0, now);
+        let answer = next(&far.one).expect("answered where it came from");
+        assert_eq!(receiver.last_source, None, "a handshake 1 can be a replay");
+
+        // A session starts on the keepalive, which is the first thing to prove the sender is there.
+        let mut keepalive = Vec::new();
+        assert!(matches!(sender.open(&answer, 0, &mut keepalive), Opened::Reply(_)));
+        receiver.take(&keepalive, from(&far.one), 1, now);
+        assert_eq!(receiver.last_source, Some(from(&far.one)));
+
+        receiver.take(&sealed(&sender, &audio_packet()), from(&far.one), 2, now);
+
+        // A replay and junk from the peer's IP, on another port.
+        receiver.take(&hello, from(&far.other), 1500, now);
+        assert!(next(&far.other).is_some(), "the replay gets its answer where it says it's from");
+        receiver.take(&[0xE3; 40], from(&far.other), 1500, now);
+        receiver.take(&audio_packet(), from(&far.other), 1500, now);
+        assert_eq!(receiver.last_source, Some(from(&far.one)));
+
+        receiver.tick(2000);
+        assert!(next(&far.one).is_some(), "rule 10's keepalive goes to the last real source");
+        assert_eq!(next(&far.other), None);
+
+        receiver.take(&sealed(&sender, &audio_packet()), from(&far.other), 2100, now);
+        assert_eq!(receiver.last_source, Some(from(&far.other)), "a sender that moved is followed");
+    }
+
+    #[test]
+    fn a_report_goes_back_sealed() {
+        let far = Far::new();
+        let (sender, channel) = linked_channels();
+        let mut receiver = far.receiver(&channel);
+        let now = Instant::now();
+        receiver.take(&sealed(&sender, &audio_packet()), from(&far.one), 1, now);
+        receiver.report(now);
+        let report = next(&far.one).expect("a stream that's alive gets a report");
+        assert!(packet::parse(&report).is_err(), "nothing readable on the wire");
+        let mut plain = Vec::new();
+        let Opened::Data(bytes) = sender.open(&report, 2, &mut plain) else { panic!("not from the session") };
+        assert!(matches!(packet::parse(bytes), Ok(packet::Packet { body: Body::Report(_), .. })));
+    }
+
+    #[test]
+    fn the_session_is_ready_with_nothing_being_sent() {
+        let _figures = figures_to_myself();
+        let (out, channel) = paired_channels();
+        let (listen, socket) = (bound(), bound());
+        let target = listen.local_addr().unwrap();
+        let (stream, hub, stop) = (Mutex::default(), Hub::default(), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| receive_loop(&listen, &stream, target, &channel, &stop));
+            scope.spawn(|| sender::send_loop(&socket, target, &out, &hub, &stop));
+            let end = Instant::now() + Duration::from_secs(3);
+            let ready = || [&out, &channel].iter().all(|c| c.security() == LinkSecurity::Encrypted);
+            while !ready() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert!(ready());
+        });
+        assert_eq!(stream.lock().unwrap().counts().received, 0);
     }
 
     #[test]

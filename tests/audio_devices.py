@@ -132,7 +132,8 @@ def tool(name, *args, **kw):
 
 def device(name, listen, peer, seconds, **choices):
     e = env_for(name)
-    e.update(MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds), **choices)
+    e.update(MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds),
+             MK_PAIRING=paired_files(BASE)["ab".index(name)], **choices)
     return subprocess.Popen([BIN, "--ignored", "--exact", "audio::live::whole_device", "--nocapture"], env=e,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
@@ -315,6 +316,9 @@ def mute_test():
     check("once B confirms it, A is muted", muted("a", sid))
     heard = level(record("b", 1), 1000)
     check("a muted output still sends", heard > -20, f"{heard:.1f} dB on B")
+    # Long enough to count as settled. Short of that, the hold is 3 seconds from about a second after
+    # the sound stops, which is when the check below comes, and which of them goes first is chance.
+    time.sleep(1.5)
     pa.kill(); pa.wait()
     time.sleep(4)
     check("a pause in the sound doesn't bring the output back", muted("a", sid))

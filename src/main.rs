@@ -369,11 +369,11 @@ fn run_service(cli: Cli) {
     match parse_peer_socket_addr(&audio_target_str, cli.audio_port) {
         Ok((_, audio_addr)) => {
             if cli.audio_listen {
-                if let Err(e) = audio::start_audio_listener(cli.audio_port, audio_addr) {
+                if let Err(e) = audio::start_audio_listener(cli.audio_port, audio_addr, secure.audio_in.clone()) {
                     eprintln!("[Audio] Warning: failed to start audio listener: {}", e);
                 }
             }
-            if let Err(e) = audio::start_audio_sender(audio_addr) {
+            if let Err(e) = audio::start_audio_sender(audio_addr, secure.audio_out.clone()) {
                 eprintln!("[Audio] Warning: failed to start audio sender: {}", e);
             }
         }
