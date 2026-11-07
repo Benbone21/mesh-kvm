@@ -12,6 +12,8 @@ pub mod devices;
 pub mod jitter;
 pub mod mix;
 pub mod packet;
+#[cfg(any(target_os = "windows", test))]
+pub mod probe;
 // PipeWire converts to and from 48 kHz by itself, so only Windows needs this.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod resample;

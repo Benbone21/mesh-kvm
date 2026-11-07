@@ -507,6 +507,12 @@ fn flag() -> MuteFlag {
     MuteFlag::new(crate::settings::config_dir().join(FLAG_FILE))
 }
 
+/// True when the record lists something mesh-kvm has muted, here or in a running service.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn holds_mute() -> bool {
+    !flag().read().is_empty()
+}
+
 /// Points the controller at the output being sent, whichever device that is now. It works out the
 /// same answer the capture does, so the two can't end up on different devices.
 struct ChosenOutput<B: MuteBackend>(B);
