@@ -5,7 +5,7 @@
 //! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    devices, peer_listening, reaching_peer, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    devices, peer_listening, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
     AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS,
 };
 use crate::settings::write_atomically;
@@ -443,6 +443,8 @@ struct Readings {
     setting: bool,
     output_chosen: bool,
     capture_running: bool,
+    /// Muting the output won't silence that capture.
+    capture_survives_mute: bool,
     /// Packets sent with real sound in them, however long ago.
     sound_packets: u64,
     peer_online: bool,
@@ -474,6 +476,7 @@ impl LiveSignals {
                 setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
                 output_chosen: devices::choice().output != devices::NONE,
                 capture_running: AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
+                capture_survives_mute: AUDIO_CAPTURE_SURVIVES_MUTE.load(Ordering::Relaxed),
                 sound_packets: AUDIO_TX_SOUND_PACKETS.load(Ordering::Relaxed),
                 peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
                 peer_listening: peer_listening(now, RECENT_AUDIO),
@@ -491,7 +494,7 @@ impl LiveSignals {
         self.sound_packets = r.sound_packets;
         let confirmed = r.capture_running && sending_sound && r.peer_hearing;
         let connected = r.capture_running && r.peer_listening;
-        let requested = r.setting && r.output_chosen && r.peer_online;
+        let requested = r.setting && r.output_chosen && r.peer_online && r.capture_survives_mute;
         MuteInputs {
             setting: r.setting,
             send_on: r.output_chosen,
@@ -1072,6 +1075,7 @@ mod tests {
         setting: true,
         output_chosen: true,
         capture_running: true,
+        capture_survives_mute: true,
         sound_packets: 0,
         peer_online: true,
         peer_listening: true,
@@ -1202,6 +1206,36 @@ mod tests {
         let gone = Readings { sound_packets: 10, peer_listening: false, ..QUIET_LINK };
         run(&mut c, &mut signals, gone, t + STEP * 11);
         assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_capture_the_mute_would_silence_is_never_muted_for() {
+        // Ordinary loopback on Windows: the sound is confirmed, and muting would cut it off.
+        let (mut outputs, flag) = (Outputs::default(), flag("no-exclusion"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..30 {
+            let r = Readings { capture_survives_mute: false, ..sounding(second + 1) };
+            run(&mut c, &mut signals, r, t + STEP * second as u32);
+        }
+        drop(c);
+        assert!(outputs.writes.is_empty(), "{:?}", outputs.writes);
+    }
+
+    #[test]
+    fn exclusion_failing_gives_the_output_back_at_once() {
+        let (mut outputs, flag) = (Outputs::default(), flag("exclusion-fails"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        let fell_back = Readings { capture_survives_mute: false, ..sounding(11) };
+        run(&mut c, &mut signals, fell_back, t + STEP * 10);
+        assert!(!c.backend.is(SPEAKERS), "the capture is ordinary now, and a mute would silence it");
     }
 
     #[test]

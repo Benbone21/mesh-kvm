@@ -11,7 +11,7 @@ use super::devices::{self, CaptureHealth, Device, InUse, Lists, Resolved};
 use super::jitter::RxStream;
 use super::mix::{Signal, Source};
 use super::resample::Resampler;
-use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB, RATE};
+use super::{drain_received, finish_received, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB, RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::collections::{HashMap, VecDeque};
@@ -620,6 +620,7 @@ fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Res
         let capture: IAudioCaptureClient = client.GetService().map_err(|e| format!("service: {e}"))?;
         client.Start().map_err(|e| format!("start: {e}"))?;
         exclusion().started();
+        AUDIO_CAPTURE_SURVIVES_MUTE.store(true, Ordering::Relaxed);
         let mut intake = Intake::new(&HUB.output, CHANNELS, RATE);
         while !stop.load(Ordering::SeqCst) {
             if WaitForSingleObject(event, PROCESS_WAIT_MS) == WAIT_OBJECT_0 && !read_packets(&capture, &mut intake) {
@@ -647,7 +648,9 @@ fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
     match how {
         OutputCapture::Endpoint(pick) => capture_device(find_output(pick.as_ref()), true, &HUB.output, &stop),
         OutputCapture::Excluding => {
-            match capture_excluding(&stop) {
+            let result = capture_excluding(&stop);
+            AUDIO_CAPTURE_SURVIVES_MUTE.store(false, Ordering::Relaxed);
+            match result {
                 Ok(()) => exclusion().stopped_cleanly(),
                 Err(e) => {
                     crate::settings::log_note(&format!(
@@ -662,11 +665,23 @@ fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
     }
 }
 
-/// Whether to capture with process exclusion. An echo needs received audio playing on the same
-/// endpoint that's being captured, so for anything else, loopback of the endpoint is the better
-/// capture: it's what the dropdown asks for, and it can't echo.
-fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_try: bool) -> bool {
-    sent.is_some() && sent == play && receiving && may_try
+/// Whether to capture with process exclusion. Measured on a real laptop, ordinary loopback follows
+/// the endpoint's mute and volume exactly, so a mute silences it, while exclusion captures from
+/// before them. So Play only on the other device needs it from the start, as changing capture when
+/// the mute comes on would break up the sound. Otherwise it's for an echo, which needs received audio
+/// playing on the endpoint being captured, and loopback is the better capture: it's what the
+/// dropdown asks for, and it can't echo.
+fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_try: bool, play_only: bool) -> bool {
+    let echo_likely = sent == play && receiving;
+    sent.is_some() && may_try && (play_only || echo_likely)
+}
+
+/// Why the output stays on when it was meant to be muted.
+fn no_mute_note(play_only: bool, sending_output: bool, failing: bool) -> Option<String> {
+    (play_only && sending_output && failing).then(|| {
+        "This output isn't being muted, because the capture that keeps working when muted isn't running. Sound plays on both devices."
+            .to_string()
+    })
 }
 
 /// Whether what's sent can be trusted to leave out what's played, now or as soon as it matters.
@@ -696,7 +711,8 @@ fn engine() {
             (exclusion.may_try(now), exclusion.failing)
         };
         let receiving = RECEIVING.load(Ordering::SeqCst);
-        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try);
+        let play_only = AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed);
+        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try, play_only);
 
         // By the device, even for the default, so that a change of default restarts the capture.
         let mic_pick = input.id(lists.default_input.as_ref()).and_then(|id| inputs.get(&id).cloned());
@@ -717,6 +733,7 @@ fn engine() {
             input.missing_note("microphone or line-in"),
             sent.missing_note("output to send"),
             play.missing_note("output to play on"),
+            no_mute_note(play_only, sent != Resolved::Off, failing),
             whole_device.then(|| "While both devices are sending, all of this device's sound is sent, not just this output's.".to_string()),
             (input != Resolved::Off)
                 .then(|| mic.health(&HUB.mic, true, true, now).note("microphone or line-in", MIC_HELP, now))
@@ -896,11 +913,29 @@ mod tests {
     #[test]
     fn exclusion_is_only_used_when_an_echo_could_really_happen() {
         let (a, b) = (Some("speakers"), Some("headset"));
-        assert!(needs_exclusion(a, a, true, true));
-        assert!(!needs_exclusion(a, b, true, true), "playing elsewhere: plain loopback can't echo");
-        assert!(!needs_exclusion(a, a, false, true), "nothing arriving: nothing to echo");
-        assert!(!needs_exclusion(a, a, true, false), "it's waiting before trying again");
-        assert!(!needs_exclusion(None, None, true, true), "nothing being sent");
+        assert!(needs_exclusion(a, a, true, true, false));
+        assert!(!needs_exclusion(a, b, true, true, false), "playing elsewhere: plain loopback can't echo");
+        assert!(!needs_exclusion(a, a, false, true, false), "nothing arriving: nothing to echo");
+        assert!(!needs_exclusion(a, a, true, false, false), "it's waiting before trying again");
+        assert!(!needs_exclusion(None, None, true, true, false), "nothing being sent");
+    }
+
+    #[test]
+    fn play_only_on_the_other_device_captures_with_exclusion_from_the_start() {
+        let (a, b) = (Some("speakers"), Some("headset"));
+        assert!(needs_exclusion(a, a, false, true, true), "with nothing being received");
+        assert!(needs_exclusion(a, b, false, true, true), "and whichever outputs are chosen");
+        assert!(!needs_exclusion(a, a, false, false, true), "unless it's waiting to try again");
+        assert!(!needs_exclusion(None, a, false, true, true), "or nothing is being sent");
+    }
+
+    #[test]
+    fn exclusion_not_working_says_why_nothing_is_muted() {
+        let note = no_mute_note(true, true, true).unwrap();
+        assert!(note.contains("isn't being muted"), "{note}");
+        assert_eq!(no_mute_note(true, true, false), None, "it's working");
+        assert_eq!(no_mute_note(false, true, true), None, "muting isn't wanted");
+        assert_eq!(no_mute_note(true, false, true), None, "no output is being sent");
     }
 
     #[test]
