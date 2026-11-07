@@ -17,6 +17,8 @@ const LOCK: &str = "lock";
 /// bad. The one installed now is the way back if `apt` leaves a package half done.
 const KEEP: usize = 2;
 const APT: &str = "/usr/bin/apt-get";
+const DPKG_DEB: &str = "/usr/bin/dpkg-deb";
+const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// How long to wait for anything else using `apt`, such as a scheduled upgrade.
 const APT_LOCK_SECONDS: &str = "DPkg::Lock::Timeout=120";
 
@@ -139,6 +141,31 @@ impl Cache {
     }
 }
 
+/// Makes sure the package says it's this program at this version. The signature already covers
+/// that, so this only stops a release put together wrongly from installing as something else.
+pub fn check_package(package: &Path, version: Version) -> Result<(), String> {
+    let output = Command::new(DPKG_DEB)
+        .arg("-f")
+        .arg(package)
+        .args(["Package", "Version"])
+        .env_clear()
+        .env("PATH", SYSTEM_PATH)
+        .env("LC_ALL", "C.UTF-8")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("dpkg-deb couldn't start: {e}"))?;
+    if output.status.success() && fields_match(&String::from_utf8_lossy(&output.stdout), version) {
+        return Ok(());
+    }
+    Err(format!("That package isn't mesh-kvm {version}."))
+}
+
+fn fields_match(said: &str, version: Version) -> bool {
+    let field = |name: &str| said.lines().find_map(|l| l.strip_prefix(name)).map(str::trim);
+    field("Package:") == Some("mesh-kvm") && field("Version:") == Some(version.to_string().as_str())
+}
+
 /// Installs `package` with nothing of the caller's around it. Going through `apt` keeps the
 /// Timeshift hook running, and `--no-remove` means a package can't take anything else away.
 /// `Err` is apt's last word.
@@ -149,7 +176,7 @@ pub fn run_apt(package: &Path) -> Result<(), String> {
         .args(["-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "-o", APT_LOCK_SECONDS])
         .arg(package)
         .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("PATH", SYSTEM_PATH)
         .env("DEBIAN_FRONTEND", "noninteractive")
         .env("LC_ALL", "C.UTF-8")
         .env("HOME", "/root")
@@ -245,8 +272,30 @@ mod tests {
         let cache = Cache::open(&root("stale"), me()).unwrap();
         stage(&cache, b"old", b"old", b"old");
         fs::write(cache.staged("left-behind"), "x").unwrap();
-        cache.clear_staging();
-        assert!(!cache.staging().exists());
+        let source = cache.root.join("source");
+        fs::write(&source, "new").unwrap();
+        let open = || File::open(&source).unwrap();
+        let opened = Opened { manifest: open(), signature: open(), package: open() };
+        cache.fill_staging(opened, PACKAGE).unwrap();
+        assert!(!cache.staged("left-behind").exists());
+        assert_eq!(fs::read(cache.staged(PACKAGE)).unwrap(), b"new");
+    }
+
+    #[test]
+    fn only_this_package_at_this_version_passes() {
+        let version = v("0.7.0");
+        assert!(fields_match("Package: mesh-kvm\nVersion: 0.7.0\n", version));
+        for bad in [
+            "Package: other\nVersion: 0.7.0\n",
+            "Package: mesh-kvm\nVersion: 0.7.1\n",
+            "Package: mesh-kvm\n",
+            "Version: 0.7.0\n",
+            "",
+            "Package: mesh-kvm-extra\nVersion: 0.7.0\n",
+            "Package: mesh-kvm\nVersion: 0.7.0-1\n",
+        ] {
+            assert!(!fields_match(bad, version), "{bad:?}");
+        }
     }
 
     #[test]

@@ -96,6 +96,10 @@ mod linux {
             cache.clear_staging();
             return refused(why.to_string());
         }
+        if let Err(why) = cache::check_package(&cache.staged(&package), version) {
+            cache.clear_staging();
+            return refused(why);
+        }
         process::ready_for_child();
         match cache::run_apt(&cache.staged(&package)) {
             Ok(()) => {

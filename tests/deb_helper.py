@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import pathlib
+import resource
 import shutil
 import signal
 import stat
@@ -41,12 +42,17 @@ NEW = "0.7.0"
 
 FAKE_APT = """#!/bin/sh
 # Writes down everything `apply-update` handed it, then does as it's told.
+ls /proc/$$/fd > /mnt/fake/apt-fds
 {
     echo "args=$*"
     echo "cwd=$(pwd)"
     echo "umask=$(umask)"
-    echo "fds=$(ls /proc/$$/fd | tr '\\n' ' ')"
+    echo "fds=$(tr '\\n' ' ' < /mnt/fake/apt-fds)"
     echo "fsize=$(ulimit -Sf)"
+    echo "stack=$(ulimit -Ss)"
+    echo "session=$(cut -d ' ' -f 6 /proc/$$/stat)"
+    echo "sigign=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$$/status)"
+    echo "sigblk=$(sed -n 's/^SigBlk:[[:space:]]*//p' /proc/$$/status)"
     for arg in "$@"; do last=$arg; done
     echo "sha=$(sha256sum "$last" | cut -d ' ' -f 1)"
     echo "owner=$(stat -c '%u %a' "$last")"
@@ -88,6 +94,27 @@ def manifest(version, package, name=None):
     return json.dumps(body).encode()
 
 
+debs = {}
+
+
+def deb(version, package="mesh-kvm", control_version=None):
+    """A real package, small, as the helper reads its fields with dpkg-deb."""
+    key = (version, package, control_version)
+    if key not in debs:
+        root = pathlib.Path("/mnt/fake/deb-root")
+        shutil.rmtree(root, ignore_errors=True)
+        (root / "DEBIAN").mkdir(parents=True)
+        (root / "DEBIAN/control").write_text(
+            f"Package: {package}\nVersion: {control_version or version}\nArchitecture: amd64\nMaintainer: t <t@example.invalid>\nDescription: t\n")
+        built = pathlib.Path("/mnt/fake/built.deb")
+        made = subprocess.run(["dpkg-deb", "--build", "--root-owner-group", str(root), str(built)], capture_output=True, text=True,
+                              env=dict(os.environ, TMPDIR="/mnt/fake"))
+        if made.returncode:
+            sys.exit(f"dpkg-deb: {made.stderr}")
+        debs[key] = built.read_bytes()
+    return debs[key]
+
+
 def own(path):
     os.lchown(path, USER, USER)
 
@@ -97,8 +124,9 @@ def write_as_user(path, data):
     own(path)
 
 
-def place(signer, version=NEW, package=b"the package", folder=None, listed=None):
+def place(signer, version=NEW, package=None, folder=None, listed=None):
     """A good download for `version`, as the service would leave it. Returns its folder."""
+    package = package or deb(version)
     shutil.rmtree(UPDATES, ignore_errors=True)
     folder = UPDATES / (folder or version)
     folder.mkdir(parents=True)
@@ -152,13 +180,13 @@ def tampering(helper, signer):
     lines, _ = record()
     check("apt gets the checked copy, not the user's file", f"{CACHE}/staging/{package}" in lines["args"], lines)
     check("the copy apt gets is root's and private", lines["owner"] == "0 600", lines)
-    check("the copy apt gets is the good package", lines["sha"] == hashlib.sha256(b"the package").hexdigest(), lines)
+    check("the copy apt gets is the good package", lines["sha"] == hashlib.sha256(deb(NEW)).hexdigest(), lines)
     check("install is non-interactive through apt-get install -y", lines["args"].startswith("install -y --no-remove"), lines)
     check("the package stays as the way back", (CACHE / "kept" / package).exists())
     check("nothing stays in staging", not (CACHE / "staging").exists())
 
     folder = place(signer)
-    write_as_user(folder / package, b"the package with something added")
+    write_as_user(folder / package, deb(NEW) + b"something added")
     refused("a tampered package is refused", run(helper, [NEW], env), "doesn't match")
     check("a refused copy is thrown away", not (CACHE / "staging").exists())
 
@@ -179,6 +207,13 @@ def tampering(helper, signer):
     refused("an old signed release is refused", run(helper, ["0.6.0"], env), "isn't newer")
     folder = place(signer, version=RUNNING)
     refused("the running version is refused", run(helper, [RUNNING], env), "isn't newer")
+
+    place(signer, package=deb(NEW, package="something-else"))
+    refused("a signed package of another name is refused", run(helper, [NEW], env), "isn't mesh-kvm")
+    place(signer, package=deb(NEW, control_version="0.6.0"))
+    refused("a signed package that says it's another version is refused", run(helper, [NEW], env), "isn't mesh-kvm")
+    place(signer, package=b"signed, but no package at all")
+    refused("a signed file that isn't a package is refused", run(helper, [NEW], env), "isn't mesh-kvm")
 
     place(signer, version=NEW, folder=NEW, listed="0.8.0")
     refused("a signed release for another version is refused", run(helper, [NEW], env))
@@ -312,6 +347,10 @@ def environment(helper, signer):
     def set_up():
         os.umask(0)
         os.chdir("/mnt/fake")
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGALRM, signal.SIGCHLD):
+            signal.signal(number, signal.SIG_IGN)
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGALRM})
+        resource.setrlimit(resource.RLIMIT_STACK, (65536, resource.getrlimit(resource.RLIMIT_STACK)[1]))
 
     result = run(helper, [NEW], helper_env(signer), pass_fds=[write_end], preexec_fn=set_up)
     os.close(read_end)
@@ -321,6 +360,10 @@ def environment(helper, signer):
     check("no open file reaches apt", set(lines["fds"].split()) <= {"0", "1", "2", "10"}, lines)
     check("apt runs with the normal umask", lines["umask"].lstrip("0") == "22", lines)
     check("apt runs from /", lines["cwd"] == "/", lines)
+    check("signals the caller ignored are back to normal", int(lines["sigign"], 16) == 0, lines)
+    check("signals the caller blocked are back to normal", int(lines["sigblk"], 16) == 0, lines)
+    check("a tiny stack limit doesn't reach apt", lines["stack"] == "8192", lines)
+    check("apt isn't in the caller's session", int(lines["session"]) != os.getsid(0), lines)
 
     # The helper closes what it's given, so a closed stdout can't become something it opens.
     place(signer)
@@ -338,9 +381,9 @@ def races(helper, signer):
     """A program of the user's swaps the package for another for as long as this runs."""
     env = helper_env(signer)
     package = f"mesh-kvm_{NEW}_amd64.deb"
-    good = hashlib.sha256(b"the package").hexdigest()
+    real = deb(NEW)
+    good = hashlib.sha256(real).hexdigest()
     folder = place(signer)
-    evil = folder / "evil"
     stop = threading.Event()
 
     def swap():
@@ -349,22 +392,29 @@ def races(helper, signer):
         while not stop.is_set():
             write_as_user(spare, b"evil package")
             os.replace(spare, target)
-            write_as_user(spare, b"the package")
+            write_as_user(spare, real)
             os.replace(spare, target)
 
     swapper = threading.Thread(target=swap)
     swapper.start()
     apt_saw = set()
+    installs = refusals = 0
     try:
-        for _ in range(60):
+        # Both have to happen for this to have shown anything.
+        for _ in range(400):
             result = run(helper, [NEW], env)
             if apt_was_called():
+                installs += 1
                 apt_saw.add(record()[0]["sha"])
+            elif result.returncode == 2:
+                refusals += 1
+            if installs >= 5 and refusals >= 5:
+                break
     finally:
         stop.set()
         swapper.join()
     check("swapping the package mid-run never gets anything else to apt", apt_saw <= {good}, apt_saw)
-    check("the race really ran", result is not None and not evil.exists())
+    check("the swapping really did land on both sides of a copy", installs >= 5 and refusals >= 5, f"{installs} installed, {refusals} refused")
 
     # Two at once, as a way to catch one half way.
     place(signer)
@@ -470,6 +520,6 @@ if __name__ == "__main__":
     programs = [str(pathlib.Path(p).resolve()) for p in sys.argv[1:]]
     if not programs:
         sys.exit(__doc__)
-    command = ["timeout", "-k", "5", "300", "unshare", "--user", "--map-root-user", "--map-auto", "--mount", "--pid", "--fork", "--kill-child",
+    command = ["timeout", "-k", "5", "300", "unshare", "--user", "--map-root-user", "--map-auto", "--mount", "--pid", "--fork", "--mount-proc", "--kill-child",
                sys.executable, "-I", str(pathlib.Path(__file__).resolve()), *programs]
     sys.exit(subprocess.run(command, env=dict(os.environ, DEB_HELPER_INSIDE="1")).returncode)

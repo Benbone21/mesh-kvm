@@ -6,6 +6,8 @@ use std::path::PathBuf;
 /// `pkexec` starts this with whatever limits the caller chose. A tiny file size limit would cut
 /// packages short halfway through writing them to `/usr`, so these go back to what's normal.
 const OPEN_FILES: libc::rlim_t = 4096;
+/// The usual default. Neither a tiny limit nor no limit at all is what `apt` was tested with.
+const STACK: libc::rlim_t = 8 * 1024 * 1024;
 
 /// Everything here runs before anything else, and none of it can fail in a way worth stopping for.
 pub fn harden() {
@@ -19,6 +21,9 @@ pub fn harden() {
         }
         // Nothing the caller had open reaches `apt`, or the package's scripts.
         libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+        // Away from the caller's terminal and process group, so nothing can be typed into it.
+        libc::setsid();
+        reset_signals();
         libc::umask(0o077);
         libc::setgroups(0, std::ptr::null());
         libc::chdir(c"/".as_ptr());
@@ -27,11 +32,29 @@ pub fn harden() {
         libc::setrlimit(libc::RLIMIT_CORE, &none);
         let open_files = libc::rlimit { rlim_cur: OPEN_FILES, rlim_max: OPEN_FILES };
         libc::setrlimit(libc::RLIMIT_NOFILE, &open_files);
+        let stack = libc::rlimit { rlim_cur: STACK, rlim_max: libc::RLIM_INFINITY };
+        libc::setrlimit(libc::RLIMIT_STACK, &stack);
+        // A caller's low priority or high OOM score could get `apt` killed halfway through.
+        libc::setpriority(libc::PRIO_PROCESS, 0, 0);
         let unlimited = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
         for limit in [libc::RLIMIT_FSIZE, libc::RLIMIT_CPU, libc::RLIMIT_AS, libc::RLIMIT_DATA, libc::RLIMIT_NPROC] {
             libc::setrlimit(limit, &unlimited);
         }
     }
+    let _ = std::fs::write("/proc/self/oom_score_adj", "0");
+}
+
+/// An ignored or blocked signal would carry through to `apt`, and an ignored alarm would undo the
+/// limit on copying. Rust's own choice for `SIGPIPE` stays: a child gets it back at the default.
+unsafe fn reset_signals() {
+    for signal in 1..libc::SIGRTMAX() {
+        if signal != libc::SIGPIPE && signal != libc::SIGKILL && signal != libc::SIGSTOP {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+    let mut nothing = std::mem::zeroed();
+    libc::sigemptyset(&mut nothing);
+    libc::sigprocmask(libc::SIG_SETMASK, &nothing, std::ptr::null_mut());
 }
 
 /// `pkexec` has cleared most of this already. Nothing here depends on that.
