@@ -13,6 +13,7 @@ mod protocol;
 mod router;
 mod settings;
 mod spatial;
+mod update;
 mod webui;
 
 use clap::Parser;
@@ -96,6 +97,11 @@ struct Cli {
     #[cfg(target_os = "linux")]
     #[arg(long, hide = true)]
     read_clipboard: bool,
+
+    /// See a new exe through its first minute, and put the old one back if it fails
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    update_watch: bool,
 
     /// Write the menu and login launchers for this exe (Linux), then exit
     #[cfg(target_os = "linux")]
@@ -222,6 +228,12 @@ fn main() {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    if cli.update_watch {
+        update::windows::run_watcher();
+        return;
+    }
+
     if cli.licenses {
         println!("{}", licenses::TEXT);
         // A Windows program with a window has nowhere to print, unless its output is redirected.
@@ -342,7 +354,7 @@ fn run_service(cli: Cli) {
     let pinned = chosen.as_ref().is_some_and(|c| c.2);
     println!(
         "=== mesh-kvm v{} | Role: {} | Peer: {} ===",
-        env!("CARGO_PKG_VERSION"),
+        update::trust::running_version(),
         cli.role,
         if peer_text.is_empty() { "none yet" } else { &peer_text },
     );
@@ -351,6 +363,8 @@ fn run_service(cli: Cli) {
     let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
     let displays = spatial::start_displays(state.clone(), platform.clone());
+    let trial = displays.clone();
+    update::start(peer_ip.clone(), Box::new(move || trial.trial_running()));
     let handler = spatial::studio_handler(state.clone(), platform.clone(), displays);
     if let Err(e) = webui::start(listener, peer_ip.clone(), handler) {
         fail(&e);

@@ -213,6 +213,12 @@ impl DisplayManager {
         json!({ "displays": self.state().list }).to_string()
     }
 
+    /// True while a change is under way or a screen is still owed its old mode.
+    pub fn trial_running(&self) -> bool {
+        let state = self.state();
+        state.change.is_some() || state.owed.is_some()
+    }
+
     /// What `/api/local` says about a change: the one waiting for an answer, and the last outcome.
     pub fn status_json(&self) -> Value {
         let mut state = self.state();
@@ -995,6 +1001,19 @@ mod tests {
         answer(&manager, true);
         wait_until("it to settle", || heard.lock().unwrap().len() == 3);
         assert_eq!(*heard.lock().unwrap(), [TrialStarting, MonitorsChanged, TrialOver]);
+    }
+
+    #[test]
+    fn a_trial_counts_as_running_until_it_is_answered() {
+        let fake = FakeScreens::at(mode(2560, 1440, 144));
+        let manager = manager(&fake, Duration::from_secs(60), None);
+        assert!(!manager.trial_running());
+        ask_for(&manager, &mode(1920, 1080, 60));
+        assert!(manager.trial_running());
+        wait_until("the countdown", || stage(&manager).as_deref() == Some("waiting"));
+        assert!(manager.trial_running());
+        answer(&manager, true);
+        wait_until("it to settle", || !manager.trial_running());
     }
 
     #[test]

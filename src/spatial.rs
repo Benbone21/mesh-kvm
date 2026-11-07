@@ -972,6 +972,9 @@ pub fn studio_handler(
                 if act == "set_audio_device" {
                     return Some(crate::settings::set_audio_device(&val, req.from_app_here));
                 }
+                if let Some(reply) = crate::update::handle_action(act, req.from_app_here) {
+                    return Some(reply);
+                }
                 // These reach the operating system, under the same rule as every other change:
                 // `webui` has already turned away anything but the app here and the other device.
                 match act {
@@ -1046,7 +1049,8 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "peer_pinned": g.peer_pinned,
         "device_name": crate::settings::device_name(),
         "peer_ip": peer_ip,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::update::trust::running_version().to_string(),
+        "update": crate::update::status_json(),
         "os": platform.os_name(),
         "peer_online": g.telemetry.peer_online,
         "active_node": g.telemetry.active_node,

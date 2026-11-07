@@ -336,7 +336,10 @@ fn install_launchers() {
         return;
     };
 
-    install::clear_stale(&installed_exe);
+    // While an update proves itself, the old exe is what would put things right.
+    if !crate::update::windows::swap_pending() {
+        install::clear_stale(&installed_exe);
+    }
     if let Ok(cur_exe) = std::env::current_exe() {
         if install::needs_install(&cur_exe, &installed_exe) {
             if let Err(e) = install::replace_exe(&cur_exe, &installed_exe) {
