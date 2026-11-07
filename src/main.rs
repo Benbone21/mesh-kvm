@@ -329,6 +329,8 @@ fn wait_for_old_service() {
 
 /// Runs the service until it is told to stop.
 fn run_service(cli: Cli) {
+    #[cfg(feature = "test-hooks")]
+    update::trust::hang_if_told();
     wait_for_old_service();
 
     // First of all, so that a second service stops here and touches nothing.

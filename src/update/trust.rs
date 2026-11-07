@@ -68,15 +68,31 @@ pub fn running_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("the package has a plain version")
 }
 
+/// What's on the end of a test exe, if anything.
+#[cfg(feature = "test-hooks")]
+fn test_exe_tail() -> Option<&'static str> {
+    static TAIL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let read = || {
+        let exe = std::fs::read(std::env::current_exe().ok()?).ok()?;
+        let tail = &exe[exe.len().saturating_sub(64)..];
+        let at = tail.windows(TEST_VERSION_TAG.len()).position(|w| w == TEST_VERSION_TAG)?;
+        Some(String::from_utf8_lossy(&tail[at + TEST_VERSION_TAG.len()..]).into_owned())
+    };
+    TAIL.get_or_init(read).as_deref()
+}
+
 #[cfg(feature = "test-hooks")]
 fn test_version() -> Option<Version> {
-    let exe = std::fs::read(std::env::current_exe().ok()?).ok()?;
-    let tail = &exe[exe.len().saturating_sub(64)..];
-    let tagged = tail.windows(TEST_VERSION_TAG.len()).position(|w| w == TEST_VERSION_TAG).and_then(|at| {
-        let text = std::str::from_utf8(&tail[at + TEST_VERSION_TAG.len()..]).ok()?;
-        Version::parse(text.split_whitespace().next()?)
-    });
+    let tagged = test_exe_tail().and_then(|tail| Version::parse(tail.split_whitespace().next()?));
     tagged.or_else(|| Version::parse(&std::env::var(TEST_VERSION_ENV).ok()?))
+}
+
+/// A test exe can be one that starts and never gets anywhere.
+#[cfg(feature = "test-hooks")]
+pub fn hang_if_told() {
+    while test_exe_tail().is_some_and(|tail| tail.contains("HANG")) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 /// The key in `text`, or `None` for the placeholder or anything else that isn't a usable key.

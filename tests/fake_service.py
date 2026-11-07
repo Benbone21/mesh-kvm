@@ -14,6 +14,8 @@ poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/
 --update picks where an update has got to: none, both, offline, peer-downloading, here-downloading, updating-peer,
 waiting-peer, installing, view-only, peer-failed, apt-failed, restored or stale. POST {"state": ...} to
 /fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
+--version says what version the service is, which POST {"version": ...} to /fake/version changes, as
+an update would, so the app can be seen starting again.
 """
 
 import argparse
@@ -69,6 +71,7 @@ class World:
         self.settings = {"Debian": default_settings(), "Windows": default_settings()}
         self.requests = []
         self.update = update_states()["none"]
+        self.version = "0.3.0"
 
     def rects(self, node):
         if not self.screens[node]:
@@ -96,7 +99,7 @@ class World:
         status = {
             "node": node.lower(), "device_name": self.names[node], "hostname": "bread" if node == "Debian" else "THINKPAD",
             "ip": "192.168.8.210" if node == "Debian" else "192.168.8.241", "peer_ip": "192.168.8.241", "paired": True,
-            "version": "0.3.0", "os": "", "label": "", "peer_online": self.online, "active_node": self.active, "panic_mode": False,
+            "version": self.version, "os": "", "label": "", "peer_online": self.online, "active_node": self.active, "panic_mode": False,
             "game_lock": False, "game_reason": "", "displays": self.rects(node), "cursor": [2600, 700], "autostart": True,
             "peer_pinned": False, "main_device": 0, "main_conflict": False,
             "display_change": {"change": None, "note": self.note[node]},
@@ -271,6 +274,8 @@ def serve(world):
                     set_link_state(world, body["state"])
                 elif self.path == "/fake/update":
                     world.update = update_states()[body["state"]]
+                elif self.path == "/fake/version":
+                    world.version = body["version"]
                 elif self.path.endswith("/api/local/action"):
                     if any(word in body.get("action", "") for word in ("audio", "play_only", "update")):
                         world.requests.append({"device": self.node()} | body)
@@ -344,9 +349,11 @@ if __name__ == "__main__":
     parser.add_argument("--audio", default="idle", choices=list(audio_states()))
     parser.add_argument("--link", default="good", choices=list(link_states()))
     parser.add_argument("--update", default="none", choices=list(update_states()))
+    parser.add_argument("--version", default="0.3.0")
     options = parser.parse_args()
     world = World(options.monitors, options.name_style == "long", options.no_modes)
     set_audio_state(world, options.audio)
     set_link_state(world, options.link)
     world.update = update_states()[options.update]
+    world.version = options.version
     serve(world)
