@@ -3,15 +3,16 @@
 
 use super::store::Ready;
 use super::swap::{self, Marker, OnStart, Paths, WatchHost};
-use super::trust::{running_version, Version};
+use super::store::Store;
+use super::trust::{check_file, running_version, Version};
 use super::{Installer, Updater};
 use crate::app::install::{aside_path, installed_exe};
-use crate::app::launch::{restart_service, RESTARTING_ENV};
+use crate::app::launch::{args_for_watcher, args_from_watcher, restart_service, RESTARTING_ENV};
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-const WATCH_FLAG: &str = "--update-watch";
 
 pub struct Swap;
 
@@ -38,12 +39,13 @@ impl Installer for Swap {
         let paths = paths().ok_or("Couldn't find where mesh-kvm is installed.")?;
         crate::mute::shutdown();
         let marker = Marker { from: running_version().to_string(), to: ready.version.to_string() };
-        let swapped = swap::swap_in(&paths, &ready.file, &marker).and_then(|()| start_watcher(&paths));
-        if let Err(why) = swapped {
+        let check = |copy: &Path| {
+            let content = File::open(copy).map_err(|e| format!("Couldn't check the new version's copy: {e}"))?;
+            check_file(&ready.signed, content).map_err(|why| why.to_string())
+        };
+        if let Err(why) = swap::swap_and_watch(&paths, &ready.file, &marker, &check, &|| start_watcher(&paths)) {
             // The mute is already released, and only a new start brings it back.
-            let _ = swap::put_old_back(&paths);
-            paths.clear_marker();
-            paths.leave_note(&format!("The update couldn't be installed, so nothing changed. {why}"));
+            paths.leave_note(&format!("The update couldn't be installed, so this copy keeps running. {why}"));
             return Err(restart_service());
         }
         std::process::exit(0);
@@ -53,7 +55,7 @@ impl Installer for Swap {
 /// Runs from the old exe, as the new one may not run at all.
 fn start_watcher(paths: &Paths) -> Result<(), String> {
     Command::new(aside_path(&paths.installed))
-        .arg(WATCH_FLAG)
+        .args(args_for_watcher(std::env::args().skip(1).collect()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -72,7 +74,7 @@ pub fn swap_pending() -> bool {
 pub fn after_start(updater: &Arc<Updater>) {
     let Some(paths) = paths() else { return };
     paths.clear_failed();
-    if let Some(note) = paths.take_note() {
+    if let Some(note) = paths.read_note() {
         let mut status = updater.status();
         status.stage = super::status::Stage::Failed;
         status.note = Some(note);
@@ -88,7 +90,9 @@ pub fn after_start(updater: &Arc<Updater>) {
 }
 
 struct RealHost {
-    exe: std::path::PathBuf,
+    exe: PathBuf,
+    /// What the service was started with, so that it comes back the same.
+    args: Vec<String>,
     started: Instant,
     new_service: Option<Child>,
 }
@@ -96,7 +100,7 @@ struct RealHost {
 impl RealHost {
     fn start(&self) -> Option<Child> {
         Command::new(&self.exe)
-            .args(["--role", crate::platform::ROLE])
+            .args(&self.args)
             .env(RESTARTING_ENV, "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -122,6 +126,12 @@ impl WatchHost for RealHost {
         let _ = self.start();
     }
 
+    fn reject(&mut self, version: &str) {
+        if let Some(version) = Version::parse(version) {
+            Store::new(super::store::folder()).reject(version);
+        }
+    }
+
     fn wait(&self, time: Duration) {
         std::thread::sleep(time);
     }
@@ -134,6 +144,10 @@ impl WatchHost for RealHost {
 /// `--update-watch`.
 pub fn run_watcher() {
     let Some(paths) = paths() else { return };
-    let mut host = RealHost { exe: paths.installed.clone(), started: Instant::now(), new_service: None };
+    let (args, tray) = args_from_watcher(std::env::args().skip(1).collect());
+    let mut host = RealHost { exe: paths.installed.clone(), args, started: Instant::now(), new_service: None };
     swap::watch(&paths, &mut host);
+    if tray {
+        let _ = Command::new(&paths.installed).arg("--tray").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
 }

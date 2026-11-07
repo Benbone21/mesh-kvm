@@ -7,18 +7,20 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))] // Only the Windows build swaps.
 
 use super::trust::Version;
-use crate::app::install::{aside_path, replace_exe};
+use crate::app::install::aside_path;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long the new copy has to run before it counts as healthy.
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+/// Starts the watcher, in place of a service.
+pub const WATCH_FLAG: &str = "--update-watch";
 /// How long after the swap it has to get there.
 pub const RESTORE_AFTER: Duration = Duration::from_secs(60);
 const LOOK_EVERY: Duration = Duration::from_millis(500);
-const MARKER_NAME: &str = "update-pending.json";
+pub const MARKER_NAME: &str = "update-pending.json";
 const NOTE_NAME: &str = "update-note.txt";
 
 /// Says a swap is waiting for the new copy to prove itself.
@@ -69,26 +71,91 @@ impl Paths {
         let _ = fs::write(self.note(), note);
     }
 
-    /// What a failed update left for the app, once.
-    pub fn take_note(&self) -> Option<String> {
-        let note = fs::read_to_string(self.note()).ok()?;
-        let _ = fs::remove_file(self.note());
-        Some(note)
+    /// What a failed update left for the app. It stays until the next swap.
+    pub fn read_note(&self) -> Option<String> {
+        fs::read_to_string(self.note()).ok()
     }
 
-    /// A failed exe is left behind if it couldn't be stopped. Any later start clears it.
+    fn clear_note(&self) {
+        let _ = fs::remove_file(self.note());
+    }
+
+    pub fn staged(&self) -> PathBuf {
+        let mut name = self.installed.as_os_str().to_owned();
+        name.push(".new");
+        PathBuf::from(name)
+    }
+
+    /// A failed exe is left behind if it couldn't be stopped, and a copy if a swap was cut short.
+    /// Any later start clears them.
     pub fn clear_failed(&self) {
         let _ = fs::remove_file(self.failed());
+        let _ = fs::remove_file(self.staged());
     }
 }
 
-/// Puts `new_exe` in the installed place, with the old one kept beside it. The marker goes first,
-/// so that a swap can never have happened without one.
-pub fn swap_in(paths: &Paths, new_exe: &Path, marker: &Marker) -> Result<(), String> {
-    let text = serde_json::to_vec(marker).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&paths.folder).map_err(|e| format!("Couldn't write the update's marker: {e}"))?;
-    fs::write(paths.marker(), text).map_err(|e| format!("Couldn't write the update's marker: {e}"))?;
-    replace_exe(new_exe, &paths.installed).inspect_err(|_| paths.clear_marker())
+/// Copies `new_exe` beside the installed exe and makes sure it has reached the disk.
+fn stage(paths: &Paths, new_exe: &Path) -> std::io::Result<()> {
+    let mut source = File::open(new_exe)?;
+    let mut staged = File::create(paths.staged())?;
+    std::io::copy(&mut source, &mut staged)?;
+    staged.sync_all()
+}
+
+/// Written whole or not at all, as a crash mustn't leave half a marker.
+fn write_marker(paths: &Paths, marker: &Marker) -> Result<(), String> {
+    let failed = |e: &dyn std::fmt::Display| format!("Couldn't write the update's marker: {e}");
+    let text = serde_json::to_vec(marker).map_err(|e| failed(&e))?;
+    fs::create_dir_all(&paths.folder).map_err(|e| failed(&e))?;
+    let fresh = paths.marker().with_extension("tmp");
+    fs::write(&fresh, text).map_err(|e| failed(&e))?;
+    fs::rename(&fresh, paths.marker()).map_err(|e| {
+        let _ = fs::remove_file(&fresh);
+        failed(&e)
+    })
+}
+
+/// Puts `new_exe` in the installed place, with the old one kept beside it. The slow, fallible part
+/// happens beside the installed exe, which is only touched by two renames once the copy has passed
+/// `check`. The marker comes first, so a crash between the renames can be recovered from. On `Err`
+/// the installed exe is the one that was there before, and nothing is left behind.
+pub fn swap_in(paths: &Paths, new_exe: &Path, marker: &Marker, check: &dyn Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+    let drop_staged = || {
+        let _ = fs::remove_file(paths.staged());
+    };
+    stage(paths, new_exe).map_err(|e| format!("Couldn't copy the new version into place: {e}")).inspect_err(|_| drop_staged())?;
+    check(&paths.staged()).inspect_err(|_| drop_staged())?;
+    write_marker(paths, marker).inspect_err(|_| drop_staged())?;
+    let aside = aside_path(&paths.installed);
+    if let Err(e) = fs::rename(&paths.installed, &aside) {
+        drop_staged();
+        paths.clear_marker();
+        return Err(format!("Couldn't move the running copy aside: {e}"));
+    }
+    if let Err(e) = fs::rename(paths.staged(), &paths.installed) {
+        let _ = fs::rename(&aside, &paths.installed);
+        drop_staged();
+        paths.clear_marker();
+        return Err(format!("Couldn't put the new version in place: {e}"));
+    }
+    paths.clear_note();
+    Ok(())
+}
+
+/// Swaps, and starts the watcher. The old exe only comes back if the swap really happened: after a
+/// swap that failed, what's beside the installed exe is an older version still.
+pub fn swap_and_watch(
+    paths: &Paths,
+    new_exe: &Path,
+    marker: &Marker,
+    check: &dyn Fn(&Path) -> Result<(), String>,
+    start_watcher: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    swap_in(paths, new_exe, marker, check)?;
+    start_watcher().inspect_err(|_| {
+        let _ = put_old_back(paths);
+        paths.clear_marker();
+    })
 }
 
 /// Puts the old exe back. The new one is moved rather than deleted, as it may be running.
@@ -112,13 +179,22 @@ pub trait WatchHost {
     fn stop_new_service(&mut self);
     /// Starts whatever is now in the installed place.
     fn start_restored_service(&mut self);
+    /// Keeps `version` from being fetched or installed again.
+    fn reject(&mut self, version: &str);
     fn wait(&self, time: Duration);
     fn elapsed(&self) -> Duration;
 }
 
-/// Starts the new copy and sees it through. Ends once it's healthy, or once it's undone.
+/// Starts the new copy and sees it through. It ends with a service running, whatever it found:
+/// it also runs at login when a marker is there, as nothing else would then be watching.
 pub fn watch(paths: &Paths, host: &mut dyn WatchHost) {
-    let Some(marker) = paths.read_marker() else { return };
+    if !paths.swap_pending() {
+        return host.start_new_service();
+    }
+    let marker = paths.read_marker();
+    if !paths.installed.exists() {
+        return restore(paths, host, marker.as_ref(), false);
+    }
     host.start_new_service();
     while host.elapsed() < RESTORE_AFTER {
         if !paths.swap_pending() {
@@ -126,14 +202,24 @@ pub fn watch(paths: &Paths, host: &mut dyn WatchHost) {
         }
         host.wait(LOOK_EVERY);
     }
-    if !paths.swap_pending() {
-        return;
+    if paths.swap_pending() {
+        host.stop_new_service();
+        restore(paths, host, marker.as_ref(), true);
     }
-    host.stop_new_service();
-    let note = match put_old_back(paths) {
-        Ok(()) => format!("Version {} didn't start properly, so version {} was put back.", marker.to, marker.from),
-        Err(why) => format!("Version {} didn't start properly. {why}", marker.to),
+}
+
+/// Puts the old exe back and says why. `blame` is for a new version that had its chance.
+fn restore(paths: &Paths, host: &mut dyn WatchHost, marker: Option<&Marker>, blame: bool) {
+    let (to, from) = marker.map_or(("The new version", "the old one"), |m| (m.to.as_str(), m.from.as_str()));
+    let restored = put_old_back(paths);
+    let note = match (&restored, blame) {
+        (Ok(()), false) => format!("The update to {to} was interrupted, so {from} was put back. It can be tried again."),
+        (Ok(()), true) => format!("Version {to} didn't start properly, so version {from} was put back. It won't be offered again."),
+        (Err(why), _) => format!("Version {to} didn't start properly. {why}"),
     };
+    if let (Ok(()), true, Some(marker)) = (&restored, blame, marker) {
+        host.reject(&marker.to);
+    }
     paths.leave_note(&note);
     paths.clear_marker();
     host.start_restored_service();
@@ -193,7 +279,7 @@ mod tests {
         fs::write(&paths.installed, "old").unwrap();
         let new = paths.installed.with_file_name("new.exe");
         fs::write(&new, "new").unwrap();
-        swap_in(paths, &new, &marker()).unwrap();
+        swap_in(paths, &new, &marker(), &|_| Ok(())).unwrap();
     }
 
     /// `healthy_at` is when the new copy clears the marker, in time since the swap.
@@ -204,6 +290,7 @@ mod tests {
         calls: Vec<&'static str>,
         /// What the installed place held when the restored service was started.
         restored: Option<String>,
+        rejected: Option<String>,
     }
 
     impl WatchHost for FakeHost {
@@ -217,6 +304,9 @@ mod tests {
             self.calls.push("start restored");
             self.restored = fs::read_to_string(&self.paths.installed).ok();
         }
+        fn reject(&mut self, version: &str) {
+            self.rejected = Some(version.to_string());
+        }
         fn wait(&self, time: Duration) {
             self.now.set(self.now.get() + time);
             if self.healthy_at.is_some_and(|at| self.now.get() >= at) {
@@ -229,7 +319,7 @@ mod tests {
     }
 
     fn host(paths: &Paths, healthy_at: Option<Duration>) -> FakeHost {
-        FakeHost { paths: paths.clone(), now: Cell::new(Duration::ZERO), healthy_at, calls: Vec::new(), restored: None }
+        FakeHost { paths: paths.clone(), now: Cell::new(Duration::ZERO), healthy_at, calls: Vec::new(), restored: None, rejected: None }
     }
 
     #[test]
@@ -245,9 +335,126 @@ mod tests {
     fn a_swap_that_fails_leaves_everything_as_it_was() {
         let paths = paths("swap-fails");
         fs::write(&paths.installed, "old").unwrap();
-        assert!(swap_in(&paths, Path::new("/no/such/file"), &marker()).is_err());
+        assert!(swap_in(&paths, Path::new("/no/such/file"), &marker(), &|_| Ok(())).is_err());
         assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "old");
         assert!(!paths.swap_pending());
+    }
+
+    fn new_exe(paths: &Paths) -> PathBuf {
+        let new = paths.installed.with_file_name("downloaded.exe");
+        fs::write(&new, "new").unwrap();
+        new
+    }
+
+    #[test]
+    fn the_new_exe_is_checked_in_place_before_anything_moves() {
+        let paths = paths("staged");
+        fs::write(&paths.installed, "old").unwrap();
+        let new = new_exe(&paths);
+        let seen = std::cell::RefCell::new(None);
+        let check = |staged: &Path| {
+            *seen.borrow_mut() = Some((staged.to_path_buf(), fs::read_to_string(staged).unwrap(), fs::read_to_string(&paths.installed).unwrap()));
+            Ok(())
+        };
+        swap_in(&paths, &new, &marker(), &check).unwrap();
+        let (staged, staged_text, installed_then) = seen.into_inner().expect("it was checked");
+        assert_eq!(staged, paths.staged(), "beside the installed exe");
+        assert_eq!((staged_text.as_str(), installed_then.as_str()), ("new", "old"));
+        assert!(!paths.staged().exists(), "it's the installed one now");
+    }
+
+    #[test]
+    fn a_copy_that_fails_its_check_changes_nothing() {
+        let paths = paths("bad-copy");
+        fs::write(&paths.installed, "old").unwrap();
+        fs::write(aside_path(&paths.installed), "older").unwrap();
+        let new = new_exe(&paths);
+        assert!(swap_in(&paths, &new, &marker(), &|_| Err("doesn't match".into())).is_err());
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "old");
+        assert_eq!(fs::read_to_string(aside_path(&paths.installed)).unwrap(), "older");
+        assert!(!paths.staged().exists() && !paths.swap_pending());
+    }
+
+    #[test]
+    fn a_marker_that_can_not_be_written_leaves_the_installed_exe_alone() {
+        let paths = paths("no-marker");
+        fs::write(&paths.installed, "current").unwrap();
+        fs::write(aside_path(&paths.installed), "older").unwrap();
+        let new = new_exe(&paths);
+        fs::create_dir_all(paths.marker()).unwrap();
+        let result = swap_and_watch(&paths, &new, &marker(), &|_| Ok(()), &|| panic!("nothing to watch"));
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "current", "no silent downgrade");
+        assert_eq!(fs::read_to_string(aside_path(&paths.installed)).unwrap(), "older");
+        assert!(!paths.staged().exists());
+    }
+
+    #[test]
+    fn an_old_exe_that_is_locked_never_comes_back_over_the_current_one() {
+        let paths = paths("locked");
+        fs::write(&paths.installed, "current").unwrap();
+        // Something in the way that can't be replaced, as a running exe can't.
+        let aside = aside_path(&paths.installed);
+        fs::create_dir_all(aside.join("held")).unwrap();
+        let new = new_exe(&paths);
+        let result = swap_and_watch(&paths, &new, &marker(), &|_| Ok(()), &|| panic!("nothing to watch"));
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "current");
+        assert!(!paths.swap_pending() && !paths.staged().exists());
+    }
+
+    #[test]
+    fn a_watcher_that_will_not_start_puts_the_old_exe_back() {
+        let paths = paths("no-watcher");
+        fs::write(&paths.installed, "old").unwrap();
+        let new = new_exe(&paths);
+        assert!(swap_and_watch(&paths, &new, &marker(), &|_| Ok(()), &|| Err("no".into())).is_err());
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "old");
+        assert!(!paths.swap_pending());
+    }
+
+    #[test]
+    fn a_crash_between_the_renames_goes_straight_back_with_no_blame() {
+        let paths = paths("crash");
+        swapped(&paths);
+        fs::rename(&paths.installed, paths.staged()).unwrap();
+        let mut host = host(&paths, None);
+        watch(&paths, &mut host);
+        assert_eq!(host.calls, vec!["start restored"], "no waiting for an exe that isn't there");
+        assert_eq!(host.restored.as_deref(), Some("old"));
+        assert_eq!(host.rejected, None, "the new version did nothing wrong");
+        assert!(paths.read_note().unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn a_login_with_no_marker_still_ends_with_a_service() {
+        let paths = paths("login");
+        fs::write(&paths.installed, "new").unwrap();
+        let mut host = host(&paths, None);
+        watch(&paths, &mut host);
+        assert_eq!(host.calls, vec!["start new"]);
+    }
+
+    #[test]
+    fn a_half_written_marker_still_gets_the_new_copy_watched() {
+        let paths = paths("half");
+        swapped(&paths);
+        fs::write(paths.marker(), "{\"fr").unwrap();
+        let mut host = host(&paths, None);
+        watch(&paths, &mut host);
+        assert_eq!(host.restored.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_version_that_failed_is_turned_down_and_the_note_stays() {
+        let paths = paths("reject");
+        swapped(&paths);
+        let mut host = host(&paths, None);
+        watch(&paths, &mut host);
+        assert_eq!(host.rejected.as_deref(), Some("0.7.1"));
+        let note = paths.read_note().unwrap();
+        assert!(note.contains("won't be offered again"), "{note}");
+        assert_eq!(paths.read_note().as_deref(), Some(note.as_str()), "it lasts past a restart");
     }
 
     #[test]
@@ -258,7 +465,7 @@ mod tests {
         watch(&paths, &mut host);
         assert_eq!(host.calls, vec!["start new"]);
         assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "new");
-        assert_eq!(paths.take_note(), None);
+        assert_eq!(paths.read_note(), None);
     }
 
     #[test]
@@ -272,17 +479,8 @@ mod tests {
         assert_eq!(host.now.get(), RESTORE_AFTER);
         assert!(!aside_path(&paths.installed).exists());
         assert!(!paths.swap_pending());
-        let note = paths.take_note().unwrap();
+        let note = paths.read_note().unwrap();
         assert!(note.contains("0.7.1") && note.contains("0.7.0"), "{note}");
-        assert_eq!(paths.take_note(), None, "the note is given once");
-    }
-
-    #[test]
-    fn with_nothing_to_watch_the_watcher_touches_nothing() {
-        let paths = paths("nothing");
-        let mut host = host(&paths, None);
-        watch(&paths, &mut host);
-        assert!(host.calls.is_empty());
     }
 
     #[test]
@@ -293,7 +491,7 @@ mod tests {
         let mut host = host(&paths, None);
         watch(&paths, &mut host);
         assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "new", "better than nothing");
-        assert!(paths.take_note().unwrap().contains("gone"));
+        assert!(paths.read_note().unwrap().contains("gone"));
     }
 
     #[test]

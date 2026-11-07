@@ -1,7 +1,7 @@
 //! The `updates` folder: one folder per version, holding what was downloaded for it, and a small
 //! record of when a check last worked and which versions were turned down.
 
-use super::trust::{check_file, Manifest, Rejected, Version, MANIFEST_NAME, MAX_MANIFEST, SIGNATURE_NAME, SIGNATURE_SIZE};
+use super::trust::{check_file, Manifest, Rejected, SignedFile, Version, MANIFEST_NAME, MAX_MANIFEST, SIGNATURE_NAME, SIGNATURE_SIZE};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -27,6 +27,8 @@ pub fn now_seconds() -> u64 {
 pub struct Ready {
     pub version: Version,
     pub file: PathBuf,
+    /// What the file was signed as, for checking a copy of it.
+    pub signed: SignedFile,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -114,7 +116,7 @@ impl Store {
         let file = dir.join(name);
         let content = File::open(&file).map_err(|e| Rejected::Unreadable(e.to_string()))?;
         check_file(signed, content)?;
-        Ok(Ready { version, file })
+        Ok(Ready { version, file, signed: signed.clone() })
     }
 
     /// The newest finished download that still passes. Run at the start, so that a download
@@ -182,7 +184,7 @@ mod tests {
         place(&store, "0.7.0", b"new");
         let key = signing_key(1).verifying_key();
         let ready = store.newest_ready(Some(&key), v("0.6.1"), |_| NAME.into()).unwrap();
-        assert_eq!(ready, Ready { version: v("0.7.0"), file: store.version_dir(v("0.7.0")).join(NAME) });
+        assert_eq!((ready.version, ready.file), (v("0.7.0"), store.version_dir(v("0.7.0")).join(NAME)));
     }
 
     #[test]
