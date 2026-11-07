@@ -1,7 +1,9 @@
-// Input and audio are wired in. `Services::pairing`, `stream`, `pairing`, and saving and
-// fingerprints in `keys` aren't yet, and the task that finishes them removes this.
+// Input, audio, the control listener and the clipboard are wired in. `pairing`, saving and
+// fingerprints in `keys`, and the API side of `control` aren't yet, and the tasks that finish
+// them remove this.
 #![allow(dead_code)]
 
+pub mod control;
 pub mod datagram;
 pub mod keys;
 pub mod pairing;

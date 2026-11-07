@@ -391,11 +391,30 @@ fn run_service(cli: Cli) {
         Err(e) => eprintln!("[Audio] Invalid audio target address: {}", e),
     }
 
-    // Phase 3: Unified Clipboard Sync (TCP 24852)
-    if cli.clipboard {
-        if let Err(e) = clipboard::start_clipboard_sync(peer_ip, cli.clipboard_port) {
-            eprintln!("[Clipboard] Warning: failed to start clipboard sync: {}", e);
+    // Phase 3: the control listener (TCP 24852) and the unified clipboard over it. The listener runs
+    // with the clipboard off too, as the peer API needs it. Unpaired, neither has anyone to talk to.
+    match secure.pairing.as_ref().filter(|p| p.peer.is_some()) {
+        Some(pairing) => {
+            match peer_ip.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    let incoming: secure::control::Incoming = std::sync::Arc::new(|stream, purpose| match purpose {
+                        secure::stream::Purpose::Clipboard => clipboard::take_incoming(stream),
+                        // The peer API is wired in with its handlers.
+                        secure::stream::Purpose::Api => {}
+                    });
+                    if let Err(e) = secure::control::start(cli.clipboard_port, ip, pairing.clone(), incoming) {
+                        eprintln!("[Control] Warning: failed to start the control listener: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("[Control] Bad peer address {peer_ip}: {e}"),
+            }
+            if cli.clipboard {
+                if let Err(e) = clipboard::start_clipboard_sync(peer_ip, cli.clipboard_port) {
+                    eprintln!("[Clipboard] Warning: failed to start clipboard sync: {}", e);
+                }
+            }
         }
+        None => println!("[Control] Not paired, so the clipboard stays on this device."),
     }
 
     // Phase 1: Asymmetric Input & Screen-Edge Focus Engine (UDP 24850)

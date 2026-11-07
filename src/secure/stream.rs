@@ -36,6 +36,8 @@ pub trait Wire: Read + Write + Send {
     /// Says nothing more will be written. The other side reads end of stream.
     fn end_writing(&mut self) -> io::Result<()>;
     fn set_read_wait(&mut self, wait: Option<Duration>) -> io::Result<()>;
+    /// How long one write may stall before it fails, so a stuck peer can't hold a sender for ever.
+    fn set_write_wait(&mut self, wait: Option<Duration>) -> io::Result<()>;
 }
 
 impl Wire for TcpStream {
@@ -45,6 +47,10 @@ impl Wire for TcpStream {
 
     fn set_read_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
         self.set_read_timeout(wait)
+    }
+
+    fn set_write_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        self.set_write_timeout(wait)
     }
 }
 
@@ -291,6 +297,10 @@ impl Wire for SecureStream {
     fn set_read_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
         self.tcp.set_read_timeout(wait)
     }
+
+    fn set_write_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        self.tcp.set_write_timeout(wait)
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +402,22 @@ mod tests {
         server.read_exact(&mut got).unwrap();
         let err = server.read(&mut [0u8; 4]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_cannot_hold_a_write_for_ever() {
+        let (mut client, _server) = linked();
+        client.set_write_wait(Some(Duration::from_millis(300))).unwrap();
+        let started = Instant::now();
+        let chunk = vec![0u8; 64 * 1024];
+        let err = loop {
+            if let Err(e) = client.write_all(&chunk) {
+                break e;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "the write never gave up");
+        };
+        assert!(matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock), "{err:?}");
+        assert!(client.write_all(b"more").is_err(), "a half-written frame leaves the stream unusable");
     }
 
     #[test]

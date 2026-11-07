@@ -6,10 +6,15 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(not(test))]
+use crate::secure::control;
+#[cfg(not(test))]
+use crate::secure::stream::Purpose;
+use crate::secure::stream::{SecureStream, Wire};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// This device's clipboard goes to the peer.
@@ -43,7 +48,7 @@ const RETRY_EVERY: Duration = Duration::from_secs(1);
 /// Text that couldn't be sent for this long is left behind. It won't be what anyone is waiting for.
 const RETRY_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// What the receiver answers with, in one byte. A device from before these closes without a word.
+/// What the receiver answers with, in one byte.
 const ANSWER_TAKEN: u8 = 1;
 const ANSWER_NEWER_HERE: u8 = 2;
 const ANSWER_NOT_RECEIVING: u8 = 3;
@@ -60,8 +65,8 @@ static BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The note, and whether it says something went wrong.
 static NOTE: Mutex<(String, bool)> = Mutex::new((String::new(), false));
 static OUTBOX: Mutex<Outbox> = Mutex::new(Outbox { waiting: None });
-/// The other device has given an answer before, so it isn't a 0.5 device.
-static PEER_ANSWERS: AtomicBool = AtomicBool::new(false);
+/// The clipboard sync is running, so what comes in over the control connection is taken.
+static SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// What the clipboard last did, for the app to show, and whether that was a failure.
 pub fn clipboard_note() -> (String, bool) {
@@ -240,7 +245,7 @@ enum Sent {
     Failed,
     /// Over the limit, so it never left.
     TooLarge,
-    /// It closed without a word, as a device from before the answers does.
+    /// It answered with something this version doesn't know, so it is newer.
     NoAnswer,
     /// It couldn't be reached, or stopped answering. The link may yet come back.
     Unreachable(String),
@@ -723,22 +728,30 @@ fn read_copy<R: Read>(reader: &mut R) -> Result<(u64, ClipboardPayload), String>
 
 /// Gives the answer and closes. Closing with anything unread resets the connection, which can
 /// destroy the answer on its way, so this side stops writing first and reads what's left for a moment.
-fn finish(mut stream: TcpStream, answer: u8) {
+fn finish<W: Wire>(mut stream: W, answer: u8) {
     let _ = stream.write_all(&[answer]);
-    let _ = stream.shutdown(Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.end_writing();
+    let _ = stream.set_read_wait(Some(Duration::from_millis(200)));
     let until = Instant::now() + Duration::from_secs(2);
     let mut drain = vec![0u8; CHUNK_BYTES];
     while Instant::now() < until && stream.read(&mut drain).is_ok_and(|got| got > 0) {}
 }
 
-fn receive(mut stream: TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    // Nothing was going to be sent, so nothing failed.
-    if stream.peek(&mut [0u8; 1]).is_ok_and(|got| got == 0) {
-        return Ok(());
+fn receive<W: Wire>(mut stream: W, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<(), String> {
+    let _ = stream.set_read_wait(Some(IO_TIMEOUT));
+    let _ = stream.set_write_wait(Some(IO_TIMEOUT));
+    let mut first = [0u8; 1];
+    match stream.read(&mut first) {
+        // It ended without sending anything, so nothing failed. A connection that was cut is an error
+        // from the read and not this.
+        Ok(0) => return Ok(()),
+        Ok(_) => {}
+        Err(e) => {
+            finish(stream, ANSWER_FAILED);
+            return Err(e.to_string());
+        }
     }
-    let taken = take_copy(&mut stream, tracker, inbox);
+    let taken = take_copy(&mut first.as_slice().chain(&mut stream), tracker, inbox);
     finish(stream, *taken.as_ref().unwrap_or(&ANSWER_FAILED));
     taken.map(|_| ())
 }
@@ -760,7 +773,7 @@ fn write_clipboard(tracker: &Mutex<Tracker>, fingerprint: u64, set: impl FnOnce(
 }
 
 /// Takes in one copy, and returns the answer to give.
-fn take_copy(stream: &mut TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<u8, String> {
+fn take_copy<R: Read>(stream: &mut R, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<u8, String> {
     let (age, payload) = read_copy(stream)?;
     let newest = tracker.lock().map(|mut t| t.take_from_peer(made_at(Instant::now(), age))).unwrap_or(true);
     if !newest {
@@ -801,48 +814,26 @@ fn take_copy(stream: &mut TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> 
     Ok(ANSWER_TAKEN)
 }
 
+fn tracker() -> &'static Mutex<Tracker> {
+    static TRACKER: OnceLock<Mutex<Tracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(Tracker::default()))
+}
+
+/// A clipboard connection from the peer, handed on by the control listener. It runs on the
+/// connection's own thread: text copied during a long transfer must not wait for it.
+pub fn take_incoming(stream: SecureStream) {
+    if !SYNC_RUNNING.load(Ordering::SeqCst) || !CLIPBOARD_RECEIVE.load(Ordering::SeqCst) {
+        finish(stream, ANSWER_NOT_RECEIVING);
+    } else if let Err(e) = receive(stream, tracker(), &inbox_dir()) {
+        set_failure(format!("Couldn't receive the clipboard: {e}"));
+    }
+}
+
+/// Starts the watching and sending. Receiving comes through the control listener, which
+/// `take_incoming` answers for.
 pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
     let peer: IpAddr = peer_ip.parse().map_err(|e| format!("Bad peer address {peer_ip}: {e}"))?;
-    let tracker = Arc::new(Mutex::new(Tracker::default()));
-    let tracker_rx = Arc::clone(&tracker);
-
-    // 1. Spawn TCP receiver on Port 24852
-    std::thread::Builder::new()
-        .name("mesh-kvm-clip-rx".to_string())
-        .spawn(move || {
-            let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-            let listener = match TcpListener::bind(bind_addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("[Clipboard] Failed to bind TCP {}: {}", bind_addr, e);
-                    return;
-                }
-            };
-            println!("[Clipboard] Unified clipboard sync listening on TCP {}", bind_addr);
-
-            let inbox = inbox_dir();
-            for stream in listener.incoming().flatten() {
-                // Files land on disk, so only the peer gets to write here.
-                if stream.peer_addr().map(|a| a.ip()).ok() != Some(peer) {
-                    continue;
-                }
-                // Each on its own thread: text copied during a long transfer must not wait for it.
-                let tracker = Arc::clone(&tracker_rx);
-                let inbox = inbox.clone();
-                let _ = std::thread::Builder::new().name("mesh-kvm-clip-in".to_string()).spawn(
-                    move || {
-                        if !CLIPBOARD_RECEIVE.load(Ordering::SeqCst) {
-                            finish(stream, ANSWER_NOT_RECEIVING);
-                        } else if let Err(e) = receive(stream, &tracker, &inbox) {
-                            set_failure(format!("Couldn't receive the clipboard: {e}"));
-                        }
-                    },
-                );
-            }
-        })
-        .map_err(|e| e.to_string())?;
-
-    // 2. Spawn the retrying of text that couldn't be sent. Its own thread, as waiting on a poor
+    // 1. Spawn the retrying of text that couldn't be sent. Its own thread, as waiting on a poor
     // link must not hold up noticing the next copy.
     let retry_addr = SocketAddr::new(peer, port);
     std::thread::Builder::new()
@@ -855,7 +846,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
 
-    // 3. Spawn clipboard watcher and TCP sender
+    // 2. Spawn clipboard watcher and sender
     std::thread::Builder::new()
         .name("mesh-kvm-clip-tx".to_string())
         .spawn(move || {
@@ -899,7 +890,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
                 let Look::Got(Some(snapshot)) = look else { continue };
                 let fingerprint = snapshot.fingerprint();
                 let now = Instant::now();
-                let changed = tracker.lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
+                let changed = tracker().lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
 
                 // Tracked even with sending off, so that what was copied meanwhile does not go out
                 // the moment sending comes back on.
@@ -910,6 +901,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
 
+    SYNC_RUNNING.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -979,10 +971,21 @@ fn retry_waiting(target_addr: SocketAddr, outbox: &Mutex<Outbox>, newest_turn: u
     }
 }
 
-fn connect(target_addr: SocketAddr) -> Result<TcpStream, String> {
-    let stream = TcpStream::connect_timeout(&target_addr, CONNECT_WAIT).map_err(|e| e.to_string())?;
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_read_timeout(Some(ANSWER_WAIT));
+/// The connection to the peer. The handshake counts inside `CONNECT_WAIT`.
+#[cfg(not(test))]
+fn connect(target_addr: SocketAddr) -> Result<SecureStream, String> {
+    let mut stream = control::open(target_addr, Purpose::Clipboard, CONNECT_WAIT)?;
+    let _ = stream.set_write_wait(Some(IO_TIMEOUT));
+    let _ = stream.set_read_wait(Some(ANSWER_WAIT));
+    Ok(stream)
+}
+
+/// Tests that don't need the encryption run over plain TCP.
+#[cfg(test)]
+fn connect(target_addr: SocketAddr) -> Result<std::net::TcpStream, String> {
+    let mut stream = std::net::TcpStream::connect_timeout(&target_addr, CONNECT_WAIT).map_err(|e| e.to_string())?;
+    let _ = stream.set_write_wait(Some(IO_TIMEOUT));
+    let _ = stream.set_read_wait(Some(ANSWER_WAIT));
     Ok(stream)
 }
 
@@ -992,38 +995,31 @@ fn answer_wait(bytes: u64) -> Duration {
     ANSWER_WAIT + Duration::from_secs(bytes.min(MAX_IN_FLIGHT) / SLOWEST_BYTES_PER_SECOND)
 }
 
-fn read_answer(stream: &mut TcpStream, answers: &AtomicBool) -> Sent {
+fn read_answer<R: Read>(stream: &mut R) -> Sent {
     let mut answer = [0u8; 1];
-    let sent = match stream.read(&mut answer) {
-        Ok(0) => Sent::NoAnswer,
-        Ok(_) => match answer[0] {
+    match stream.read(&mut answer) {
+        Ok(1) => match answer[0] {
             ANSWER_TAKEN => Sent::Taken,
             ANSWER_NEWER_HERE => Sent::NewerThere,
             ANSWER_NOT_RECEIVING => Sent::NotReceiving,
             ANSWER_FAILED => Sent::Failed,
             _ => Sent::NoAnswer,
         },
-        // It was there, and hung up on what it was sent: a 0.5 device closes with the text unread.
-        Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe) => Sent::NoAnswer,
-        Err(e) => Sent::Unreachable(e.to_string()),
-    };
-    match sent {
-        // One that has answered before can read all this, so it was restarting.
-        Sent::NoAnswer if answers.load(Ordering::SeqCst) => Sent::Unreachable("It closed part way through".to_string()),
-        Sent::NoAnswer | Sent::Unreachable(_) => sent,
-        answered => {
-            answers.store(true, Ordering::SeqCst);
-            answered
+        // It was there and hung up on what it was sent, or restarted: the link may yet come back.
+        Ok(_) => Sent::Unreachable("It closed part way through".to_string()),
+        Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof) => {
+            Sent::Unreachable("It closed part way through".to_string())
         }
+        Err(e) => Sent::Unreachable(e.to_string()),
     }
 }
 
 /// A write that succeeded only means the text left this device, so the answer is what counts.
 fn send_text(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent {
-    send_text_to(target_addr, text, copied_at, &PEER_ANSWERS)
+    send_text_to(target_addr, text, copied_at)
 }
 
-fn send_text_to(target_addr: SocketAddr, text: &str, copied_at: Instant, answers: &AtomicBool) -> Sent {
+fn send_text_to(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent {
     if text.len() > MAX_FRAME_BYTES {
         return Sent::TooLarge;
     }
@@ -1034,11 +1030,11 @@ fn send_text_to(target_addr: SocketAddr, text: &str, copied_at: Instant, answers
     let age_ms = age_ms(copied_at, Instant::now());
     let written = write_frame(&mut stream, &ClipboardPayload::Stamp { age_ms })
         .and_then(|()| write_frame(&mut stream, &ClipboardPayload::Text(text.to_string())));
-    let _ = stream.set_read_timeout(Some(answer_wait(text.len() as u64)));
+    let _ = stream.set_read_wait(Some(answer_wait(text.len() as u64)));
     match written {
-        Ok(()) => read_answer(&mut stream, answers),
+        Ok(()) => read_answer(&mut stream),
         // It may have closed on seeing a stamp it can't read, and an answer tells the two apart.
-        Err(e) => match read_answer(&mut stream, answers) {
+        Err(e) => match read_answer(&mut stream) {
             Sent::Unreachable(_) => Sent::Unreachable(e),
             sent => sent,
         },
@@ -1066,8 +1062,8 @@ fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, t
             let mut stream = connect(target_addr).map_err(|e| unsent(what, &e))?;
             write_frame(&mut stream, &stamp).map_err(|e| unsent(what, &e))?;
             write_frame(&mut stream, &payload).map_err(|e| unsent(what, &e))?;
-            let _ = stream.set_read_timeout(Some(answer_wait(size)));
-            answer_note(read_answer(&mut stream, &PEER_ANSWERS), what, "Sent an image")
+            let _ = stream.set_read_wait(Some(answer_wait(size)));
+            answer_note(read_answer(&mut stream), what, "Sent an image")
         }
         Snapshot::Files(paths) => {
             let sources = collect_entries(&paths).map_err(|e| unsent("the files", &e))?;
@@ -1080,8 +1076,8 @@ fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, t
             write_contents(&mut stream, &sources, || NEWEST_SEND.load(Ordering::SeqCst) != turn)
                 .map_err(|e| unsent(&count, &e))?;
             let size = sources.iter().map(|(_, entry)| entry.size).sum();
-            let _ = stream.set_read_timeout(Some(answer_wait(size)));
-            answer_note(read_answer(&mut stream, &PEER_ANSWERS), &count, &format!("Sent {count}"))
+            let _ = stream.set_read_wait(Some(answer_wait(size)));
+            answer_note(read_answer(&mut stream), &count, &format!("Sent {count}"))
         }
     }
 }
@@ -1101,7 +1097,9 @@ fn answer_note(sent: Sent, what: &str, done: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure::stream::{Purpose, SecureStream};
     use std::io::Cursor;
+    use std::net::TcpListener;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mesh-clip-{}-{name}", std::process::id()));
@@ -1254,9 +1252,9 @@ mod tests {
         assert_eq!(outbox.lock().unwrap().due(7, true, Instant::now()), Due::Nothing);
     }
 
-    /// What a 0.5 device does: it can't read a stamp, so it reads that one frame and closes, with
-    /// the text unread. Closing like that resets the connection rather than ending it.
-    fn close_like_0_5(listener: TcpListener) -> std::thread::JoinHandle<()> {
+    /// A device that reads one frame and hangs up with the text unread. Closing like that resets the
+    /// connection rather than ending it.
+    fn hang_up_after_one_frame(listener: TcpListener) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut len = [0u8; 4];
@@ -1269,25 +1267,11 @@ mod tests {
     }
 
     #[test]
-    fn a_device_from_before_the_answers_is_told_apart_from_a_dead_link() {
+    fn a_hang_up_with_no_answer_is_a_dead_link_to_try_again() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap();
-        let other = close_like_0_5(listener);
-        assert_eq!(send_text_to(target, "hello", Instant::now(), &AtomicBool::new(false)), Sent::NoAnswer);
-        other.join().unwrap();
-    }
-
-    #[test]
-    fn a_device_that_has_answered_before_is_only_restarting() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let target = listener.local_addr().unwrap();
-        let answers = AtomicBool::new(false);
-        let other = take_one(listener.try_clone().unwrap(), Some(ANSWER_TAKEN));
-        assert_eq!(send_text_to(target, "hello", Instant::now(), &answers), Sent::Taken);
-        other.join().unwrap();
-
-        let other = close_like_0_5(listener);
-        let sent = send_text_to(target, "hello", Instant::now(), &answers);
+        let other = hang_up_after_one_frame(listener);
+        let sent = send_text_to(target, "hello", Instant::now());
         other.join().unwrap();
         assert!(matches!(sent, Sent::Unreachable(_)), "{sent:?}");
         let outbox = Mutex::new(Outbox { waiting: None });
@@ -1295,14 +1279,123 @@ mod tests {
         assert!(matches!(outbox.lock().unwrap().due(9, true, Instant::now()), Due::Send { .. }), "so it's tried again");
     }
 
-    /// Run by hand against the published 0.5 program, listening on `MK_CLIP_TARGET`.
     #[test]
-    #[ignore = "needs a running 0.5 device"]
-    fn a_real_0_5_device_is_told_apart() {
-        let target = std::env::var("MK_CLIP_TARGET").unwrap().parse().unwrap();
-        let sent = send_text_to(target, "hello", Instant::now(), &AtomicBool::new(false));
-        println!("SENT {sent:?}");
-        assert_eq!(sent, Sent::NoAnswer);
+    fn an_answer_this_version_does_not_know_asks_for_an_update() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let other = take_one(listener, Some(99));
+        assert_eq!(send_text(target, "hello", Instant::now()), Sent::NoAnswer);
+        other.join().unwrap();
+    }
+
+    /// Connected secure streams: the sender's, then the receiver's.
+    fn secure_pair() -> (SecureStream, SecureStream) {
+        use crate::secure::keys::{Pairing, PeerKey};
+        let mut a = Pairing::fresh();
+        let mut b = Pairing::fresh();
+        a.peer = Some(PeerKey { public: b.identity.public, name: "b".into(), paired_at: 0 });
+        b.peer = Some(PeerKey { public: a.identity.public, name: "a".into(), paired_at: 0 });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            SecureStream::accept(tcp, &b, Duration::from_secs(5)).unwrap().0
+        });
+        let client = SecureStream::connect(addr, &a, Purpose::Clipboard, Duration::from_secs(5)).unwrap();
+        (client, server.join().unwrap())
+    }
+
+    #[test]
+    fn text_goes_through_a_secure_stream() {
+        let (mut sender, mut receiver) = secure_pair();
+        let other = std::thread::spawn(move || {
+            let (age, payload) = read_copy(&mut receiver).unwrap();
+            finish(receiver, ANSWER_TAKEN);
+            (age, payload)
+        });
+        write_frame(&mut sender, &ClipboardPayload::Stamp { age_ms: 1234 }).unwrap();
+        write_frame(&mut sender, &ClipboardPayload::Text("hello".into())).unwrap();
+        assert_eq!(read_answer(&mut sender), Sent::Taken);
+        let (age, payload) = other.join().unwrap();
+        assert_eq!(age, 1234);
+        assert!(matches!(payload, ClipboardPayload::Text(t) if t == "hello"));
+    }
+
+    #[test]
+    fn an_answer_survives_a_secure_receiver_that_stops_reading() {
+        let (mut sender, receiver) = secure_pair();
+        let other = std::thread::spawn(move || finish(receiver, ANSWER_NEWER_HERE));
+        // Plenty goes unread on the far side.
+        write_frame(&mut sender, &ClipboardPayload::Text("x".repeat(3 * 1024 * 1024))).ok();
+        assert_eq!(read_answer(&mut sender), Sent::NewerThere);
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn a_secure_stream_that_hangs_up_unanswered_reads_as_a_dead_link() {
+        let (mut sender, receiver) = secure_pair();
+        drop(receiver);
+        assert!(matches!(read_answer(&mut sender), Sent::Unreachable(_)));
+        let (mut sender, mut receiver) = secure_pair();
+        receiver.end_writing().unwrap();
+        assert!(matches!(read_answer(&mut sender), Sent::Unreachable(_)), "an end with no answer is no answer");
+    }
+
+    /// Sends a file's frames, and then `part` of its `size` bytes.
+    fn send_part_of_a_file(sender: &mut SecureStream, size: u64, part: usize) {
+        write_frame(sender, &ClipboardPayload::Stamp { age_ms: 0 }).unwrap();
+        let entries = vec![FileEntry { path: "big.bin".to_string(), size, is_dir: false }];
+        write_frame(sender, &ClipboardPayload::Files(entries)).unwrap();
+        sender.write_all(&vec![5u8; part]).unwrap();
+    }
+
+    fn batches_in(inbox: &Path) -> usize {
+        fs::read_dir(inbox).map(|dir| dir.flatten().count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_transfer_cut_off_is_not_taken() {
+        let inbox = scratch("cut-secure");
+        let tracker = Mutex::new(Tracker::default());
+        // Cut: the connection goes with the file half sent and no end frame.
+        let (mut sender, receiver) = secure_pair();
+        send_part_of_a_file(&mut sender, 1_000_000, 300_000);
+        drop(sender);
+        assert!(receive(receiver, &tracker, &inbox).is_err());
+        assert_eq!(batches_in(&inbox), 0, "no half batch is left to pass as a whole one");
+
+        // Ended early on purpose: still short, so it fails, and the sender is told so.
+        let (mut sender, receiver) = secure_pair();
+        send_part_of_a_file(&mut sender, 1_000_000, 300_000);
+        sender.end_writing().unwrap();
+        assert!(receive(receiver, &tracker, &inbox).is_err());
+        assert_eq!(read_answer(&mut sender), Sent::Failed);
+        assert_eq!(batches_in(&inbox), 0);
+        let _ = fs::remove_dir_all(inbox);
+    }
+
+    #[test]
+    fn a_secure_connection_that_ends_without_a_word_is_not_a_failure() {
+        let (mut sender, receiver) = secure_pair();
+        sender.end_writing().unwrap();
+        let tracker = Mutex::new(Tracker::default());
+        assert_eq!(receive(receiver, &tracker, Path::new("unused")), Ok(()));
+    }
+
+    #[test]
+    fn a_secure_connection_cut_without_a_word_is_a_failure() {
+        let (sender, receiver) = secure_pair();
+        drop(sender);
+        let tracker = Mutex::new(Tracker::default());
+        assert!(receive(receiver, &tracker, Path::new("unused")).is_err());
+    }
+
+    #[test]
+    fn a_clipboard_that_is_not_running_answers_not_receiving() {
+        let (mut sender, receiver) = secure_pair();
+        let other = std::thread::spawn(move || take_incoming(receiver));
+        assert_eq!(read_answer(&mut sender), Sent::NotReceiving);
+        other.join().unwrap();
     }
 
     #[test]
@@ -1582,6 +1675,7 @@ mod tests {
 #[cfg(test)]
 mod reads {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::AtomicU32;
     use std::sync::mpsc::{channel, Sender};
 
