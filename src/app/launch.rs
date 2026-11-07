@@ -31,6 +31,7 @@ const VBS_HEAD: &str = "Set WshShell = CreateObject(\"WScript.Shell\")\r\n";
 ///
 /// If an update hasn't proved itself, as with a reboot right after the swap, the installed exe may
 /// be missing or broken. The old exe then does the starting, as a watcher that can put things back.
+/// It runs as a copy, as `Run` goes through the shell, which won't start a file called `.old`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn windows_vbs(exe: &str, peer: Option<&str>) -> String {
     let service = match peer {
@@ -40,10 +41,12 @@ pub fn windows_vbs(exe: &str, peer: Option<&str>) -> String {
     let folder = exe.rsplit_once('\\').map_or("", |(folder, _)| folder);
     let marker = crate::update::swap::MARKER_NAME;
     let aside = format!("{exe}.old");
-    let watcher = vbs_run(&aside, &format!("{} --tray {service}", crate::update::swap::WATCH_FLAG));
+    let copy = format!("{folder}\\{}", crate::update::swap::RECOVERY_EXE);
+    let watcher = vbs_run(&copy, &format!("{} --tray {service}", crate::update::swap::WATCH_FLAG));
     format!(
         "{VBS_HEAD}Set Fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
          If Fso.FileExists(\"{folder}\\{marker}\") And Fso.FileExists(\"{aside}\") Then\r\n\
+         Fso.CopyFile \"{aside}\", \"{copy}\", True\r\n\
          {watcher}WScript.Quit\r\nEnd If\r\n{}{}",
         vbs_run(exe, &service),
         vbs_run(exe, "--tray")
@@ -844,8 +847,11 @@ mod tests {
         let vbs = windows_vbs(EXE, None);
         assert!(vbs.contains(r#"Fso.FileExists("C:\Users\me\AppData\Local\mesh-kvm\update-pending.json")"#), "{vbs}");
         assert!(vbs.contains(&format!(r#"Fso.FileExists("{EXE}.old")"#)), "{vbs}");
-        let watcher = format!("WshShell.Run \"\"\"{EXE}.old\"\" --update-watch --tray --role windows\", 0, False");
+        let copy = r"C:\Users\me\AppData\Local\mesh-kvm\mesh-kvm-recover.exe";
+        assert!(vbs.contains(&format!(r#"Fso.CopyFile "{EXE}.old", "{copy}", True"#)), "{vbs}");
+        let watcher = format!("WshShell.Run \"\"\"{copy}\"\" --update-watch --tray --role windows\", 0, False");
         assert!(vbs.contains(&watcher), "{vbs}");
+        assert!(vbs.split_once("End If").unwrap().0.lines().filter(|l| l.contains("WshShell.Run")).all(|l| l.contains(".exe\"\"")), "the shell only runs an exe");
         let (recovery, normal) = vbs.split_once("End If").unwrap();
         assert!(recovery.contains("WScript.Quit"), "the normal start doesn't run as well");
         assert!(normal.contains("--role windows") && normal.contains("--tray"), "{vbs}");

@@ -20,6 +20,8 @@ pub const WATCH_FLAG: &str = "--update-watch";
 /// How long after the swap it has to get there.
 pub const RESTORE_AFTER: Duration = Duration::from_secs(60);
 const LOOK_EVERY: Duration = Duration::from_millis(500);
+/// What the login script runs the old exe as.
+pub const RECOVERY_EXE: &str = "mesh-kvm-recover.exe";
 pub const MARKER_NAME: &str = "update-pending.json";
 const NOTE_NAME: &str = "update-note.txt";
 
@@ -91,6 +93,7 @@ impl Paths {
     pub fn clear_failed(&self) {
         let _ = fs::remove_file(self.failed());
         let _ = fs::remove_file(self.staged());
+        let _ = fs::remove_file(self.folder.join(RECOVERY_EXE));
     }
 }
 
@@ -424,6 +427,17 @@ mod tests {
         assert_eq!(host.restored.as_deref(), Some("old"));
         assert_eq!(host.rejected, None, "the new version did nothing wrong");
         assert!(paths.read_note().unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn what_a_recovery_left_behind_is_cleared_at_a_later_start() {
+        let paths = paths("leftovers");
+        fs::create_dir_all(&paths.folder).unwrap();
+        for file in [paths.failed(), paths.staged(), paths.folder.join(RECOVERY_EXE)] {
+            fs::write(&file, "x").unwrap();
+            paths.clear_failed();
+            assert!(!file.exists(), "{}", file.display());
+        }
     }
 
     #[test]
