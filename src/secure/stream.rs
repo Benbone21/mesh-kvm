@@ -68,6 +68,8 @@ pub struct SecureStream {
     broken: bool,
     /// The end frame was sent.
     closed: bool,
+    /// Reads fail once this passes, however the bytes arrive. None: each socket read has its own wait.
+    read_deadline: Option<Instant>,
 }
 
 fn bad(why: &str) -> io::Error {
@@ -135,8 +137,13 @@ fn io_text(what: &str, e: io::Error) -> String {
 }
 
 impl SecureStream {
+    /// One limit on everything read from now on, for an answer that must come whole in time.
+    pub fn set_read_deadline(&mut self, deadline: Option<Instant>) {
+        self.read_deadline = deadline;
+    }
+
     fn new(tcp: TcpStream, noise: TransportState, raw: Vec<u8>) -> SecureStream {
-        SecureStream { tcp, noise, raw, plain: Vec::new(), used: 0, ended: false, broken: false, closed: false }
+        SecureStream { tcp, noise, raw, plain: Vec::new(), used: 0, ended: false, broken: false, closed: false, read_deadline: None }
     }
 
     pub fn connect(target: SocketAddr, pairing: &Pairing, purpose: Purpose, wait: Duration) -> Result<SecureStream, String> {
@@ -249,7 +256,7 @@ impl Read for SecureStream {
             if self.ended {
                 return Ok(0);
             }
-            let next = self.next_plain(None)?;
+            let next = self.next_plain(self.read_deadline)?;
             if next.is_empty() {
                 self.ended = true;
                 return Ok(0);

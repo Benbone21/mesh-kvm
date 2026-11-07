@@ -190,9 +190,12 @@ impl Link {
 
 fn exchange(stream: &mut SecureStream, request: &ApiRequest) -> Result<(u16, String), String> {
     stream.set_write_wait(Some(WRITE_WAIT)).map_err(|e| e.to_string())?;
-    stream.set_read_wait(Some(ANSWER_WAIT)).map_err(|e| e.to_string())?;
     write_msg(stream, request).map_err(|e| format!("peer unreachable: {e}"))?;
-    let answer: ApiAnswer = read_msg(stream).map_err(|e| format!("peer didn't answer: {e}"))?;
+    // One limit for the whole answer, so a trickle can't hold the link.
+    stream.set_read_deadline(Some(Instant::now() + ANSWER_WAIT));
+    let answer = read_msg::<ApiAnswer>(stream).map_err(|e| format!("peer didn't answer: {e}"));
+    stream.set_read_deadline(None);
+    let answer = answer?;
     Ok((answer.status, answer.body))
 }
 
@@ -376,12 +379,48 @@ mod tests {
         let err = link.call(Some(&a), Some(addr), "POST", "/api/state", &big).unwrap_err();
         assert!(err.contains("too large"), "{err}");
         assert_eq!(count.load(Ordering::SeqCst), 0, "nothing was sent");
-        // A frame that claims more is closed on, before anything is allocated for it.
-        let mut raw = open_with(Some(&a), addr, Purpose::Api, WAIT).unwrap();
-        raw.write_all(&((MAX_FRAME as u32) + 1).to_be_bytes()).unwrap();
-        raw.set_read_wait(Some(WAIT)).unwrap();
-        let mut byte = [0u8; 1];
-        assert!(matches!(raw.read(&mut byte), Ok(0) | Err(_)));
+    }
+
+    #[test]
+    fn a_frame_that_claims_over_4_mib_is_refused_before_it_is_read() {
+        let too_long = ((MAX_FRAME + 1) as u32).to_be_bytes();
+        let err = read_msg::<ApiRequest>(&mut std::io::Cursor::new(too_long.to_vec())).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let exact = (MAX_FRAME as u32).to_be_bytes();
+        let err = read_msg::<ApiRequest>(&mut std::io::Cursor::new(exact.to_vec())).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "the limit itself is allowed");
+    }
+
+    #[test]
+    fn an_answer_that_trickles_fails_at_the_deadline_and_the_next_call_reconnects() {
+        let (a, b) = paired_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let incoming: Incoming = Arc::new(move |mut stream, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                // One byte of the length every 300 ms, which never completes in time.
+                let _ = read_msg::<ApiRequest>(&mut stream);
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if stream.write_all(&[0]).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            } else {
+                serve_api(stream, Arc::new(|_| Some("{}".to_string())));
+            }
+        });
+        serve(listener, "127.0.0.1".parse().unwrap(), Arc::new(b), incoming).unwrap();
+        let link = Link::new(HOUR);
+        let started = Instant::now();
+        assert!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").is_err());
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(1100) && took < Duration::from_millis(1600), "{took:?}");
+        assert_eq!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
