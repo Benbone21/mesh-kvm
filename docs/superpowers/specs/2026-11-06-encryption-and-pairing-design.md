@@ -71,8 +71,11 @@ with them ran on Linux and under Wine for `x86_64-pc-windows-gnu`, with no cmake
 | `secure/pairing.rs` | The pairing exchange and its time-limited listener | `spake2`, `snow`, `keys` |
 
 Time comes in as `now_ms`, as in `link.rs`, so all of it can be tested without
-sleeping. `link.rs` and `router.rs` do not change: they see the same `Packet` values
-they see today, only fewer forged ones.
+sleeping. `router.rs` does not change, and `link.rs` gains only `handshake_heard`, for the
+one-way note below: they see the same `Packet` values they see today, only fewer forged ones.
+
+Channels are built when the service starts, so pairing or unpairing restarts the service,
+through the same `settings` restart that a new peer address uses.
 
 ## Pairing
 
