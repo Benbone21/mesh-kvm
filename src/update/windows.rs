@@ -80,10 +80,13 @@ pub fn after_start(updater: &Arc<Updater>) {
         status.note = Some(note);
     }
     if swap::on_start(&paths, updater.running) == OnStart::ProveHealthy {
+        updater.status().proving = true;
         let started = Instant::now();
         let answers = || matches!(crate::webui::http_call("127.0.0.1", "GET", "/api/local", ""), Ok((200, _)));
+        let updater = updater.clone();
         let spawned = std::thread::Builder::new().name("mesh-kvm-update-health".into()).spawn(move || {
             swap::prove_healthy(&paths, started, &answers, &std::thread::sleep);
+            updater.status().proving = false;
         });
         drop(spawned);
     }

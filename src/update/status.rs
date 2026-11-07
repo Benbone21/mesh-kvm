@@ -34,6 +34,10 @@ pub struct Status {
     pub note: Option<String>,
     /// Too long has gone by with no good check.
     pub stale: bool,
+    /// This is a new version that hasn't proved itself yet, and could still go back.
+    pub proving: bool,
+    /// The failure is the other device's, and this device stayed as it was.
+    pub failed_on_peer: bool,
 }
 
 impl Status {
@@ -61,6 +65,8 @@ impl Status {
             "state": self.state(can_install),
             "note": note,
             "progress": self.progress,
+            "proving": self.proving,
+            "failed_on": self.failed_on_peer.then_some("peer"),
         })
     }
 }
@@ -76,7 +82,10 @@ mod tests {
     #[test]
     fn nothing_new_says_so_with_the_version_running() {
         let json = Status::default().json(v("0.7.0"), true);
-        assert_eq!(json, json!({ "current": "0.7.0", "available": null, "ready": false, "state": "idle", "note": null, "progress": null }));
+        assert_eq!(
+            json,
+            json!({ "current": "0.7.0", "available": null, "ready": false, "state": "idle", "note": null, "progress": null, "proving": false, "failed_on": null })
+        );
     }
 
     #[test]

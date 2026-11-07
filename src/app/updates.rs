@@ -19,6 +19,8 @@ pub struct UpdateStatus {
     pub state: String,
     pub note: Option<String>,
     pub progress: Option<u8>,
+    /// "peer" when the failure was the other device's.
+    pub failed_on: Option<String>,
 }
 
 impl UpdateStatus {
@@ -93,6 +95,8 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
         "updating_peer" => return Some(Banner::step(format!("Updating {name}"))),
         "waiting_for_peer" => return Some(Banner::step("Waiting for it to come back")),
         "installing" => return Some(Banner::step("Updating this device")),
+        // The other device got there in the end, so what's left is for this one to follow.
+        "failed" if failed_peer_has_arrived(snapshot, local) => {}
         "failed" => {
             let text = local.note.clone().unwrap_or_else(|| "The update didn't work.".to_string());
             let button = local.available.as_deref().filter(|_| local.ready).and_then(|v| ready_banner(snapshot, v, &name).button);
@@ -116,6 +120,11 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
     }
     let version = local.available.as_deref().filter(|_| local.ready)?;
     Some(ready_banner(snapshot, version, &name))
+}
+
+fn failed_peer_has_arrived(snapshot: &Snapshot, local: &UpdateStatus) -> bool {
+    let arrived = snapshot.peer.as_ref().is_some_and(|p| Some(p.version.as_str()) == local.available.as_deref());
+    local.failed_on.as_deref() == Some("peer") && local.ready && arrived
 }
 
 /// Offering a version this device has ready, which depends on the other device.
@@ -306,6 +315,22 @@ mod tests {
         assert_eq!(banner.button, Some(UpdateButton::Both));
         here.ready = false;
         assert_eq!(update_banner(&snapshot(here, None)).unwrap().button, None, "nothing left to try");
+    }
+
+    #[test]
+    fn a_failure_that_was_the_other_devices_clears_once_it_turns_up_on_the_version() {
+        let mut here = status("failed", Some("0.7.1"), true);
+        here.note = Some("SACBOOKPRO didn't come back on version 0.7.1 within 5 minutes.".into());
+        here.failed_on = Some("peer".into());
+        let mut late = snapshot(here.clone(), Some(Some(status("idle", None, false))));
+        late.peer.as_mut().unwrap().version = "0.7.1".into();
+        let banner = update_banner(&late).unwrap();
+        assert!(!banner.failed);
+        assert_eq!(banner.button, Some(UpdateButton::ThisDevice));
+        assert!(update_banner(&snapshot(here.clone(), Some(Some(ready())))).unwrap().failed, "still on the old version");
+        here.failed_on = None;
+        late.local.as_mut().unwrap().update = Some(here);
+        assert!(update_banner(&late).unwrap().failed, "this device's own failure stays");
     }
 
     #[test]

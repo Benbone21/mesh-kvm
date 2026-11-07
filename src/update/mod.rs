@@ -15,7 +15,7 @@ pub mod trust;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use both::{Devices, PeerLook, Step};
+use both::{Asked, Devices, PeerLook, Step};
 use check::Check;
 use ed25519_dalek::VerifyingKey;
 use fetch::{Server, Source};
@@ -37,8 +37,14 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const TRIAL_WAIT: Duration = Duration::from_secs(2 * 60);
 const TRIAL_LOOK: Duration = Duration::from_millis(500);
 
+/// The shortest gap between updates the other device can ask for.
+const PEER_INSTALL_GAP: Duration = Duration::from_secs(60);
+
 const NOTHING_READY: &str = r#"{"ok":false,"error":"No update is ready on this device."}"#;
 const ALREADY_UPDATING: &str = r#"{"ok":false,"error":"An update is already running."}"#;
+const TURNED_DOWN: &str = r#"{"ok":false,"error":"That version was turned down on this device."}"#;
+const STILL_PROVING: &str = r#"{"ok":false,"error":"This version is still proving itself."}"#;
+const TOO_SOON: &str = r#"{"ok":false,"error":"The other device asked very recently. Try again in a minute."}"#;
 const ONLY_FROM_HERE: &str = r#"{"ok":false,"error":"Updating both devices can only be started from this device."}"#;
 
 /// Keeps a line for the log. Tests have no business in the real one.
@@ -84,6 +90,8 @@ pub struct Updater {
     /// Only one update at a time.
     busy: AtomicBool,
     wake: Mutex<Option<Sender<()>>>,
+    /// When the other device last started an update here.
+    peer_installed_at: Mutex<Option<Instant>>,
 }
 
 impl Updater {
@@ -95,7 +103,7 @@ impl Updater {
         trial_running: Box<dyn Fn() -> bool + Send + Sync>,
         peer: Arc<dyn PeerLink>,
     ) -> Self {
-        Self { status: Mutex::default(), store, key, running, installer, trial_running, peer, busy: AtomicBool::new(false), wake: Mutex::default() }
+        Self { status: Mutex::default(), store, key, running, installer, trial_running, peer, busy: AtomicBool::new(false), wake: Mutex::default(), peer_installed_at: Mutex::default() }
     }
 
     fn status(&self) -> MutexGuard<'_, Status> {
@@ -110,7 +118,7 @@ impl Updater {
             running: self.running,
             status: &self.status,
             file_name,
-            fetch_file: self.installer.can_install(),
+            installed_copy: self.installer.can_install(),
             gaps: &check::RETRY_GAPS,
         }
     }
@@ -120,7 +128,9 @@ impl Updater {
         let installer = self.installer.clone();
         let file_name = move |version| installer.file_name(version);
         let check = self.check(source, &file_name);
-        self.store.remove_installed(self.running);
+        if self.installer.can_install() {
+            self.store.remove_installed(self.running);
+        }
         check.look_on_disk();
         let mut wait = FIRST_CHECK;
         loop {
@@ -157,12 +167,30 @@ impl Updater {
         if !status.ready || !self.installer.can_install() {
             return Err(NOTHING_READY);
         }
+        if status.available.is_some_and(|version| self.store.is_rejected(version)) {
+            return Err(TURNED_DOWN);
+        }
+        if status.proving {
+            return Err(STILL_PROVING);
+        }
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(ALREADY_UPDATING);
         }
         status.stage = first;
         status.note = None;
+        status.failed_on_peer = false;
         Ok(())
+    }
+
+    /// True if the other device may start an update now, which counts as it doing so. A rollback
+    /// or a failed install shouldn't turn into a loop run from over there.
+    fn peer_may_install(&self, now: Instant) -> bool {
+        let mut last = self.peer_installed_at.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| now.saturating_duration_since(at) < PEER_INSTALL_GAP) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     fn fail(&self, note: String) {
@@ -207,23 +235,44 @@ impl Updater {
         self.status().stage = Stage::Installing;
         let version = self.newest().ok_or("No update is ready on this device.")?;
         let ready = self.store.verify(self.key.as_ref(), self.running, version, &self.file_for(version));
-        let ready = ready.map_err(|why: Rejected| {
+        self.installer.install(&ready.map_err(|why| self.after_bad_look(version, why))?)
+    }
+
+    /// A download that was fine and no longer is. One damaged on disk is fetched again, and only
+    /// something wrong with the release itself counts against it.
+    fn after_bad_look(&self, version: Version, why: Rejected) -> String {
+        if !why.is_about_the_release() {
+            return why.to_string();
+        }
+        let damaged = matches!(why, Rejected::WrongHash | Rejected::WrongSize);
+        if damaged {
+            self.store.remove_download(version, &self.file_for(version));
+        } else {
             self.store.reject(version);
-            let mut status = self.status();
-            status.ready = false;
-            status.available = None;
-            why.to_string()
-        })?;
-        self.installer.install(&ready)
+        }
+        let mut status = self.status();
+        status.ready = false;
+        status.available = None;
+        drop(status);
+        if damaged {
+            self.check_now();
+            return "The download was damaged, so it's being fetched again.".to_string();
+        }
+        why.to_string()
     }
 
     /// The whole of "Update both devices".
     fn update_both_now(&self) {
         let Some(target) = self.newest() else { return self.fail("No update is ready on this device.".to_string()) };
-        let done = self.wait_for_trial().and_then(|()| both::update_peer_first(self, target));
-        match done {
+        if let Err(note) = self.wait_for_trial() {
+            return self.fail(note);
+        }
+        match both::update_peer_first(self, target) {
             Ok(()) => self.install_here(),
-            Err(note) => self.fail(note),
+            Err(note) => {
+                self.status().failed_on_peer = true;
+                self.fail(note);
+            }
         }
     }
 
@@ -243,6 +292,7 @@ impl Updater {
         };
         match action {
             "check_update" => Some(self.check_now()),
+            "install_update" if !from_app_here && !self.peer_may_install(Instant::now()) => Some(TOO_SOON.to_string()),
             "install_update" => Some(start(Stage::Installing, Self::install_here)),
             "update_both" if !from_app_here => Some(ONLY_FROM_HERE.to_string()),
             "update_both" => Some(start(Stage::UpdatingPeer, Self::update_both_now)),
@@ -256,7 +306,7 @@ impl Devices for Updater {
         self.peer.look()
     }
 
-    fn ask_peer_to_install(&self) -> Result<(), String> {
+    fn ask_peer_to_install(&self) -> Asked {
         self.peer.install()
     }
 
@@ -353,11 +403,11 @@ mod tests {
     impl PeerLink for FakePeer {
         fn look(&self) -> Option<PeerLook> {
             let asked = *self.asked.lock().unwrap() > 0;
-            Some(PeerLook { name: "Laptop".into(), version: Some(v(if asked { "0.7.0" } else { "0.6.1" })), failed: None })
+            Some(PeerLook { name: "Laptop".into(), version: Some(v(if asked { "0.7.0" } else { "0.6.1" })), ..Default::default() })
         }
-        fn install(&self) -> Result<(), String> {
+        fn install(&self) -> Asked {
             *self.asked.lock().unwrap() += 1;
-            Ok(())
+            Asked::Accepted
         }
     }
 
@@ -431,7 +481,20 @@ mod tests {
         assert!(installer.installed.lock().unwrap().is_empty());
         let status = updater.status().clone();
         assert_eq!((status.stage, status.ready), (Stage::Failed, false));
-        assert!(status.note.unwrap().contains("doesn't match"));
+        assert!(status.note.unwrap().contains("fetched again"));
+        assert!(!updater.store.is_rejected(v("0.7.0")), "one bad file doesn't cost the version");
+        assert!(!updater.store.version_dir(v("0.7.0")).join(FILE).exists());
+    }
+
+    #[test]
+    fn a_file_that_can_not_be_read_for_a_moment_costs_nothing() {
+        let (updater, installer, _) = updater("unreadable", FakeInstaller::default(), no_trial());
+        fs::remove_file(updater.store.version_dir(v("0.7.0")).join(FILE)).unwrap();
+        updater.answer("install_update", false);
+        settle(&updater, &installer);
+        assert_eq!(updater.status().stage, Stage::Failed);
+        assert!(!updater.store.is_rejected(v("0.7.0")));
+        assert!(updater.status().ready, "the next look sorts it out");
     }
 
     #[test]
@@ -441,7 +504,7 @@ mod tests {
         settle(&updater, &installer);
         settle_stage(&updater, Stage::Failed);
         assert_eq!(updater.status().note.as_deref(), Some("apt said no."));
-        assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
+        assert_eq!(updater.answer("install_update", true).unwrap(), crate::settings::OK_RESPONSE);
     }
 
     fn settle_stage(updater: &Updater, stage: Stage) {
@@ -458,7 +521,7 @@ mod tests {
     fn a_second_update_can_not_start_during_the_first() {
         let (updater, _, _) = updater("twice", FakeInstaller::default(), Box::new(|| true));
         assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
-        assert_eq!(updater.answer("install_update", false).unwrap(), ALREADY_UPDATING);
+        assert_eq!(updater.answer("install_update", true).unwrap(), ALREADY_UPDATING);
         assert_eq!(updater.answer("update_both", true).unwrap(), ALREADY_UPDATING);
     }
 
@@ -506,6 +569,60 @@ mod tests {
         // The action has no way to name a file or a version: `answer` only ever sees its name.
         let (updater, _, _) = updater("names", FakeInstaller::default(), no_trial());
         assert_eq!(updater.answer("set_something_else", true), None);
+    }
+
+    #[test]
+    fn a_version_rolled_back_can_not_be_asked_for_again() {
+        let (updater, installer, _) = updater("rolled-back", FakeInstaller::default(), no_trial());
+        updater.store.reject(v("0.7.0"));
+        assert_eq!(updater.answer("install_update", false).unwrap(), TURNED_DOWN);
+        assert_eq!(updater.answer("install_update", true).unwrap(), TURNED_DOWN);
+        assert!(installer.installed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nothing_new_installs_while_this_version_is_still_proving_itself() {
+        let (updater, installer, _) = updater("proving", FakeInstaller::default(), no_trial());
+        updater.status().proving = true;
+        assert_eq!(updater.answer("install_update", false).unwrap(), STILL_PROVING);
+        assert!(installer.installed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_peer_can_only_ask_so_often_and_the_app_here_is_not_held_back() {
+        let (updater, _, _) = updater("rate", FakeInstaller { fails: Some("No.".into()), ..Default::default() }, no_trial());
+        let now = Instant::now();
+        assert!(updater.peer_may_install(now));
+        assert!(!updater.peer_may_install(now + Duration::from_secs(59)));
+        assert!(updater.peer_may_install(now + PEER_INSTALL_GAP));
+    }
+
+    #[test]
+    fn a_second_request_from_the_peer_is_refused_with_a_reason() {
+        let (updater, installer, _) = updater("rate-real", FakeInstaller { fails: Some("No.".into()), ..Default::default() }, no_trial());
+        assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
+        settle(&updater, &installer);
+        settle_stage(&updater, Stage::Failed);
+        assert_eq!(updater.answer("install_update", false).unwrap(), TOO_SOON);
+        assert_eq!(updater.answer("install_update", true).unwrap(), crate::settings::OK_RESPONSE, "the person here can try again");
+    }
+
+    #[test]
+    fn a_peer_that_failed_is_marked_as_the_one_that_failed() {
+        struct Refuses;
+        impl PeerLink for Refuses {
+            fn look(&self) -> Option<PeerLook> {
+                Some(PeerLook { name: "Laptop".into(), version: Some(v("0.6.1")), ..Default::default() })
+            }
+            fn install(&self) -> Asked {
+                Asked::Refused("No.".into())
+            }
+        }
+        let (updater, _, _) = updater("peer-fail", FakeInstaller::default(), no_trial());
+        let updater = Arc::new(Updater { peer: Arc::new(Refuses), ..Arc::into_inner(updater).unwrap() });
+        updater.answer("update_both", true);
+        settle_stage(&updater, Stage::Failed);
+        assert_eq!(updater.json()["failed_on"], "peer");
     }
 
     #[test]

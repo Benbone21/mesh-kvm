@@ -154,7 +154,8 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
 
     if let Some(rest) = req.path.strip_prefix("/api/peer") {
         let target = if rest.is_empty() { "/" } else { rest };
-        match http_call(peer_ip, &req.method, target, &req.body) {
+        let call = if req.body.contains("install_update") { http_call_patient } else { http_call };
+        match call(peer_ip, &req.method, target, &req.body) {
             Ok((status, body)) => {
                 let st = if status == 200 { "200 OK".to_string() } else { format!("{} Peer", status) };
                 respond(&mut stream, &st, "application/json", &body)
@@ -196,6 +197,11 @@ pub fn http_call(host: &str, method: &str, path: &str, body: &str) -> Result<(u1
     http_call_port(host, UI_PORT, method, path, body)
 }
 
+/// `http_call` for a request that matters enough to wait out a slow link.
+pub fn http_call_patient(host: &str, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+    http_call_within(host, UI_PORT, method, path, body, Duration::from_secs(3), Duration::from_secs(10))
+}
+
 /// `http_call` to a port other than the Studio's.
 pub fn http_call_port(
     host: &str,
@@ -204,12 +210,24 @@ pub fn http_call_port(
     path: &str,
     body: &str,
 ) -> Result<(u16, String), String> {
+    http_call_within(host, port, method, path, body, Duration::from_millis(350), Duration::from_millis(1200))
+}
+
+fn http_call_within(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    connect: Duration,
+    read: Duration,
+) -> Result<(u16, String), String> {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| format!("bad peer address: {}", e))?;
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(350))
+    let mut s = TcpStream::connect_timeout(&addr, connect)
         .map_err(|e| format!("peer unreachable: {}", e))?;
-    let _ = s.set_read_timeout(Some(Duration::from_millis(1200)));
+    let _ = s.set_read_timeout(Some(read));
     let _ = s.set_write_timeout(Some(Duration::from_millis(600)));
     let req = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
