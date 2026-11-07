@@ -51,6 +51,7 @@ snow = { version = "0.10", default-features = false, features = [
     "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom",
 ] }
 spake2 = "0.4"
+getrandom = "0.2"
 ```
 
 These features leave out `ring` and AES, so all of it is pure Rust. A throwaway build
@@ -103,6 +104,17 @@ Frames are a big-endian `u16` length and then the bytes.
 3. The showing device checks message 3, saves the pairing, sends an encrypted `ok`, and
    closes. The entering device saves on reading `ok`.
 
+The PSK only comes in at message 3, so message 2 hands the showing device's public key and
+name to whoever connected, before the code is checked. The same goes for the entering device's
+public key in message 3, though its name is behind the PSK. Both are kept, as a public key is no
+secret and proves nothing without its private key, a device name says little more, and each is
+encrypted to the other end's ephemeral key, so only the one on the connection gets it, not anyone
+listening. Moving them behind the code would mean a different pattern, for nothing security rests on.
+
+A connection from any other address is closed unread and doesn't touch the code, and the entering
+device takes a close before any reply to mean this, and says to check the address saved on the
+other device.
+
 The first connection that starts the exchange uses up the code, whether or not it
 succeeds, and 24853 closes. An attacker therefore gets one guess in a million per
 code, and the person sees that the code failed. If the `ok` is lost, one device is
@@ -131,7 +143,9 @@ in sorted order, shown as `4F2A-91C3`. It is the same on both devices, and is on
 to check by eye. Security doesn't rest on it.
 
 Unpairing removes `peer` on this device and tells the other device over the control
-channel if it can. If it can't, the other device's handshakes are simply refused.
+channel if it can. If it can't, the other device's handshakes are simply refused. A device
+that has finished a new pairing refuses that message until it has restarted, as its channels
+still trust the old peer until then.
 
 ## UDP channels
 
@@ -206,7 +220,10 @@ Rules:
 6. A device whose current session is 10 minutes old starts a new handshake and keeps
    using the old one until the new one is confirmed.
 7. A session is dropped at 1 hour, so keys can't outlive a failing rotation for long.
-8. Handshake 1 is answered at most 10 times a second, as each one costs key operations.
+8. At most 200 handshake 1s a second reach the key operations, junk included, as each one costs
+   those. At most 50 valid ones a second are answered, counted only once one has checked out, so
+   that junk from the peer's address can't use up real answers. A flood past 200 a second can still
+   hold off real handshakes, which is the flooding the threat model leaves out.
 9. A device able to initiate that has sealed something since it last opened anything
    authenticated, and has heard nothing authenticated for 3 seconds, starts a handshake at
    rule 1's pace, keeping current until the new one is confirmed. The 3 seconds also count from
@@ -294,7 +311,8 @@ ciphertext, with up to 65519 bytes of plaintext each.
   the code must not be.
 - `POST /api/local/action` gains `pair_show`, `pair_enter` with the code, `pair_cancel`, and
   `unpair`. All are refused from `Peer`.
-- `/api/local` gains `secure: "unpaired" | "connecting" | "encrypted"` and `old_peer`.
+- `/api/local` gains `secure: "unpaired" | "connecting" | "encrypted"` and `old_peer`. `secure`
+  reports the input channel only: audio and TCP make their own sessions, and can be behind it.
 
 The existing `paired` field means a peer address is set. It stays as it is for now, and the
 app rebuild can rename it.
@@ -322,7 +340,7 @@ If only one device is updated:
 
 - The new device drops the old one's plaintext. A `MKVM` or `MKAU` packet from the peer's
   address sets `old_peer` for 10 seconds, and the app says to update it. This could be
-  forged, and only shows a note.
+  forged, and only shows a note, which an encrypted link with the peer online doesn't show.
 - The old device drops the new device's packets, as they don't start with its magic.
 
 To roll back, reinstall 0.6.1 on both. It ignores `pairing.json`, and traffic is plaintext

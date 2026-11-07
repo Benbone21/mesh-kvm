@@ -1042,7 +1042,7 @@ fn send_text_to(target_addr: SocketAddr, text: &str, copied_at: Instant) -> Sent
     let _ = stream.set_read_wait(Some(answer_wait(text.len() as u64)));
     match written {
         Ok(()) => read_answer(&mut stream),
-        // It may have closed on seeing a stamp it can't read, and an answer tells the two apart.
+        // It may have answered and closed before the write failed, and an answer says more.
         Err(e) => match read_answer(&mut stream) {
             Sent::Unreachable(_) => Sent::Unreachable(e),
             sent => sent,

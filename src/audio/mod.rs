@@ -544,6 +544,7 @@ mod tests {
 
     #[test]
     fn a_handshake_is_answered_at_its_own_source_and_moves_nothing() {
+        let _figures = figures_to_myself();
         let far = Far::new();
         let (sender, channel) = paired_channels();
         let mut receiver = far.receiver(&channel);

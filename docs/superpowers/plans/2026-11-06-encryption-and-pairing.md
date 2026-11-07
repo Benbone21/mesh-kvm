@@ -354,7 +354,7 @@ Tests drive two channels through a test helper `Wire` that passes `tick` and `Re
 
 Measured by Task 13 against tag `v0.6.1`, on one desktop, with the release test binaries and `tests/netem_link.py`. The test's clock truncates to milliseconds, which takes the same 0.5 ms or so off both builds, so differences mean more than absolute values.
 
-**Seal and open together, on Linux:** 2.46 µs at 40 bytes, 2.49 µs at 160, 3.79 µs at 1400.
+**Seal and open together, on Linux:** 2.46 µs at 40 bytes, 2.49 µs at 160, 3.79 µs at 1400. Seal and open weren't measured again under Wine, so Task 3's figure stands for it.
 
 **Median delivery, in ms, three interleaved runs each:**
 

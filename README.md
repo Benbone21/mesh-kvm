@@ -4,7 +4,7 @@ mesh-kvm shares one mouse and keyboard between a Debian desktop and a Windows la
 
 The two devices are equal. Each one is both client and host, each keeps its own copy of the layout, and you can arrange screens and switch devices from either one. A Mac version is planned, but there is no Mac build yet.
 
-Both devices run the same version. Update them together: a Debian build and a laptop build from different versions may not understand each other's packets.
+Both devices have to run the same version, so update them together. A device on a version from before encryption shares nothing with this one, and each works alone until both are updated and paired.
 
 Everything between the two devices is encrypted. They pair once with a 6-digit code, and after that a device that merely has the right IP address gets nothing.
 
@@ -35,7 +35,9 @@ The devices share nothing until they're paired. You do this once. It needs mesh-
 2. On the other device, choose Pair, then Enter a code here, and type the code. Use that device's own keyboard, as the devices can't share one until they're paired.
 3. Both devices show the same fingerprint under Settings, such as `4F2A-91C3`, and the link comes up.
 
-A wrong code can't be tried again: show a new one. TCP port 24853 is open only while a code is showing, and accepts only the other device if its address is known. A firewall on either device has to allow it for that long, as well as the usual UDP 24850 and 24851 and TCP 24852.
+A wrong code can't be tried again: show a new one. TCP port 24853 is open only while a code is showing. If the device showing the code has the other device's address saved, it accepts only that address. With no address saved it accepts any address for that 2-minute, one-try window, so someone else on the network could take the try, with one guess in a million per code. If the wrong address is saved, the device entering the code says so, and the code stays good.
+
+Only the device showing the code needs its firewall to let 24853 in, for that long. Both need the usual UDP 24850 and 24851 and TCP 24852.
 
 Without a window, `mesh-kvm --pair-show` and `mesh-kvm --pair <code>` do the same through the running service.
 

@@ -456,6 +456,8 @@ def stranger_run(a, b, stranger, sniffer, first, second):
     check("the sniffer lost nothing", dropped == 0, str(dropped))
     udp, others = udp_frames(capture, DEVICE_A)
     answers = [(port, data[:8].hex()) for port, data in udp if port not in (INPUT_PORT, AUDIO_PORT) or data[:1] not in (bytes([HANDSHAKE_1]), bytes([DATA_PACKET]))]
+    sent = sum(1 for _, d in udp if d[:1] in (bytes([HANDSHAKE_1]), bytes([DATA_PACKET])))
+    check("A was sending all along, so the silence below comes from the stranger's side", sent > 0, str(sent))
     check("the capture shows no answer over UDP", not answers, str(answers[:3]))
     check("no handshake was answered", not any(data[:1] == bytes([HANDSHAKE_2]) for _, data in udp))
     check("no TCP payload left A", not any(protocol == 6 and length > 0 for protocol, length in others), str([o for o in others if o[1]][:3]))
