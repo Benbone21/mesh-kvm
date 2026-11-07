@@ -192,7 +192,7 @@ fn attempt(
     let deadline = (Instant::now() + READ_LIMIT).min(until);
     let mut ex = Exchange { tcp, raw: Vec::new(), deadline };
     let read = |what: &str, e: io::Error| {
-        if e.kind() == io::ErrorKind::TimedOut && Instant::now() >= until {
+        if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) && Instant::now() >= until {
             PairError::Expired
         } else {
             failed(what, e)
@@ -265,7 +265,6 @@ pub fn enter(code: &str, me: &Pairing, my_name: &str, target: SocketAddr) -> Res
 mod tests {
     use super::*;
     use crate::secure::keys::Pairing;
-    use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -352,13 +351,46 @@ mod tests {
         assert!(t.join().unwrap().is_ok());
     }
 
-    #[test]
-    fn a_stranger_that_sends_junk_uses_up_the_code_without_panic() {
+    /// Plays the entering side by hand up to `stage` (0 junk first, 1 junk as message 1, 3 junk as message 3).
+    fn junk_at(stage: u8) -> Result<(PeerKey, IpAddr), PairError> {
         let (l, addr) = listener();
         let t = thread::spawn(move || show("123456", &Pairing::fresh(), "Desk", l, None, soon(10)));
-        let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(&[0xff; 300]).unwrap();
-        assert!(matches!(t.join().unwrap(), Err(PairError::Failed(_))));
+        let mut ex = Exchange { tcp: TcpStream::connect(addr).unwrap(), raw: Vec::new(), deadline: soon(5) };
+        if stage == 0 {
+            ex.send(&[1, 2, 3]).unwrap();
+        } else {
+            let (spake, mine) = spake_pair("123456", false);
+            ex.send(&mine).unwrap();
+            let theirs = ex.recv().unwrap();
+            let mut noise = start(&Pairing::fresh(), false, &theirs, &mine, spake).unwrap();
+            let mut buf = vec![0u8; 65535];
+            if stage == 1 {
+                ex.send(&[9, 9, 9]).unwrap();
+            } else {
+                let n = noise.write_message(&[], &mut buf).unwrap();
+                ex.send(&buf[..n]).unwrap();
+                ex.recv().unwrap();
+                ex.send(&[7; 80]).unwrap();
+            }
+        }
+        t.join().unwrap()
+    }
+
+    #[test]
+    fn a_stranger_that_sends_junk_uses_up_the_code_without_panic() {
+        let started = Instant::now();
+        assert!(matches!(junk_at(0), Err(PairError::Failed(_))));
+        assert!(matches!(junk_at(1), Err(PairError::Failed(_))));
+        assert!(matches!(junk_at(3), Err(PairError::WrongCode)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_silent_connection_past_the_deadline_expires() {
+        let (l, addr) = listener();
+        let t = thread::spawn(move || show("123456", &Pairing::fresh(), "Desk", l, None, soon(1)));
+        let _quiet = TcpStream::connect(addr).unwrap();
+        assert!(matches!(t.join().unwrap(), Err(PairError::Expired)));
     }
 
     #[test]
