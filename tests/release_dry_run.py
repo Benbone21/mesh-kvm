@@ -123,8 +123,8 @@ def refusals(tree):
     refuses("the latest version again is refused", tree.dry(latest=tree.version), "isn't newer")
     refuses("an older version than the latest is refused", tree.dry(latest="99.0.0"), "isn't newer")
 
-    tree.git("tag", f"v{tree.version}")
-    refuses("a tag that exists is refused", tree.dry(), "already exists")
+    tree.git("tag", f"v{tree.version}", "HEAD~1")
+    refuses("a tag on another commit is refused", tree.dry(), "another commit")
     tree.git("tag", "-d", f"v{tree.version}")
 
     empty = tree.notes.with_name("empty.md")
@@ -152,8 +152,14 @@ def whole_dry_run(tree):
     for name, entry in manifest["files"].items():
         data = (dist / name).read_bytes()
         check(f"{name} matches its size and hash", entry == {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}, entry)
-        check(f"{name} holds the release key", tree.public.encode() in data or name.endswith(".deb"))
-        check(f"{name} has no test hooks", b"MESH_KVM_TEST" not in data or name.endswith(".deb"))
+    programs = {"mesh-kvm-windows-x86_64.exe": (dist / "mesh-kvm-windows-x86_64.exe").read_bytes()}
+    for path in ["./usr/bin/mesh-kvm", "./usr/lib/mesh-kvm/apply-update"]:
+        unpack = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", str(dist / deb_name)], stdout=subprocess.PIPE)
+        programs[path] = subprocess.run(["tar", "-xO", path], stdin=unpack.stdout, capture_output=True, check=True).stdout
+        unpack.wait()
+    for name, data in programs.items():
+        check(f"{name} holds the release key", tree.public.encode() in data)
+        check(f"{name} has no test hooks", b"MESH_KVM_TEST" not in data)
 
     listing = subprocess.run(["dpkg-deb", "-c", str(dist / deb_name)], capture_output=True, text=True, check=True).stdout
     lines = {line.split()[-1]: line.split()[0] for line in listing.splitlines()}
@@ -167,10 +173,69 @@ def whole_dry_run(tree):
     check("the .deb has the version", f"Version: {version}" in fields, fields)
 
     out = result.stdout
-    check("the release would be full and latest", "gh release create" in out and "--latest" in out and "--verify-tag" in out, out[-600:])
-    check("it would tag and push the tag", f"git tag -a v{version}" in out and f"git push origin v{version}" in out, out[-600:])
+    steps = [out.find(step) for step in (f"git tag -a v{version}", "gh release create", f"git push origin v{version}", "gh release edit")]
+    check("it tags, uploads a draft, pushes the tag and publishes, in that order", -1 not in steps and steps == sorted(steps), out[-900:])
+    check("the upload is a draft", "--draft --title" in out, out[-900:])
+    check("the release ends up full and latest", "--draft=false --latest --verify-tag" in out, out[-900:])
     check("all four files would be uploaded", all(n in out for n in ["release.json.sig", deb_name, "mesh-kvm-windows-x86_64.exe"]), out[-600:])
     check("the notes come from the file given", str(tree.notes) in out, out[-600:])
+
+
+def built_wrongly(tree):
+    """What was built is changed under the script, with `cargo` doing nothing, so that each check
+    on what's about to ship is the only thing that could catch it."""
+    cargo = tree.bin / "cargo"
+    cargo.write_text("#!/bin/sh\nexit 0\n")
+    cargo.chmod(0o755)
+    exe = tree.target / "release/mesh-kvm"
+    helper = tree.target / "release/apply-update"
+    windows = tree.target / "x86_64-pc-windows-gnu/release/mesh-kvm.exe"
+    key = tree.public.encode()
+    version = tree.version.encode()
+
+    def with_change(name, path, change, says):
+        saved = path.with_name(path.name + ".saved")
+        shutil.copy2(path, saved)
+        path.unlink()
+        path.write_bytes(change(saved.read_bytes()))
+        path.chmod(0o755)
+        refuses(name, tree.dry(timeout=120), says)
+        saved.replace(path)
+
+    hooked = lambda data: data + b"MESH_KVM_TEST_RELEASE_KEY"
+    keyless = lambda data: data.replace(key, b"0" * len(key))
+    with_change("a test-hooks Debian program in the .deb is refused", exe, hooked, "test hooks")
+    with_change("a test-hooks helper in the .deb is refused", helper, hooked, "test hooks")
+    with_change("a test-hooks Windows exe is refused", windows, hooked, "test hooks")
+    with_change("a Debian program with no key is refused", exe, keyless, "doesn't hold the release key")
+    with_change("a helper with no key is refused", helper, keyless, "doesn't hold the release key")
+    with_change("a Windows exe with no key is refused", windows, keyless, "doesn't hold the release key")
+    with_change("a Windows exe of another version is refused", windows, lambda d: d.replace(b"mesh-kvm/" + version, b"mesh-kvm/9.9.9"), "isn't version")
+
+    # A stand-in that does everything the real one does but say its version.
+    real = exe.with_name("mesh-kvm.real")
+    shutil.copy2(exe, real)
+    script = f"#!/bin/sh\n# {tree.public}\n[ \"$1\" = --version ] && {{ echo 'mesh-kvm 9.9.9'; exit 0; }}\nexec {real} \"$@\"\n".encode()
+    with_change("a program that says another version is refused", exe, lambda _: script, "not version")
+    real.unlink()
+
+    dpkg_deb = tree.bin / "dpkg-deb"
+    for field, value, says in [("Package", "something-else", "isn't the mesh-kvm package"), ("Version", "9.9.9", "isn't version")]:
+        dpkg_deb.write_text(f"#!/bin/sh\n[ \"$1\" = -f ] && [ \"$3\" = {field} ] && {{ echo {value}; exit 0; }}\nexec /usr/bin/dpkg-deb \"$@\"\n")
+        dpkg_deb.chmod(0o755)
+        refuses(f"a .deb with the wrong {field} is refused", tree.dry(timeout=120), says)
+    dpkg_deb.unlink()
+
+    result = tree.dry(timeout=120)
+    check("with everything back, it passes again", result.returncode == 0, result.stderr[-400:])
+
+    # A run that failed after the tag: run again, it carries on from the tag on this commit.
+    tree.git("tag", f"v{tree.version}")
+    result = tree.dry(timeout=120)
+    check("a tag on this commit doesn't stop a second run", result.returncode == 0, result.stderr[-400:])
+    check("the second run doesn't tag again", "git tag -a" not in result.stdout and "gh release create" in result.stdout, result.stdout[-500:])
+    tree.git("tag", "-d", f"v{tree.version}")
+    cargo.unlink()
 
 
 def nothing_escaped(tree):
@@ -185,6 +250,7 @@ if __name__ == "__main__":
     tree = Tree(pathlib.Path(sys.argv[1]).resolve())
     refusals(tree)
     whole_dry_run(tree)
+    built_wrongly(tree)
     nothing_escaped(tree)
     print("ALL PASS" if failures == 0 else f"{failures} FAILED")
     sys.exit(1 if failures else 0)
