@@ -86,7 +86,7 @@ fn limit(tcp: &TcpStream, deadline: Option<Instant>) -> io::Result<()> {
 }
 
 /// One whole frame's body. Bytes read so far stay in `raw` if this fails, a timeout included.
-fn read_frame(tcp: &mut TcpStream, raw: &mut Vec<u8>, deadline: Option<Instant>) -> io::Result<Vec<u8>> {
+pub(super) fn read_frame(tcp: &mut TcpStream, raw: &mut Vec<u8>, deadline: Option<Instant>) -> io::Result<Vec<u8>> {
     loop {
         if let Some(head) = raw.get(..LEN_PREFIX) {
             let len = u16::from_be_bytes([head[0], head[1]]) as usize;
@@ -107,7 +107,7 @@ fn read_frame(tcp: &mut TcpStream, raw: &mut Vec<u8>, deadline: Option<Instant>)
     }
 }
 
-fn write_frame(tcp: &mut TcpStream, body: &[u8], deadline: Option<Instant>) -> io::Result<()> {
+pub(super) fn write_frame(tcp: &mut TcpStream, body: &[u8], deadline: Option<Instant>) -> io::Result<()> {
     let len = u16::try_from(body.len()).map_err(|_| bad("frame too long"))?;
     let mut out = Vec::with_capacity(LEN_PREFIX + body.len());
     out.extend_from_slice(&len.to_be_bytes());
