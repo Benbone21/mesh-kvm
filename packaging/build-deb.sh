@@ -1,28 +1,35 @@
 #!/bin/sh
-# Builds target/deb/mesh-kvm_<version>_amd64.deb from target/release/mesh-kvm.
+# Builds <target>/deb/mesh-kvm_<version>_amd64.deb from <target>/release, where <target> is
+# $CARGO_TARGET_DIR if that's set and target otherwise.
 set -eu
 cd "$(dirname "$0")/.."
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-exe=target/release/mesh-kvm
-out=target/deb
+target=${CARGO_TARGET_DIR:-target}
+exe=$target/release/mesh-kvm
+out=$target/deb
 root=$out/root
 rm -rf "$out"
-mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/systemd/user" "$root/usr/lib/udev/rules.d" \
+mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/mesh-kvm" "$root/usr/lib/systemd/user" "$root/usr/lib/udev/rules.d" \
     "$root/usr/share/applications" "$root/etc/xdg/autostart" \
+    "$root/usr/share/polkit-1/actions" "$root/usr/share/polkit-1/rules.d" \
     "$root/usr/share/icons/hicolor/32x32/apps" "$root/usr/share/doc/mesh-kvm"
 
 install -m 755 "$exe" "$root/usr/bin/mesh-kvm"
+install -m 755 "$target/release/apply-update" "$root/usr/lib/mesh-kvm/apply-update"
+install -m 644 packaging/deb/io.github.benbone21.mesh-kvm.apply-update.policy "$root/usr/share/polkit-1/actions/"
+install -m 644 packaging/deb/50-mesh-kvm-update.rules "$root/usr/share/polkit-1/rules.d/"
 install -m 644 packaging/deb/mesh-kvm.service "$root/usr/lib/systemd/user/"
 install -m 644 99-mesh-kvm-uinput.rules "$root/usr/lib/udev/rules.d/"
-install -m 755 packaging/deb/postinst packaging/deb/prerm "$root/DEBIAN/"
+install -m 755 packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm "$root/DEBIAN/"
 install -m 644 README.md "$root/usr/share/doc/mesh-kvm/"
 install -m 644 third_party/opus/COPYING "$root/usr/share/doc/mesh-kvm/opus-COPYING"
 
 # The program writes its own launchers and icon; only their paths differ here.
 home=$out/home
 mkdir -p "$home"
-HOME=$PWD/$home "$exe" --install-launchers >/dev/null
+home=$(realpath "$home")
+HOME=$home "$exe" --install-launchers >/dev/null
 sed "s|^Exec=.*mesh-kvm |Exec=/usr/bin/mesh-kvm |" "$home/.local/share/applications/mesh-kvm.desktop" \
     >"$root/usr/share/applications/mesh-kvm.desktop"
 sed "s|^Exec=.*mesh-kvm |Exec=/usr/bin/mesh-kvm |" "$home/.config/autostart/mesh-kvm-tray.desktop" \
@@ -41,7 +48,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: bread <jj1nfz2nb@mozmail.com>
 Installed-Size: $size
-Depends: libc6 (>= 2.39), libgcc-s1, pipewire-bin, wireplumber, x11-xserver-utils, libkscreen-bin, qdbus-qt6, dbus-bin, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6
+Depends: libc6 (>= 2.39), libgcc-s1, pipewire-bin, wireplumber, x11-xserver-utils, libkscreen-bin, qdbus-qt6, dbus-bin, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6, pkexec, polkitd
 Recommends: libgl1
 Description: Share one mouse, keyboard, clipboard and audio between devices
  mesh-kvm moves the pointer between a Debian desktop and a Windows laptop

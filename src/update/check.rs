@@ -166,6 +166,7 @@ impl Check<'_> {
                 let mut status = self.status();
                 status.available = Some(version);
                 status.ready = true;
+                status.note = None;
             }
             Err(why) => self.turn_down(version, why),
         }
@@ -304,6 +305,18 @@ mod tests {
         let before = world.requests();
         world.look(&[]);
         assert_eq!(world.requests(), before + 1, "that version is left alone");
+    }
+
+    #[test]
+    fn a_good_release_after_a_bad_one_clears_the_note() {
+        let world = World::new("recovers");
+        let json = manifest_json("0.7.0", FILE, b"x");
+        world.publish_as("0.7.0", json.clone(), sign(&signing_key(2), &json), b"x");
+        world.look(&[]);
+        assert!(world.status().note.is_some());
+        world.publish("0.7.1", b"fixed");
+        world.look(&[]);
+        assert_eq!((world.status().ready, world.status().note), (true, None));
     }
 
     #[test]
