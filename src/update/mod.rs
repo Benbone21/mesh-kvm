@@ -21,7 +21,7 @@ use ed25519_dalek::VerifyingKey;
 use fetch::{Server, Source};
 use peer::{PeerApi, PeerLink};
 use serde_json::Value;
-use status::{Stage, Status, STALE_AFTER};
+use status::{Preflight, Stage, Status, STALE_AFTER};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -64,6 +64,14 @@ pub trait Installer: Send + Sync {
     /// Installs `ready`. `Err` is worded for the person to read. A success ends this process, so
     /// `Ok` only comes back from a test.
     fn install(&self, ready: &Ready) -> Result<(), String>;
+    /// Whether an install would be let through, without installing anything.
+    fn preflight(&self) -> Preflight {
+        Preflight::Allowed
+    }
+    /// The command that installs `ready` by hand, if that's a thing here.
+    fn by_hand(&self, _ready: &Ready) -> Option<String> {
+        None
+    }
 }
 
 fn installer() -> Arc<dyn Installer> {
@@ -131,7 +139,7 @@ impl Updater {
         if self.installer.can_install() {
             self.store.remove_installed(self.running);
         }
-        check.look_on_disk();
+        self.look_at_permission(check.look_on_disk().as_ref());
         let mut wait = FIRST_CHECK;
         loop {
             match wake.recv_timeout(wait) {
@@ -139,10 +147,22 @@ impl Updater {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             check.run();
+            self.look_at_permission(check.look_on_disk().as_ref());
             self.note_if_late(now_seconds());
             wait = CHECK_EVERY;
             while wake.try_recv().is_ok() {}
         }
+    }
+
+    /// Finds out early whether this device will let the ready download install, so the app can
+    /// say so before anyone clicks.
+    fn look_at_permission(&self, ready: Option<&Ready>) {
+        let can = self.installer.can_install();
+        let preflight = ready.filter(|_| can).map(|_| self.installer.preflight());
+        let by_hand = ready.filter(|_| can).and_then(|ready| self.installer.by_hand(ready));
+        let mut status = self.status();
+        status.preflight = preflight;
+        status.by_hand = by_hand;
     }
 
     fn note_if_late(&self, now: u64) {
@@ -278,7 +298,8 @@ impl Updater {
 
     /// Answers an action this module owns, or `None` for one it doesn't. The action names no file
     /// or version: all anyone can ask for is the download that has already passed its checks.
-    fn answer(self: &Arc<Self>, action: &str, from_app_here: bool) -> Option<String> {
+    fn answer(self: &Arc<Self>, request: &Value, from_app_here: bool) -> Option<String> {
+        let action = request["action"].as_str()?;
         let start = |first: Stage, work: fn(&Self)| {
             if let Err(refused) = self.claim(first) {
                 return refused.to_string();
@@ -357,8 +378,8 @@ pub fn status_json() -> Value {
 }
 
 /// See `Updater::answer`.
-pub fn handle_action(action: &str, from_app_here: bool) -> Option<String> {
-    UPDATER.get()?.answer(action, from_app_here)
+pub fn handle_action(request: &Value, from_app_here: bool) -> Option<String> {
+    UPDATER.get()?.answer(request, from_app_here)
 }
 
 #[cfg(test)]
@@ -366,6 +387,7 @@ mod tests {
     use super::trust::testing::*;
     use super::trust::{MANIFEST_NAME, SIGNATURE_NAME};
     use super::*;
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
 
@@ -380,6 +402,7 @@ mod tests {
         not_installed_copy: bool,
         fails: Option<String>,
         installed: Mutex<Vec<Version>>,
+        files: Mutex<Vec<PathBuf>>,
     }
 
     impl Installer for FakeInstaller {
@@ -391,6 +414,7 @@ mod tests {
         }
         fn install(&self, ready: &Ready) -> Result<(), String> {
             self.installed.lock().unwrap().push(ready.version);
+            self.files.lock().unwrap().push(ready.file.clone());
             self.fails.clone().map_or(Ok(()), Err)
         }
     }
@@ -451,7 +475,7 @@ mod tests {
     #[test]
     fn asking_to_install_installs_the_checked_download() {
         let (updater, installer, _) = updater("install", FakeInstaller::default(), no_trial());
-        assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), crate::settings::OK_RESPONSE);
         settle(&updater, &installer);
         assert_eq!(*installer.installed.lock().unwrap(), vec![v("0.7.0")]);
     }
@@ -460,15 +484,15 @@ mod tests {
     fn with_nothing_ready_there_is_nothing_to_install() {
         let (updater, installer, _) = updater("none-ready", FakeInstaller::default(), no_trial());
         updater.status().ready = false;
-        assert_eq!(updater.answer("install_update", true).unwrap(), NOTHING_READY);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), NOTHING_READY);
         assert!(installer.installed.lock().unwrap().is_empty());
     }
 
     #[test]
     fn a_copy_that_is_not_the_installed_one_never_installs() {
         let (updater, installer, _) = updater("copy", FakeInstaller { not_installed_copy: true, ..Default::default() }, no_trial());
-        assert_eq!(updater.answer("install_update", true).unwrap(), NOTHING_READY);
-        assert_eq!(updater.answer("update_both", true).unwrap(), NOTHING_READY);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), NOTHING_READY);
+        assert_eq!(updater.answer(&json!({ "action": "update_both" }), true).unwrap(), NOTHING_READY);
         assert!(installer.installed.lock().unwrap().is_empty());
     }
 
@@ -476,7 +500,7 @@ mod tests {
     fn a_download_that_changed_since_it_was_checked_is_not_installed() {
         let (updater, installer, _) = updater("changed", FakeInstaller::default(), no_trial());
         fs::write(updater.store.version_dir(v("0.7.0")).join(FILE), b"swapped").unwrap();
-        updater.answer("install_update", false);
+        updater.answer(&json!({ "action": "install_update" }), false);
         settle(&updater, &installer);
         assert!(installer.installed.lock().unwrap().is_empty());
         let status = updater.status().clone();
@@ -490,7 +514,7 @@ mod tests {
     fn a_file_that_can_not_be_read_for_a_moment_costs_nothing() {
         let (updater, installer, _) = updater("unreadable", FakeInstaller::default(), no_trial());
         fs::remove_file(updater.store.version_dir(v("0.7.0")).join(FILE)).unwrap();
-        updater.answer("install_update", false);
+        updater.answer(&json!({ "action": "install_update" }), false);
         settle(&updater, &installer);
         assert_eq!(updater.status().stage, Stage::Failed);
         assert!(!updater.store.is_rejected(v("0.7.0")));
@@ -500,11 +524,11 @@ mod tests {
     #[test]
     fn a_failed_install_says_why_and_can_be_tried_again() {
         let (updater, installer, _) = updater("fails", FakeInstaller { fails: Some("apt said no.".into()), ..Default::default() }, no_trial());
-        updater.answer("install_update", false);
+        updater.answer(&json!({ "action": "install_update" }), false);
         settle(&updater, &installer);
         settle_stage(&updater, Stage::Failed);
         assert_eq!(updater.status().note.as_deref(), Some("apt said no."));
-        assert_eq!(updater.answer("install_update", true).unwrap(), crate::settings::OK_RESPONSE);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), crate::settings::OK_RESPONSE);
     }
 
     fn settle_stage(updater: &Updater, stage: Stage) {
@@ -520,9 +544,9 @@ mod tests {
     #[test]
     fn a_second_update_can_not_start_during_the_first() {
         let (updater, _, _) = updater("twice", FakeInstaller::default(), Box::new(|| true));
-        assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
-        assert_eq!(updater.answer("install_update", true).unwrap(), ALREADY_UPDATING);
-        assert_eq!(updater.answer("update_both", true).unwrap(), ALREADY_UPDATING);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), crate::settings::OK_RESPONSE);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), ALREADY_UPDATING);
+        assert_eq!(updater.answer(&json!({ "action": "update_both" }), true).unwrap(), ALREADY_UPDATING);
     }
 
     #[test]
@@ -530,7 +554,7 @@ mod tests {
         let trial = Arc::new(AtomicBool::new(true));
         let running = trial.clone();
         let (updater, installer, _) = updater("trial", FakeInstaller::default(), Box::new(move || running.load(Ordering::SeqCst)));
-        updater.answer("install_update", false);
+        updater.answer(&json!({ "action": "install_update" }), false);
         settle_stage(&updater, Stage::WaitingForTrial);
         assert!(installer.installed.lock().unwrap().is_empty());
         trial.store(false, Ordering::SeqCst);
@@ -541,7 +565,7 @@ mod tests {
     #[test]
     fn only_the_app_here_can_start_updating_both() {
         let (updater, installer, peer) = updater("both-refused", FakeInstaller::default(), no_trial());
-        assert_eq!(updater.answer("update_both", false).unwrap(), ONLY_FROM_HERE);
+        assert_eq!(updater.answer(&json!({ "action": "update_both" }), false).unwrap(), ONLY_FROM_HERE);
         assert_eq!(*peer.asked.lock().unwrap(), 0);
         assert!(installer.installed.lock().unwrap().is_empty());
     }
@@ -549,7 +573,7 @@ mod tests {
     #[test]
     fn update_both_does_the_other_device_first_and_then_this_one() {
         let (updater, installer, peer) = updater("both", FakeInstaller::default(), no_trial());
-        updater.answer("update_both", true);
+        updater.answer(&json!({ "action": "update_both" }), true);
         for _ in 0..400 {
             if !installer.installed.lock().unwrap().is_empty() {
                 break;
@@ -565,18 +589,59 @@ mod tests {
     }
 
     #[test]
-    fn extra_fields_in_the_request_mean_nothing() {
-        // The action has no way to name a file or a version: `answer` only ever sees its name.
-        let (updater, _, _) = updater("names", FakeInstaller::default(), no_trial());
-        assert_eq!(updater.answer("set_something_else", true), None);
+    fn a_request_can_not_name_a_file_or_a_version() {
+        let (updater, installer, _) = updater("names", FakeInstaller::default(), no_trial());
+        let dir = updater.store.version_dir(v("0.7.0"));
+        let request = json!({ "action": "install_update", "version": "9.9.9", "file": "/etc/shadow", "ready": { "file": "/etc/shadow" } });
+        assert_eq!(updater.answer(&request, false).unwrap(), crate::settings::OK_RESPONSE);
+        settle(&updater, &installer);
+        assert_eq!(*installer.installed.lock().unwrap(), vec![v("0.7.0")]);
+        assert_eq!(*installer.files.lock().unwrap(), vec![dir.join(FILE)]);
+    }
+
+    #[test]
+    fn a_request_that_is_not_for_updates_is_left_alone() {
+        let (updater, _, _) = updater("others", FakeInstaller::default(), no_trial());
+        assert_eq!(updater.answer(&json!({ "action": "set_something_else" }), true), None);
+        assert_eq!(updater.answer(&json!({}), true), None);
+    }
+
+    #[test]
+    fn the_preflight_is_reported_with_a_download_ready_and_not_without() {
+        struct Blocked;
+        impl Installer for Blocked {
+            fn can_install(&self) -> bool {
+                true
+            }
+            fn file_name(&self, _version: Version) -> String {
+                FILE.to_string()
+            }
+            fn install(&self, _ready: &Ready) -> Result<(), String> {
+                Ok(())
+            }
+            fn preflight(&self) -> Preflight {
+                Preflight::Denied
+            }
+            fn by_hand(&self, ready: &Ready) -> Option<String> {
+                Some(format!("sudo apt-get install {}", ready.file.display()))
+            }
+        }
+        let (updater, _, _) = updater("preflight", FakeInstaller::default(), no_trial());
+        let updater = Updater { installer: Arc::new(Blocked), ..Arc::into_inner(updater).unwrap() };
+        let ready = updater.store.verify(updater.key.as_ref(), v("0.6.1"), v("0.7.0"), FILE).unwrap();
+        updater.look_at_permission(Some(&ready));
+        assert_eq!(updater.json()["preflight"], "denied");
+        assert!(updater.json()["by_hand"].as_str().unwrap().ends_with(FILE));
+        updater.look_at_permission(None);
+        assert_eq!(updater.json()["preflight"], Value::Null);
     }
 
     #[test]
     fn a_version_rolled_back_can_not_be_asked_for_again() {
         let (updater, installer, _) = updater("rolled-back", FakeInstaller::default(), no_trial());
         updater.store.reject(v("0.7.0"));
-        assert_eq!(updater.answer("install_update", false).unwrap(), TURNED_DOWN);
-        assert_eq!(updater.answer("install_update", true).unwrap(), TURNED_DOWN);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), TURNED_DOWN);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), TURNED_DOWN);
         assert!(installer.installed.lock().unwrap().is_empty());
     }
 
@@ -584,7 +649,7 @@ mod tests {
     fn nothing_new_installs_while_this_version_is_still_proving_itself() {
         let (updater, installer, _) = updater("proving", FakeInstaller::default(), no_trial());
         updater.status().proving = true;
-        assert_eq!(updater.answer("install_update", false).unwrap(), STILL_PROVING);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), STILL_PROVING);
         assert!(installer.installed.lock().unwrap().is_empty());
     }
 
@@ -600,11 +665,11 @@ mod tests {
     #[test]
     fn a_second_request_from_the_peer_is_refused_with_a_reason() {
         let (updater, installer, _) = updater("rate-real", FakeInstaller { fails: Some("No.".into()), ..Default::default() }, no_trial());
-        assert_eq!(updater.answer("install_update", false).unwrap(), crate::settings::OK_RESPONSE);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), crate::settings::OK_RESPONSE);
         settle(&updater, &installer);
         settle_stage(&updater, Stage::Failed);
-        assert_eq!(updater.answer("install_update", false).unwrap(), TOO_SOON);
-        assert_eq!(updater.answer("install_update", true).unwrap(), crate::settings::OK_RESPONSE, "the person here can try again");
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), false).unwrap(), TOO_SOON);
+        assert_eq!(updater.answer(&json!({ "action": "install_update" }), true).unwrap(), crate::settings::OK_RESPONSE, "the person here can try again");
     }
 
     #[test]
@@ -620,7 +685,7 @@ mod tests {
         }
         let (updater, _, _) = updater("peer-fail", FakeInstaller::default(), no_trial());
         let updater = Arc::new(Updater { peer: Arc::new(Refuses), ..Arc::into_inner(updater).unwrap() });
-        updater.answer("update_both", true);
+        updater.answer(&json!({ "action": "update_both" }), true);
         settle_stage(&updater, Stage::Failed);
         assert_eq!(updater.json()["failed_on"], "peer");
     }

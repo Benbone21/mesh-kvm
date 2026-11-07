@@ -22,6 +22,29 @@ pub enum Stage {
     Failed,
 }
 
+/// Whether this device would let an install go ahead, found out without installing anything.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Only Debian has anything to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preflight {
+    Allowed,
+    /// It would want a password, or has no agent to ask for one.
+    NeedsPassword,
+    Denied,
+    /// It couldn't be found out, which proves nothing either way.
+    Unknown,
+}
+
+impl Preflight {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::NeedsPassword => "needs_password",
+            Self::Denied => "denied",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
     /// The newest version with a good signature, downloaded or not.
@@ -38,6 +61,10 @@ pub struct Status {
     pub proving: bool,
     /// The failure is the other device's, and this device stayed as it was.
     pub failed_on_peer: bool,
+    /// What was last found out about installing here, with a download ready.
+    pub preflight: Option<Preflight>,
+    /// The command that installs the ready download by hand, where there is one.
+    pub by_hand: Option<String>,
 }
 
 impl Status {
@@ -67,6 +94,8 @@ impl Status {
             "progress": self.progress,
             "proving": self.proving,
             "failed_on": self.failed_on_peer.then_some("peer"),
+            "preflight": self.preflight.map(Preflight::name),
+            "by_hand": self.by_hand,
         })
     }
 }
@@ -84,7 +113,7 @@ mod tests {
         let json = Status::default().json(v("0.7.0"), true);
         assert_eq!(
             json,
-            json!({ "current": "0.7.0", "available": null, "ready": false, "state": "idle", "note": null, "progress": null, "proving": false, "failed_on": null })
+            json!({ "current": "0.7.0", "available": null, "ready": false, "state": "idle", "note": null, "progress": null, "proving": false, "failed_on": null, "preflight": null, "by_hand": null })
         );
     }
 
@@ -95,6 +124,13 @@ mod tests {
         assert_eq!((&installed["state"], &installed["ready"], &installed["available"]), (&json!("ready"), &json!(true), &json!("0.7.1")));
         let elsewhere = status.json(v("0.7.0"), false);
         assert_eq!((&elsewhere["state"], &elsewhere["ready"]), (&json!("view_only"), &json!(false)));
+    }
+
+    #[test]
+    fn what_the_preflight_found_is_reported() {
+        let status = Status { preflight: Some(Preflight::NeedsPassword), by_hand: Some("sudo x".into()), ..Default::default() };
+        let json = status.json(v("0.7.0"), true);
+        assert_eq!((&json["preflight"], &json["by_hand"]), (&json!("needs_password"), &json!("sudo x")));
     }
 
     #[test]

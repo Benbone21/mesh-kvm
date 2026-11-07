@@ -21,6 +21,10 @@ pub struct UpdateStatus {
     pub progress: Option<u8>,
     /// "peer" when the failure was the other device's.
     pub failed_on: Option<String>,
+    /// "allowed", "needs_password", "denied" or "unknown".
+    pub preflight: Option<String>,
+    /// The command that installs the ready download by hand.
+    pub by_hand: Option<String>,
 }
 
 impl UpdateStatus {
@@ -31,6 +35,11 @@ impl UpdateStatus {
 
     fn is_ready_with(&self, version: &str) -> bool {
         self.ready && self.available.as_deref() == Some(version)
+    }
+
+    /// True when this device has said it won't let an install go ahead.
+    fn is_blocked(&self) -> bool {
+        matches!(self.preflight.as_deref(), Some("needs_password" | "denied"))
     }
 }
 
@@ -119,6 +128,14 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
         return Some(Banner { text, detail: None, button: None, notes: Some(version.to_string()), failed: false, busy: false });
     }
     let version = local.available.as_deref().filter(|_| local.ready)?;
+    if local.is_blocked() {
+        let why = match local.preflight.as_deref() {
+            Some("denied") => "This device doesn't allow mesh-kvm to install updates.",
+            _ => "This device wants a password before installing, and mesh-kvm can't ask for one.",
+        };
+        let detail = local.by_hand.as_ref().map_or_else(|| why.to_string(), |command| format!("{why} To update by hand, run: {command}"));
+        return Some(Banner::ready(version, detail, None));
+    }
     Some(ready_banner(snapshot, version, &name))
 }
 
@@ -136,6 +153,9 @@ fn ready_banner(snapshot: &Snapshot, version: &str, name: &str) -> Banner {
     let Some(update) = peer.update.as_ref() else {
         return Banner::ready(version, format!("{name} can't update itself. {apart}"), Some(UpdateButton::ThisDevice));
     };
+    if update.is_ready_with(version) && update.is_blocked() {
+        return Banner::ready(version, format!("{name} can't install it by itself. {apart}"), Some(UpdateButton::ThisDevice));
+    }
     if update.is_ready_with(version) {
         return Banner::ready(version, SHARING_DROPS.to_string(), Some(UpdateButton::Both));
     }
@@ -331,6 +351,35 @@ mod tests {
         here.failed_on = None;
         late.local.as_mut().unwrap().update = Some(here);
         assert!(update_banner(&late).unwrap().failed, "this device's own failure stays");
+    }
+
+    #[test]
+    fn a_device_that_would_not_install_says_so_with_the_command_and_no_button() {
+        for (answer, says) in [("needs_password", "wants a password"), ("denied", "doesn't allow")] {
+            let mut here = ready();
+            here.preflight = Some(answer.into());
+            here.by_hand = Some("sudo apt-get install /x.deb".into());
+            let banner = update_banner(&snapshot(here, Some(Some(ready())))).unwrap();
+            assert_eq!(banner.button, None, "{answer}");
+            let detail = banner.detail.unwrap();
+            assert!(detail.contains(says) && detail.ends_with("sudo apt-get install /x.deb"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_preflight_that_found_nothing_out_stops_nothing() {
+        let mut here = ready();
+        here.preflight = Some("unknown".into());
+        assert_eq!(update_banner(&snapshot(here, Some(Some(ready())))).unwrap().button, Some(UpdateButton::Both));
+    }
+
+    #[test]
+    fn an_other_device_that_would_not_install_leaves_this_device_only() {
+        let mut there = ready();
+        there.preflight = Some("denied".into());
+        let banner = update_banner(&snapshot(ready(), Some(Some(there)))).unwrap();
+        assert_eq!(banner.button, Some(UpdateButton::ThisDevice));
+        assert!(banner.detail.unwrap().contains("can't install it by itself"));
     }
 
     #[test]

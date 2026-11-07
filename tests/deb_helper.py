@@ -42,12 +42,11 @@ NEW = "0.7.0"
 
 FAKE_APT = """#!/bin/sh
 # Writes down everything `apply-update` handed it, then does as it's told.
-ls /proc/$$/fd > /mnt/fake/apt-fds
+ls -l /proc/$$/fd > /mnt/fake/apt-fds
 {
     echo "args=$*"
     echo "cwd=$(pwd)"
     echo "umask=$(umask)"
-    echo "fds=$(tr '\\n' ' ' < /mnt/fake/apt-fds)"
     echo "fsize=$(ulimit -Sf)"
     echo "stack=$(ulimit -Ss)"
     echo "session=$(cut -d ' ' -f 6 /proc/$$/stat)"
@@ -352,12 +351,14 @@ def environment(helper, signer):
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGALRM})
         resource.setrlimit(resource.RLIMIT_STACK, (65536, resource.getrlimit(resource.RLIMIT_STACK)[1]))
 
+    passed_pipe = f"pipe:[{os.fstat(write_end).st_ino}]"
     result = run(helper, [NEW], helper_env(signer), pass_fds=[write_end], preexec_fn=set_up)
     os.close(read_end)
     os.close(write_end)
     installed("a caller's open file, umask and folder don't matter", result)
     lines, _ = record()
-    check("no open file reaches apt", set(lines["fds"].split()) <= {"0", "1", "2", "10"}, lines)
+    open_files = pathlib.Path("/mnt/fake/apt-fds").read_text()
+    check("no open file reaches apt", passed_pipe not in open_files, open_files)
     check("apt runs with the normal umask", lines["umask"].lstrip("0") == "22", lines)
     check("apt runs from /", lines["cwd"] == "/", lines)
     check("signals the caller ignored are back to normal", int(lines["sigign"], 16) == 0, lines)

@@ -12,7 +12,7 @@ sending, failure, echo, missing, old, laptop, nomute or wrong. POST {"state": ..
 and GET /fake/requests for the audio actions the app has sent. --link picks how the link looks: good,
 poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/link to change that too.
 --update picks where an update has got to: none, both, offline, peer-downloading, here-downloading, updating-peer,
-waiting-peer, installing, view-only, peer-failed, apt-failed, restored or stale. POST {"state": ...} to
+waiting-peer, installing, view-only, peer-failed, apt-failed, restored, no-polkit or stale. POST {"state": ...} to
 /fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
 --version says what version the service is, which POST {"version": ...} to /fake/version changes, as
 an update would, so the app can be seen starting again.
@@ -205,8 +205,8 @@ def set_audio_state(world, name):
         world.settings["Windows"]["audio"] = audio_idle() | WINDOWS_DEVICES | windows
 
 
-def update_status(state="idle", available="0.7.1", ready=False, note=None, progress=None):
-    return {"current": "0.7.0", "available": available, "ready": ready, "state": state, "note": note, "progress": progress}
+def update_status(state="idle", available="0.7.1", ready=False, note=None, progress=None, **more):
+    return {"current": "0.7.0", "available": available, "ready": ready, "state": state, "note": note, "progress": progress} | more
 
 
 def update_states():
@@ -227,6 +227,7 @@ def update_states():
         "peer-failed": (update_status("failed", ready=True, note="ThinkPad didn't come back on version 0.7.1 within 5 minutes, so this device stayed as it is."), ready),
         "apt-failed": (update_status("failed", ready=True, note="The update failed, and the old version keeps running. E: Sub-process /usr/bin/dpkg returned an error code (1) To go back by hand, run: sudo apt-get install --reinstall --allow-downgrades /var/cache/mesh-kvm/kept/mesh-kvm_0.7.0_amd64.deb"), ready),
         "restored": (update_status("failed", ready=True, note="Version 0.7.1 didn't start properly, so version 0.7.0 was put back."), None),
+        "no-polkit": (update_status("ready", ready=True, preflight="needs_password", by_hand="sudo apt-get install /home/bread/.config/mesh-kvm/updates/0.7.1/mesh-kvm_0.7.1_amd64.deb"), ready),
         "stale": (update_status(available=None, note="mesh-kvm hasn't been able to check for updates for 3 days."), idle),
     }
 

@@ -972,7 +972,7 @@ pub fn studio_handler(
                 if act == "set_audio_device" {
                     return Some(crate::settings::set_audio_device(&val, req.from_app_here));
                 }
-                if let Some(reply) = crate::update::handle_action(act, req.from_app_here) {
+                if let Some(reply) = crate::update::handle_action(&val, req.from_app_here) {
                     return Some(reply);
                 }
                 // These reach the operating system, under the same rule as every other change:
