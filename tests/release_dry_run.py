@@ -54,6 +54,10 @@ class Tree:
         scratch.mkdir(parents=True)
         subprocess.run(["git", "clone", "-q", "--local", str(REPO), str(self.dir)], check=True)
         subprocess.run(["git", "-C", str(self.dir), "remote", "remove", "origin"], check=True)
+        # The version in Cargo.toml has usually been released already, and this is a pretend one.
+        tags = subprocess.run(["git", "-C", str(self.dir), "tag"], capture_output=True, text=True, check=True).stdout.split()
+        if tags:
+            subprocess.run(["git", "-C", str(self.dir), "tag", "-d", *tags], check=True, capture_output=True)
         self.bin.mkdir()
         gh = self.bin / "gh"
         gh.write_text(f"#!/bin/sh\necho \"$@\" >> {self.gh_log}\nexit 1\n")
