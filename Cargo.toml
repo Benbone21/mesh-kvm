@@ -25,6 +25,7 @@ snow = { version = "0.10", default-features = false, features = [
 ] }
 spake2 = "0.4"
 blake2 = "0.10"
+getrandom = "0.2"
 
 [build-dependencies]
 cc = "1"

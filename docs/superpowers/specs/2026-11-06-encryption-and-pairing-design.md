@@ -177,36 +177,69 @@ puts input in order.
 
 ### Sessions
 
-Each channel holds up to three:
+Each channel holds:
 
 - **current:** sends and receives.
 - **previous:** receives only, for 60 seconds after being replaced, so packets in flight
   across a change of keys are not lost.
-- **pending:** receives only, on a responder that has not yet seen data from the initiator.
+- **pending:** up to 4, receive only, oldest dropped: a responder's sessions that have not
+  yet seen data from the initiator.
+
+An initiator also keeps its last 4 outstanding handshakes, oldest dropped, so an answer slower
+than the retries still counts. This covers round trips above 250 ms.
 
 Rules:
 
 1. A device with no current session sends handshake 1 every 250 ms, with up to 50 ms of
    jitter, for 10 seconds, and then once a second.
-2. On a valid handshake 2, the initiator makes the session current and sends two keepalives.
-3. On a valid handshake 1 from the paired key, the responder replaces any pending
-   session, answers, and leaves current alone.
-4. The first data that opens on the pending session makes it current.
-5. A device whose current session is 10 minutes old starts a new handshake and keeps
+2. On a valid handshake 2, the initiator makes the session current, sends two keepalives,
+   and clears its other outstanding handshakes, so a late answer from the same burst is refused.
+3. On a valid handshake 1 from the paired key, the responder adds a pending session, answers,
+   and leaves current alone.
+4. The first data that opens on a pending session makes it current if it was created after
+   current began, and clears the other pending sessions and any outstanding handshakes.
+   Data on an older pending session opens, but that session stays receive-only.
+5. With `Role::Both`, a device with an outstanding handshake that receives a valid handshake 1
+   compares public keys. The lower key ignores it, though it still counts as heard for the
+   one-way note, and lets its own handshake win. The higher key abandons its outstanding
+   handshakes and answers.
+6. A device whose current session is 10 minutes old starts a new handshake and keeps
    using the old one until the new one is confirmed.
-6. A session is dropped at 1 hour, so keys can't outlive a failing rotation for long.
-7. Handshake 1 is answered at most 10 times a second, as each one costs key operations.
+7. A session is dropped at 1 hour, so keys can't outlive a failing rotation for long.
+8. Handshake 1 is answered at most 10 times a second, as each one costs key operations.
+9. A device able to initiate that has sealed something since it last opened anything
+   authenticated, and has heard nothing authenticated for 3 seconds, starts a handshake at
+   rule 1's pace, keeping current until the new one is confirmed. The 3 seconds also count from
+   the first thing sealed after a quiet spell, or that packet would start a needless handshake.
+   Data and handshake 2 count as heard. Handshake 1 doesn't, as a replay is one. A handshake
+   that silence started is abandoned if the peer is heard first.
+10. A device with a current session that has received data and sent nothing for 1 second sends
+    a keepalive from `tick`, to the last source address, which the caller's `send` knows.
+    Keepalives don't trigger this or rule 9, on either side, or two idle devices would keep
+    each other going.
 
-Rule 3 is what makes a replayed handshake 1 harmless: it can only create a pending
-session that nothing can confirm. Input is symmetric, so both devices can initiate at
-once, and both sessions work. Audio's sender always initiates and its receiver always
-answers, so audio is ready before the first sound.
+Handshakes cross all the time: a device with only a pending session has no current one, so rule 1
+has it start its own, and at rotation a responder's session is older than the initiator's by one
+flight of handshake 1, so both reach 10 minutes as the first handshake lands. If each device simply
+took the other's session, each would send on what the other holds as previous, and the link would
+die when that ran out. Rules 4 and 5 keep them on one session, and rule 9 heals whatever those miss.
+
+Rule 3 is what keeps a replayed handshake 1 from touching current: it can only create a pending
+session that nothing can confirm. Replays can evict a real pending session, or make the higher key
+abandon a handshake, and then rule 9 or the next retry repairs it, as it would a lost packet.
+Audio's sender always initiates and its receiver always answers, so audio is ready before the
+first sound. A receiver that restarts can't start a handshake, and rules 9 and 10 are how its sender
+finds out, with or without audio reports.
 
 ### Behaviour on bad Wi-Fi
 
-- A dropout keeps the session, so nothing needs repeating when the link returns.
+- A dropout keeps the session, so nothing needs repeating when the link returns. Sending into
+  it starts handshakes after 3 seconds, and current stays in use until one is confirmed.
 - A restart costs one round trip, retried every 250 ms. At 30% loss each way, about half
-  of tries succeed, so this usually takes under a second.
+  of tries succeed, so this usually takes under a second. Round trips above 250 ms work too,
+  as the last 4 tries are kept on both sides.
+- An audio receiver's restart can't be seen from its end, so it takes up to 3 seconds of
+  silence and then that round trip.
 - Packets that fail any check are dropped silently and never count as link activity:
   `core.route(Event::PeerAlive)` moves after `open`.
 - The hooks on Windows stay safe: `seal` takes no lock held across work, only a brief one
