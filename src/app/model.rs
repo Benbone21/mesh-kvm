@@ -1356,7 +1356,7 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     }
     if snapshot.peer.is_none() {
         return Some(format!(
-            "{other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24880."
+            "{other} is out of reach, so each device is working on its own. Check that mesh-kvm is running on it, and that its firewall allows TCP port 24852."
         ));
     }
     let older = |d: &DeviceStatus| d.is_older() || d.has_no_shared_layout();
@@ -1517,7 +1517,7 @@ mod tests {
         let local: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
         let snap = Snapshot { local: Some(local), ..Default::default() };
         let msg = status_message(&snap).unwrap();
-        assert!(msg.contains("TCP port 24880"), "{msg}");
+        assert!(msg.contains("TCP port 24852"), "{msg}");
         assert!(msg.starts_with("The other device is out of reach"), "{msg}");
     }
 
@@ -2059,7 +2059,7 @@ mod tests {
         snap.peer = None;
         snap.local.as_mut().unwrap().panic_mode = true;
         snap.layout = None;
-        assert!(status_message(&snap).unwrap().contains("TCP port 24880"));
+        assert!(status_message(&snap).unwrap().contains("TCP port 24852"));
     }
 
     #[test]
