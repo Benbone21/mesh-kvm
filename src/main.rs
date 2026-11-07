@@ -358,8 +358,42 @@ fn run_pair_command(cli: &Cli) -> i32 {
         None => serde_json::json!({ "action": "pair_show" }),
     };
     let mut call = |method: &str, path: &str, body: &str| webui::http_call("127.0.0.1", method, path, body);
+    #[cfg(target_os = "windows")]
+    let mut say = windows_output();
+    #[cfg(not(target_os = "windows"))]
     let mut say = |line: &str| println!("{line}");
     pair_through(&mut call, &body.to_string(), cli.pair.is_none(), &mut say, &|| std::thread::sleep(PAIR_POLL_EVERY))
+}
+
+/// Where a Windows build says things: it has no console of its own. Redirected output is left
+/// alone, then the calling terminal is attached, and with neither the lines go in message boxes.
+#[cfg(target_os = "windows")]
+fn windows_output() -> Box<dyn FnMut(&str)> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE};
+    let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if !out.is_null() && out != INVALID_HANDLE_VALUE {
+        return Box::new(|line| println!("{line}"));
+    }
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
+        use std::io::Write;
+        if let Ok(mut console) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            return Box::new(move |line| {
+                let _ = writeln!(console, "{line}");
+            });
+        }
+    }
+    let icon = windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION;
+    // A box waits to be closed. The code's stays up on its own thread while pairing goes on, and
+    // the result is waited on so that it is read before the program ends.
+    Box::new(move |line| {
+        let waiting_for_result = !line.starts_with("Code:") && !line.starts_with("Enter it");
+        let line = line.to_string();
+        let shown = std::thread::spawn(move || show_box(&line, icon));
+        if waiting_for_result {
+            let _ = shown.join();
+        }
+    })
 }
 
 fn said_paired(say: &mut dyn FnMut(&str), status: &serde_json::Value) -> i32 {
