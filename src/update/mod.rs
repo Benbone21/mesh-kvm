@@ -39,6 +39,14 @@ const NOTHING_READY: &str = r#"{"ok":false,"error":"No update is ready on this d
 const ALREADY_UPDATING: &str = r#"{"ok":false,"error":"An update is already running."}"#;
 const ONLY_FROM_HERE: &str = r#"{"ok":false,"error":"Updating both devices can only be started from this device."}"#;
 
+/// Keeps a line for the log. Tests have no business in the real one.
+fn log(note: &str) {
+    #[cfg(not(test))]
+    crate::settings::log_note(note);
+    #[cfg(test)]
+    let _ = note;
+}
+
 /// What installing takes on this operating system.
 pub trait Installer: Send + Sync {
     /// True on the installed copy. Any other copy only says that an update exists.
@@ -191,7 +199,7 @@ impl Updater {
     }
 
     fn fail(&self, note: String) {
-        crate::settings::log_note(&format!("Update failed: {note}"));
+        log(&format!("Update failed: {note}"));
         let mut status = self.status();
         status.stage = Stage::Failed;
         status.note = Some(note);
@@ -320,7 +328,7 @@ pub fn start(peer_ip: String, trial_running: Box<dyn Fn() -> bool + Send + Sync>
         updater.run_checks(&Source::new(Server::github()), &woken);
     });
     if let Err(e) = spawned {
-        crate::settings::log_note(&format!("Couldn't start checking for updates: {e}"));
+        log(&format!("Couldn't start checking for updates: {e}"));
     }
 }
 

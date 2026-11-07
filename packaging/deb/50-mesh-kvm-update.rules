@@ -1,0 +1,9 @@
+// The active local user can install a mesh-kvm update with no password. That's safe only because
+// this one program trusts nothing it's handed: see src/update/apply/main.rs.
+polkit.addRule(function(action, subject) {
+    if (action.id == "io.github.benbone21.mesh-kvm.apply-update" &&
+        action.lookup("program") == "/usr/lib/mesh-kvm/apply-update" &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

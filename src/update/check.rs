@@ -72,7 +72,7 @@ impl Check<'_> {
     /// Puts down a release that didn't pass. An old release isn't worth a word: it's just ignored.
     fn turn_down(&self, version: Version, why: Rejected) {
         self.store.reject(version);
-        crate::settings::log_note(&format!("Update {version} turned down: {why}"));
+        super::log(&format!("Update {version} turned down: {why}"));
         if !matches!(why, Rejected::NotNewer(_)) {
             self.status().note = Some(why.to_string());
         }
