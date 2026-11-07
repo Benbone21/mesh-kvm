@@ -448,7 +448,7 @@ pub fn save_current() {
 
 fn audio_notes(mut notes: Vec<String>) -> Vec<String> {
     if crate::mute::barred() {
-        notes.push("Sound stopped as soon as this output was muted, so it's staying on for now.".to_string());
+        notes.push("Sound keeps stopping just after this output is muted, so it's staying on for now.".to_string());
     }
     notes
 }

@@ -28,13 +28,17 @@ const SLEEP_WAIT: Duration = Duration::from_millis(1500);
 /// Once sound has been going, a silence this long keeps the output muted, so a pause between
 /// tracks doesn't bring it back and take it away again.
 const SILENCE_HOLD: Duration = Duration::from_secs(30);
-/// Sound that stops within this long of the mute may have been stopped by it: some Windows outputs
-/// could give silence to a capture once muted. So this is not yet a settled mute.
+/// Sound that stops within this long of the mute may have been stopped by it, as ordinary Windows
+/// loopback is. So this is not yet a settled mute.
 const SETTLED_AFTER: Duration = Duration::from_secs(5);
 /// How long an unsettled mute waits out a silence. Nobody may be hearing anything, so not long.
 const UNSETTLED_HOLD: Duration = Duration::from_secs(3);
-/// Sound vanishing on a mute this many times running stops the muting for a while.
+/// Sound vanishing on a mute this many times running stops the muting for a while. Muting only
+/// happens with a capture that a mute can't reach, so this is a safety net: what it mostly sees is
+/// short sounds. A capture that really was being silenced would come round every few seconds, so
+/// only ones this close together count.
 const VANISHED_LIMIT: u32 = 2;
+const VANISHED_WITHIN: Duration = Duration::from_secs(30);
 const FIRST_BAR: Duration = Duration::from_secs(30);
 const LONGEST_BAR: Duration = Duration::from_secs(600);
 const FLAG_FILE: &str = "mute-state.json";
@@ -60,7 +64,7 @@ pub fn should_mute(
     setting && sending && peer_online && reaching_peer && !receiving_audio
 }
 
-/// Muting stopped because the sound stopped with it, so the app can say so.
+/// Muting stopped because sound kept stopping just after it, so the app can say so.
 static BARRED: AtomicBool = AtomicBool::new(false);
 
 /// True while muting is off because sound kept vanishing when it was on.
@@ -378,6 +382,7 @@ struct SoundHold {
     since: Option<Instant>,
     last_confirmed: Option<Instant>,
     vanished: u32,
+    last_vanished: Option<Instant>,
     barred_until: Option<Instant>,
     next_bar: Option<Duration>,
 }
@@ -390,13 +395,18 @@ impl SoundHold {
             self.next_bar = None;
             return;
         }
+        if self.last_vanished.is_none_or(|at| now.duration_since(at) >= VANISHED_WITHIN) {
+            self.vanished = 0;
+        }
         self.vanished += 1;
+        self.last_vanished = Some(now);
         if self.vanished >= VANISHED_LIMIT {
             let bar = self.next_bar.unwrap_or(FIRST_BAR);
             self.barred_until = Some(now + bar);
             self.next_bar = Some((bar * 2).min(LONGEST_BAR));
             // One more failure is enough once the bar lifts.
             self.vanished = VANISHED_LIMIT - 1;
+            self.last_vanished = self.barred_until;
         }
     }
 
@@ -1200,6 +1210,40 @@ mod tests {
         assert!(mutes.len() >= 3, "it does try again: {mutes:?}");
         assert!(mutes.len() <= 12, "but it backs off: {mutes:?}");
         assert!(signals.hold.next_bar.is_some());
+    }
+
+    #[test]
+    fn a_healthy_capture_keeps_its_mute_for_as_long_as_the_sound_lasts() {
+        let (mut outputs, flag) = (Outputs::default(), flag("healthy"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..600 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+            assert!(c.backend.is(SPEAKERS) && !signals.hold.barred(t + STEP * second as u32), "{second}");
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1);
+    }
+
+    #[test]
+    fn short_sounds_now_and_then_are_not_taken_for_a_mute_stopping_the_sound() {
+        // A notification every minute: each one mutes and lets go, which is fine.
+        let (mut outputs, flag) = (Outputs::default(), flag("dings"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let mut packets = 0;
+        for second in 0..600u32 {
+            if second % 60 == 0 {
+                packets += 1;
+            }
+            let hearing = second % 60 < 2;
+            let r = Readings { sound_packets: packets, peer_hearing: hearing, ..QUIET_LINK };
+            let now = t + STEP * second;
+            run(&mut c, &mut signals, r, now);
+            assert!(!signals.hold.barred(now), "{second}");
+        }
     }
 
     #[test]
