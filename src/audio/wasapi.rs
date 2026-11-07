@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
@@ -53,6 +53,7 @@ const PROCESS_BUFFER: i64 = 200_000;
 const PROCESS_WAIT_MS: u32 = 100;
 const FIRST_EXCLUSION_RETRY: Duration = Duration::from_secs(5);
 const LONGEST_EXCLUSION_RETRY: Duration = Duration::from_secs(300);
+const EXCLUSION_PROVES_ITSELF: Duration = Duration::from_secs(60);
 const BITS: u16 = 16;
 /// How long a new stream waits for the old one. They notice being stopped every `STREAM_TICK`.
 const LONGEST_STOP_WAIT: Duration = Duration::from_millis(400);
@@ -68,7 +69,7 @@ static WAKE: LazyLock<Signal> = LazyLock::new(Signal::default);
 static RECEIVING: AtomicBool = AtomicBool::new(false);
 /// How process loopback has been getting on.
 static EXCLUSION: Mutex<Exclusion> =
-    Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None });
+    Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None });
 /// The output to play on, with `None` meaning the default.
 static PLAY_DEVICE: Mutex<Option<Pick>> = Mutex::new(None);
 
@@ -501,6 +502,8 @@ struct Exclusion {
     failing: bool,
     next_try: Option<Instant>,
     backoff: Option<Duration>,
+    /// When the capture running now began.
+    started_at: Option<Instant>,
 }
 
 impl Exclusion {
@@ -510,6 +513,7 @@ impl Exclusion {
 
     fn failed(&mut self, error: &ExclusionError, now: Instant) {
         self.failing = true;
+        self.started_at = None;
         if matches!(error, ExclusionError::Unsupported(_)) {
             self.unsupported = true;
             return;
@@ -520,14 +524,24 @@ impl Exclusion {
     }
 
     /// Capture started. If it doesn't last, the wait carries on growing from where it was.
-    fn started(&mut self) {
+    fn started(&mut self, now: Instant) {
         self.failing = false;
+        self.started_at = Some(now);
+    }
+
+    /// A capture that's lasted has shown the trouble is over, so the next one starts from scratch.
+    fn note_running(&mut self, now: Instant) {
+        if self.started_at.is_some_and(|at| now.duration_since(at) >= EXCLUSION_PROVES_ITSELF) {
+            self.backoff = None;
+            self.next_try = None;
+        }
     }
 
     /// It ran until told to stop.
     fn stopped_cleanly(&mut self) {
         self.backoff = None;
         self.next_try = None;
+        self.started_at = None;
     }
 }
 
@@ -621,11 +635,13 @@ fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Res
         client.SetEventHandle(event).map_err(|e| format!("event: {e}"))?;
         let capture: IAudioCaptureClient = client.GetService().map_err(|e| format!("service: {e}"))?;
         client.Start().map_err(|e| format!("start: {e}"))?;
-        exclusion().started();
+        exclusion().started(Instant::now());
         AUDIO_CAPTURE_SURVIVES_MUTE.store(true, Ordering::Relaxed);
         let mut intake = Intake::new(&HUB.output, CHANNELS, RATE);
         while !stop.load(Ordering::SeqCst) {
-            if WaitForSingleObject(event, PROCESS_WAIT_MS) == WAIT_OBJECT_0 && !read_packets(&capture, &mut intake) {
+            // Looked at even when nothing arrives: that's how a client that's gone bad is found out.
+            let _ = WaitForSingleObject(event, PROCESS_WAIT_MS);
+            if !read_packets(&capture, &mut intake) {
                 let _ = client.Stop();
                 return Err("capture stopped".to_string());
             }
@@ -688,33 +704,59 @@ fn also_mute(sent: Option<&str>, default: Option<&str>, play_only: bool) -> Opti
 const METER_FLOOR: f32 = 0.001;
 /// How long an output has to stay silent, with sound elsewhere, to be worth a mention.
 const WRONG_OUTPUT_AFTER: Duration = Duration::from_secs(5);
+const METER_READINGS: u32 = 6;
+const METER_READING_GAP: Duration = Duration::from_millis(25);
 
 /// Notices the output being sent staying silent while Windows is playing somewhere else, which
-/// sends silence for no reason anyone could see.
+/// sends silence for no reason anyone could see. It takes the whole time to say so, and a passing
+/// quiet moment on the default doesn't take it back, so the note can't come and go with the music.
 #[derive(Default)]
 struct WrongOutput {
     since: Option<Instant>,
+    showing: bool,
+    default_heard: Option<Instant>,
 }
 
 impl WrongOutput {
     /// Takes the peak of each lately, or None when there's nothing to compare.
     fn note(&mut self, peaks: Option<(f32, f32)>, now: Instant) -> bool {
-        let wrong = peaks.is_some_and(|(chosen, default)| chosen < METER_FLOOR && default >= METER_FLOOR);
-        if !wrong {
+        let Some((_, default)) = peaks.filter(|(chosen, _)| *chosen < METER_FLOOR) else {
+            *self = Self::default();
+            return false;
+        };
+        let sounding = default >= METER_FLOOR;
+        if sounding {
+            self.default_heard = Some(now);
+        }
+        if self.showing {
+            if self.default_heard.is_none_or(|at| now.duration_since(at) >= WRONG_OUTPUT_AFTER) {
+                *self = Self::default();
+            }
+            return self.showing;
+        }
+        if !sounding {
             self.since = None;
             return false;
         }
-        now.duration_since(*self.since.get_or_insert(now)) >= WRONG_OUTPUT_AFTER
+        self.showing = now.duration_since(*self.since.get_or_insert(now)) >= WRONG_OUTPUT_AFTER;
+        self.showing
     }
 }
 
-/// How loud an output has been since this was last asked. Windows keeps this up itself, so it
-/// costs a read, and it happens with the device lists, not with the audio.
+/// How loud an output is. This reads Windows's meter, away from the audio. A reading covers only the
+/// device period before it, about 10 ms, so it takes a few to catch anything but a steady sound. The
+/// meter comes before the endpoint's volume and mute, which is what's wanted here: it says what's
+/// playing, whatever can be heard.
 fn peak_of(all: &IMMDeviceEnumerator, id: &str) -> Option<f32> {
     let id: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let meter: IAudioMeterInformation = all.GetDevice(PCWSTR(id.as_ptr())).ok()?.Activate(CLSCTX_ALL, None).ok()?;
-        meter.GetPeakValue().ok()
+        let mut peak = meter.GetPeakValue().ok()?;
+        for _ in 1..METER_READINGS {
+            std::thread::sleep(METER_READING_GAP);
+            peak = peak.max(meter.GetPeakValue().ok()?);
+        }
+        Some(peak)
     }
 }
 
@@ -722,6 +764,12 @@ fn read_peaks(sent: Option<&str>, default: Option<&str>) -> Option<(f32, f32)> {
     let (sent, default) = (sent?, default?);
     let all = enumerator().ok()?;
     Some((peak_of(&all, sent)?, peak_of(&all, default)?))
+}
+
+/// Whether the meters can say anything. With exclusion, every output is sent. And sound received here
+/// and played on the default is our own, so it doesn't show that Windows is playing there.
+fn worth_comparing(excluding: bool, sent: Option<&str>, default: Option<&str>, play: Option<&str>, receiving: bool) -> bool {
+    !excluding && sent.is_some() && sent != default && !(receiving && play == default)
 }
 
 fn wrong_output_note(sent: Option<&str>, default: Option<&str>, lists: &Lists) -> Option<String> {
@@ -761,7 +809,8 @@ fn engine() {
         let sent_id = sent.id(lists.default_output.as_ref());
         let play_id = play.id(lists.default_output.as_ref());
         let (may_try, failing) = {
-            let exclusion = exclusion();
+            let mut exclusion = exclusion();
+            exclusion.note_running(now);
             (exclusion.may_try(now), exclusion.failing)
         };
         let receiving = RECEIVING.load(Ordering::SeqCst);
@@ -784,7 +833,7 @@ fn engine() {
 
         // Exclusion takes every output, so which one is chosen only matters without it.
         let default_id = lists.default_output.as_deref();
-        let compare = !excluding && sent_id.as_deref() != default_id;
+        let compare = worth_comparing(excluding, sent_id.as_deref(), default_id, play_id.as_deref(), receiving);
         let peaks = if compare { read_peaks(sent_id.as_deref(), default_id) } else { None };
         let on_wrong_output = wrong_output.note(peaks, now);
         let notes = [
@@ -1023,6 +1072,56 @@ mod tests {
     }
 
     #[test]
+    fn the_note_doesn_t_come_and_go_with_the_music() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        for second in 0..=5 {
+            watch.note(Some((0.0, 0.3)), at(second));
+        }
+        assert!(watch.note(Some((0.0, 0.0)), at(6)), "a quiet moment on the default");
+        assert!(watch.note(Some((0.0, 0.3)), at(7)));
+        assert!(watch.note(Some((0.0, 0.0)), at(11)));
+        assert!(!watch.note(Some((0.0, 0.0)), at(12)), "five seconds of nothing ends it");
+    }
+
+    #[test]
+    fn a_gap_on_the_default_while_counting_starts_the_count_again() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        watch.note(Some((0.0, 0.3)), at(0));
+        watch.note(Some((0.0, 0.0)), at(3));
+        assert!(!watch.note(Some((0.0, 0.3)), at(5)), "it has to hold for the whole time");
+        assert!(watch.note(Some((0.0, 0.3)), at(10)));
+    }
+
+    #[test]
+    fn our_own_sound_on_the_default_is_not_windows_playing_there() {
+        let (a, b, c) = (Some("headset"), Some("speakers"), Some("hdmi"));
+        assert!(worth_comparing(false, a, b, b, false));
+        assert!(!worth_comparing(false, a, b, b, true), "receiving, and playing on the default");
+        assert!(worth_comparing(false, a, b, c, true), "receiving, but playing elsewhere");
+        assert!(!worth_comparing(true, a, b, b, false), "exclusion takes every output");
+        assert!(!worth_comparing(false, b, b, b, false), "the chosen output is the default");
+        assert!(!worth_comparing(false, None, b, b, false), "nothing is being sent");
+    }
+
+    #[test]
+    fn a_good_run_clears_the_wait_and_a_short_one_doesn_t() {
+        let (mut state, t) = (fresh_exclusion(), Instant::now());
+        for _ in 0..5 {
+            state.failed(&ExclusionError::Failed("x".into()), t);
+        }
+        let grown = state.backoff;
+        state.started(t);
+        state.note_running(t + EXCLUSION_PROVES_ITSELF - Duration::from_secs(1));
+        assert_eq!(state.backoff, grown, "it has yet to prove itself");
+        state.note_running(t + EXCLUSION_PROVES_ITSELF);
+        assert_eq!(state.backoff, None);
+        state.failed(&ExclusionError::Failed("x".into()), t);
+        assert_eq!(state.backoff, Some(FIRST_EXCLUSION_RETRY * 2), "starting from the first wait again");
+    }
+
+    #[test]
     fn the_note_names_both_outputs() {
         let lists = Lists {
             outputs: vec![device("{1}", "Steam Streaming Speakers"), device("{2}", "Speakers (Realtek(R) Audio)")],
@@ -1053,7 +1152,7 @@ mod tests {
     }
 
     fn fresh_exclusion() -> Exclusion {
-        Exclusion { unsupported: false, failing: false, next_try: None, backoff: None }
+        Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None }
     }
 
     #[test]
@@ -1079,7 +1178,7 @@ mod tests {
     fn exclusion_coming_back_clears_the_warning_and_the_wait_after_a_good_run() {
         let (mut state, t) = (fresh_exclusion(), Instant::now());
         state.failed(&ExclusionError::Failed("x".into()), t);
-        state.started();
+        state.started(t);
         assert!(!state.failing);
         assert!(state.backoff.is_some(), "it has yet to prove itself");
         state.stopped_cleanly();
