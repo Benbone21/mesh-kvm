@@ -911,12 +911,12 @@ const PASSES_PER_MONITOR_CHECK: u32 = 10;
 
 /// Keeps this device's copy of the layout current, off the input thread: monitor detection can
 /// hang, and the other device can take a while to answer.
-pub fn start_sync(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>, peer_ip: String) {
+pub fn start_sync(state: Arc<RwLock<SharedSpatialState>>, platform: Arc<dyn Platform>) {
     let spawned = std::thread::Builder::new().name("mesh-kvm-layout-sync".to_string()).spawn(move || {
         let mut passes = 0u32;
         loop {
             std::thread::sleep(SYNC_EVERY);
-            pull_layout(&state, || match crate::webui::http_call(&peer_ip, "GET", "/api/state", "") {
+            pull_layout(&state, || match crate::secure::control::peer_call("GET", "/api/state", "") {
                 Ok((200, body)) => Some(body),
                 _ => None,
             });
@@ -1662,9 +1662,9 @@ mod tests {
         let handler = studio_handler(state, platform, displays.clone());
         let id = displays.status_json()["change"]["id"].clone();
         let body = serde_json::json!({ "action": "keep_display_mode", "change_id": id }).to_string();
-        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "192.168.8.241");
+        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
         assert!(handler(&from_peer).unwrap().contains("only be kept on the device"));
-        let here = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "127.0.0.1");
+        let here = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Local);
         assert_eq!(handler(&here).unwrap(), crate::settings::OK_RESPONSE);
     }
 
@@ -1674,7 +1674,7 @@ mod tests {
         let platform: Arc<dyn Platform> = Arc::new(NoScreens);
         let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change());
         let body = serde_json::json!({ "action": "set_audio_device", "role": "input", "id": "mic" }).to_string();
-        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, "192.168.8.241");
+        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
         assert!(handler(&from_peer).unwrap().contains("device it belongs to"));
     }
 

@@ -357,7 +357,7 @@ fn run_service(cli: Cli) {
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
     let displays = spatial::start_displays(state.clone(), platform.clone());
     let handler = spatial::studio_handler(state.clone(), platform.clone(), displays);
-    if let Err(e) = webui::start(listener, peer_ip.clone(), handler) {
+    if let Err(e) = webui::start(listener, peer_ip.clone(), handler.clone()) {
         fail(&e);
     }
 
@@ -370,7 +370,7 @@ fn run_service(cli: Cli) {
         restart();
     };
 
-    spatial::start_sync(state.clone(), platform, peer_ip.clone());
+    spatial::start_sync(state.clone(), platform);
 
     // Phase 2: Bidirectional Audio Bus (UDP 24851)
     let audio_target_str = cli
@@ -397,10 +397,11 @@ fn run_service(cli: Cli) {
         Some(pairing) => {
             match peer_ip.parse::<std::net::IpAddr>() {
                 Ok(ip) => {
-                    let incoming: secure::control::Incoming = std::sync::Arc::new(|stream, purpose| match purpose {
+                    secure::control::set_target(std::net::SocketAddr::new(ip, cli.clipboard_port));
+                    let api = handler.clone();
+                    let incoming: secure::control::Incoming = std::sync::Arc::new(move |stream, purpose| match purpose {
                         secure::stream::Purpose::Clipboard => clipboard::take_incoming(stream),
-                        // The peer API is wired in with its handlers.
-                        secure::stream::Purpose::Api => {}
+                        secure::stream::Purpose::Api => secure::control::serve_api(stream, api.clone()),
                     });
                     if let Err(e) = secure::control::start(cli.clipboard_port, ip, pairing.clone(), incoming) {
                         eprintln!("[Control] Warning: failed to start the control listener: {}", e);

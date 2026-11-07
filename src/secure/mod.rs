@@ -1,6 +1,5 @@
-// Input, audio, the control listener and the clipboard are wired in. `pairing`, saving and
-// fingerprints in `keys`, and the API side of `control` aren't yet, and the tasks that finish
-// them remove this.
+// Input, audio, the control listener, the clipboard and the peer API are wired in. `pairing`,
+// saving and fingerprints in `keys` aren't yet, and the tasks that finish them remove this.
 #![allow(dead_code)]
 
 pub mod control;

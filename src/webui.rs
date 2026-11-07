@@ -1,15 +1,18 @@
-//! Cross-platform local API server (TCP 24880), used by the native app.
+//! Cross-platform local API server (TCP 24880, loopback only), used by the native app.
 //!
 //! Every node (Debian + Windows) exposes the following. Any other path, including `/`, is a 404:
 //!   GET  /api/local              -> this node's live status (node-specific handler)
 //!   POST /api/local/action       -> this node's local actions (audio, autostart, focus, panic...)
-//!   ANY  /api/peer/<path>        -> transparently proxied to http://<peer_ip>:24880/<path>
+//!   ANY  /api/peer/<path>        -> sent to the other device over the encrypted control connection
 //!   GET  /api/state              -> this node's copy of the layout, and live telemetry
 //!   POST /api/layout             -> an edit to the layout
 //!   POST /api/action             -> layout-wide actions (focus, release, game lock...)
+//!
+//! The other device asks for the same paths over `secure::control`, with the exception of
+//! `/api/peer`. This port is never open to the network.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,50 +20,78 @@ pub const UI_PORT: u16 = 24880;
 /// What `local_ip_toward` gives when there is no route to the address.
 pub const UNKNOWN_ADDRESS: &str = "unknown";
 const REFUSED: &str = r#"{"ok":false,"error":"Changes can only come from this device or the other device."}"#;
+const NOT_FOUND: &str = r#"{"error":"not found"}"#;
+
+/// Where a request came from. `Peer` is made only by `HttpRequest::from_peer`, for requests that
+/// arrived over the encrypted control connection: nothing a request says can make one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A program on this device.
+    Local,
+    /// A web page in a browser, which sends an `Origin` header, or anything else that isn't a
+    /// program on this device.
+    Browser,
+    /// The paired device, authenticated by its key.
+    Peer,
+}
 
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub body: String,
-    /// From a program on this device, and not from a web page in a browser here, which would
-    /// send an `Origin` header.
+    /// From a program on this device, and not from a web page in a browser here.
     pub from_app_here: bool,
-    /// Where the connection came from.
-    source: Option<IpAddr>,
-    /// A browser sent this, for some web page.
-    from_browser: bool,
+    source: Source,
+    /// The `Host` header, if one was sent.
+    host: Option<String>,
 }
 
 impl HttpRequest {
-    /// True if this request may change anything. Reading is open, as the layout sync needs it.
-    /// Changes come from a program on this device, or from the other device, whose proxy passes
-    /// on what its own app asks for. A web page never qualifies, wherever its browser runs.
-    fn may_change_state(&self, peer_ip: &str) -> bool {
-        let trusted = self.source.is_some_and(|ip| ip.is_loopback() || ip.to_string() == peer_ip);
-        self.method == "GET" || (trusted && !self.from_browser)
+    /// A request that came in on the control connection, from the paired device.
+    pub fn from_peer(method: &str, path: &str, body: &str) -> Self {
+        Self::new(method, path, body, Source::Peer, None)
     }
 
-    /// True if this request may go on to the other device. Unlike the other device's own proxy
-    /// asking here, it would arrive there looking like it came from this device, so a change has
-    /// to come from the app on this one.
+    fn new(method: &str, path: &str, body: &str, source: Source, host: Option<String>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            body: body.into(),
+            from_app_here: source == Source::Local,
+            source,
+            host,
+        }
+    }
+
+    /// True if this request may change anything. Reading is open, as the layout sync needs it.
+    /// Changes come from a program on this device, or from the other device. A web page never
+    /// qualifies, wherever its browser runs.
+    fn may_change_state(&self) -> bool {
+        self.method == "GET" || self.source != Source::Browser
+    }
+
+    /// True if this request may go on to the other device. A change has to come from the app on
+    /// this one, and the other device's own requests never go back to it.
     fn may_use_proxy(&self) -> bool {
-        self.method == "GET" || self.from_app_here
+        self.source != Source::Peer && (self.method == "GET" || self.from_app_here)
+    }
+
+    /// A page on another name reaching this port by way of DNS rebinding sends its own name.
+    fn host_allowed(&self) -> bool {
+        let Some(host) = &self.host else { return true };
+        let name = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host.as_str(),
+        };
+        name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
     }
 }
 
 #[cfg(test)]
 impl HttpRequest {
     /// A request as it would arrive from `source`.
-    pub fn for_test(method: &str, path: &str, body: &str, source: &str) -> Self {
-        let source: IpAddr = source.parse().unwrap();
-        Self {
-            method: method.into(),
-            path: path.into(),
-            body: body.into(),
-            from_app_here: source.is_loopback(),
-            source: Some(source),
-            from_browser: false,
-        }
+    pub fn for_test(method: &str, path: &str, body: &str, source: Source) -> Self {
+        Self::new(method, path, body, source, None)
     }
 }
 
@@ -70,13 +101,19 @@ pub type Handler = Arc<dyn Fn(&HttpRequest) -> Option<String> + Send + Sync>;
 /// Takes the API port. This comes before anything else in the service: it is what keeps a second
 /// one from starting.
 pub fn bind() -> Result<TcpListener, std::io::Error> {
-    TcpListener::bind(("0.0.0.0", UI_PORT))
+    bind_on(UI_PORT)
+}
+
+/// Loopback only: the other device comes in by the control connection.
+fn bind_on(port: u16) -> Result<TcpListener, std::io::Error> {
+    TcpListener::bind(("127.0.0.1", port))
 }
 
 pub fn start(listener: TcpListener, peer_ip: String, handler: Handler) -> Result<(), String> {
     println!(
-        "[Studio] mesh-kvm API listening on port {} (peer proxy -> {}:{})",
-        UI_PORT, peer_ip, UI_PORT
+        "[Studio] mesh-kvm API listening on 127.0.0.1:{} (peer: {})",
+        UI_PORT,
+        if peer_ip.is_empty() { "none yet" } else { &peer_ip }
     );
     std::thread::Builder::new()
         .name("mesh-kvm-studio".to_string())
@@ -123,6 +160,7 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     let content_len = header("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(4 * 1024 * 1024);
     let from_browser = header("origin").is_some();
     let from_here = stream.peer_addr().is_ok_and(|a| a.ip().is_loopback());
+    let host = header("host").map(str::to_string);
     while data.len() < header_end + content_len {
         let n = stream.read(&mut buf).ok()?;
         if n == 0 {
@@ -132,12 +170,26 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
     }
     let body_end = (header_end + content_len).min(data.len());
     let body = String::from_utf8_lossy(&data[header_end..body_end]).to_string();
-    let source = stream.peer_addr().ok().map(|a| a.ip());
-    Some(HttpRequest { method, path, body, from_app_here: from_here && !from_browser, source, from_browser })
+    let source = if from_here && !from_browser { Source::Local } else { Source::Browser };
+    Some(HttpRequest::new(&method, &path, &body, source, host))
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// What the handler makes of a request that isn't for the other device, as a status and a body.
+/// The control connection answers through this too, so both sides draw the same lines.
+pub fn answer(req: &HttpRequest, handler: &Handler) -> (u16, String) {
+    if !req.may_change_state() || (req.path.starts_with("/api/peer") && !req.may_use_proxy()) {
+        return (403, REFUSED.to_string());
+    }
+    if req.path.starts_with("/api/") && !req.path.starts_with("/api/peer") {
+        if let Some(body) = handler(req) {
+            return (200, body);
+        }
+    }
+    (404, NOT_FOUND.to_string())
 }
 
 fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
@@ -146,15 +198,18 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         None => return,
     };
 
-    let proxied = req.path.starts_with("/api/peer");
-    if !req.may_change_state(peer_ip) || (proxied && !req.may_use_proxy()) {
-        respond(&mut stream, "403 Forbidden", "application/json", REFUSED);
+    if !req.host_allowed() {
+        respond(&mut stream, "403 Forbidden", "application/json", r#"{"error":"wrong host"}"#);
         return;
     }
 
     if let Some(rest) = req.path.strip_prefix("/api/peer") {
+        if !req.may_change_state() || !req.may_use_proxy() {
+            respond(&mut stream, "403 Forbidden", "application/json", REFUSED);
+            return;
+        }
         let target = if rest.is_empty() { "/" } else { rest };
-        match http_call(peer_ip, &req.method, target, &req.body) {
+        match crate::secure::control::peer_call(&req.method, target, &req.body) {
             Ok((status, body)) => {
                 let st = if status == 200 { "200 OK".to_string() } else { format!("{} Peer", status) };
                 respond(&mut stream, &st, "application/json", &body)
@@ -169,15 +224,13 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         return;
     }
 
-    if req.path.starts_with("/api/") {
-        match handler(&req) {
-            Some(body) => respond(&mut stream, "200 OK", "application/json", &body),
-            None => respond(&mut stream, "404 Not Found", "application/json", r#"{"error":"not found"}"#),
-        }
-        return;
-    }
-
-    respond(&mut stream, "404 Not Found", "application/json", r#"{"error":"not found"}"#);
+    let (status, body) = answer(&req, &handler);
+    let line = match status {
+        200 => "200 OK",
+        403 => "403 Forbidden",
+        _ => "404 Not Found",
+    };
+    respond(&mut stream, line, "application/json", &body);
 }
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
@@ -191,7 +244,7 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = stream.write_all(body.as_bytes());
 }
 
-/// Minimal blocking HTTP/1.1 client used for the peer proxy.
+/// Minimal blocking HTTP/1.1 client for this device's own port.
 pub fn http_call(host: &str, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     http_call_port(host, UI_PORT, method, path, body)
 }
@@ -263,66 +316,83 @@ pub fn hostname() -> String {
 mod tests {
     use super::*;
 
-    /// Sends one raw request to a server on `address`, and returns what the handler was told.
-    fn seen_by_handler(address: &str, connect_to: &str, request: &'static str) -> bool {
-        let listener = TcpListener::bind((address, 0)).unwrap();
+    /// Sends one raw request to a server on loopback, and returns what the handler would be told.
+    fn seen_by_handler(request: &'static str) -> HttpRequest {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let client = TcpStream::connect((connect_to, port)).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
-        let mut client = client;
         client.write_all(request.as_bytes()).unwrap();
-        read_request(&mut stream).unwrap().from_app_here
+        read_request(&mut stream).unwrap()
     }
 
     #[test]
     fn only_a_program_on_this_device_counts_as_the_app_here() {
         let plain = "POST /api/local/action HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         let browser = "POST /api/local/action HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n";
-        assert!(seen_by_handler("127.0.0.1", "127.0.0.1", plain));
-        assert!(!seen_by_handler("127.0.0.1", "127.0.0.1", browser));
-    }
-
-    const PEER: &str = "192.168.8.210";
-
-    fn request(method: &str, path: &str, source: &str, origin: bool) -> HttpRequest {
-        let source: IpAddr = source.parse().unwrap();
-        HttpRequest {
-            method: method.into(),
-            path: path.into(),
-            body: String::new(),
-            from_app_here: source.is_loopback() && !origin,
-            source: Some(source),
-            from_browser: origin,
-        }
+        assert!(seen_by_handler(plain).from_app_here);
+        assert!(!seen_by_handler(browser).from_app_here);
     }
 
     #[test]
-    fn changes_come_only_from_this_device_or_the_other_one() {
-        let may = |source, origin| request("POST", "/api/layout", source, origin).may_change_state(PEER);
-        assert!(may("127.0.0.1", false));
-        assert!(may(PEER, false));
-        assert!(!may("192.168.8.77", false), "another host on the network");
-        assert!(!may("127.0.0.1", true), "a web page on this device");
-        assert!(!may(PEER, true), "a web page on the other device");
-        // With no peer yet, only this device can change anything.
-        assert!(!request("POST", "/api/layout", "192.168.8.77", false).may_change_state(""));
+    fn a_header_cannot_make_a_request_a_peer_one() {
+        let forged = "POST /api/layout HTTP/1.1\r\nX-Source: peer\r\nSource: Peer\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(seen_by_handler(forged).source, Source::Local);
+        let browser = "POST /api/layout HTTP/1.1\r\nOrigin: http://evil.example\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(seen_by_handler(browser).source, Source::Browser);
+    }
+
+    fn request(method: &str, path: &str, source: Source) -> HttpRequest {
+        HttpRequest::for_test(method, path, "", source)
+    }
+
+    #[test]
+    fn a_peer_request_may_change_state_and_a_browser_may_not() {
+        let may = |source| request("POST", "/api/layout", source).may_change_state();
+        assert!(may(Source::Local));
+        assert!(may(Source::Peer));
+        assert!(!may(Source::Browser), "a web page, wherever its browser runs");
+        assert!(request("GET", "/api/state", Source::Browser).may_change_state(), "reading stays open");
     }
 
     #[test]
     fn anything_but_a_read_counts_as_a_change_and_reading_stays_open() {
         for method in ["PUT", "DELETE", "PATCH", "OPTIONS"] {
-            assert!(!request(method, "/api/layout", "192.168.8.77", false).may_change_state(PEER), "{method}");
+            assert!(!request(method, "/api/layout", Source::Browser).may_change_state(), "{method}");
         }
-        assert!(request("GET", "/api/state", "192.168.8.77", false).may_change_state(PEER));
     }
 
     #[test]
-    fn only_the_app_here_can_send_a_change_through_to_the_other_device() {
-        assert!(request("POST", "/api/peer/api/layout", "127.0.0.1", false).may_use_proxy());
-        // It would reach the other device from this one's address, and be trusted there.
-        assert!(!request("POST", "/api/peer/api/layout", PEER, false).may_use_proxy());
-        assert!(!request("POST", "/api/peer/api/layout", "127.0.0.1", true).may_use_proxy());
-        assert!(request("GET", "/api/peer/api/local", "192.168.8.77", false).may_use_proxy());
+    fn a_peer_request_cannot_use_the_proxy() {
+        assert!(request("POST", "/api/peer/api/layout", Source::Local).may_use_proxy());
+        assert!(!request("POST", "/api/peer/api/layout", Source::Peer).may_use_proxy());
+        assert!(!request("GET", "/api/peer/api/local", Source::Peer).may_use_proxy(), "not even a read");
+        assert!(!request("POST", "/api/peer/api/layout", Source::Browser).may_use_proxy());
+        assert!(request("GET", "/api/peer/api/local", Source::Browser).may_use_proxy());
+    }
+
+    #[test]
+    fn only_a_local_program_counts_as_the_app_here() {
+        assert!(request("POST", "/api/local/action", Source::Local).from_app_here);
+        assert!(!request("POST", "/api/local/action", Source::Peer).from_app_here);
+        assert!(!request("POST", "/api/local/action", Source::Browser).from_app_here);
+    }
+
+    #[test]
+    fn the_peer_api_refuses_the_proxy_and_unknown_paths() {
+        let handler: Handler = Arc::new(|req| (req.path == "/api/state").then(|| r#"{"ok":true}"#.to_string()));
+        let ask = |method, path| answer(&HttpRequest::from_peer(method, path, ""), &handler).0;
+        assert_eq!(ask("GET", "/api/state"), 200);
+        assert_eq!(ask("GET", "/api/nothing"), 404);
+        assert_eq!(ask("GET", "/"), 404);
+        assert_eq!(ask("GET", "/api/peer/api/state"), 403);
+        assert_eq!(ask("POST", "/api/peer"), 403);
+    }
+
+    #[test]
+    fn the_port_is_bound_to_loopback_only() {
+        let listener = bind_on(0).unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
     }
 
     /// One request over a real socket: its status line and everything else that came back.
@@ -332,7 +402,7 @@ mod tests {
         let handler: Handler = Arc::new(|_| Some(r#"{"ok":true}"#.to_string()));
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, PEER, handler);
+            handle_conn(stream, "192.168.8.210", handler);
         });
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client.write_all(request.as_bytes()).unwrap();
@@ -350,6 +420,20 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         let reply = exchange("GET /api/state HTTP/1.1\r\nOrigin: http://evil.example\r\n\r\n".into());
         assert!(!reply.to_lowercase().contains("access-control"), "{reply}");
+    }
+
+    #[test]
+    fn a_wrong_host_is_refused() {
+        let get = |host: &str| exchange(format!("GET /api/state HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+        assert!(get("evil.example").starts_with("HTTP/1.1 403"));
+        assert!(get("evil.example:24880").starts_with("HTTP/1.1 403"));
+        assert!(get("127.0.0.1.evil.example").starts_with("HTTP/1.1 403"));
+        assert!(get("127.0.0.1:24880").starts_with("HTTP/1.1 200"));
+        assert!(get("127.0.0.1").starts_with("HTTP/1.1 200"));
+        assert!(get("localhost:24880").starts_with("HTTP/1.1 200"));
+        assert!(get("LocalHost").starts_with("HTTP/1.1 200"));
+        let none = exchange("GET /api/state HTTP/1.1\r\n\r\n".into());
+        assert!(none.starts_with("HTTP/1.1 200"), "http_call always sends one, but a missing one is no rebinding");
     }
 
     #[test]
