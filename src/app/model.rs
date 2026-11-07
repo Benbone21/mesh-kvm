@@ -250,6 +250,9 @@ pub fn receiving_quality(audio: &AudioStatus) -> Option<String> {
 pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
     let link = status.link.as_ref()?;
     if !status.peer_online {
+        if link.one_way && link.one_way_held {
+            return Some((one_way_line(other), true));
+        }
         let text = if link.returning {
             format!("Link is down. Control goes back to {other} when it returns.")
         } else {
@@ -258,7 +261,7 @@ pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
         return Some((text, true));
     }
     if link.one_way {
-        return Some((format!("Link is one way: {other} can't hear this device."), true));
+        return Some((one_way_line(other), true));
     }
     if link.returning {
         return Some((format!("Link is back. Control is on its way to {other}."), false));
@@ -275,6 +278,10 @@ pub fn link_line(status: &DeviceStatus, other: &str) -> Option<(String, bool)> {
         (None, None) => "Link is up, and being measured.".to_string(),
     };
     Some((text, poor))
+}
+
+fn one_way_line(other: &str) -> String {
+    format!("Link is one way: {other} can't hear this device.")
 }
 
 /// What's behind the figure in the link line.
@@ -329,6 +336,10 @@ pub struct DeviceStatus {
     pub display_change: DisplayChanges,
     /// Missing from a service that doesn't measure the link.
     pub link: Option<LinkStatus>,
+    /// "unpaired", "connecting" or "encrypted". Missing from a service that doesn't encrypt.
+    pub secure: String,
+    /// The other device is running a version that can't encrypt.
+    pub old_peer: bool,
 }
 
 /// `link` in `/api/local`: how the link looks from one device.
@@ -349,6 +360,10 @@ pub struct LinkStatus {
     pub returning: bool,
     /// "same", "older", "other", or "unknown" while it can't tell.
     pub peer_version: String,
+    /// `one_way` has held for a second, which the client works out. A link coming up says it for
+    /// a moment, and a note that flickers is worse than none.
+    #[serde(skip)]
+    pub one_way_held: bool,
 }
 
 /// From this much on, the link line stands out.
@@ -558,6 +573,9 @@ pub fn layout_edit(was: &LayoutConfig, now: &LayoutConfig) -> Option<Value> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
+    /// From `/api/pairing`, which the client only asks for while it matters. A failed ask keeps
+    /// the last answer.
+    pub pairing: Option<super::pairing::PairingStatus>,
     pub local: Option<DeviceStatus>,
     pub peer: Option<DeviceStatus>,
     pub layout: Option<LayoutState>,
@@ -1319,6 +1337,18 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     }
     let other = snapshot.title(snapshot.in_order()[1]);
     let link = local.link.as_ref();
+    // An older device never links, so these can't wait for the link branches below.
+    if local.old_peer {
+        return Some(format!(
+            "{other} is running an older mesh-kvm that can't encrypt. Update it, then pair. Nothing from it is being used."
+        ));
+    }
+    if local.secure == "unpaired" {
+        return Some("Not paired yet. Keyboard, mouse, audio and clipboard stay on each device.".into());
+    }
+    if !local.peer_online && link.is_some_and(|l| l.one_way && l.one_way_held) {
+        return Some(one_way_message(&other));
+    }
     if link.is_some_and(|l| l.returning) {
         return Some(format!(
             "The link to {other} dropped, so each device is using its own keyboard and mouse for now. Control goes back to {other} once the link is back."
@@ -1339,9 +1369,7 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
         ));
     }
     if local.peer_online && link.is_some_and(|l| l.one_way) {
-        return Some(format!(
-            "{other} can't hear this device, though this device hears it. A firewall on {other} is the usual reason. Each device stays on its own keyboard and mouse until that's fixed."
-        ));
+        return Some(one_way_message(&other));
     }
     match link.map(|l| l.peer_version.as_str()) {
         Some("older") => {
@@ -1367,6 +1395,12 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
         );
     }
     snapshot.peer.as_ref().and_then(|peer| echo_message(local, peer))
+}
+
+fn one_way_message(other: &str) -> String {
+    format!(
+        "{other} can't hear this device, though this device hears it. A firewall on {other} is the usual reason. Each device stays on its own keyboard and mouse until that's fixed."
+    )
 }
 
 /// Both devices sending output sound only echoes if one can't keep what it plays out of what it
@@ -2296,6 +2330,61 @@ mod tests {
         assert_eq!(link_line(&linked_status(link.clone()), "Laptop"), Some(("Link is one way: Laptop can't hear this device.".to_string(), true)));
         let message = status_message(&link_snapshot(true, link, true)).unwrap();
         assert!(message.contains("can't hear this device"), "{message}");
+    }
+
+    fn encrypted_snapshot(secure: &str, old_peer: bool) -> Snapshot {
+        let mut snap = link_snapshot(false, LinkStatus::default(), false);
+        let local = snap.local.as_mut().unwrap();
+        local.secure = secure.into();
+        local.old_peer = old_peer;
+        snap
+    }
+
+    #[test]
+    fn an_old_peer_gets_its_own_notice_though_it_can_never_be_online() {
+        let snap = encrypted_snapshot("unpaired", true);
+        assert!(!snap.local.as_ref().unwrap().peer_online && snap.peer.is_none());
+        let other = snap.title(snap.in_order()[1]);
+        assert_eq!(
+            status_message(&snap).unwrap(),
+            format!("{other} is running an older mesh-kvm that can't encrypt. Update it, then pair. Nothing from it is being used.")
+        );
+        // Paired already, and still the older device is the thing to say.
+        let paired = encrypted_snapshot("connecting", true);
+        assert!(status_message(&paired).unwrap().contains("older mesh-kvm that can't encrypt"));
+    }
+
+    #[test]
+    fn an_unpaired_device_says_what_stays_on_each_device() {
+        let snap = encrypted_snapshot("unpaired", false);
+        assert_eq!(
+            status_message(&snap).unwrap(),
+            "Not paired yet. Keyboard, mouse, audio and clipboard stay on each device."
+        );
+        // A service that doesn't say, or one that is paired, has no such note.
+        for secure in ["", "connecting", "encrypted"] {
+            let message = status_message(&encrypted_snapshot(secure, false)).unwrap_or_default();
+            assert!(!message.contains("Not paired yet"), "{secure}: {message}");
+        }
+    }
+
+    #[test]
+    fn the_offline_one_way_note_waits_until_it_has_held() {
+        let down = |held: bool| {
+            let link = LinkStatus { one_way: true, one_way_held: held, ..LinkStatus::default() };
+            DeviceStatus { peer_online: false, link: Some(link), ..DeviceStatus::default() }
+        };
+        let (text, _) = link_line(&down(false), "Laptop").unwrap();
+        assert!(text.starts_with("Link is down"), "{text}");
+        assert_eq!(link_line(&down(true), "Laptop"), Some(("Link is one way: Laptop can't hear this device.".to_string(), true)));
+        let one_way = |held| LinkStatus { one_way: true, one_way_held: held, ..LinkStatus::default() };
+        let waiting = status_message(&link_snapshot(false, one_way(false), true)).unwrap();
+        assert!(waiting.contains("found but not linked yet"), "{waiting}");
+        let held = status_message(&link_snapshot(false, one_way(true), true)).unwrap();
+        assert!(held.contains("can't hear this device"), "{held}");
+        // With the other device out of reach too, the one way note is still the news.
+        let alone = status_message(&link_snapshot(false, one_way(true), false)).unwrap();
+        assert!(alone.contains("can't hear this device"), "{alone}");
     }
 
     #[test]

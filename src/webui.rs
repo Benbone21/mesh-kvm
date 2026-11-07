@@ -261,12 +261,24 @@ pub fn http_call_port(
     path: &str,
     body: &str,
 ) -> Result<(u16, String), String> {
+    http_call_port_waiting(host, port, method, path, body, Duration::from_millis(1200))
+}
+
+/// `http_call_port` with its own wait for the answer, for calls that can take seconds.
+pub fn http_call_port_waiting(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    wait: Duration,
+) -> Result<(u16, String), String> {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| format!("bad peer address: {}", e))?;
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(350))
         .map_err(|e| format!("peer unreachable: {}", e))?;
-    let _ = s.set_read_timeout(Some(Duration::from_millis(1200)));
+    let _ = s.set_read_timeout(Some(wait));
     let _ = s.set_write_timeout(Some(Duration::from_millis(600)));
     let req = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

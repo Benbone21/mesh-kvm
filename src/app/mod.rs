@@ -3,6 +3,7 @@ mod icon;
 pub mod install;
 pub mod launch;
 pub mod model;
+mod pairing;
 pub mod single;
 mod canvas;
 mod panels;

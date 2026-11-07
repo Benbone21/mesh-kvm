@@ -2,7 +2,8 @@
 
 use super::model::{older_message, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
 use crate::platform::DisplayInfo;
-use crate::webui::{http_call_port, UI_PORT};
+use super::pairing::PairingStatus;
+use crate::webui::{http_call_port, http_call_port_waiting, UI_PORT};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -21,6 +22,11 @@ const UNKNOWN_ACTION: &str = "unknown action";
 const LOCALHOST: &str = "127.0.0.1";
 /// What the peer proxy answers when the other device doesn't.
 const PEER_UNREACHABLE: u16 = 502;
+/// How long a pairing action may take to answer: `unpair` tells the other device, and the others
+/// wait for it. The longest is about five seconds.
+const PAIRING_WAIT: Duration = Duration::from_secs(6);
+/// A one way link has to hold this long before the link line says so while the link is down.
+const ONE_WAY_HOLD: Duration = Duration::from_secs(1);
 const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
 
 struct Job {
@@ -36,6 +42,34 @@ struct Shared {
     last_error: Mutex<Option<(String, Instant)>>,
     error_hold: Duration,
     stop: AtomicBool,
+    /// The window wants to see `/api/pairing`, which holds a code and so isn't asked for otherwise.
+    pairing_wanted: AtomicBool,
+}
+
+/// What the service said to a pairing action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairingReply {
+    Done,
+    /// It said no, worded for the person to read.
+    Refused(String),
+    /// No answer. After a pairing the service restarts, so this is not a failure by itself.
+    NoAnswer,
+}
+
+/// Tells when `one_way` has been true for `ONE_WAY_HOLD` without a break.
+#[derive(Default)]
+struct OneWayHold {
+    since: Option<Instant>,
+}
+
+impl OneWayHold {
+    fn held(&mut self, one_way: bool, now: Instant) -> bool {
+        if !one_way {
+            self.since = None;
+            return false;
+        }
+        now.duration_since(*self.since.get_or_insert(now)) >= ONE_WAY_HOLD
+    }
 }
 
 /// Keeps the latest `Snapshot` fresh on a background thread, and sends changes on another, so
@@ -74,6 +108,7 @@ impl Client {
             last_error: Mutex::default(),
             error_hold,
             stop: AtomicBool::new(false),
+            pairing_wanted: AtomicBool::new(false),
         });
         let poller = shared.clone();
         std::thread::Builder::new()
@@ -81,8 +116,21 @@ impl Client {
             .spawn(move || {
                 let mut last: Option<(Snapshot, Option<String>)> = None;
                 let mut displays = DisplayLook::default();
+                let mut one_way = OneWayHold::default();
+                let mut pairing: Option<PairingStatus> = None;
                 while !poller.stop.load(Ordering::Relaxed) {
                     let mut snap = poll_once(port);
+                    let link = snap.local.as_mut().and_then(|l| l.link.as_mut());
+                    let held = one_way.held(link.as_ref().is_some_and(|l| l.one_way), Instant::now());
+                    if let Some(link) = link {
+                        link.one_way_held = held;
+                    }
+                    // A failed ask is a service that is busy or restarting, so the last answer stays.
+                    let unlinked = snap.local.as_ref().is_some_and(|l| !l.secure.is_empty() && l.secure != "encrypted");
+                    if unlinked || poller.pairing_wanted.load(Ordering::Relaxed) {
+                        pairing = pairing_at(port).or(pairing);
+                    }
+                    snap.pairing = pairing.clone();
                     if let Some(every) = displays_every {
                         displays.fill(&mut snap, port, every);
                     }
@@ -115,6 +163,35 @@ impl Client {
             })
             .expect("start the send thread");
         Self { port, shared, jobs }
+    }
+
+    /// Says whether the window needs the pairing status, so it is asked for only then.
+    pub fn want_pairing(&self, wanted: bool) {
+        self.shared.pairing_wanted.store(wanted, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn wants_pairing(&self) -> bool {
+        self.shared.pairing_wanted.load(Ordering::Relaxed)
+    }
+
+    /// Sends a pairing action such as `{"action": "pair_enter", "code": "482917"}` to this device.
+    ///
+    /// This can block for seconds, so the UI must call it off the UI thread.
+    pub fn pairing_action(&self, action: serde_json::Value) -> PairingReply {
+        let reply =
+            http_call_port_waiting(LOCALHOST, self.port, "POST", "/api/local/action", &action.to_string(), PAIRING_WAIT);
+        match reply {
+            Ok((200, body)) => {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if body["ok"] != false {
+                    return PairingReply::Done;
+                }
+                PairingReply::Refused(body["error"].as_str().unwrap_or("mesh-kvm didn't accept that.").to_string())
+            }
+            Ok(_) => PairingReply::Refused("mesh-kvm didn't accept that. Restart it, then try again.".into()),
+            Err(_) => PairingReply::NoAnswer,
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -290,6 +367,10 @@ fn poll_once(port: u16) -> Snapshot {
     // Every device keeps its own copy of the layout.
     let layout = get(port, "/api/state").and_then(|b| LayoutState::parse(&b));
     Snapshot { local: Some(local), peer, layout, ..Default::default() }
+}
+
+fn pairing_at(port: u16) -> Option<PairingStatus> {
+    serde_json::from_str(&get(port, "/api/pairing")?).ok()
 }
 
 fn displays_at(port: u16, path: &str) -> Option<Vec<DisplayInfo>> {
@@ -776,5 +857,105 @@ mod tests {
         assert!(down.contains("Check that it's running") && !down.contains("refused"), "{down}");
         assert_eq!(send_problem("Desk tower", Ok((200, r#"{"ok":true}"#.into()))), None);
         assert_eq!(send_problem("Desk tower", Ok((200, "not json".into()))), None);
+    }
+
+    fn secure_local(secure: &str) -> String {
+        format!(r#"{{"node":"debian","device_name":"debian-box","peer_online":false,"secure":"{secure}"}}"#)
+    }
+
+    fn pairing_stub(secure: &'static str) -> (u16, Log) {
+        stub(move |method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, secure_local(secure)),
+            ("GET", "/api/pairing") => (200, r#"{"state":"showing","code":"482917","seconds_left":90}"#.into()),
+            _ => (404, "{}".into()),
+        })
+    }
+
+    fn asks_for_pairing(log: &Log) -> usize {
+        log.lock().unwrap().iter().filter(|r| r.1 == "/api/pairing").count()
+    }
+
+    #[test]
+    fn pairing_is_not_polled_when_encrypted_and_nobody_is_looking() {
+        let (port, log) = pairing_stub("encrypted");
+        let (client, _rx) = start(port);
+        wait_for("the local device", || client.snapshot().local.is_some());
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(asks_for_pairing(&log), 0);
+        client.want_pairing(true);
+        wait_for("the pairing status", || client.snapshot().pairing.is_some());
+        assert_eq!(client.snapshot().pairing.unwrap().code.as_deref(), Some("482917"));
+    }
+
+    #[test]
+    fn pairing_is_polled_while_the_link_is_not_encrypted() {
+        for secure in ["unpaired", "connecting"] {
+            let (port, log) = pairing_stub(secure);
+            let (client, _rx) = start(port);
+            wait_for("the pairing status", || client.snapshot().pairing.is_some());
+            assert!(asks_for_pairing(&log) > 0, "{secure}");
+        }
+        // A service from before pairing says nothing, and has no such path.
+        let (port, log) = stub(|_, path, _| if path == "/api/local" { (200, local_json("debian")) } else { (404, "{}".into()) });
+        let (client, _rx) = start(port);
+        wait_for("the local device", || client.snapshot().local.is_some());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(asks_for_pairing(&log), 0);
+    }
+
+    #[test]
+    fn a_failed_pairing_poll_keeps_what_was_known() {
+        let up = Arc::new(AtomicBool::new(true));
+        let answer = up.clone();
+        let (port, _) = stub(move |method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, secure_local("unpaired")),
+            ("GET", "/api/pairing") if answer.load(Ordering::SeqCst) => (200, r#"{"state":"entering"}"#.into()),
+            _ => (HANG_UP, String::new()),
+        });
+        let (client, _rx) = start(port);
+        wait_for("the pairing status", || client.snapshot().pairing.is_some());
+        up.store(false, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(client.snapshot().pairing.map(|p| p.state), Some("entering".to_string()));
+    }
+
+    #[test]
+    fn a_pairing_action_waits_longer_than_a_status_call_does() {
+        let (port, log) = stub(|method, path, body| {
+            if method == "POST" && path == "/api/local/action" {
+                std::thread::sleep(Duration::from_millis(1700));
+                return if body.contains("pair_enter") {
+                    (200, r#"{"ok":false,"error":"The code is 6 digits."}"#.into())
+                } else {
+                    (200, r#"{"ok":true}"#.into())
+                };
+            }
+            (404, "{}".into())
+        });
+        let (client, _rx) = start(port);
+        assert_eq!(client.pairing_action(serde_json::json!({ "action": "unpair" })), PairingReply::Done);
+        assert_eq!(
+            client.pairing_action(serde_json::json!({ "action": "pair_enter", "code": "1" })),
+            PairingReply::Refused("The code is 6 digits.".into())
+        );
+        assert_eq!(posts(&log).len(), 2);
+    }
+
+    #[test]
+    fn a_pairing_action_with_no_service_has_no_answer() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (client, _rx) = start(port);
+        assert_eq!(client.pairing_action(serde_json::json!({ "action": "pair_cancel" })), PairingReply::NoAnswer);
+    }
+
+    #[test]
+    fn a_one_way_link_counts_as_held_only_after_a_second() {
+        let (mut hold, start) = (OneWayHold::default(), Instant::now());
+        assert!(!hold.held(true, start));
+        assert!(!hold.held(true, start + Duration::from_millis(900)));
+        assert!(hold.held(true, start + Duration::from_millis(1000)));
+        assert!(!hold.held(false, start + Duration::from_millis(1100)), "it cleared");
+        assert!(!hold.held(true, start + Duration::from_millis(1200)), "and starts again");
+        assert!(hold.held(true, start + Duration::from_millis(2300)));
     }
 }

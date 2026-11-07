@@ -2,9 +2,10 @@
 //! decisions live in `model`; the arrangement is in `canvas`, and the device controls in `panels`.
 
 use super::canvas::Canvas;
-use super::client::Client;
+use super::client::{Client, PairingReply};
 use super::launch::ServiceStarter;
 use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, Light, ModeChange, ServiceStart, Snapshot};
+use super::pairing::{self, PairingInput, PairingRequest, PairingView};
 use super::panels::{self, Panels, Requests, Shared};
 use super::theme::{self, AMBER, DEEP, INK, PANEL, RED};
 use super::widgets::{paint_light, paint_name_and_state, segment, slide_switch, slider_row, small};
@@ -101,11 +102,29 @@ struct PeerPrompt {
 }
 
 const LICENCES_WIDTH: f32 = 600.0;
+/// How long the pairing window says it worked before it goes.
+const PAIRED_SHOWN: Duration = Duration::from_secs(2);
+
+/// The pairing window, and the things waiting on the service for it.
+#[derive(Default)]
+struct PairingWindow {
+    open: bool,
+    input: PairingInput,
+    /// A show or a code with the service. Pairing can take seconds, so it runs off the UI thread.
+    pending: Option<Receiver<PairingReply>>,
+    /// When the status first said it was paired.
+    paired_at: Option<Instant>,
+    unpairing: Option<Receiver<PairingReply>>,
+    unpair_error: Option<String>,
+}
 
 struct Window {
     client: Arc<Client>,
     starter: ServiceStarter,
     peer_prompt: PeerPrompt,
+    pairing: PairingWindow,
+    /// The Settings menu was drawn this frame, so it is open and wants the fingerprint.
+    pairing_in_menu: bool,
     show_licences: bool,
     edits: Edits,
     layout: LayoutDraft,
@@ -145,6 +164,8 @@ impl Window {
             client: Arc::new(client),
             starter,
             peer_prompt: PeerPrompt::default(),
+            pairing: PairingWindow::default(),
+            pairing_in_menu: false,
             show_licences: false,
             edits: Edits::default(),
             layout: LayoutDraft::default(),
@@ -195,6 +216,8 @@ impl Window {
         let on = model::enabled(snapshot);
         self.collect_main_change();
         self.collect_peer_change();
+        self.collect_pairing();
+        self.pairing_in_menu = false;
         self.clear_stale_main_error(snapshot, &on);
         let start = self.starter.state();
         self.layout.follow(snapshot.layout.clone(), self.canvas.is_dragging(), now);
@@ -259,6 +282,9 @@ impl Window {
         if let Some((device, change)) = snapshot.mode_change() {
             self.mode_prompt(ctx, snapshot, device, change);
         }
+        self.pairing_window(ctx, snapshot, now);
+        // The menu is drawn inside the header, so only now is it known whether it was open.
+        self.client.want_pairing(self.pairing.open || self.pairing_in_menu);
 
         self.canvas.end_lost_drag(ctx, &mut self.layout, now);
         self.send_changes(now);
@@ -398,6 +424,111 @@ impl Window {
         }
     }
 
+    /// Starts a pairing action on a background thread, as the service can take seconds to answer.
+    fn send_pairing(&self, ctx: &egui::Context, action: serde_json::Value) -> Receiver<PairingReply> {
+        let (done, reply) = mpsc::channel();
+        let (client, ctx) = (self.client.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(client.pairing_action(action));
+            ctx.request_repaint();
+        });
+        reply
+    }
+
+    /// Cancels in the background, for when nobody waits to hear.
+    fn cancel_pairing(&self) {
+        let client = self.client.clone();
+        std::thread::spawn(move || {
+            client.pairing_action(serde_json::json!({ "action": "pair_cancel" }));
+        });
+    }
+
+    fn open_pairing(&mut self, snapshot: &Snapshot) {
+        self.pairing = PairingWindow { open: true, ..PairingWindow::default() };
+        // An attempt that failed before is over, and shouldn't be the first thing to see.
+        if snapshot.pairing.as_ref().is_some_and(|p| p.state == "failed") {
+            self.cancel_pairing();
+        }
+    }
+
+    fn collect_pairing(&mut self) {
+        if let Some(reply) = self.pairing.pending.as_ref().map(Receiver::try_recv) {
+            match reply {
+                Ok(PairingReply::Refused(why)) => {
+                    self.pairing.input.refusal = Some(why);
+                    self.pairing.pending = None;
+                }
+                // The status says how it went, and a service that is restarting says nothing.
+                Ok(_) | Err(TryRecvError::Disconnected) => self.pairing.pending = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(reply) = self.pairing.unpairing.as_ref().map(Receiver::try_recv) {
+            match reply {
+                Ok(PairingReply::Refused(why)) => {
+                    self.pairing.unpair_error = Some(why);
+                    self.pairing.unpairing = None;
+                }
+                Ok(_) | Err(TryRecvError::Disconnected) => self.pairing.unpairing = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn apply_pairing(&mut self, ctx: &egui::Context, snapshot: &Snapshot, request: Option<PairingRequest>) {
+        match request {
+            Some(PairingRequest::Show) => {
+                self.pairing.input.refusal = None;
+                self.pairing.pending = Some(self.send_pairing(ctx, serde_json::json!({ "action": "pair_show" })));
+            }
+            Some(PairingRequest::Enter(code)) => {
+                self.pairing.input.refusal = None;
+                let action = serde_json::json!({ "action": "pair_enter", "code": code });
+                self.pairing.pending = Some(self.send_pairing(ctx, action));
+            }
+            Some(PairingRequest::Cancel) => {
+                let busy = snapshot.pairing.as_ref().is_some_and(|p| matches!(p.state.as_str(), "showing" | "entering" | "failed"));
+                if busy || self.pairing.pending.is_some() {
+                    self.cancel_pairing();
+                }
+                self.pairing = PairingWindow::default();
+            }
+            None => {}
+        }
+    }
+
+    fn pairing_window(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) {
+        if !self.pairing.open {
+            return;
+        }
+        // The service restarts to pair, so the first thing seen after may be a peer already there.
+        let paired = snapshot.pairing.as_ref().is_some_and(|p| p.state == "paired" || p.peer_name.is_some());
+        if paired && self.pairing.paired_at.is_none() {
+            self.pairing.paired_at = Some(now);
+        }
+        if let Some(at) = self.pairing.paired_at {
+            match PAIRED_SHOWN.checked_sub(now.saturating_duration_since(at)).filter(|left| !left.is_zero()) {
+                Some(left) => ctx.request_repaint_after(left),
+                None => {
+                    self.pairing = PairingWindow::default();
+                    return;
+                }
+            }
+        }
+        let other = snapshot.name(snapshot.in_order()[1]);
+        let here = snapshot.name(snapshot.in_order()[0]);
+        let address = snapshot.local.as_ref().map(|l| l.peer_ip.as_str()).filter(|a| !a.is_empty() && *a != UNKNOWN_ADDRESS);
+        let state = snapshot.pairing.as_ref().map(|p| p.state.as_str());
+        let working = self.pairing.pending.is_some() || state == Some("entering");
+        let view = PairingView { status: snapshot.pairing.as_ref(), other: &other, this_device: &here, other_address: address, working };
+        let request = pairing::window(ctx, &view, &mut self.pairing.input);
+        self.apply_pairing(ctx, snapshot, request);
+        // The countdown on a code moves each second.
+        if state == Some("showing") {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
     fn send_changes(&mut self, now: Instant) {
         for ((device, control), value) in self.edits.take_due(now) {
             self.client.local_action(device, control.action(value));
@@ -515,10 +646,41 @@ impl Window {
                 ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
             }
         }
+        self.pairing_settings(ui, snapshot);
         ui.add_space(8.0);
         if ui.button("Licences").clicked() {
             self.show_licences = true;
             ui.close_menu();
+        }
+    }
+
+    /// Whether the devices are paired, in the Settings menu. A service that doesn't encrypt has nothing here.
+    fn pairing_settings(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
+        let Some(local) = snapshot.local.as_ref().filter(|l| !l.secure.is_empty()) else { return };
+        self.pairing_in_menu = true;
+        ui.add_space(8.0);
+        if local.secure == "unpaired" {
+            if ui.button("Pair").clicked() {
+                self.open_pairing(snapshot);
+                ui.close_menu();
+            }
+            return;
+        }
+        ui.label(format!("Paired with {}", snapshot.title(snapshot.in_order()[1])));
+        ui.label(small("Everything between these devices is encrypted."));
+        if let Some(fingerprint) = snapshot.pairing.as_ref().and_then(|p| p.fingerprint.as_deref()) {
+            ui.label(small(format!("Fingerprint, the same on both: {fingerprint}")));
+        }
+        let unpairing = self.pairing.unpairing.is_some();
+        if ui.add_enabled(!unpairing, egui::Button::new("Unpair")).clicked() {
+            self.pairing.unpair_error = None;
+            self.pairing.unpairing = Some(self.send_pairing(ui.ctx(), serde_json::json!({ "action": "unpair" })));
+        }
+        if unpairing {
+            ui.label(small("Still working on it."));
+        }
+        if let Some(error) = &self.pairing.unpair_error {
+            ui.label(small(error).color(RED));
         }
     }
 
@@ -1159,5 +1321,135 @@ mod tests {
         assert_eq!(device_details(Some(&d), true), "This device, debian-host, 192.168.8.2");
         assert_eq!(device_details(Some(&d), false), "debian-host, 192.168.8.2");
         assert_eq!(device_details(None, false), "Not connected");
+    }
+
+    fn secure(mut snapshot: Snapshot, secure: &str) -> Snapshot {
+        snapshot.local.as_mut().unwrap().secure = secure.into();
+        snapshot
+    }
+
+    fn paired_status() -> crate::app::pairing::PairingStatus {
+        serde_json::from_str(r#"{"state":"idle","peer_name":"Laptop","fingerprint":"4F2A-91C3"}"#).unwrap()
+    }
+
+    /// The Settings menu's contents, drawn on their own.
+    fn menu_text(window: &mut Window, snapshot: &Snapshot) -> String {
+        let ctx = context();
+        let mut text = String::new();
+        for _ in 0..2 {
+            let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE.into())), ..Default::default() };
+            let output = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, snapshot));
+            });
+            text = drawn_text(&output);
+        }
+        text
+    }
+
+    #[test]
+    fn the_settings_menu_shows_the_fingerprint_and_unpair_when_paired() {
+        let mut window = window();
+        let mut snapshot = secure(linked(), "encrypted");
+        snapshot.pairing = Some(paired_status());
+        let text = menu_text(&mut window, &snapshot);
+        for line in [
+            "Paired with windows-host",
+            "Everything between these devices is encrypted.",
+            "Fingerprint, the same on both: 4F2A-91C3",
+            "Unpair",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        assert!(!text.contains("\nPair\n"), "{text}");
+        assert!(window.pairing_in_menu, "asking for the fingerprint while the menu is open");
+    }
+
+    #[test]
+    fn the_settings_menu_offers_pair_when_unpaired() {
+        let mut window = window();
+        let text = menu_text(&mut window, &secure(linked(), "unpaired"));
+        assert!(text.contains("\nPair\n"), "{text}");
+        assert!(!text.contains("Unpair") && !text.contains("Fingerprint"), "{text}");
+        // A service that doesn't encrypt has neither.
+        let text = menu_text(&mut window, &linked());
+        assert!(!text.contains("Pair") && !text.contains("Unpair"), "{text}");
+    }
+
+    #[test]
+    fn an_old_peer_shows_the_update_notice_with_the_other_device_offline() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        snapshot.peer = None;
+        let local = snapshot.local.as_mut().unwrap();
+        local.peer_online = false;
+        local.secure = "unpaired".into();
+        local.old_peer = true;
+        local.link = Some(Default::default());
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("is running an older mesh-kvm that can't encrypt. Update it, then pair."), "{text}");
+        assert!(!text.contains("Not paired yet"), "{text}");
+    }
+
+    #[test]
+    fn the_pair_window_opens_asks_for_the_status_and_closes_when_paired() {
+        let (ctx, mut window) = (context(), window());
+        let now = Instant::now();
+        let mut snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+        assert!(text.contains("Show a code here") && text.contains("Enter a code here"), "{text}");
+        assert!(window.client.wants_pairing());
+
+        // The service restarts after pairing, so the window may only ever see the result.
+        snapshot.pairing = Some(paired_status());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+        assert!(text.contains("Paired with Laptop"), "{text}");
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now + Duration::from_secs(3));
+        assert!(!window.pairing.open);
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now + Duration::from_secs(4)));
+        assert!(!text.contains("Paired with Laptop"), "{text}");
+        assert!(!window.client.wants_pairing());
+    }
+
+    #[test]
+    fn a_pairing_action_never_blocks_the_window_and_keeps_it_working() {
+        let (ctx, mut window) = (context(), window());
+        let snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        // An action that has not been answered, as a slow one would be.
+        let (_answer, waiting) = mpsc::channel();
+        window.pairing.pending = Some(waiting);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("Still working on it."), "{text}");
+        assert!(window.pairing.pending.is_some());
+
+        // Sent for real, the call runs on its own thread and the window carries on.
+        window.pairing.pending = None;
+        window.apply_pairing(&ctx, &snapshot, Some(PairingRequest::Show));
+        for _ in 0..400 {
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+            if window.pairing.pending.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Nothing listens, which a restarting service looks like too, so that is no error.
+        assert!(window.pairing.pending.is_none());
+        assert!(window.pairing.input.refusal.is_none());
+    }
+
+    #[test]
+    fn a_refused_code_is_shown_in_the_box_it_came_from() {
+        let (ctx, mut window) = (context(), window());
+        let snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        window.pairing.input.entering = true;
+        window.pairing.input.refusal = Some("Set the other device's address first, then enter the code.".into());
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("Set the other device's address first"), "{text}");
     }
 }
