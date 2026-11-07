@@ -72,6 +72,10 @@ pub fn barred() -> bool {
 pub trait MuteBackend {
     /// The output to mute, or None when it can't be found.
     fn default_device(&mut self) -> Option<String>;
+    /// Everything to mute: usually just that one.
+    fn targets(&mut self) -> Option<Vec<String>> {
+        self.default_device().map(|device| vec![device])
+    }
     /// None when the device is absent or can't be read.
     fn is_muted(&mut self, device: &str) -> Option<bool>;
     /// False when the device is absent or the change failed.
@@ -184,8 +188,8 @@ pub struct MuteController<B: MuteBackend> {
     /// Every device silent because of mesh-kvm, so ours to restore. More than one when a device
     /// we muted was unplugged and the next default was muted too.
     owned: Vec<String>,
-    /// The owned device that is still the default. Any other owned device is waiting for restore.
-    active: Option<String>,
+    /// The owned devices still meant to be muted. Any other owned device is waiting for restore.
+    active: Vec<String>,
     /// Devices the person has taken charge of until muting is next asked for.
     hands_off: Vec<String>,
     wanted: bool,
@@ -205,7 +209,7 @@ impl<B: MuteBackend> MuteController<B> {
             backend,
             flag,
             owned,
-            active: None,
+            active: Vec::new(),
             hands_off: Vec::new(),
             wanted: false,
             next_watch: None,
@@ -233,12 +237,13 @@ impl<B: MuteBackend> MuteController<B> {
             }
         }
         if !want {
-            self.active = None;
+            self.active.clear();
         }
-        let default = if want { self.read_default(now) } else { None };
+        let targets = if want { self.read_targets(now) } else { None };
         self.restore_stranded(now);
-        if let Some(device) = default {
-            let worked = self.settle_default(&device);
+        if let Some(targets) = targets {
+            // Each gets its turn, however the last one went.
+            let worked = targets.iter().fold(true, |worked, device| self.settle_target(device) && worked);
             self.default_work.record(worked, now);
         }
     }
@@ -246,42 +251,41 @@ impl<B: MuteBackend> MuteController<B> {
     /// Gives everything back, ignoring any retry gap: there may be no later tick. Whatever fails
     /// stays on record for later.
     pub fn release(&mut self) {
-        self.active = None;
+        self.active.clear();
         let all = self.owned.clone();
         if !all.is_empty() {
             self.restore(&all);
         }
     }
 
-    /// The default, when it is time to look. Noticing that it moved strands the old device.
-    fn read_default(&mut self, now: Instant) -> Option<String> {
+    /// What to mute, when it is time to look. Noticing that it moved strands the old device.
+    fn read_targets(&mut self, now: Instant) -> Option<Vec<String>> {
         let waiting = self.next_watch.is_some_and(|at| now < at);
         if waiting || !self.default_work.due(now) {
             return None;
         }
         self.next_watch = Some(now + WATCH_INTERVAL);
-        let device = self.backend.default_device();
-        match &device {
-            Some(device) => self.active = self.owned.contains(device).then(|| device.clone()),
+        let targets = self.backend.targets();
+        match &targets {
+            Some(targets) => self.active = targets.iter().filter(|device| self.owned.contains(device)).cloned().collect(),
             None => self.default_work.record(false, now),
         }
-        device
+        targets
     }
 
     fn restore_stranded(&mut self, now: Instant) {
-        let active = self.active.as_ref();
         let stranded: Vec<String> =
-            self.owned.iter().filter(|device| Some(*device) != active).cloned().collect();
+            self.owned.iter().filter(|device| !self.active.contains(device)).cloned().collect();
         if !stranded.is_empty() && self.restoring.due(now) {
             let worked = self.restore(&stranded);
             self.restoring.record(worked, now);
         }
     }
 
-    fn settle_default(&mut self, device: &str) -> bool {
+    fn settle_target(&mut self, device: &str) -> bool {
         if self.hands_off.iter().any(|d| d == device) {
             true
-        } else if self.active.as_deref() == Some(device) {
+        } else if self.active.iter().any(|d| d == device) {
             self.watch(device)
         } else {
             self.mute(device)
@@ -306,7 +310,7 @@ impl<B: MuteBackend> MuteController<B> {
         let worked = self.backend.set_muted(device, true);
         // A failure report doesn't prove nothing happened, so only a clean read gives up the claim.
         if worked || self.backend.is_muted(device) != Some(false) {
-            self.active = Some(device.to_string());
+            self.active.push(device.to_string());
         } else {
             self.owned.pop();
             self.flag.write(&self.owned);
@@ -321,7 +325,7 @@ impl<B: MuteBackend> MuteController<B> {
             Some(true) => true,
             Some(false) => {
                 self.owned.retain(|d| d != device);
-                self.active = None;
+                self.active.retain(|d| d != device);
                 self.hands_off.push(device.to_string());
                 self.flag.write(&self.owned);
                 true
@@ -470,7 +474,7 @@ impl LiveSignals {
         // With Play off, or playing elsewhere, muting this output silences none of it.
         let playing_here = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
             && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0
-            && in_use.play == in_use.output;
+            && (in_use.play == in_use.output || (in_use.play.is_some() && in_use.play == in_use.also_mute));
         let inputs = self.apply(
             Readings {
                 setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
@@ -517,6 +521,12 @@ struct ChosenOutput<B: MuteBackend>(B);
 impl<B: MuteBackend> MuteBackend for ChosenOutput<B> {
     fn default_device(&mut self) -> Option<String> {
         devices::in_use().output.or_else(|| self.0.default_device())
+    }
+
+    fn targets(&mut self) -> Option<Vec<String>> {
+        let mut targets = vec![self.default_device()?];
+        targets.extend(devices::in_use().also_mute.filter(|device| !targets.contains(device)));
+        Some(targets)
     }
 
     fn is_muted(&mut self, device: &str) -> Option<bool> {
@@ -1236,6 +1246,97 @@ mod tests {
         let fell_back = Readings { capture_survives_mute: false, ..sounding(11) };
         run(&mut c, &mut signals, fell_back, t + STEP * 10);
         assert!(!c.backend.is(SPEAKERS), "the capture is ordinary now, and a mute would silence it");
+    }
+
+    /// Two outputs to mute: what's chosen, and the one Windows is really playing on.
+    struct TwoOutputs<'a>(&'a mut Outputs);
+
+    impl MuteBackend for TwoOutputs<'_> {
+        fn default_device(&mut self) -> Option<String> {
+            (&mut *self.0).default_device()
+        }
+
+        fn targets(&mut self) -> Option<Vec<String>> {
+            let chosen = (&mut *self.0).default_device()?;
+            Some(vec![chosen, HEADSET.to_string()])
+        }
+
+        fn is_muted(&mut self, device: &str) -> Option<bool> {
+            (&mut *self.0).is_muted(device)
+        }
+
+        fn set_muted(&mut self, device: &str, muted: bool) -> bool {
+            (&mut *self.0).set_muted(device, muted)
+        }
+    }
+
+    #[test]
+    fn both_outputs_are_muted_on_one_record_and_both_come_back() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-outputs"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        c.tick(SENDING, t + STEP);
+        assert!(c.backend.0.is(SPEAKERS) && c.backend.0.is(HEADSET));
+        let record = std::fs::read_to_string(&path).unwrap();
+        assert!(record.contains(SPEAKERS) && record.contains(HEADSET), "{record}");
+        c.tick(STOPPED, t + STEP * 2);
+        assert!(!c.backend.0.is(SPEAKERS) && !c.backend.0.is(HEADSET));
+        assert!(!path.exists());
+        drop(c);
+        assert_eq!(outputs.writes.len(), 4, "muted once each, and left alone: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_crash_with_two_outputs_muted_restores_both_from_the_record() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-crash"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        c.tick(SENDING, Instant::now());
+        drop(c);
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), MuteFlag::new(path.clone()));
+        c.release();
+        drop(c);
+        assert!(!outputs.is(SPEAKERS) && !outputs.is(HEADSET));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_manual_unmute_of_one_output_leaves_the_other_muted() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-manual"));
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        c.backend.0.muted.insert(HEADSET.into(), false);
+        c.tick(SENDING, t + STEP);
+        c.tick(SENDING, t + STEP * 2);
+        assert!(c.backend.0.is(SPEAKERS));
+        assert!(!c.backend.0.is(HEADSET), "not fought");
+    }
+
+    #[test]
+    fn an_output_that_stops_being_a_target_comes_back_and_the_other_stays_muted() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-then-one"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        drop(c);
+        let mut c = MuteController::new(&mut outputs, MuteFlag::new(path));
+        c.tick(SENDING, t + STEP);
+        assert!(c.backend.is(SPEAKERS), "still the target");
+        assert!(!c.backend.is(HEADSET), "no longer one");
+    }
+
+    #[test]
+    fn the_chosen_output_and_the_windows_default_are_both_targets_once_each() {
+        let mut outputs = Outputs::default();
+        let mut chosen = ChosenOutput(&mut outputs);
+        let two = devices::InUse { output: Some(HEADSET.into()), also_mute: Some(SPEAKERS.into()), ..Default::default() };
+        devices::set_in_use(two);
+        assert_eq!(chosen.targets().unwrap(), [HEADSET, SPEAKERS]);
+        devices::set_in_use(devices::InUse::default());
     }
 
     #[test]

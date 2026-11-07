@@ -676,6 +676,12 @@ fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_
     sent.is_some() && may_try && (play_only || echo_likely)
 }
 
+/// What else to mute. Exclusion takes every app's sound on every output, so the speakers really
+/// playing are the Windows default, which need not be the output chosen.
+fn also_mute(sent: Option<&str>, default: Option<&str>, play_only: bool) -> Option<String> {
+    default.filter(|default| play_only && sent.is_some() && sent != Some(*default)).map(String::from)
+}
+
 /// Why the output stays on when it was meant to be muted.
 fn no_mute_note(play_only: bool, sending_output: bool, failing: bool) -> Option<String> {
     (play_only && sending_output && failing).then(|| {
@@ -745,6 +751,7 @@ fn engine() {
         ];
         devices::set_in_use(InUse {
             output: sent_id.clone(),
+            also_mute: also_mute(sent_id.as_deref(), lists.default_output.as_deref(), play_only),
             play: play_id.clone(),
             echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
             notes: notes.into_iter().flatten().collect(),
@@ -927,6 +934,15 @@ mod tests {
         assert!(needs_exclusion(a, b, false, true, true), "and whichever outputs are chosen");
         assert!(!needs_exclusion(a, a, false, false, true), "unless it's waiting to try again");
         assert!(!needs_exclusion(None, a, false, true, true), "or nothing is being sent");
+    }
+
+    #[test]
+    fn the_windows_default_is_muted_too_if_it_isn_t_the_chosen_output() {
+        let (a, b) = (Some("headset"), Some("speakers"));
+        assert_eq!(also_mute(a, b, true).as_deref(), Some("speakers"));
+        assert_eq!(also_mute(b, b, true), None, "it's the same one");
+        assert_eq!(also_mute(a, b, false), None, "muting isn't wanted");
+        assert_eq!(also_mute(None, b, true), None, "no output is being sent");
     }
 
     #[test]
