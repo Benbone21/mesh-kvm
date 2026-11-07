@@ -19,7 +19,8 @@ const SMOOTHING: f32 = 0.4;
 const BEATS_KEPT: usize = 32;
 /// How long a peer that says nothing of its version is given, with the link up.
 const VERSION_WAIT_MS: u64 = 3000;
-/// How long the app keeps saying the other device can't be read after the last such packet.
+/// How long the app keeps saying the other device can't be read, or sends plain packets, after the
+/// last such packet.
 const UNREADABLE_FOR_MS: u64 = 10_000;
 /// Figures that depend on the other device hearing this one last this long without an answer. A
 /// heartbeat and a few lost answers fit well inside it.
@@ -383,6 +384,15 @@ pub fn press_event(event: PressEvent) -> Event {
     }
 }
 
+/// Something from the peer's address that wasn't a packet to act on, and says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unopened {
+    /// Plain `MKVM` or `MKAU`. Anyone can forge this, so all it may ever do is show a note.
+    OldPeer,
+    /// From inside the session, so really from the peer, and not a packet this version can read.
+    Unreadable,
+}
+
 /// What this device can say of the other one's version.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -435,6 +445,7 @@ pub struct PeerLink {
     protocol: Option<u16>,
     first_packet: Option<u64>,
     unreadable_at: Option<u64>,
+    old_peer_at: Option<u64>,
     /// The last valid handshake heard from the peer.
     handshake_at: Option<u64>,
     online: bool,
@@ -467,9 +478,24 @@ impl PeerLink {
         self.presses.stats
     }
 
-    /// A packet from the peer that starts right and can't be read.
+    /// A packet from inside the session that starts right and can't be read.
     pub fn unreadable(&mut self, now_ms: u64) {
         self.unreadable_at = Some(now_ms);
+    }
+
+    pub fn note(&mut self, what: Unopened, now_ms: u64) {
+        match what {
+            Unopened::OldPeer => self.old_peer_at = Some(now_ms),
+            Unopened::Unreadable => self.unreadable(now_ms),
+        }
+    }
+
+    /// Plain packets came from the peer's address lately. This is for a note and nothing else: it
+    /// must never reach `peer_version`, or a forged packet could turn off numbered presses.
+    // Nothing shows this yet; the task that adds it to `/api/local` removes this.
+    #[allow(dead_code)]
+    pub fn old_peer(&self, now_ms: u64) -> bool {
+        self.old_peer_at.is_some_and(|at| now_ms.saturating_sub(at) < UNREADABLE_FOR_MS)
     }
 
     /// The peer is trying to start a session. With the link down, that means it's being heard here
@@ -636,6 +662,33 @@ mod tests {
             Some(Payload::Presses { newest, events, .. }) => (newest, events),
             other => panic!("expected presses: {other:?}"),
         }
+    }
+
+    /// A link that has had a report from the other device, on this version.
+    fn same_version_link() -> PeerLink {
+        let (mut link, mut sender) = (PeerLink::default(), PeerLink::default());
+        link.heard_state(&sender.next_state(HeldInput::default(), false, false, 0, 0), 0);
+        assert_eq!(link.peer_version(0), PeerVersion::Same);
+        link
+    }
+
+    #[test]
+    fn a_plain_packet_is_only_a_note_for_a_while() {
+        let mut link = same_version_link();
+        assert!(!link.old_peer(1000));
+        link.note(Unopened::OldPeer, 1000);
+        assert!(link.old_peer(1000));
+        assert!(link.old_peer(1000 + UNREADABLE_FOR_MS - 1));
+        assert!(!link.old_peer(1000 + UNREADABLE_FOR_MS));
+        assert_eq!(link.peer_version(1000), PeerVersion::Same, "anyone can forge one");
+    }
+
+    #[test]
+    fn what_cant_be_read_inside_a_session_is_another_version_and_no_old_peer() {
+        let mut link = same_version_link();
+        link.note(Unopened::Unreadable, 1000);
+        assert_eq!(link.peer_version(1000), PeerVersion::Other);
+        assert!(!link.old_peer(1000));
     }
 
     #[test]

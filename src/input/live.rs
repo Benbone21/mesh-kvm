@@ -118,7 +118,7 @@ impl Device {
     fn receive(&mut self, datagram: &[u8], from: SocketAddr) {
         let now_ms = self.now_ms();
         let link = &mut self.link;
-        let Some(packet) = self.udp.socket.open(datagram, from, now_ms, &mut self.opened, &mut || link.unreadable(now_ms)) else {
+        let Some(packet) = self.udp.socket.open(datagram, from, now_ms, &mut self.opened, &mut |what| link.note(what, now_ms)) else {
             return;
         };
         self.route(Event::PeerAlive { now_ms });

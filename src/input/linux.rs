@@ -1283,7 +1283,7 @@ pub fn run_debian_node(
 
         // 1. Drain incoming UDP packets on port 24850
         while let Ok((len, src_addr)) = peer_socket.socket.recv_from(&mut udp_buf) {
-            let Some(pkt) = peer_socket.open(&udp_buf[..len], src_addr, now_ms(), &mut opened, &mut || link.unreadable(now_ms())) else {
+            let Some(pkt) = peer_socket.open(&udp_buf[..len], src_addr, now_ms(), &mut opened, &mut |what| link.note(what, now_ms())) else {
                 continue;
             };
             core.route(Event::PeerAlive { now_ms: now_ms() });

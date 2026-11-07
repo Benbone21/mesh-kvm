@@ -1012,8 +1012,8 @@ pub fn run_windows_node(
                 }
                 match rx_peer.socket.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
-                        let unreadable = &mut || link().unreadable(now_ms());
-                        let Some(pkt) = rx_peer.open(&buf[..len], src_addr, now_ms(), &mut opened, unreadable) else {
+                        let note = &mut |what| link().note(what, now_ms());
+                        let Some(pkt) = rx_peer.open(&buf[..len], src_addr, now_ms(), &mut opened, note) else {
                             continue;
                         };
                         route(Event::PeerAlive { now_ms: now_ms() });

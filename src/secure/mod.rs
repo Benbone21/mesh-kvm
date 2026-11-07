@@ -1,4 +1,5 @@
-// Nothing calls this yet; a later task wires it in and removes this.
+// Input is wired in. The audio channels, `Services::pairing`, `stream`, `pairing`, and saving and
+// fingerprints in `keys` aren't yet, and the task that finishes them removes this.
 #![allow(dead_code)]
 
 pub mod datagram;

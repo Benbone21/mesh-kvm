@@ -11,6 +11,7 @@ pub mod win_logic;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+use self::link::Unopened;
 use crate::protocol::{NodeId, Packet, Payload, PressEvent, PACKET_MAGIC};
 use crate::router::Action;
 use crate::secure::datagram::{Channel, Opened};
@@ -82,10 +83,10 @@ impl PeerSocket {
     }
 
     /// Takes in a datagram, answering it if it needs that. Only a packet that checked out comes
-    /// back, so whatever counts as hearing the peer goes after this. `unreadable` is for something
-    /// from the peer's address that says it's on another version. Handshakes happen here, so this
-    /// is for the receive thread and never a hook.
-    pub fn open(&self, datagram: &[u8], from: SocketAddr, now_ms: u64, plain: &mut Vec<u8>, unreadable: &mut dyn FnMut()) -> Option<Packet> {
+    /// back, so whatever counts as hearing the peer goes after this. `note` hears of anything from
+    /// the peer's address that says it's on another version. Handshakes happen here, so this is for
+    /// the receive thread and never a hook.
+    pub fn open(&self, datagram: &[u8], from: SocketAddr, now_ms: u64, plain: &mut Vec<u8>, note: &mut dyn FnMut(Unopened)) -> Option<Packet> {
         if !from_peer(from, self.peer) {
             return None;
         }
@@ -93,7 +94,7 @@ impl PeerSocket {
             Opened::Data(bytes) => {
                 let packet = Packet::decode(bytes);
                 if packet.is_err() && bytes.starts_with(&PACKET_MAGIC) {
-                    unreadable();
+                    note(Unopened::Unreadable);
                 }
                 packet.ok()
             }
@@ -102,7 +103,7 @@ impl PeerSocket {
                 None
             }
             Opened::OldPeer => {
-                unreadable();
+                note(Unopened::OldPeer);
                 None
             }
             Opened::Heard | Opened::Refused => None,
@@ -243,14 +244,13 @@ mod tests {
         (peer_socket(&a, &socket_a, &socket_b), peer_socket(&b, &socket_b, &socket_a))
     }
 
-    /// The next datagram at `to`, and whether it was a packet for the caller, and whether it said
-    /// the other device is on another version.
-    fn take(to: &PeerSocket, now_ms: u64) -> (Option<Packet>, bool) {
+    /// The next datagram at `to`: the packet for the caller, if it was one, and what else it said.
+    fn take(to: &PeerSocket, now_ms: u64) -> (Option<Packet>, Option<Unopened>) {
         let mut buf = [0u8; MAX_DATAGRAM];
         let (len, from) = to.socket.recv_from(&mut buf).unwrap();
-        let mut unreadable = false;
-        let packet = to.open(&buf[..len], from, now_ms, &mut Vec::new(), &mut || unreadable = true);
-        (packet, unreadable)
+        let mut noted = None;
+        let packet = to.open(&buf[..len], from, now_ms, &mut Vec::new(), &mut |what| noted = Some(what));
+        (packet, noted)
     }
 
     /// Handshake 1, handshake 2, and the keepalive that confirms it.
@@ -271,9 +271,9 @@ mod tests {
     fn a_sealed_packet_comes_out_the_other_end() {
         let (a, b) = linked();
         a.send(&heartbeat());
-        let (packet, unreadable) = take(&b, 2);
+        let (packet, noted) = take(&b, 2);
         assert!(matches!(packet.map(|p| p.payload), Some(Payload::Heartbeat)));
-        assert!(!unreadable);
+        assert_eq!(noted, None);
     }
 
     #[test]
@@ -290,8 +290,9 @@ mod tests {
         let mut keepalive = Vec::new();
         assert!(a.channel.seal(&[], &mut keepalive));
         a.socket.send_to(&keepalive, a.peer).unwrap();
-        let (packet, unreadable) = take(&b, 2);
-        assert!(packet.is_none() && !unreadable);
+        let (packet, noted) = take(&b, 2);
+        assert!(packet.is_none());
+        assert_eq!(noted, None);
     }
 
     #[test]
@@ -306,32 +307,40 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_packet_says_old_version_and_is_not_a_packet() {
+    fn a_plain_packet_on_a_linked_pair_is_a_note_and_changes_nothing() {
         let (a, b) = linked();
+        let (mut link, mut sender) = (link::PeerLink::default(), link::PeerLink::default());
+        link.heard_state(&sender.next_state(Default::default(), false, false, 0, 2), 2);
         a.socket.send_to(&heartbeat(), a.peer).unwrap();
-        let (packet, unreadable) = take(&b, 2);
+
+        let (packet, noted) = take(&b, 2);
         assert!(packet.is_none());
-        assert!(unreadable);
+        link.note(noted.unwrap(), 2);
+        assert!(link.old_peer(2));
+        assert_eq!(link.peer_version(2), link::PeerVersion::Same, "so presses stay numbered");
+
+        a.send(&heartbeat());
+        assert!(take(&b, 3).0.is_some(), "and the session carries on");
     }
 
     #[test]
     fn a_session_packet_that_cant_be_read_says_other_version() {
         let (a, b) = linked();
         a.send(&PACKET_MAGIC);
-        let (packet, unreadable) = take(&b, 2);
+        let (packet, noted) = take(&b, 2);
         assert!(packet.is_none());
-        assert!(unreadable);
+        assert_eq!(noted, Some(Unopened::Unreadable));
         a.send(b"not one of ours");
-        assert_eq!(take(&b, 2).1, false);
+        assert_eq!(take(&b, 2).1, None);
     }
 
     #[test]
     fn a_stranger_is_not_listened_to_at_all() {
         let (_a, b) = linked();
-        let mut unreadable = false;
+        let mut noted = None;
         let from = "192.0.2.1:24850".parse().unwrap();
-        assert!(b.open(&heartbeat(), from, 2, &mut Vec::new(), &mut || unreadable = true).is_none());
-        assert!(!unreadable);
+        assert!(b.open(&heartbeat(), from, 2, &mut Vec::new(), &mut |what| noted = Some(what)).is_none());
+        assert_eq!(noted, None);
     }
 
     #[test]
@@ -343,7 +352,7 @@ mod tests {
         // From the peer's address, on another port.
         let elsewhere = bound("127.0.0.1");
         let from = elsewhere.local_addr().unwrap();
-        assert!(b.open(&buf[..len], from, 1, &mut Vec::new(), &mut || ()).is_none());
+        assert!(b.open(&buf[..len], from, 1, &mut Vec::new(), &mut |_| ()).is_none());
         assert!(elsewhere.recv_from(&mut buf).is_ok());
     }
 
