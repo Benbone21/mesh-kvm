@@ -463,6 +463,7 @@ pub fn audio_status_json() -> serde_json::Value {
         "play": choice.play,
         "inputs": lists.inputs,
         "outputs": lists.outputs,
+        "hint": in_use.hint,
         "notes": audio_notes(in_use.notes),
         "echo_safe": in_use.echo_safe,
         "bitrate": AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),

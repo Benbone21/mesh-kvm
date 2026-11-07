@@ -63,15 +63,19 @@ Each device has its own audio controls, and sound can go both ways at once.
 
 - Microphone or line-in to send, and Output to send, choose what this device sends. Each lists your real devices by name, or None. Choosing anything starts sending, and if you choose both they are sent mixed, turned down just enough that the sum doesn't clip. A microphone can only be chosen on the device it belongs to, though the other device can turn it off.
 - Play received audio on chooses where sound from the other device plays. Play audio turns it off.
-- Play only on the other device mutes the output you chose to send, so you hear that sound on one device only. It is on by default.
+- Play only on the other device mutes the output you chose to send, so you hear that sound on one device only. It is on by default. On Windows it also mutes the default output if that's a different one, and changes what's sent: see below.
 - Audio quality chooses the bitrate of what this device sends: 64, 96, 128 or 256 kbit/s, or Uncompressed at about 1.6 Mbit/s. Each packet adds about 32 kbit/s on the network on top of that. On poor Wi-Fi, use a lower one: smaller packets get through more often.
 - The lines under each part say how the audio is doing: how much is lost on the way, how much couldn't be repaired, and how much is held back to smooth out the network. A note appears if a capture can't be opened, delivers nothing, or a microphone gives only silence.
 
 ### Play only on the other device
 
-The output is muted only once the other device confirms that real sound is coming out of its output. A pause in the sound keeps it muted for up to 30 seconds, so it doesn't go on and off between tracks. It comes back when you stop sending, the link drops, the other device stops playing, or sound from the other device is playing on that same output. If sound stops right after muting, which could mean the mute itself stopped it, the output comes back within seconds, and after this happens twice it stays on for a while and a note says so. Sending a microphone doesn't mute anything. If you had muted the output yourself, it stays muted, and if you unmute it by hand, mesh-kvm leaves it alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
+On Windows, muting an output also silences an ordinary recording of it, and it follows the volume slider too. A test on the laptop showed that exactly. So with this on, mesh-kvm asks Windows for all sound except its own, which comes from before the mute and the volume slider. That has three effects: every app's sound on every output is sent, a small line under Output to send says so, and the level sent no longer changes with the laptop's volume. It also means the output chosen no longer decides what's sent, so the Windows default output is muted as well. If Windows won't do this, nothing is muted, sound plays on both devices, and a note says why. Debian doesn't need any of this.
+
+The output is muted only once the other device confirms that real sound is coming out of its output. A pause in the sound keeps it muted for up to 30 seconds, so it doesn't go on and off between tracks. It comes back when you stop sending, the link drops, the other device stops playing, or sound from the other device is playing on that same output. If sound stops right after muting, the output comes back within seconds, and if this happens twice in half a minute it stays on for a while and a note says so. Sending a microphone doesn't mute anything. If you had muted the output yourself, it stays muted, and if you unmute it by hand, mesh-kvm leaves it alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
 
 ### Devices coming and going
+
+On Windows without Play only on the other device, sending an output that nothing plays on sends silence. If it stays silent for about 5 seconds while the default output has sound, a note says so.
 
 Plug a device in or take it out and the lists update without restarting anything. If a chosen device isn't there, the system default is used and a note says so, and mesh-kvm goes back to your choice when the device returns. With System default chosen, capture and muting both follow the default to its new device.
 
@@ -80,7 +84,7 @@ Plug a device in or take it out and the lists update without restarting anything
 When both devices send an output, each must leave out what it plays, or the sound goes round and round as an echo.
 
 - On Debian, mesh-kvm doesn't record the output. It connects to each app playing there, and leaves itself out, so this always works. It also means that the output's own volume and mute don't change what's sent.
-- On Windows, recording an output includes everything playing on it. If received audio plays on a different output, that's fine. If it plays on the same output, then while both directions are in use mesh-kvm asks Windows for all sound except its own, on Windows 10 version 2004 or later. Windows can't limit that to one output, so a note says that all of the laptop's sound is being sent. If that fails, mesh-kvm goes back to ordinary recording, the app warns that you may hear an echo, and it tries again now and then, unless Windows says it can't do this at all.
+- On Windows, recording an output includes everything playing on it. If received audio plays on a different output, that's fine. If it plays on the same output, then while both directions are in use mesh-kvm asks Windows for all sound except its own, on Windows 10 version 2004 or later. Windows can't limit that to one output, so a line under Output to send says that all of the laptop's sound is being sent. If that fails, mesh-kvm goes back to ordinary recording, the app warns that you may hear an echo, and it tries again now and then, unless Windows says it can't do this at all.
 
 A microphone that can hear the speakers will still pick them up. Headphones avoid that.
 
@@ -154,6 +158,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 
 ## Limits
 
+- On Windows, Play only on the other device sends every app's sound. It can't send just one output and mute it, because a mute silences a recording of that output.
 - The Windows lock screen and UAC prompts can't be controlled remotely. Use the laptop's own keyboard and trackpad for those.
 - The API port (24880) stays open on the network, and it and the input traffic are not encrypted until the encryption stage. Only use mesh-kvm on a network you trust. Anyone on the network can read a device's status, but only that device and the other one can change anything, and only the app on the same device can change the other device's address.
 - Addresses are IPv4 only, and there is no automatic discovery.

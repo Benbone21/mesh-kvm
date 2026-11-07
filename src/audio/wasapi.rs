@@ -18,9 +18,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PWSTR};
+use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
@@ -57,6 +58,7 @@ const BITS: u16 = 16;
 const LONGEST_STOP_WAIT: Duration = Duration::from_millis(400);
 /// How long a stream failing stays in the notes.
 const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(4);
+const ALL_SOUND_HINT: &str = "All of this device's sound is sent, from every app and output.";
 /// What to try when a microphone gives nothing. Windows can block one for every app.
 const MIC_HELP: &str = "Check that Microphone access is on in Windows privacy settings.";
 
@@ -682,6 +684,51 @@ fn also_mute(sent: Option<&str>, default: Option<&str>, play_only: bool) -> Opti
     default.filter(|default| play_only && sent.is_some() && sent != Some(*default)).map(String::from)
 }
 
+/// Below this peak, an output is silent.
+const METER_FLOOR: f32 = 0.001;
+/// How long an output has to stay silent, with sound elsewhere, to be worth a mention.
+const WRONG_OUTPUT_AFTER: Duration = Duration::from_secs(5);
+
+/// Notices the output being sent staying silent while Windows is playing somewhere else, which
+/// sends silence for no reason anyone could see.
+#[derive(Default)]
+struct WrongOutput {
+    since: Option<Instant>,
+}
+
+impl WrongOutput {
+    /// Takes the peak of each lately, or None when there's nothing to compare.
+    fn note(&mut self, peaks: Option<(f32, f32)>, now: Instant) -> bool {
+        let wrong = peaks.is_some_and(|(chosen, default)| chosen < METER_FLOOR && default >= METER_FLOOR);
+        if !wrong {
+            self.since = None;
+            return false;
+        }
+        now.duration_since(*self.since.get_or_insert(now)) >= WRONG_OUTPUT_AFTER
+    }
+}
+
+/// How loud an output has been since this was last asked. Windows keeps this up itself, so it
+/// costs a read, and it happens with the device lists, not with the audio.
+fn peak_of(all: &IMMDeviceEnumerator, id: &str) -> Option<f32> {
+    let id: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let meter: IAudioMeterInformation = all.GetDevice(PCWSTR(id.as_ptr())).ok()?.Activate(CLSCTX_ALL, None).ok()?;
+        meter.GetPeakValue().ok()
+    }
+}
+
+fn read_peaks(sent: Option<&str>, default: Option<&str>) -> Option<(f32, f32)> {
+    let (sent, default) = (sent?, default?);
+    let all = enumerator().ok()?;
+    Some((peak_of(&all, sent)?, peak_of(&all, default)?))
+}
+
+fn wrong_output_note(sent: Option<&str>, default: Option<&str>, lists: &Lists) -> Option<String> {
+    let name = |id: Option<&str>| lists.outputs.iter().find(|d| Some(d.id.as_str()) == id).map(|d| d.name.clone());
+    Some(format!("Nothing is playing on {}. Windows is playing on {}.", name(sent)?, name(default)?))
+}
+
 /// Why the output stays on when it was meant to be muted.
 fn no_mute_note(play_only: bool, sending_output: bool, failing: bool) -> Option<String> {
     (play_only && sending_output && failing).then(|| {
@@ -699,6 +746,7 @@ fn engine() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let mut mic = Worker::<Option<Pick>>::default();
     let mut output = Worker::<OutputCapture>::default();
+    let mut wrong_output = WrongOutput::default();
     loop {
         WAKE.wait(LOOK_EVERY);
         let now = Instant::now();
@@ -734,13 +782,17 @@ fn engine() {
         *PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner) =
             play_id.as_ref().and_then(|id| outputs.get(id).cloned());
 
-        let whole_device = excluding && choice.output != devices::DEFAULT;
+        // Exclusion takes every output, so which one is chosen only matters without it.
+        let default_id = lists.default_output.as_deref();
+        let compare = !excluding && sent_id.as_deref() != default_id;
+        let peaks = if compare { read_peaks(sent_id.as_deref(), default_id) } else { None };
+        let on_wrong_output = wrong_output.note(peaks, now);
         let notes = [
             input.missing_note("microphone or line-in"),
             sent.missing_note("output to send"),
             play.missing_note("output to play on"),
             no_mute_note(play_only, sent != Resolved::Off, failing),
-            whole_device.then(|| "While both devices are sending, all of this device's sound is sent, not just this output's.".to_string()),
+            on_wrong_output.then(|| wrong_output_note(sent_id.as_deref(), default_id, &lists)).flatten(),
             (input != Resolved::Off)
                 .then(|| mic.health(&HUB.mic, true, true, now).note("microphone or line-in", MIC_HELP, now))
                 .flatten(),
@@ -754,6 +806,7 @@ fn engine() {
             also_mute: also_mute(sent_id.as_deref(), lists.default_output.as_deref(), play_only),
             play: play_id.clone(),
             echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
+            hint: if excluding { ALL_SOUND_HINT.to_string() } else { String::new() },
             notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);
@@ -943,6 +996,43 @@ mod tests {
         assert_eq!(also_mute(b, b, true), None, "it's the same one");
         assert_eq!(also_mute(a, b, false), None, "muting isn't wanted");
         assert_eq!(also_mute(None, b, true), None, "no output is being sent");
+    }
+
+    #[test]
+    fn a_silent_output_with_sound_elsewhere_is_called_out_after_about_five_seconds() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        for second in 0..5 {
+            assert!(!watch.note(Some((0.0, 0.3)), at(second)), "{second}");
+        }
+        assert!(watch.note(Some((0.0, 0.3)), at(5)));
+        assert!(watch.note(Some((0.0, 0.3)), at(6)), "and stays");
+    }
+
+    #[test]
+    fn sound_on_the_chosen_output_or_silence_everywhere_says_nothing() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        watch.note(Some((0.0, 0.3)), at(0));
+        assert!(!watch.note(Some((0.2, 0.3)), at(6)), "the chosen output came to life");
+        assert!(!watch.note(Some((0.0, 0.3)), at(7)), "and the count starts again");
+        assert!(!watch.note(Some((0.0, 0.3)), at(11)));
+        assert!(!watch.note(Some((0.0, 0.0)), at(13)), "nothing is playing anywhere");
+        assert!(!watch.note(Some((0.0, 0.3)), at(14)));
+        assert!(!watch.note(None, at(30)), "nothing to compare");
+    }
+
+    #[test]
+    fn the_note_names_both_outputs() {
+        let lists = Lists {
+            outputs: vec![device("{1}", "Steam Streaming Speakers"), device("{2}", "Speakers (Realtek(R) Audio)")],
+            ..Default::default()
+        };
+        assert_eq!(
+            wrong_output_note(Some("{1}"), Some("{2}"), &lists).unwrap(),
+            "Nothing is playing on Steam Streaming Speakers. Windows is playing on Speakers (Realtek(R) Audio)."
+        );
+        assert_eq!(wrong_output_note(Some("{9}"), Some("{2}"), &lists), None);
     }
 
     #[test]

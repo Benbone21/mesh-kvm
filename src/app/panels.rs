@@ -359,6 +359,9 @@ impl DevicePanel<'_, '_> {
             ui.label(small("This can only be changed on that device."));
         }
         self.device_picker(ui, DeviceRole::Output, "Output to send", &outputs, &output);
+        if !self.status.audio.hint.is_empty() {
+            ui.label(small(&self.status.audio.hint));
+        }
         meter(ui, self.status.audio.tx_peak);
         self.toggle(ui, Control::PlayOnlyOnOther, "Play only on the other device");
         self.bitrate_picker(ui);
