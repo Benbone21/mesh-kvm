@@ -188,6 +188,8 @@ Main device behaviour:
 
 ## Link and security
 
+> Replaced by `2026-11-06-encryption-and-pairing-design.md`.
+
 Pairing:
 
 - The app on one device shows a 6-digit code, and the user enters it on the other.
