@@ -40,6 +40,22 @@ pub trait Wire: Read + Write + Send {
     fn set_write_wait(&mut self, wait: Option<Duration>) -> io::Result<()>;
 }
 
+/// For tests that can go either way, plain or secure.
+#[cfg(test)]
+impl Wire for Box<dyn Wire> {
+    fn end_writing(&mut self) -> io::Result<()> {
+        (**self).end_writing()
+    }
+
+    fn set_read_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_wait(wait)
+    }
+
+    fn set_write_wait(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        (**self).set_write_wait(wait)
+    }
+}
+
 impl Wire for TcpStream {
     fn end_writing(&mut self) -> io::Result<()> {
         self.shutdown(std::net::Shutdown::Write)

@@ -67,7 +67,6 @@ fn serve(listener: TcpListener, peer: IpAddr, pairing: Arc<Pairing>, incoming: I
 }
 
 /// A connection to the peer's listener, with the handshake done inside `wait`.
-#[cfg(not(test))]
 pub fn open(target: SocketAddr, purpose: Purpose, wait: Duration) -> Result<SecureStream, String> {
     open_with(super::services().pairing.as_deref(), target, purpose, wait)
 }
@@ -243,6 +242,70 @@ mod tests {
         });
         serve(listener, peer, Arc::new(server), incoming).unwrap();
         (addr, rx)
+    }
+
+    /// What a reconnect takes against the plain connect it replaced, which is `TcpStream::connect_timeout`
+    /// with the same limit. `tests/netem_link.py` puts this on a lossy link.
+    #[test]
+    #[ignore = "run by tests/netem_link.py"]
+    fn reconnects_against_a_plain_connect() {
+        let tries = std::env::var("MK_TRIES").ok().and_then(|n| n.parse().ok()).unwrap_or(200);
+        let (a, b) = paired_pair();
+        let (secure, _handed) = serving("127.0.0.1".parse().unwrap(), b.clone());
+        // Whole calls too, as a reconnect now happens only after a failure.
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = api_listener.local_addr().unwrap();
+        let handler: Handler = Arc::new(|_| Some("{}".to_string()));
+        let incoming: Incoming = Arc::new(move |stream, _| serve_api(stream, handler.clone()));
+        serve(api_listener, "127.0.0.1".parse().unwrap(), Arc::new(b), incoming).unwrap();
+        let link = Link::new(HOUR);
+        let mut failed_calls = 0;
+        let plain_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let plain = plain_listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for connection in plain_listener.incoming() {
+                drop(connection);
+            }
+        });
+        let timed = |connect: &mut dyn FnMut() -> bool| {
+            let started = Instant::now();
+            let made = connect();
+            (made, started.elapsed().as_secs_f64() * 1000.0)
+        };
+        let (mut secure_times, mut plain_times) = (Vec::new(), Vec::new());
+        let (mut secure_misses, mut plain_misses) = (0, 0);
+        for _ in 0..tries {
+            let (made, took) = timed(&mut || open_with(Some(&a), secure, Purpose::Api, CONNECT_WAIT).is_ok());
+            secure_misses += u32::from(!made);
+            if made {
+                secure_times.push(took);
+            }
+            let (made, took) = timed(&mut || TcpStream::connect_timeout(&plain, CONNECT_WAIT).is_ok());
+            plain_misses += u32::from(!made);
+            if made {
+                plain_times.push(took);
+            }
+            failed_calls += u32::from(link.call(Some(&a), Some(api), "GET", "/api/state", "").is_err());
+            // As often as the app asks.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let middle = |times: &mut Vec<f64>| {
+            times.sort_by(f64::total_cmp);
+            times.get(times.len() / 2).copied().unwrap_or(0.0)
+        };
+        println!(
+            "RECONNECT {}",
+            serde_json::json!({
+                "tries": tries,
+                "secure_misses": secure_misses,
+                "plain_misses": plain_misses,
+                "failed_calls": failed_calls,
+                "secure_median_ms": middle(&mut secure_times),
+                "plain_median_ms": middle(&mut plain_times),
+                "secure_most_ms": secure_times.last(),
+                "plain_most_ms": plain_times.last(),
+            })
+        );
     }
 
     #[test]

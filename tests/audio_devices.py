@@ -123,11 +123,11 @@ def start_sound_server(name):
 def tool(name, *args, **kw):
     return subprocess.run(args, env=env_for(name), capture_output=True, text=True, timeout=10, **kw)
 
-def device(name, listen, peer, seconds, **choices):
+def device(name, listen, peer, seconds, around=(), **choices):
     e = env_for(name)
     e.update(MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds),
              MK_PAIRING=paired_files(BASE)["ab".index(name)], **choices)
-    return subprocess.Popen([BIN, "--ignored", "--exact", "audio::live::whole_device", "--nocapture"], env=e,
+    return subprocess.Popen([*around, BIN, "--ignored", "--exact", "audio::live::whole_device", "--nocapture"], env=e,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
 class Reader(threading.Thread):

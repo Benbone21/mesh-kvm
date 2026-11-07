@@ -11,7 +11,7 @@ use crate::secure::datagram::{Channel, Label, LinkSecurity, Role};
 use crate::secure::keys::{Loaded, Pairing};
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +23,11 @@ const BUTTONS: u16 = 256;
 
 fn number(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+}
+
+/// An address from the environment, or loopback. Two namespaces need more than that.
+fn host(name: &str) -> IpAddr {
+    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
 
 fn wall_ms() -> u64 {
@@ -80,13 +85,45 @@ struct Udp {
     seq: u64,
     presses: PressLog,
     start: Instant,
+    showing: Showing,
+}
+
+/// What `tests/capture_link.py` asks for: the exact bytes of each packet with keys in it, so it can
+/// look for them on the wire, and for its control run those bytes going out in the clear as well.
+struct Showing {
+    print: bool,
+    plain_to: Option<(UdpSocket, SocketAddr)>,
+}
+
+impl Showing {
+    fn from_env() -> Showing {
+        let plain_to = std::env::var("MK_PLAIN_TO").ok().map(|target| {
+            let target: SocketAddr = target.parse().expect("MK_PLAIN_TO is an address");
+            (UdpSocket::bind(("0.0.0.0", 0)).unwrap(), target)
+        });
+        Showing { print: std::env::var_os("MK_SHOW_KEYS").is_some(), plain_to }
+    }
+
+    fn keys_sent(&self, bytes: &[u8]) {
+        if self.print {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            println!("KEYS {hex}");
+        }
+        if let Some((socket, target)) = &self.plain_to {
+            let _ = socket.send_to(bytes, target);
+        }
+    }
 }
 
 impl PeerSender for Udp {
     fn send(&mut self, payload: Payload) {
+        let has_keys = matches!(payload, Payload::Presses { .. } | Payload::KeyEvent { .. });
         let packet = Packet::new(self.seq, self.node, payload);
         self.seq = self.seq.wrapping_add(1);
         if let Ok(bytes) = packet.encode() {
+            if has_keys {
+                self.showing.keys_sent(&bytes);
+            }
             self.socket.send(&bytes);
         }
     }
@@ -195,9 +232,9 @@ fn channel_from_test_pairing() -> Arc<Channel> {
 #[ignore = "run by tests/netem_link.py"]
 fn whole_device() {
     let me = number("MK_ME", 0) as DeviceId;
-    let socket = UdpSocket::bind(("127.0.0.1", number("MK_LISTEN", 24961) as u16)).unwrap();
+    let socket = UdpSocket::bind((host("MK_HOST"), number("MK_LISTEN", 24961) as u16)).unwrap();
     socket.set_nonblocking(true).unwrap();
-    let peer = SocketAddr::from(([127, 0, 0, 1], number("MK_PEER", 24962) as u16));
+    let peer = SocketAddr::new(host("MK_PEER_HOST"), number("MK_PEER", 24962) as u16);
     let now_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
     let node = if me == 0 { NodeId::Debian } else { NodeId::Windows };
     let start = Instant::now();
@@ -216,6 +253,7 @@ fn whole_device() {
             seq: number("MK_SEQ", now_us),
             presses: PressLog::default(),
             start,
+            showing: Showing::from_env(),
         },
         link: PeerLink::default(),
         start,

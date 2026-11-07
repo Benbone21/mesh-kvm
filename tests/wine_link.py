@@ -1261,6 +1261,8 @@ class LinuxDevice:
     """The real Linux build on the other device's side, with its own HOME and nothing to reach
     this machine's keyboard, mouse or sound with."""
 
+    flags = ("--role", "debian")
+
     def __init__(self, binary, holder, folder, log):
         self.binary, self.log, self.proc = binary, log, None
         self.enter_namespace = ["nsenter", f"--net=/proc/{holder.pid}/ns/net"]
@@ -1280,7 +1282,7 @@ class LinuxDevice:
 
     def start(self):
         command = [*self.enter_namespace, "unshare", "-m", "--propagation", "private", "sh", "-c", SANDBOX, "sh",
-                   self.binary, "--role", "debian", "--mouse-device", "/dev/null", "--width", "1920", "--height", "1080"]
+                   self.binary, *self.flags, "--mouse-device", "/dev/null", "--width", "1920", "--height", "1080"]
         self.proc = subprocess.Popen(command, env=self.env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
 
     def stop(self):

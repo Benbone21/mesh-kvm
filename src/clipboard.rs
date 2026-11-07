@@ -6,11 +6,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Read, Write};
-#[cfg(not(test))]
 use crate::secure::control;
-#[cfg(not(test))]
-use crate::secure::stream::Purpose;
-use crate::secure::stream::{SecureStream, Wire};
+use crate::secure::stream::{Purpose, SecureStream, Wire};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -870,39 +867,43 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
             let mut said_stuck = false;
             loop {
                 std::thread::sleep(if reader.held_up() { HELPER_POLL_INTERVAL } else { POLL_INTERVAL });
-
-                let look = reader.read();
-                match look {
-                    Look::Waiting => continue,
-                    Look::Stuck => {
-                        if !said_stuck && CLIPBOARD_SEND.load(Ordering::SeqCst) {
-                            set_failure(STUCK_NOTE);
-                        }
-                        said_stuck = true;
-                        continue;
-                    }
-                    Look::Got(_) if said_stuck => {
-                        said_stuck = false;
-                        clear_stuck_note();
-                    }
-                    Look::Got(_) => {}
-                }
-                let Look::Got(Some(snapshot)) = look else { continue };
-                let fingerprint = snapshot.fingerprint();
-                let now = Instant::now();
-                let changed = tracker().lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
-
-                // Tracked even with sending off, so that what was copied meanwhile does not go out
-                // the moment sending comes back on.
-                if changed && CLIPBOARD_SEND.load(Ordering::SeqCst) {
-                    send_snapshot(target_addr, snapshot, &inbox, now);
-                }
+                look_once(&mut reader, &mut said_stuck, target_addr, &inbox);
             }
         })
         .map_err(|e| e.to_string())?;
 
     SYNC_RUNNING.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// One look at the clipboard, sending what's new.
+fn look_once(reader: &mut TimedReader<Snapshot>, said_stuck: &mut bool, target_addr: SocketAddr, inbox: &Path) {
+    let look = reader.read();
+    match look {
+        Look::Waiting => return,
+        Look::Stuck => {
+            if !*said_stuck && CLIPBOARD_SEND.load(Ordering::SeqCst) {
+                set_failure(STUCK_NOTE);
+            }
+            *said_stuck = true;
+            return;
+        }
+        Look::Got(_) if *said_stuck => {
+            *said_stuck = false;
+            clear_stuck_note();
+        }
+        Look::Got(_) => {}
+    }
+    let Look::Got(Some(snapshot)) = look else { return };
+    let fingerprint = snapshot.fingerprint();
+    let now = Instant::now();
+    let changed = tracker().lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
+
+    // Tracked even with sending off, so that what was copied meanwhile does not go out
+    // the moment sending comes back on.
+    if changed && CLIPBOARD_SEND.load(Ordering::SeqCst) {
+        send_snapshot(target_addr, snapshot, inbox, now);
+    }
 }
 
 /// Sends off the watching thread, so that a long transfer doesn't hide the next copy.
@@ -972,22 +973,30 @@ fn retry_waiting(target_addr: SocketAddr, outbox: &Mutex<Outbox>, newest_turn: u
 }
 
 /// The connection to the peer. The handshake counts inside `CONNECT_WAIT`.
-#[cfg(not(test))]
-fn connect(target_addr: SocketAddr) -> Result<SecureStream, String> {
+fn connect_secure(target_addr: SocketAddr) -> Result<SecureStream, String> {
     let mut stream = control::open(target_addr, Purpose::Clipboard, CONNECT_WAIT)?;
     let _ = stream.set_write_wait(Some(IO_TIMEOUT));
     let _ = stream.set_read_wait(Some(ANSWER_WAIT));
     Ok(stream)
 }
 
-/// Tests that don't need the encryption run over plain TCP.
+#[cfg(not(test))]
+use connect_secure as connect;
+
+/// Tests that don't need the encryption run over plain TCP. `tests/capture_link.py` needs it.
 #[cfg(test)]
-fn connect(target_addr: SocketAddr) -> Result<std::net::TcpStream, String> {
+fn connect(target_addr: SocketAddr) -> Result<Box<dyn Wire>, String> {
+    if SECURE_IN_TESTS.load(Ordering::SeqCst) {
+        return Ok(Box::new(connect_secure(target_addr)?));
+    }
     let mut stream = std::net::TcpStream::connect_timeout(&target_addr, CONNECT_WAIT).map_err(|e| e.to_string())?;
     let _ = stream.set_write_wait(Some(IO_TIMEOUT));
     let _ = stream.set_read_wait(Some(ANSWER_WAIT));
-    Ok(stream)
+    Ok(Box::new(stream))
 }
+
+#[cfg(test)]
+static SECURE_IN_TESTS: AtomicBool = AtomicBool::new(false);
 
 /// How long an answer can take once everything is written, as the last of it may still be in the
 /// network on the slowest link.
@@ -1923,6 +1932,49 @@ mod reads {
 #[cfg(all(test, target_os = "linux"))]
 mod live {
     use super::*;
+
+    /// The watching and sending the service does, over the real secure connection, with each line
+    /// on stdin as the next thing copied. Only the clipboard is pretend, so this reaches no display.
+    /// It needs `pairing.json` in `HOME`, and sends to `MK_PEER`.
+    #[test]
+    #[ignore = "run by tests/capture_link.py"]
+    fn whole_sender() {
+        SECURE_IN_TESTS.store(true, Ordering::SeqCst);
+        let target: SocketAddr = std::env::var("MK_PEER").expect("MK_PEER").parse().expect("an address");
+        let copied = Arc::new(Mutex::new(Snapshot::Text("on the clipboard at the start".to_string())));
+        let for_reads = Arc::clone(&copied);
+        let open: OpenReader<Snapshot> = Arc::new(move || {
+            let copied = Arc::clone(&for_reads);
+            Box::new(move || match &*copied.lock().unwrap() {
+                Snapshot::Text(text) => Some(Snapshot::Text(text.clone())),
+                _ => None,
+            })
+        });
+        let (lines, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines().map_while(Result::ok) {
+                let _ = lines.send(line);
+            }
+        });
+        let mut reader = TimedReader::new(open, None, READ_LIMIT);
+        let mut said_stuck = false;
+        let inbox = inbox_dir();
+        let (mut last, mut finished) = (String::new(), false);
+        while !finished {
+            std::thread::sleep(POLL_INTERVAL);
+            look_once(&mut reader, &mut said_stuck, target, &inbox);
+            match read.try_recv() {
+                Ok(line) => *copied.lock().unwrap() = Snapshot::Text(line),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => finished = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            let (note, _) = clipboard_note();
+            if note != last {
+                println!("NOTE {note}");
+                last = note;
+            }
+        }
+    }
 
     /// Watches the real clipboard, as the service does, printing what it notices. For a script
     /// beside an isolated compositor, as this would otherwise watch the real one.

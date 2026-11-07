@@ -17,9 +17,12 @@ or audio, and all of it ends when this script does:
 
 The test binary is what `cargo test --release --no-run` prints. The scenes are clean, loss, delay,
 reorder, mixed, dropout, reverse, flood, stay, stayreverse, oneway, oneway-start, outage,
-outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy and bursty. numpy must be importable. Set AUDIO_TMP
+outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy, bursty and reconnect. numpy must be importable. Set AUDIO_TMP
 to keep the sound servers' files somewhere other than /tmp. Keep it under about 70 characters: past
 that their sockets don't fit in a socket path, the servers don't start, and every tone comes out silent.
+From a long checkout, a private mount keeps it short:
+
+    unshare -rmnpf --kill-child --mount-proc bash -c 'mount --bind target/netem /mnt && AUDIO_TMP=/mnt python3 tests/netem_link.py path/to/test-binary'
 """
 import json
 import os
@@ -65,16 +68,17 @@ def clean():
 
 
 class Device:
-    def __init__(self, me, listen, peer, seconds, main=0, seq=None):
+    def __init__(self, me, listen, peer, seconds, main=0, seq=None, around=(), **more):
         env = dict(os.environ, MK_ME=str(me), MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds), MK_MAIN=str(main),
-                   MK_PAIRING=audio.paired_files(audio.BASE)[me])
+                   MK_PAIRING=audio.paired_files(audio.BASE)[me], **more)
         if seq is not None:
             env["MK_SEQ"] = str(seq)
-        self.p = subprocess.Popen([audio.BIN, "--ignored", "--exact", "input::live::whole_device", "--nocapture"], env=env,
+        self.p = subprocess.Popen([*around, audio.BIN, "--ignored", "--exact", "input::live::whole_device", "--nocapture"], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.last = {}
         self.watchers = []
         self.injected = []
+        self.keys_sent = []
         threading.Thread(target=self.read, daemon=True).start()
 
     def read(self):
@@ -82,6 +86,10 @@ class Device:
             i = line.find("INJECT ")
             if i >= 0:
                 self.injected.append(json.loads(line[i + 7:]))
+                continue
+            i = line.find("KEYS ")
+            if i >= 0:
+                self.keys_sent.append(bytes.fromhex(line[i + 5:].strip()))
                 continue
             i = line.find("STATUS ")
             if i >= 0:
@@ -284,10 +292,10 @@ class Sound:
         return float(loud.mean()) if len(loud) else 0.0, longest * 50
 
 
-def forwarding_pair(seconds, main=0, sender=0, ports=(PORT_A, PORT_B)):
+def forwarding_pair(seconds, main=0, sender=0, ports=(PORT_A, PORT_B), make=Device):
     """Two devices, with `sender`'s keyboard driving the other, and control settled there."""
-    a = Device(0, ports[0], ports[1], seconds, main)
-    b = Device(1, ports[1], ports[0], seconds, main)
+    a = make(0, ports[0], ports[1], seconds, main)
+    b = make(1, ports[1], ports[0], seconds, main)
     devices = (a, b)
     source, target = devices[sender], devices[1 - sender]
     source.wait_for(lambda s: s["online"], 5)
@@ -315,13 +323,14 @@ def judge_typing(person, target, name):
     share = 100 * in_order / max(total, 1)
     print(f"    {total} presses, {in_order} delivered in order ({share:.1f}%), {misplaced} out of place, {good} of {person.shortcuts} shortcuts as Ctrl+C, "
           f"{target.last.get('moves')} moves arrived", flush=True)
-    print(f"    took {middle:.0f} ms typically, {most:.0f} ms at most. Waited for a gap: {waits}. "
+    print(f"    took {middle:.2f} ms typically, {most:.0f} ms at most. Waited for a gap: {waits}. "
           f"Longest anything stayed down after release: {person.worst:.0f} ms", flush=True)
+    print(f"    slowest presses: {[round(t) for t in sorted(times)[-5:]]} ms, over 100 ms, as (press, ms): {[(len(times) - i, round(t)) for i, t in enumerate(times) if t > 100]}", flush=True)
     check("at least 99% of presses are delivered, in order", share >= 99.0 and total >= 100, f"{in_order} of {total}")
     check("nothing lands out of order", misplaced == 0, str(misplaced))
     check("Ctrl+C arrives as Ctrl+C", good == person.shortcuts and bad == 0 and good > 0, f"{good} of {person.shortcuts}, {bad} bare")
     check("no key outlives its release for long", person.worst <= MOST_HELD_MS, f"{person.worst:.0f} ms, key {person.stuck_key}")
-    numbers.append((name, f"{in_order}/{total} in order", f"{good}/{person.shortcuts} shortcuts", f"median {middle:.0f} ms, max {most:.0f} ms",
+    numbers.append((name, f"{in_order}/{total} in order", f"{good}/{person.shortcuts} shortcuts", f"median {middle:.2f} ms, max {most:.0f} ms",
                     f"gap waits {waits.get('held')} longest {waits.get('longest_ms')} ms skipped {waits.get('skipped')}", f"stuck {person.worst:.0f} ms"))
     return waits
 
@@ -765,10 +774,32 @@ def restart_receiver():
     source.stop()
 
 
+def reconnects():
+    """A reconnect to the peer has 350 ms for TCP, the handshake and the purpose frame. It is counted
+    beside the plain connect it replaced, which was the whole of the same limit."""
+    for loss in ("5%", "30%"):
+        print(f"\n=== reconnect: netem loss {loss}", flush=True)
+        clean()
+        netem("loss", loss)
+        env = dict(os.environ, MK_TRIES=os.environ.get("RECONNECT_TRIES", "300"))
+        out = subprocess.run([audio.BIN, "--ignored", "--exact", "secure::control::tests::reconnects_against_a_plain_connect", "--nocapture"],
+                             env=env, capture_output=True, text=True).stdout
+        clean()
+        line = next((l for l in out.splitlines() if "RECONNECT " in l), None)
+        check("the reconnects were measured", line is not None, out[-300:])
+        if line is None:
+            continue
+        got = json.loads(line[line.index("RECONNECT ") + 10:])
+        print(f"    {got}", flush=True)
+        numbers.append((f"reconnect at {loss} loss", f"secure missed {got['secure_misses']}/{got['tries']}", f"plain missed {got['plain_misses']}/{got['tries']}",
+                        f"whole calls failed {got['failed_calls']}/{got['tries']}"))
+
+
 def main():
     audio.BIN = sys.argv[1]
     which = sys.argv[2:] or ["clean", "loss", "delay", "reorder", "mixed", "dropout", "reverse", "flood", "stay", "stayreverse", "oneway",
-                             "oneway-start", "outage", "outagereverse", "flapping", "panic", "release", "restart", "restart-receiver", "queued", "lossy", "bursty"]
+                             "oneway-start", "outage", "outagereverse", "flapping", "panic", "release", "restart", "restart-receiver", "queued", "lossy", "bursty",
+                             "reconnect"]
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     audio.BASE = tempfile.mkdtemp(prefix="mknet.", dir=os.environ.get("AUDIO_TMP", "/tmp"))
     try:
@@ -820,6 +851,8 @@ def main():
             release_during()
         if "restart" in which:
             restart()
+        if "reconnect" in which:
+            reconnects()
     finally:
         clean()
         shutil.rmtree(audio.BASE, ignore_errors=True)

@@ -136,7 +136,8 @@ fn whole_device() {
         play: env("MK_CHOOSE_PLAY").unwrap_or_else(|| "default".into()),
     });
     AUDIO_PEER_ONLINE.store(true, Ordering::SeqCst);
-    let peer = SocketAddr::from(([127, 0, 0, 1], peer_port));
+    let peer_host = env("MK_PEER_HOST").and_then(|host| host.parse().ok()).unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
+    let peer = SocketAddr::new(peer_host, peer_port);
     let (out, incoming) = channels_from_test_pairing();
     start_audio_listener(listen_port, peer, incoming).unwrap();
     start_audio_sender(peer, out).unwrap();
