@@ -1,7 +1,7 @@
 //! Mixes what's being sent and puts it on the wire.
 
 use super::codec::{Format, OpusEncoder, MAX_PACKET};
-use super::mix::{Limiter, Mixer};
+use super::mix::{Activity, Limiter, Mixer};
 use super::packet::{self, Body};
 use super::{devices, note_heard_back, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
 use super::{CHANNELS, OPUS_FRAME, PCM_FRAME};
@@ -18,6 +18,8 @@ const SILENCE_HOLD_FRAMES: u32 = 20;
 /// music mode with concealment: twice the spectral error, and six times the frames that were
 /// audibly wrong. At this level speech still gets repair data, and music stays as it is.
 const MOST_LOSS_HINT: u32 = 5;
+/// Sound from the output's capture this recent counts as being in the frame going out.
+const OUTPUT_SOUND_WITHIN: Duration = Duration::from_millis(200);
 /// With nothing to send, how often the other device is told the stream is alive.
 const QUIET_EVERY: Duration = Duration::from_millis(100);
 /// How long a capture can deliver nothing before that counts as quiet. Captures deliver nothing
@@ -33,6 +35,12 @@ pub static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 fn new_epoch() -> u16 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (now.subsec_nanos() >> 8) as u16 ^ now.as_secs() as u16
+}
+
+/// Whether the sound in a frame is the output's. A microphone in the same frame must not keep a
+/// mute on when the output's capture has died.
+fn output_sounding(activity: Activity, now: Instant) -> bool {
+    activity.sound.is_some_and(|at| now.saturating_duration_since(at) < OUTPUT_SOUND_WITHIN)
 }
 
 /// What became of a frame.
@@ -187,7 +195,7 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, hub: &Hub, stop: &Atomi
                 last_sent = now;
                 said_quiet = false;
             }
-            if sent == Sent::Sound {
+            if sent == Sent::Sound && output_sounding(hub.output.activity(), now) {
                 AUDIO_TX_SOUND_PACKETS.fetch_add(1, Ordering::Relaxed);
             }
             now = Instant::now();
@@ -278,6 +286,14 @@ mod tests {
             assert_eq!(packetizer.frame(&silence, &mut ignore), Sent::Silence);
         }
         assert_eq!(packetizer.frame(&silence, &mut ignore), Sent::Nothing);
+    }
+
+    #[test]
+    fn only_the_output_s_own_sound_counts_for_the_mute() {
+        let t = Instant::now();
+        assert!(output_sounding(Activity { data: Some(t), sound: Some(t) }, t + Duration::from_millis(50)));
+        assert!(!output_sounding(Activity { data: Some(t), sound: Some(t) }, t + OUTPUT_SOUND_WITHIN), "it stopped");
+        assert!(!output_sounding(Activity::default(), t), "a microphone alone, with the capture dead");
     }
 
     #[test]

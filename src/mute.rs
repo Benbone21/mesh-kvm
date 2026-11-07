@@ -388,9 +388,9 @@ struct SoundHold {
 }
 
 impl SoundHold {
-    fn end_run(&mut self, started: Instant, last: Instant, now: Instant) {
+    fn end_run(&mut self, started: Instant, last: Instant, proven: bool, now: Instant) {
         self.since = None;
-        if last.duration_since(started) >= SETTLED_AFTER {
+        if proven || last.duration_since(started) >= SETTLED_AFTER {
             self.vanished = 0;
             self.next_bar = None;
             return;
@@ -413,7 +413,9 @@ impl SoundHold {
     /// `requested`: the person wants it and the link is up. `confirmed`: real sound is going out
     /// and the far side says it's coming out of an output. `connected`: the capture is running and
     /// the far side has an output open, sound or no sound.
-    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, now: Instant) -> bool {
+    /// `proven`: that this capture carries on under a mute has been measured, so sound stopping can
+    /// only be sound stopping.
+    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, proven: bool, now: Instant) -> bool {
         if !requested {
             *self = Self::default();
             return false;
@@ -440,7 +442,7 @@ impl SoundHold {
         let settled = last.duration_since(started) >= SETTLED_AFTER;
         let hold = if settled { SILENCE_HOLD } else { UNSETTLED_HOLD };
         if now.duration_since(last) >= hold {
-            self.end_run(started, last, now);
+            self.end_run(started, last, proven, now);
             return false;
         }
         true
@@ -459,6 +461,8 @@ struct Readings {
     capture_running: bool,
     /// Muting the output won't silence that capture.
     capture_survives_mute: bool,
+    /// And that's been measured on real hardware, so a silence after muting says nothing about it.
+    capture_proven_under_mute: bool,
     /// Packets sent with real sound in them, however long ago.
     sound_packets: u64,
     peer_online: bool,
@@ -485,12 +489,14 @@ impl LiveSignals {
         let playing_here = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
             && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0
             && (in_use.play == in_use.output || (in_use.play.is_some() && in_use.play == in_use.also_mute));
+        let survives = AUDIO_CAPTURE_SURVIVES_MUTE.load(Ordering::Relaxed);
         let inputs = self.apply(
             Readings {
                 setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
                 output_chosen: devices::choice().output != devices::NONE,
                 capture_running: AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
-                capture_survives_mute: AUDIO_CAPTURE_SURVIVES_MUTE.load(Ordering::Relaxed),
+                capture_survives_mute: survives,
+                capture_proven_under_mute: survives && cfg!(target_os = "windows"),
                 sound_packets: AUDIO_TX_SOUND_PACKETS.load(Ordering::Relaxed),
                 peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
                 peer_listening: peer_listening(now, RECENT_AUDIO),
@@ -514,7 +520,7 @@ impl LiveSignals {
             send_on: r.output_chosen,
             tx_active: r.capture_running,
             peer_online: r.peer_online,
-            reaching_peer: self.hold.tick(requested, confirmed, connected, now),
+            reaching_peer: self.hold.tick(requested, confirmed, connected, r.capture_proven_under_mute, now),
             receiving_audio: self.rx.note(r.playing_here, now),
         }
     }
@@ -1096,6 +1102,7 @@ mod tests {
         output_chosen: true,
         capture_running: true,
         capture_survives_mute: true,
+        capture_proven_under_mute: false,
         sound_packets: 0,
         peer_online: true,
         peer_listening: true,
@@ -1247,6 +1254,51 @@ mod tests {
     }
 
     #[test]
+    fn short_sounds_close_together_never_bar_a_capture_proven_under_a_mute() {
+        // Windows exclusion: sound stopping is just sound stopping, however often it happens.
+        let (mut outputs, flag) = (Outputs::default(), flag("proven"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let (mut packets, mut mutes, mut was_muted) = (0, 0, false);
+        for second in 0..120u32 {
+            let hearing = second % 8 < 2;
+            packets += u64::from(hearing);
+            let r = Readings {
+                sound_packets: packets,
+                peer_hearing: hearing,
+                capture_proven_under_mute: true,
+                ..QUIET_LINK
+            };
+            let now = t + STEP * second;
+            run(&mut c, &mut signals, r, now);
+            assert!(!signals.hold.barred(now), "{second}");
+            let muted = c.backend.is(SPEAKERS);
+            mutes += u32::from(muted && !was_muted);
+            was_muted = muted;
+        }
+        assert!(mutes >= 10, "it goes on muting for each one: {mutes}");
+    }
+
+    #[test]
+    fn the_same_short_sounds_do_bar_a_capture_not_proven() {
+        let (mut outputs, flag) = (Outputs::default(), flag("not-proven"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let (mut packets, mut barred) = (0, false);
+        for second in 0..60u32 {
+            let hearing = second % 8 < 2;
+            packets += u64::from(hearing);
+            let now = t + STEP * second;
+            let r = Readings { sound_packets: packets, peer_hearing: hearing, ..QUIET_LINK };
+            run(&mut c, &mut signals, r, now);
+            barred |= signals.hold.barred(now);
+        }
+        assert!(barred);
+    }
+
+    #[test]
     fn the_far_side_going_away_gives_the_output_back_at_once_even_in_a_pause() {
         let (mut outputs, flag) = (Outputs::default(), flag("gone-in-pause"));
         let mut c = MuteController::new(&mut outputs, flag);
@@ -1388,10 +1440,10 @@ mod tests {
         let mut hold = SoundHold::default();
         let t = Instant::now();
         hold.barred_until = Some(t + LONGEST_BAR);
-        assert!(!hold.tick(true, true, true, t));
+        assert!(!hold.tick(true, true, true, false, t));
         assert!(hold.barred(t));
-        hold.tick(false, false, false, t);
-        assert!(hold.tick(true, true, true, t));
+        hold.tick(false, false, false, false, t);
+        assert!(hold.tick(true, true, true, false, t));
     }
 
     #[test]

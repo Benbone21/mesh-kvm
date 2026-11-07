@@ -62,7 +62,8 @@ pub static AUDIO_PLAYER_LIVE: AtomicBool = AtomicBool::new(false);
 
 pub static AUDIO_TX_VOLUME_PCT: AtomicU32 = AtomicU32::new(100);
 pub static AUDIO_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
-/// Of those, the ones with real sound in them, not silence or word that the stream is alive.
+/// Of those, the ones with real sound from the output's capture in them, not silence, word that the
+/// stream is alive, or a microphone alone.
 pub static AUDIO_TX_SOUND_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static AUDIO_TX_PEAK_PCT: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
