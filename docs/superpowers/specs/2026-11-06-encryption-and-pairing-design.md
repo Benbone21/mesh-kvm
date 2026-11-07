@@ -15,7 +15,7 @@ Success means:
 - Devices pair once with a 6-digit code shown in the app.
 - No control port answers an unpaired device, and port 24880 leaves the network.
 - Behaviour on bad Wi-Fi from v0.5 and v0.6 does not regress.
-- Upgrading from v0.6.0 is clear, with both devices updated together.
+- Upgrading from v0.6 is clear, with both devices updated together.
 
 ## Threat model
 
@@ -312,9 +312,9 @@ Kept small, as the rebuild of the window is a separate task:
 `mesh-kvm --pair-show` and `mesh-kvm --pair <code>` do the same through the local API, for
 tests and for use without a window.
 
-## Upgrading from v0.6.0
+## Upgrading from v0.6
 
-1. Install 0.7.0 on both devices. Laptops take the new exe the same way as before.
+1. Install the encrypted release on both devices. Its number is set when it merges. Laptops take the new exe the same way as before.
 2. Pair once. Until then each device works alone, so the code has to be typed on the
    laptop's own keyboard.
 
@@ -325,7 +325,7 @@ If only one device is updated:
   forged, and only shows a note.
 - The old device drops the new device's packets, as they don't start with its magic.
 
-To roll back, reinstall 0.6.0 on both. It ignores `pairing.json`, and traffic is plaintext
+To roll back, reinstall 0.6.1 on both. It ignores `pairing.json`, and traffic is plaintext
 again.
 
 `LINK_PROTOCOL` stays at 2, as what's inside the encryption doesn't change.
@@ -374,7 +374,7 @@ Measured and reported, not assumed:
 
 - An ignored test times `seal` and `open` for 40, 160, and 1400 bytes. The throwaway build
   gave 2.0, 2.5, and 3.8 µs for both together, on Linux and under Wine.
-- `netem_link.py` clean and mixed scenes are run on the v0.6.0 test binary and on the new
+- `netem_link.py` clean and mixed scenes are run on the v0.6.1 test binary and on the new
   one, comparing delivery times. Added median latency above 0.1 ms on the clean scene is
   treated as a bug.
 

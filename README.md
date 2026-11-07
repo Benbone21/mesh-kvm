@@ -6,6 +6,8 @@ The two devices are equal. Each one is both client and host, each keeps its own 
 
 Both devices run the same version. Update them together: a Debian build and a laptop build from different versions may not understand each other's packets.
 
+Everything between the two devices is encrypted. They pair once with a 6-digit code, and after that a device that merely has the right IP address gets nothing.
+
 ## Build
 
 You need Rust and a C compiler, plus the Windows target and a MinGW cross-compiler for the laptop build.
@@ -24,6 +26,31 @@ On Windows, double-click `mesh-kvm.exe`. It copies itself to `%LOCALAPPDATA%\mes
 On Debian, install the `.deb`, or run `mesh-kvm --install-launchers` once. That adds mesh-kvm to your applications menu and starts the tray icon when you log in.
 
 The first time the app opens on a device, it asks for the other device's address. Enter it on both devices. The app shows each device's own address in the box and next to the device's name. The address is saved, and you can change it later under Settings in the window. Use an IPv4 address such as `192.168.1.20`.
+
+## Pairing
+
+The devices share nothing until they're paired. You do this once. It needs mesh-kvm open on both, and the other device's address set on the device that enters the code.
+
+1. Open Settings in the app and choose Pair, then Show a code here. The code is good for 2 minutes and one try.
+2. On the other device, choose Pair, then Enter a code here, and type the code. Use that device's own keyboard, as the devices can't share one until they're paired.
+3. Both devices show the same fingerprint under Settings, such as `4F2A-91C3`, and the link comes up.
+
+A wrong code can't be tried again: show a new one. TCP port 24853 is open only while a code is showing, and accepts only the other device if its address is known. A firewall on either device has to allow it for that long, as well as the usual UDP 24850 and 24851 and TCP 24852.
+
+Without a window, `mesh-kvm --pair-show` and `mesh-kvm --pair <code>` do the same through the running service.
+
+Unpair is in the same Settings menu. It removes the other device here, and tells that device if it can be reached. If it can't, its handshakes are refused until you pair again. The keys are in `pairing.json`, in `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows, and unpairing keeps this device's own key. If that file can't be read, the device stays unpaired and the app says why.
+
+### What is and isn't protected
+
+Input, audio, the clipboard, files and calls to the other device's API are all encrypted and authenticated. That covers someone on the same network or Wi-Fi who can read, inject, replay, reorder or drop packets, or who takes the other device's IP address. The local API on port 24880 now only listens on the device itself.
+
+It doesn't cover:
+
+- The size and timing of packets, which still show when someone is typing.
+- Jamming or flooding the link.
+- A compromised device, or malware running as the same user. `pairing.json` holds the private key, and is readable by that user.
+- Other programs on the same device reaching 127.0.0.1:24880, which has no token yet.
 
 ## Starting and stopping
 
@@ -132,13 +159,18 @@ Debian uses `kscreen-doctor`, from the `libkscreen-bin` package, and Windows use
 
 ## Updating
 
-This version changes what the devices send each other, so update both before you use them together. If one device still runs an older mesh-kvm, the app says which one and turns off the controls it can't use. Against a 0.5 device, input still works as it did, with no correcting of lost keys and no return of control, and the app says so. The clipboard doesn't reach that device until it's updated, and a note says that too.
+The encrypted release can't talk to older versions at all, so update both devices together and then pair them. Until they're paired each device works alone, which is why the code has to be typed on the laptop's own keyboard.
+
+If only one device is updated, it ignores the other's plaintext and the app says that device needs updating. The older device drops what the new one sends, as it can't read it.
+
+To roll back, reinstall 0.6.1 on both. It ignores `pairing.json`, and traffic is plaintext again.
 
 Your settings carry over. The first start finds the address in the `--peer` your launchers already use and saves it. On Debian, it imports `layout.json` along with its pointer speed, and leaves the old file where it is. It looks in the folder the service runs in, then `~/mesh-kvm`, then the folders above the program.
 
 1. On the laptop, double-click the new `mesh-kvm.exe`. This is the normal way to install. If mesh-kvm is already running, the new copy is installed over the old one (the old one is moved aside and deleted later), the launchers are rewritten so the tray starts at login, and the new version takes effect once every `mesh-kvm.exe` is ended in Task Manager (Details tab) and started again, or at the next login.
 2. On Debian, replace the binary, restart mesh-kvm, then run `mesh-kvm --install-launchers` once to refresh the menu entry and the tray's autostart entry.
 3. Delete old downloads. Running any `mesh-kvm.exe`, old ones included, replaces the installed copy, so an old download double-clicked later puts the old version back.
+4. Pair the two devices, as under [Pairing](#pairing).
 
 ## Hotkeys
 
@@ -160,7 +192,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 
 - On Windows, Play only on the other device sends every app's sound. It can't send just one output and mute it, because a mute silences a recording of that output.
 - The Windows lock screen and UAC prompts can't be controlled remotely. Use the laptop's own keyboard and trackpad for those.
-- The API port (24880) stays open on the network, and it and the input traffic are not encrypted until the encryption stage. Only use mesh-kvm on a network you trust. Anyone on the network can read a device's status, but only that device and the other one can change anything, and only the app on the same device can change the other device's address.
+- Packet sizes and timing still show when someone is typing, and nothing stops a program on the same device calling the local API. See [What is and isn't protected](#what-is-and-isnt-protected).
 - Addresses are IPv4 only, and there is no automatic discovery.
 - There is no Mac build yet.
 
@@ -172,4 +204,6 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
 ```
 
-The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`. Set `WINE_LINK_PREFIX` to put the Wine prefix somewhere other than `/tmp`.
+The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`. Set `WINE_LINK_PREFIX` to put the Wine prefix somewhere other than `/tmp`. It speaks to the exe through `tests/noise_peer.py`, a second Noise implementation in Python, and ends with the Linux build pairing with the exe for real.
+
+`tests/capture_link.py` shows what someone on the network gets. A sniffer on a veth pair first proves it can see the markers in the clear. Then two real builds pair and call each other's API while keys, sound and clipboard text cross the same cable, and none of it may show up in the capture. Last, a third namespace takes the peer's IP address and tries plain packets, a handshake from the wrong key, and ports 24852, 24853 and 24880, and any answer fails. Its top comment says how to run it.

@@ -352,4 +352,36 @@ Tests drive two channels through a test helper `Wire` that passes `tick` and `Re
 
 ## Results
 
-Filled in by Task 13: seal and open timing, and v0.6.0 against 0.7.0 delivery times.
+Measured by Task 13 against tag `v0.6.1`, on one desktop, with the release test binaries and `tests/netem_link.py`. The test's clock truncates to milliseconds, which takes the same 0.5 ms or so off both builds, so differences mean more than absolute values.
+
+**Seal and open together, on Linux:** 2.46 µs at 40 bytes, 2.49 µs at 160, 3.79 µs at 1400.
+
+**Median delivery, in ms, three interleaved runs each:**
+
+| Scene | v0.6.1 runs | v0.6.1 median | Encrypted runs | Encrypted median | Added |
+|---|---|---|---|---|---|
+| clean | 0.07, 0.06, 0.06 | 0.06 | 0.13, 0.14, 0.07 | 0.13 | 0.07 |
+| mixed | 19.82, 19.85, 19.33 | 19.82 | 20.01, 20.22, 20.75 | 20.22 | 0.40 |
+| lossy | 0.09, 0.09, 0.09 | 0.09 | 0.11, 0.10, 0.13 | 0.11 | 0.02 |
+
+Clean is inside the 0.1 ms limit. Run to run it moves by as much as the difference, so it got six more runs each: 0.08, 0.07, 0.08, 0.08, 0.04, 0.17 on v0.6.1, and 0.09, 0.03, 0.09, 0.09, 0.09, 0.10 encrypted. Over all nine that is 0.07 against 0.09, so 0.02 ms added. Mixed has 30 ms of delay with 15 ms of jitter over about 210 presses, and its runs spread by 0.5 to 0.7 ms, so 0.40 ms there is within noise. The final full run gave 0.16 on clean and 19.68 on mixed.
+
+**Worst press delivery on `lossy`,** per run, 23 runs of 120 seconds each. Twenty of each were run side by side in separate namespaces.
+
+| Build | Median of the worst | Highest | Runs over 300 ms |
+|---|---|---|---|
+| v0.6.1 | 182 ms | 1180 ms | 8 of 23 |
+| Encrypted | 120 ms | 863 ms | 9 of 23 |
+
+This is not a regression. The first three runs alone looked like one (41 to 268 ms against 50 to 585 ms), and that went away with more runs. The earlier 1060 ms is inside what v0.6.1 does. The slow presses are mostly the same ones in both builds, such as presses 364, 1139 and 1458, as the pretend person types the same pattern. The likely cause, not proven here, is a pause in the typing: with all copies of a press lost and nothing after it to repair it, it waits for a 400 ms heartbeat, or two.
+
+**`peer_call` reconnect under loss,** with 350 ms for TCP, the handshake and the purpose frame, against `TcpStream::connect_timeout` at the same 350 ms, which is the line v0.6.1's `http_call` uses. Three runs of 300 tries, on the same link in turn:
+
+| Loss | Secure misses | Plain misses | Whole calls failed, one run of 300 |
+|---|---|---|---|
+| 5% | 92 of 900 (10.2%) | 84 of 900 (9.3%) | 0 |
+| 30% | 561 of 900 (62.3%) | 456 of 900 (50.7%) | 49 (16.3%) |
+
+Most misses are a lost SYN or SYN-ACK, whose retry comes after 1 second, in both builds. At 5% loss the two are the same. At 30% a single reconnect does miss more often, by 12 points, as the handshake's two messages each need to arrive within one 200 ms retry. The slowest success took 213 ms.
+
+The budget stays at 350 ms. v0.6.1 needed a connect for every call, so its miss rate was the failure rate of every call. Now a connection lasts and a reconnect follows a failure, so whole calls fail less often than v0.6.1's connects alone at both levels. Catching the second retry would need about 650 ms, and that wait would hold up each poll when the peer is really gone.
