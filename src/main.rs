@@ -92,6 +92,11 @@ struct Cli {
     #[arg(long, alias = "licences")]
     licenses: bool,
 
+    /// Print what's on the clipboard, for the service to read when an app has stopped answering
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true)]
+    read_clipboard: bool,
+
     /// Write the menu and login launchers for this exe (Linux), then exit
     #[cfg(target_os = "linux")]
     #[arg(long)]
@@ -210,6 +215,12 @@ fn run_tray_icon() {
 
 fn main() {
     let cli = Cli::parse();
+
+    #[cfg(target_os = "linux")]
+    if cli.read_clipboard {
+        clipboard::print_snapshot();
+        return;
+    }
 
     if cli.licenses {
         println!("{}", licenses::TEXT);

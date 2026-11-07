@@ -52,7 +52,7 @@ Closing the window does not stop sharing. The service keeps running and the tray
 Each device has its own switches in the app window.
 
 - Share mouse and Share keyboard turn sharing of each one on or off.
-- Send clipboard and Receive clipboard choose which way the clipboard travels: text, images and files. Copied files move as soon as you copy them, up to 2 GB per copy, and the last two copies stay in a `received` folder beside the settings.
+- Send clipboard and Receive clipboard choose which way the clipboard travels: text, images and files. Copied files move as soon as you copy them, up to 2 GB per copy, and the last two copies stay in a `received` folder beside the settings. If an app doesn't hand over what it copied within 2 seconds, a note says that copy wasn't sent, and the next copy from anywhere else works as usual.
 - Start mesh-kvm when this device boots controls starting at login or boot. With it off, the tray still appears at login on Debian, but the service waits until you open the app.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.
