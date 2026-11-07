@@ -209,12 +209,6 @@ fn run_tray_icon() {
 }
 
 fn main() {
-    // Before anything else: this runs beside the service and must not touch it.
-    #[cfg(target_os = "windows")]
-    if audio::probe::requested() {
-        std::process::exit(audio::probe::run());
-    }
-
     let cli = Cli::parse();
 
     if cli.licenses {

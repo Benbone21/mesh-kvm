@@ -78,11 +78,11 @@ pub fn choices_changed() {
 // Device lists
 // ============================================================================================
 
-pub(super) fn enumerator() -> WinResult<IMMDeviceEnumerator> {
+fn enumerator() -> WinResult<IMMDeviceEnumerator> {
     unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
 }
 
-pub(super) fn take_id(id: PWSTR) -> Option<String> {
+fn take_id(id: PWSTR) -> Option<String> {
     unsafe {
         let text = id.to_string().ok();
         CoTaskMemFree(Some(id.0 as *const _));
@@ -90,7 +90,7 @@ pub(super) fn take_id(id: PWSTR) -> Option<String> {
     }
 }
 
-pub(super) fn describe(device: &IMMDevice) -> Option<Device> {
+fn describe(device: &IMMDevice) -> Option<Device> {
     unsafe {
         let id = take_id(device.GetId().ok()?)?;
         let store = device.OpenPropertyStore(STGM_READ).ok()?;
@@ -163,13 +163,13 @@ fn default_endpoint(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String
 }
 
 /// The lists to show, and how to find what's on them.
-pub(super) struct Found {
-    pub(super) lists: Lists,
+struct Found {
+    lists: Lists,
     inputs: HashMap<String, Pick>,
     outputs: HashMap<String, Pick>,
 }
 
-pub(super) fn read_lists() -> Option<Found> {
+fn read_lists() -> Option<Found> {
     let all = enumerator().ok()?;
     let (inputs, outputs) = (endpoints(&all, eCapture), endpoints(&all, eRender));
     Some(Found {
@@ -471,7 +471,7 @@ const VT_BLOB: u16 = 65;
 
 /// Why process loopback didn't work.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum ExclusionError {
+enum ExclusionError {
     /// This Windows doesn't have it, so there's no use asking again.
     Unsupported(String),
     /// It might work next time.
@@ -533,7 +533,7 @@ fn exclusion() -> std::sync::MutexGuard<'static, Exclusion> {
     EXCLUSION.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-pub(super) fn activate_excluding_this_process() -> Result<IAudioClient, ExclusionError> {
+fn activate_excluding_this_process() -> Result<IAudioClient, ExclusionError> {
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -595,8 +595,7 @@ fn read_packets(capture: &IAudioCaptureClient, intake: &mut Intake) -> bool {
     }
 }
 
-/// Sets a process loopback client up to deliver, short of starting it.
-pub(super) fn open_exclusion(client: &IAudioClient, event: HANDLE) -> Result<IAudioCaptureClient, String> {
+fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Result<(), String> {
     let format = WAVEFORMATEX {
         wFormatTag: WAVE_FORMAT_PCM as u16,
         nChannels: CHANNELS as u16,
@@ -618,13 +617,7 @@ pub(super) fn open_exclusion(client: &IAudioClient, event: HANDLE) -> Result<IAu
             )
             .map_err(|e| format!("initialise: {e}"))?;
         client.SetEventHandle(event).map_err(|e| format!("event: {e}"))?;
-        client.GetService().map_err(|e| format!("service: {e}"))
-    }
-}
-
-fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Result<(), String> {
-    let capture = open_exclusion(client, event)?;
-    unsafe {
+        let capture: IAudioCaptureClient = client.GetService().map_err(|e| format!("service: {e}"))?;
         client.Start().map_err(|e| format!("start: {e}"))?;
         exclusion().started();
         let mut intake = Intake::new(&HUB.output, CHANNELS, RATE);
