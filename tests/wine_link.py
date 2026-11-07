@@ -825,6 +825,7 @@ def audio_checks():
         check("with process loopback refused, it falls back and says an echo is possible",
               audio["echo_safe"] is False, str(audio["echo_safe"]))
         check("and it keeps on sending", local()["audio"]["tx_enabled"] is True)
+        check("and says why nothing is being muted", any("isn't being muted" in n for n in audio["notes"]), str(audio["notes"]))
     call("/api/local/action", {"action": "set_audio_device", "role": "output", "id": ""})
     check("choosing None stops sending", wait_for(lambda s: not s["audio"]["tx_enabled"], 5) is not None)
     ours.close()

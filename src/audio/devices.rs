@@ -43,8 +43,12 @@ pub struct InUse {
     pub output: Option<String>,
     /// The real id of the output received audio plays on.
     pub play: Option<String>,
+    /// Another output to mute with the one sent, where capture isn't tied to one output.
+    pub also_mute: Option<String>,
     /// Whether what this device plays stays out of what it sends.
     pub echo_safe: bool,
+    /// Something worth knowing about what's sent, with nothing wrong.
+    pub hint: String,
     pub notes: Vec<String>,
 }
 

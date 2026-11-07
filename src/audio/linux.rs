@@ -565,8 +565,10 @@ fn engine() {
         ];
         devices::set_in_use(InUse {
             output: sink,
+            also_mute: None,
             play: play.id(lists.default_output.as_ref()),
             echo_safe: true,
+            hint: String::new(),
             notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);

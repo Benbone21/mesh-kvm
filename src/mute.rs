@@ -5,7 +5,7 @@
 //! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    devices, peer_listening, reaching_peer, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    devices, peer_listening, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
     AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS,
 };
 use crate::settings::write_atomically;
@@ -28,13 +28,17 @@ const SLEEP_WAIT: Duration = Duration::from_millis(1500);
 /// Once sound has been going, a silence this long keeps the output muted, so a pause between
 /// tracks doesn't bring it back and take it away again.
 const SILENCE_HOLD: Duration = Duration::from_secs(30);
-/// Sound that stops within this long of the mute may have been stopped by it: some Windows outputs
-/// could give silence to a capture once muted. So this is not yet a settled mute.
+/// Sound that stops within this long of the mute may have been stopped by it, as ordinary Windows
+/// loopback is. So this is not yet a settled mute.
 const SETTLED_AFTER: Duration = Duration::from_secs(5);
 /// How long an unsettled mute waits out a silence. Nobody may be hearing anything, so not long.
 const UNSETTLED_HOLD: Duration = Duration::from_secs(3);
-/// Sound vanishing on a mute this many times running stops the muting for a while.
+/// Sound vanishing on a mute this many times running stops the muting for a while. Muting only
+/// happens with a capture that a mute can't reach, so this is a safety net: what it mostly sees is
+/// short sounds. A capture that really was being silenced would come round every few seconds, so
+/// only ones this close together count.
 const VANISHED_LIMIT: u32 = 2;
+const VANISHED_WITHIN: Duration = Duration::from_secs(30);
 const FIRST_BAR: Duration = Duration::from_secs(30);
 const LONGEST_BAR: Duration = Duration::from_secs(600);
 const FLAG_FILE: &str = "mute-state.json";
@@ -60,7 +64,7 @@ pub fn should_mute(
     setting && sending && peer_online && reaching_peer && !receiving_audio
 }
 
-/// Muting stopped because the sound stopped with it, so the app can say so.
+/// Muting stopped because sound kept stopping just after it, so the app can say so.
 static BARRED: AtomicBool = AtomicBool::new(false);
 
 /// True while muting is off because sound kept vanishing when it was on.
@@ -72,6 +76,10 @@ pub fn barred() -> bool {
 pub trait MuteBackend {
     /// The output to mute, or None when it can't be found.
     fn default_device(&mut self) -> Option<String>;
+    /// Everything to mute: usually just that one.
+    fn targets(&mut self) -> Option<Vec<String>> {
+        self.default_device().map(|device| vec![device])
+    }
     /// None when the device is absent or can't be read.
     fn is_muted(&mut self, device: &str) -> Option<bool>;
     /// False when the device is absent or the change failed.
@@ -184,8 +192,8 @@ pub struct MuteController<B: MuteBackend> {
     /// Every device silent because of mesh-kvm, so ours to restore. More than one when a device
     /// we muted was unplugged and the next default was muted too.
     owned: Vec<String>,
-    /// The owned device that is still the default. Any other owned device is waiting for restore.
-    active: Option<String>,
+    /// The owned devices still meant to be muted. Any other owned device is waiting for restore.
+    active: Vec<String>,
     /// Devices the person has taken charge of until muting is next asked for.
     hands_off: Vec<String>,
     wanted: bool,
@@ -205,7 +213,7 @@ impl<B: MuteBackend> MuteController<B> {
             backend,
             flag,
             owned,
-            active: None,
+            active: Vec::new(),
             hands_off: Vec::new(),
             wanted: false,
             next_watch: None,
@@ -233,12 +241,13 @@ impl<B: MuteBackend> MuteController<B> {
             }
         }
         if !want {
-            self.active = None;
+            self.active.clear();
         }
-        let default = if want { self.read_default(now) } else { None };
+        let targets = if want { self.read_targets(now) } else { None };
         self.restore_stranded(now);
-        if let Some(device) = default {
-            let worked = self.settle_default(&device);
+        if let Some(targets) = targets {
+            // Each gets its turn, however the last one went.
+            let worked = targets.iter().fold(true, |worked, device| self.settle_target(device) && worked);
             self.default_work.record(worked, now);
         }
     }
@@ -246,42 +255,41 @@ impl<B: MuteBackend> MuteController<B> {
     /// Gives everything back, ignoring any retry gap: there may be no later tick. Whatever fails
     /// stays on record for later.
     pub fn release(&mut self) {
-        self.active = None;
+        self.active.clear();
         let all = self.owned.clone();
         if !all.is_empty() {
             self.restore(&all);
         }
     }
 
-    /// The default, when it is time to look. Noticing that it moved strands the old device.
-    fn read_default(&mut self, now: Instant) -> Option<String> {
+    /// What to mute, when it is time to look. Noticing that it moved strands the old device.
+    fn read_targets(&mut self, now: Instant) -> Option<Vec<String>> {
         let waiting = self.next_watch.is_some_and(|at| now < at);
         if waiting || !self.default_work.due(now) {
             return None;
         }
         self.next_watch = Some(now + WATCH_INTERVAL);
-        let device = self.backend.default_device();
-        match &device {
-            Some(device) => self.active = self.owned.contains(device).then(|| device.clone()),
+        let targets = self.backend.targets();
+        match &targets {
+            Some(targets) => self.active = targets.iter().filter(|device| self.owned.contains(device)).cloned().collect(),
             None => self.default_work.record(false, now),
         }
-        device
+        targets
     }
 
     fn restore_stranded(&mut self, now: Instant) {
-        let active = self.active.as_ref();
         let stranded: Vec<String> =
-            self.owned.iter().filter(|device| Some(*device) != active).cloned().collect();
+            self.owned.iter().filter(|device| !self.active.contains(device)).cloned().collect();
         if !stranded.is_empty() && self.restoring.due(now) {
             let worked = self.restore(&stranded);
             self.restoring.record(worked, now);
         }
     }
 
-    fn settle_default(&mut self, device: &str) -> bool {
+    fn settle_target(&mut self, device: &str) -> bool {
         if self.hands_off.iter().any(|d| d == device) {
             true
-        } else if self.active.as_deref() == Some(device) {
+        } else if self.active.iter().any(|d| d == device) {
             self.watch(device)
         } else {
             self.mute(device)
@@ -306,7 +314,7 @@ impl<B: MuteBackend> MuteController<B> {
         let worked = self.backend.set_muted(device, true);
         // A failure report doesn't prove nothing happened, so only a clean read gives up the claim.
         if worked || self.backend.is_muted(device) != Some(false) {
-            self.active = Some(device.to_string());
+            self.active.push(device.to_string());
         } else {
             self.owned.pop();
             self.flag.write(&self.owned);
@@ -321,7 +329,7 @@ impl<B: MuteBackend> MuteController<B> {
             Some(true) => true,
             Some(false) => {
                 self.owned.retain(|d| d != device);
-                self.active = None;
+                self.active.retain(|d| d != device);
                 self.hands_off.push(device.to_string());
                 self.flag.write(&self.owned);
                 true
@@ -374,32 +382,40 @@ struct SoundHold {
     since: Option<Instant>,
     last_confirmed: Option<Instant>,
     vanished: u32,
+    last_vanished: Option<Instant>,
     barred_until: Option<Instant>,
     next_bar: Option<Duration>,
 }
 
 impl SoundHold {
-    fn end_run(&mut self, started: Instant, last: Instant, now: Instant) {
+    fn end_run(&mut self, started: Instant, last: Instant, proven: bool, now: Instant) {
         self.since = None;
-        if last.duration_since(started) >= SETTLED_AFTER {
+        if proven || last.duration_since(started) >= SETTLED_AFTER {
             self.vanished = 0;
             self.next_bar = None;
             return;
         }
+        if self.last_vanished.is_none_or(|at| now.duration_since(at) >= VANISHED_WITHIN) {
+            self.vanished = 0;
+        }
         self.vanished += 1;
+        self.last_vanished = Some(now);
         if self.vanished >= VANISHED_LIMIT {
             let bar = self.next_bar.unwrap_or(FIRST_BAR);
             self.barred_until = Some(now + bar);
             self.next_bar = Some((bar * 2).min(LONGEST_BAR));
             // One more failure is enough once the bar lifts.
             self.vanished = VANISHED_LIMIT - 1;
+            self.last_vanished = self.barred_until;
         }
     }
 
     /// `requested`: the person wants it and the link is up. `confirmed`: real sound is going out
     /// and the far side says it's coming out of an output. `connected`: the capture is running and
     /// the far side has an output open, sound or no sound.
-    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, now: Instant) -> bool {
+    /// `proven`: that this capture carries on under a mute has been measured, so sound stopping can
+    /// only be sound stopping.
+    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, proven: bool, now: Instant) -> bool {
         if !requested {
             *self = Self::default();
             return false;
@@ -426,7 +442,7 @@ impl SoundHold {
         let settled = last.duration_since(started) >= SETTLED_AFTER;
         let hold = if settled { SILENCE_HOLD } else { UNSETTLED_HOLD };
         if now.duration_since(last) >= hold {
-            self.end_run(started, last, now);
+            self.end_run(started, last, proven, now);
             return false;
         }
         true
@@ -443,6 +459,10 @@ struct Readings {
     setting: bool,
     output_chosen: bool,
     capture_running: bool,
+    /// Muting the output won't silence that capture.
+    capture_survives_mute: bool,
+    /// And that's been measured on real hardware, so a silence after muting says nothing about it.
+    capture_proven_under_mute: bool,
     /// Packets sent with real sound in them, however long ago.
     sound_packets: u64,
     peer_online: bool,
@@ -468,12 +488,15 @@ impl LiveSignals {
         // With Play off, or playing elsewhere, muting this output silences none of it.
         let playing_here = !AUDIO_RX_MUTED.load(Ordering::Relaxed)
             && AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed) != 0
-            && in_use.play == in_use.output;
+            && (in_use.play == in_use.output || (in_use.play.is_some() && in_use.play == in_use.also_mute));
+        let survives = AUDIO_CAPTURE_SURVIVES_MUTE.load(Ordering::Relaxed);
         let inputs = self.apply(
             Readings {
                 setting: AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed),
                 output_chosen: devices::choice().output != devices::NONE,
                 capture_running: AUDIO_OUTPUT_CAPTURE_LIVE.load(Ordering::Relaxed),
+                capture_survives_mute: survives,
+                capture_proven_under_mute: survives && cfg!(target_os = "windows"),
                 sound_packets: AUDIO_TX_SOUND_PACKETS.load(Ordering::Relaxed),
                 peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
                 peer_listening: peer_listening(now, RECENT_AUDIO),
@@ -491,13 +514,13 @@ impl LiveSignals {
         self.sound_packets = r.sound_packets;
         let confirmed = r.capture_running && sending_sound && r.peer_hearing;
         let connected = r.capture_running && r.peer_listening;
-        let requested = r.setting && r.output_chosen && r.peer_online;
+        let requested = r.setting && r.output_chosen && r.peer_online && r.capture_survives_mute;
         MuteInputs {
             setting: r.setting,
             send_on: r.output_chosen,
             tx_active: r.capture_running,
             peer_online: r.peer_online,
-            reaching_peer: self.hold.tick(requested, confirmed, connected, now),
+            reaching_peer: self.hold.tick(requested, confirmed, connected, r.capture_proven_under_mute, now),
             receiving_audio: self.rx.note(r.playing_here, now),
         }
     }
@@ -514,6 +537,12 @@ struct ChosenOutput<B: MuteBackend>(B);
 impl<B: MuteBackend> MuteBackend for ChosenOutput<B> {
     fn default_device(&mut self) -> Option<String> {
         devices::in_use().output.or_else(|| self.0.default_device())
+    }
+
+    fn targets(&mut self) -> Option<Vec<String>> {
+        let mut targets = vec![self.default_device()?];
+        targets.extend(devices::in_use().also_mute.filter(|device| !targets.contains(device)));
+        Some(targets)
     }
 
     fn is_muted(&mut self, device: &str) -> Option<bool> {
@@ -1072,6 +1101,8 @@ mod tests {
         setting: true,
         output_chosen: true,
         capture_running: true,
+        capture_survives_mute: true,
+        capture_proven_under_mute: false,
         sound_packets: 0,
         peer_online: true,
         peer_listening: true,
@@ -1189,6 +1220,85 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_capture_keeps_its_mute_for_as_long_as_the_sound_lasts() {
+        let (mut outputs, flag) = (Outputs::default(), flag("healthy"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..600 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+            assert!(c.backend.is(SPEAKERS) && !signals.hold.barred(t + STEP * second as u32), "{second}");
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1);
+    }
+
+    #[test]
+    fn short_sounds_now_and_then_are_not_taken_for_a_mute_stopping_the_sound() {
+        // A notification every minute: each one mutes and lets go, which is fine.
+        let (mut outputs, flag) = (Outputs::default(), flag("dings"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let mut packets = 0;
+        for second in 0..600u32 {
+            if second % 60 == 0 {
+                packets += 1;
+            }
+            let hearing = second % 60 < 2;
+            let r = Readings { sound_packets: packets, peer_hearing: hearing, ..QUIET_LINK };
+            let now = t + STEP * second;
+            run(&mut c, &mut signals, r, now);
+            assert!(!signals.hold.barred(now), "{second}");
+        }
+    }
+
+    #[test]
+    fn short_sounds_close_together_never_bar_a_capture_proven_under_a_mute() {
+        // Windows exclusion: sound stopping is just sound stopping, however often it happens.
+        let (mut outputs, flag) = (Outputs::default(), flag("proven"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let (mut packets, mut mutes, mut was_muted) = (0, 0, false);
+        for second in 0..120u32 {
+            let hearing = second % 8 < 2;
+            packets += u64::from(hearing);
+            let r = Readings {
+                sound_packets: packets,
+                peer_hearing: hearing,
+                capture_proven_under_mute: true,
+                ..QUIET_LINK
+            };
+            let now = t + STEP * second;
+            run(&mut c, &mut signals, r, now);
+            assert!(!signals.hold.barred(now), "{second}");
+            let muted = c.backend.is(SPEAKERS);
+            mutes += u32::from(muted && !was_muted);
+            was_muted = muted;
+        }
+        assert!(mutes >= 10, "it goes on muting for each one: {mutes}");
+    }
+
+    #[test]
+    fn the_same_short_sounds_do_bar_a_capture_not_proven() {
+        let (mut outputs, flag) = (Outputs::default(), flag("not-proven"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        let (mut packets, mut barred) = (0, false);
+        for second in 0..60u32 {
+            let hearing = second % 8 < 2;
+            packets += u64::from(hearing);
+            let now = t + STEP * second;
+            let r = Readings { sound_packets: packets, peer_hearing: hearing, ..QUIET_LINK };
+            run(&mut c, &mut signals, r, now);
+            barred |= signals.hold.barred(now);
+        }
+        assert!(barred);
+    }
+
+    #[test]
     fn the_far_side_going_away_gives_the_output_back_at_once_even_in_a_pause() {
         let (mut outputs, flag) = (Outputs::default(), flag("gone-in-pause"));
         let mut c = MuteController::new(&mut outputs, flag);
@@ -1205,14 +1315,135 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_the_mute_would_silence_is_never_muted_for() {
+        // Ordinary loopback on Windows: the sound is confirmed, and muting would cut it off.
+        let (mut outputs, flag) = (Outputs::default(), flag("no-exclusion"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..30 {
+            let r = Readings { capture_survives_mute: false, ..sounding(second + 1) };
+            run(&mut c, &mut signals, r, t + STEP * second as u32);
+        }
+        drop(c);
+        assert!(outputs.writes.is_empty(), "{:?}", outputs.writes);
+    }
+
+    #[test]
+    fn exclusion_failing_gives_the_output_back_at_once() {
+        let (mut outputs, flag) = (Outputs::default(), flag("exclusion-fails"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        let fell_back = Readings { capture_survives_mute: false, ..sounding(11) };
+        run(&mut c, &mut signals, fell_back, t + STEP * 10);
+        assert!(!c.backend.is(SPEAKERS), "the capture is ordinary now, and a mute would silence it");
+    }
+
+    /// Two outputs to mute: what's chosen, and the one Windows is really playing on.
+    struct TwoOutputs<'a>(&'a mut Outputs);
+
+    impl MuteBackend for TwoOutputs<'_> {
+        fn default_device(&mut self) -> Option<String> {
+            (&mut *self.0).default_device()
+        }
+
+        fn targets(&mut self) -> Option<Vec<String>> {
+            let chosen = (&mut *self.0).default_device()?;
+            Some(vec![chosen, HEADSET.to_string()])
+        }
+
+        fn is_muted(&mut self, device: &str) -> Option<bool> {
+            (&mut *self.0).is_muted(device)
+        }
+
+        fn set_muted(&mut self, device: &str, muted: bool) -> bool {
+            (&mut *self.0).set_muted(device, muted)
+        }
+    }
+
+    #[test]
+    fn both_outputs_are_muted_on_one_record_and_both_come_back() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-outputs"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        c.tick(SENDING, t + STEP);
+        assert!(c.backend.0.is(SPEAKERS) && c.backend.0.is(HEADSET));
+        let record = std::fs::read_to_string(&path).unwrap();
+        assert!(record.contains(SPEAKERS) && record.contains(HEADSET), "{record}");
+        c.tick(STOPPED, t + STEP * 2);
+        assert!(!c.backend.0.is(SPEAKERS) && !c.backend.0.is(HEADSET));
+        assert!(!path.exists());
+        drop(c);
+        assert_eq!(outputs.writes.len(), 4, "muted once each, and left alone: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_crash_with_two_outputs_muted_restores_both_from_the_record() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-crash"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        c.tick(SENDING, Instant::now());
+        drop(c);
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), MuteFlag::new(path.clone()));
+        c.release();
+        drop(c);
+        assert!(!outputs.is(SPEAKERS) && !outputs.is(HEADSET));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_manual_unmute_of_one_output_leaves_the_other_muted() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-manual"));
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        c.backend.0.muted.insert(HEADSET.into(), false);
+        c.tick(SENDING, t + STEP);
+        c.tick(SENDING, t + STEP * 2);
+        assert!(c.backend.0.is(SPEAKERS));
+        assert!(!c.backend.0.is(HEADSET), "not fought");
+    }
+
+    #[test]
+    fn an_output_that_stops_being_a_target_comes_back_and_the_other_stays_muted() {
+        let (mut outputs, flag) = (Outputs::default(), flag("two-then-one"));
+        let path = flag.path.clone();
+        let mut c = MuteController::new(TwoOutputs(&mut outputs), flag);
+        let t = Instant::now();
+        c.tick(SENDING, t);
+        drop(c);
+        let mut c = MuteController::new(&mut outputs, MuteFlag::new(path));
+        c.tick(SENDING, t + STEP);
+        assert!(c.backend.is(SPEAKERS), "still the target");
+        assert!(!c.backend.is(HEADSET), "no longer one");
+    }
+
+    #[test]
+    fn the_chosen_output_and_the_windows_default_are_both_targets_once_each() {
+        let mut outputs = Outputs::default();
+        let mut chosen = ChosenOutput(&mut outputs);
+        let two = devices::InUse { output: Some(HEADSET.into()), also_mute: Some(SPEAKERS.into()), ..Default::default() };
+        devices::set_in_use(two);
+        assert_eq!(chosen.targets().unwrap(), [HEADSET, SPEAKERS]);
+        devices::set_in_use(devices::InUse::default());
+    }
+
+    #[test]
     fn a_new_request_forgets_any_bar() {
         let mut hold = SoundHold::default();
         let t = Instant::now();
         hold.barred_until = Some(t + LONGEST_BAR);
-        assert!(!hold.tick(true, true, true, t));
+        assert!(!hold.tick(true, true, true, false, t));
         assert!(hold.barred(t));
-        hold.tick(false, false, false, t);
-        assert!(hold.tick(true, true, true, t));
+        hold.tick(false, false, false, false, t);
+        assert!(hold.tick(true, true, true, false, t));
     }
 
     #[test]

@@ -448,7 +448,7 @@ pub fn save_current() {
 
 fn audio_notes(mut notes: Vec<String>) -> Vec<String> {
     if crate::mute::barred() {
-        notes.push("Sound stopped as soon as this output was muted, so it's staying on for now.".to_string());
+        notes.push("Sound keeps stopping just after this output is muted, so it's staying on for now.".to_string());
     }
     notes
 }
@@ -463,6 +463,7 @@ pub fn audio_status_json() -> serde_json::Value {
         "play": choice.play,
         "inputs": lists.inputs,
         "outputs": lists.outputs,
+        "hint": in_use.hint,
         "notes": audio_notes(in_use.notes),
         "echo_safe": in_use.echo_safe,
         "bitrate": AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),

@@ -8,7 +8,7 @@ the mode change countdown the way the real service does. Run it where that port 
         target/release/mesh-kvm --app'
 
 --name-style long tries names that don't fit. --audio picks how the audio section starts: idle,
-sending, failure, echo, missing or old. POST {"state": ...} to /fake/audio to change it while running,
+sending, failure, echo, missing, old, laptop, nomute or wrong. POST {"state": ...} to /fake/audio to change it while running,
 and GET /fake/requests for the audio actions the app has sent. --link picks how the link looks: good,
 poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/link to change that too.
 """
@@ -157,7 +157,7 @@ def audio_idle():
     return {"tx_enabled": False, "input": "", "output": "", "play": "default", "notes": [], "echo_safe": True,
             "bitrate": 96, "tx_volume": 100, "tx_peak": 0, "tx_reaching": False, "tx_connected": False, "tx_loss": 0,
             "play_only_on_other": True, "rx_muted": False, "rx_volume": 100, "rx_peak": 0, "rx_packets": 0,
-            "rx_live": False, "rx_loss": 0.0, "rx_unrepaired": 0.0, "rx_buffer_ms": 0, "rx_other_version": False}
+            "rx_live": False, "rx_loss": 0.0, "rx_unrepaired": 0.0, "rx_buffer_ms": 0, "rx_other_version": False, "hint": ""}
 
 
 def audio_states():
@@ -178,6 +178,11 @@ def audio_states():
                                "The chosen output to send isn't connected, so the system default is being used.",
                                "The chosen output to play on isn't connected, so the system default is being used."]}, {}),
         "old": ({"rx_other_version": True}, None),
+        "laptop": ({}, sending | {"output": "{0.0.0.b}", "hint": "All of this device's sound is sent, from every app and output."}),
+        "nomute": ({}, sending | {"tx_reaching": False, "notes": [
+            "This output isn't being muted, because the capture that keeps working when muted isn't running. Sound plays on both devices."]}),
+        "wrong": ({}, sending | {"output": "{0.0.0.b}", "play_only_on_other": False, "tx_reaching": False, "notes": [
+            "Nothing is playing on Headphones (USB Audio Device) (1). Windows is playing on Speakers (Realtek(R) Audio)."]}),
     }
 
 

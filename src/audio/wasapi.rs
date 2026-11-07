@@ -11,16 +11,17 @@ use super::devices::{self, CaptureHealth, Device, InUse, Lists, Resolved};
 use super::jitter::RxStream;
 use super::mix::{Signal, Source};
 use super::resample::Resampler;
-use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB, RATE};
+use super::{drain_received, finish_received, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_PLAY_ONLY_ON_OTHER, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB, RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PWSTR};
+use windows::core::{implement, Interface, Result as WinResult, BSTR, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
@@ -52,11 +53,13 @@ const PROCESS_BUFFER: i64 = 200_000;
 const PROCESS_WAIT_MS: u32 = 100;
 const FIRST_EXCLUSION_RETRY: Duration = Duration::from_secs(5);
 const LONGEST_EXCLUSION_RETRY: Duration = Duration::from_secs(300);
+const EXCLUSION_PROVES_ITSELF: Duration = Duration::from_secs(60);
 const BITS: u16 = 16;
 /// How long a new stream waits for the old one. They notice being stopped every `STREAM_TICK`.
 const LONGEST_STOP_WAIT: Duration = Duration::from_millis(400);
 /// How long a stream failing stays in the notes.
 const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(4);
+const ALL_SOUND_HINT: &str = "All of this device's sound is sent, from every app and output.";
 /// What to try when a microphone gives nothing. Windows can block one for every app.
 const MIC_HELP: &str = "Check that Microphone access is on in Windows privacy settings.";
 
@@ -66,7 +69,7 @@ static WAKE: LazyLock<Signal> = LazyLock::new(Signal::default);
 static RECEIVING: AtomicBool = AtomicBool::new(false);
 /// How process loopback has been getting on.
 static EXCLUSION: Mutex<Exclusion> =
-    Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None });
+    Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None });
 /// The output to play on, with `None` meaning the default.
 static PLAY_DEVICE: Mutex<Option<Pick>> = Mutex::new(None);
 
@@ -499,6 +502,8 @@ struct Exclusion {
     failing: bool,
     next_try: Option<Instant>,
     backoff: Option<Duration>,
+    /// When the capture running now began.
+    started_at: Option<Instant>,
 }
 
 impl Exclusion {
@@ -508,6 +513,7 @@ impl Exclusion {
 
     fn failed(&mut self, error: &ExclusionError, now: Instant) {
         self.failing = true;
+        self.started_at = None;
         if matches!(error, ExclusionError::Unsupported(_)) {
             self.unsupported = true;
             return;
@@ -518,14 +524,24 @@ impl Exclusion {
     }
 
     /// Capture started. If it doesn't last, the wait carries on growing from where it was.
-    fn started(&mut self) {
+    fn started(&mut self, now: Instant) {
         self.failing = false;
+        self.started_at = Some(now);
+    }
+
+    /// A capture that's lasted has shown the trouble is over, so the next one starts from scratch.
+    fn note_running(&mut self, now: Instant) {
+        if self.started_at.is_some_and(|at| now.duration_since(at) >= EXCLUSION_PROVES_ITSELF) {
+            self.backoff = None;
+            self.next_try = None;
+        }
     }
 
     /// It ran until told to stop.
     fn stopped_cleanly(&mut self) {
         self.backoff = None;
         self.next_try = None;
+        self.started_at = None;
     }
 }
 
@@ -619,10 +635,13 @@ fn run_exclusion(client: &IAudioClient, event: HANDLE, stop: &AtomicBool) -> Res
         client.SetEventHandle(event).map_err(|e| format!("event: {e}"))?;
         let capture: IAudioCaptureClient = client.GetService().map_err(|e| format!("service: {e}"))?;
         client.Start().map_err(|e| format!("start: {e}"))?;
-        exclusion().started();
+        exclusion().started(Instant::now());
+        AUDIO_CAPTURE_SURVIVES_MUTE.store(true, Ordering::Relaxed);
         let mut intake = Intake::new(&HUB.output, CHANNELS, RATE);
         while !stop.load(Ordering::SeqCst) {
-            if WaitForSingleObject(event, PROCESS_WAIT_MS) == WAIT_OBJECT_0 && !read_packets(&capture, &mut intake) {
+            // Looked at even when nothing arrives: that's how a client that's gone bad is found out.
+            let _ = WaitForSingleObject(event, PROCESS_WAIT_MS);
+            if !read_packets(&capture, &mut intake) {
                 let _ = client.Stop();
                 return Err("capture stopped".to_string());
             }
@@ -647,7 +666,9 @@ fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
     match how {
         OutputCapture::Endpoint(pick) => capture_device(find_output(pick.as_ref()), true, &HUB.output, &stop),
         OutputCapture::Excluding => {
-            match capture_excluding(&stop) {
+            let result = capture_excluding(&stop);
+            AUDIO_CAPTURE_SURVIVES_MUTE.store(false, Ordering::Relaxed);
+            match result {
                 Ok(()) => exclusion().stopped_cleanly(),
                 Err(e) => {
                     crate::settings::log_note(&format!(
@@ -662,11 +683,106 @@ fn run_output_capture(how: &OutputCapture, stop: Arc<AtomicBool>) {
     }
 }
 
-/// Whether to capture with process exclusion. An echo needs received audio playing on the same
-/// endpoint that's being captured, so for anything else, loopback of the endpoint is the better
-/// capture: it's what the dropdown asks for, and it can't echo.
-fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_try: bool) -> bool {
-    sent.is_some() && sent == play && receiving && may_try
+/// Whether to capture with process exclusion. Measured on a real laptop, ordinary loopback follows
+/// the endpoint's mute and volume exactly, so a mute silences it, while exclusion captures from
+/// before them. So Play only on the other device needs it from the start, as changing capture when
+/// the mute comes on would break up the sound. Otherwise it's for an echo, which needs received audio
+/// playing on the endpoint being captured, and loopback is the better capture: it's what the
+/// dropdown asks for, and it can't echo.
+fn needs_exclusion(sent: Option<&str>, play: Option<&str>, receiving: bool, may_try: bool, play_only: bool) -> bool {
+    let echo_likely = sent == play && receiving;
+    sent.is_some() && may_try && (play_only || echo_likely)
+}
+
+/// What else to mute. Exclusion takes every app's sound on every output, so the speakers really
+/// playing are the Windows default, which need not be the output chosen.
+fn also_mute(sent: Option<&str>, default: Option<&str>, play_only: bool) -> Option<String> {
+    default.filter(|default| play_only && sent.is_some() && sent != Some(*default)).map(String::from)
+}
+
+/// Below this peak, an output is silent.
+const METER_FLOOR: f32 = 0.001;
+/// How long an output has to stay silent, with sound elsewhere, to be worth a mention.
+const WRONG_OUTPUT_AFTER: Duration = Duration::from_secs(5);
+const METER_READINGS: u32 = 6;
+const METER_READING_GAP: Duration = Duration::from_millis(25);
+
+/// Notices the output being sent staying silent while Windows is playing somewhere else, which
+/// sends silence for no reason anyone could see. It takes the whole time to say so, and a passing
+/// quiet moment on the default doesn't take it back, so the note can't come and go with the music.
+#[derive(Default)]
+struct WrongOutput {
+    since: Option<Instant>,
+    showing: bool,
+    default_heard: Option<Instant>,
+}
+
+impl WrongOutput {
+    /// Takes the peak of each lately, or None when there's nothing to compare.
+    fn note(&mut self, peaks: Option<(f32, f32)>, now: Instant) -> bool {
+        let Some((_, default)) = peaks.filter(|(chosen, _)| *chosen < METER_FLOOR) else {
+            *self = Self::default();
+            return false;
+        };
+        let sounding = default >= METER_FLOOR;
+        if sounding {
+            self.default_heard = Some(now);
+        }
+        if self.showing {
+            if self.default_heard.is_none_or(|at| now.duration_since(at) >= WRONG_OUTPUT_AFTER) {
+                *self = Self::default();
+            }
+            return self.showing;
+        }
+        if !sounding {
+            self.since = None;
+            return false;
+        }
+        self.showing = now.duration_since(*self.since.get_or_insert(now)) >= WRONG_OUTPUT_AFTER;
+        self.showing
+    }
+}
+
+/// How loud an output is. This reads Windows's meter, away from the audio. A reading covers only the
+/// device period before it, about 10 ms, so it takes a few to catch anything but a steady sound. The
+/// meter comes before the endpoint's volume and mute, which is what's wanted here: it says what's
+/// playing, whatever can be heard.
+fn peak_of(all: &IMMDeviceEnumerator, id: &str) -> Option<f32> {
+    let id: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let meter: IAudioMeterInformation = all.GetDevice(PCWSTR(id.as_ptr())).ok()?.Activate(CLSCTX_ALL, None).ok()?;
+        let mut peak = meter.GetPeakValue().ok()?;
+        for _ in 1..METER_READINGS {
+            std::thread::sleep(METER_READING_GAP);
+            peak = peak.max(meter.GetPeakValue().ok()?);
+        }
+        Some(peak)
+    }
+}
+
+fn read_peaks(sent: Option<&str>, default: Option<&str>) -> Option<(f32, f32)> {
+    let (sent, default) = (sent?, default?);
+    let all = enumerator().ok()?;
+    Some((peak_of(&all, sent)?, peak_of(&all, default)?))
+}
+
+/// Whether the meters can say anything. With exclusion, every output is sent. And sound received here
+/// and played on the default is our own, so it doesn't show that Windows is playing there.
+fn worth_comparing(excluding: bool, sent: Option<&str>, default: Option<&str>, play: Option<&str>, receiving: bool) -> bool {
+    !excluding && sent.is_some() && sent != default && !(receiving && play == default)
+}
+
+fn wrong_output_note(sent: Option<&str>, default: Option<&str>, lists: &Lists) -> Option<String> {
+    let name = |id: Option<&str>| lists.outputs.iter().find(|d| Some(d.id.as_str()) == id).map(|d| d.name.clone());
+    Some(format!("Nothing is playing on {}. Windows is playing on {}.", name(sent)?, name(default)?))
+}
+
+/// Why the output stays on when it was meant to be muted.
+fn no_mute_note(play_only: bool, sending_output: bool, failing: bool) -> Option<String> {
+    (play_only && sending_output && failing).then(|| {
+        "This output isn't being muted, because the capture that keeps working when muted isn't running. Sound plays on both devices."
+            .to_string()
+    })
 }
 
 /// Whether what's sent can be trusted to leave out what's played, now or as soon as it matters.
@@ -678,6 +794,7 @@ fn engine() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let mut mic = Worker::<Option<Pick>>::default();
     let mut output = Worker::<OutputCapture>::default();
+    let mut wrong_output = WrongOutput::default();
     loop {
         WAKE.wait(LOOK_EVERY);
         let now = Instant::now();
@@ -692,11 +809,13 @@ fn engine() {
         let sent_id = sent.id(lists.default_output.as_ref());
         let play_id = play.id(lists.default_output.as_ref());
         let (may_try, failing) = {
-            let exclusion = exclusion();
+            let mut exclusion = exclusion();
+            exclusion.note_running(now);
             (exclusion.may_try(now), exclusion.failing)
         };
         let receiving = RECEIVING.load(Ordering::SeqCst);
-        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try);
+        let play_only = AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed);
+        let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try, play_only);
 
         // By the device, even for the default, so that a change of default restarts the capture.
         let mic_pick = input.id(lists.default_input.as_ref()).and_then(|id| inputs.get(&id).cloned());
@@ -712,12 +831,17 @@ fn engine() {
         *PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner) =
             play_id.as_ref().and_then(|id| outputs.get(id).cloned());
 
-        let whole_device = excluding && choice.output != devices::DEFAULT;
+        // Exclusion takes every output, so which one is chosen only matters without it.
+        let default_id = lists.default_output.as_deref();
+        let compare = worth_comparing(excluding, sent_id.as_deref(), default_id, play_id.as_deref(), receiving);
+        let peaks = if compare { read_peaks(sent_id.as_deref(), default_id) } else { None };
+        let on_wrong_output = wrong_output.note(peaks, now);
         let notes = [
             input.missing_note("microphone or line-in"),
             sent.missing_note("output to send"),
             play.missing_note("output to play on"),
-            whole_device.then(|| "While both devices are sending, all of this device's sound is sent, not just this output's.".to_string()),
+            no_mute_note(play_only, sent != Resolved::Off, failing),
+            on_wrong_output.then(|| wrong_output_note(sent_id.as_deref(), default_id, &lists)).flatten(),
             (input != Resolved::Off)
                 .then(|| mic.health(&HUB.mic, true, true, now).note("microphone or line-in", MIC_HELP, now))
                 .flatten(),
@@ -728,8 +852,10 @@ fn engine() {
         ];
         devices::set_in_use(InUse {
             output: sent_id.clone(),
+            also_mute: also_mute(sent_id.as_deref(), lists.default_output.as_deref(), play_only),
             play: play_id.clone(),
             echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
+            hint: if excluding { ALL_SOUND_HINT.to_string() } else { String::new() },
             notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);
@@ -896,11 +1022,125 @@ mod tests {
     #[test]
     fn exclusion_is_only_used_when_an_echo_could_really_happen() {
         let (a, b) = (Some("speakers"), Some("headset"));
-        assert!(needs_exclusion(a, a, true, true));
-        assert!(!needs_exclusion(a, b, true, true), "playing elsewhere: plain loopback can't echo");
-        assert!(!needs_exclusion(a, a, false, true), "nothing arriving: nothing to echo");
-        assert!(!needs_exclusion(a, a, true, false), "it's waiting before trying again");
-        assert!(!needs_exclusion(None, None, true, true), "nothing being sent");
+        assert!(needs_exclusion(a, a, true, true, false));
+        assert!(!needs_exclusion(a, b, true, true, false), "playing elsewhere: plain loopback can't echo");
+        assert!(!needs_exclusion(a, a, false, true, false), "nothing arriving: nothing to echo");
+        assert!(!needs_exclusion(a, a, true, false, false), "it's waiting before trying again");
+        assert!(!needs_exclusion(None, None, true, true, false), "nothing being sent");
+    }
+
+    #[test]
+    fn play_only_on_the_other_device_captures_with_exclusion_from_the_start() {
+        let (a, b) = (Some("speakers"), Some("headset"));
+        assert!(needs_exclusion(a, a, false, true, true), "with nothing being received");
+        assert!(needs_exclusion(a, b, false, true, true), "and whichever outputs are chosen");
+        assert!(!needs_exclusion(a, a, false, false, true), "unless it's waiting to try again");
+        assert!(!needs_exclusion(None, a, false, true, true), "or nothing is being sent");
+    }
+
+    #[test]
+    fn the_windows_default_is_muted_too_if_it_isn_t_the_chosen_output() {
+        let (a, b) = (Some("headset"), Some("speakers"));
+        assert_eq!(also_mute(a, b, true).as_deref(), Some("speakers"));
+        assert_eq!(also_mute(b, b, true), None, "it's the same one");
+        assert_eq!(also_mute(a, b, false), None, "muting isn't wanted");
+        assert_eq!(also_mute(None, b, true), None, "no output is being sent");
+    }
+
+    #[test]
+    fn a_silent_output_with_sound_elsewhere_is_called_out_after_about_five_seconds() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        for second in 0..5 {
+            assert!(!watch.note(Some((0.0, 0.3)), at(second)), "{second}");
+        }
+        assert!(watch.note(Some((0.0, 0.3)), at(5)));
+        assert!(watch.note(Some((0.0, 0.3)), at(6)), "and stays");
+    }
+
+    #[test]
+    fn sound_on_the_chosen_output_or_silence_everywhere_says_nothing() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        watch.note(Some((0.0, 0.3)), at(0));
+        assert!(!watch.note(Some((0.2, 0.3)), at(6)), "the chosen output came to life");
+        assert!(!watch.note(Some((0.0, 0.3)), at(7)), "and the count starts again");
+        assert!(!watch.note(Some((0.0, 0.3)), at(11)));
+        assert!(!watch.note(Some((0.0, 0.0)), at(13)), "nothing is playing anywhere");
+        assert!(!watch.note(Some((0.0, 0.3)), at(14)));
+        assert!(!watch.note(None, at(30)), "nothing to compare");
+    }
+
+    #[test]
+    fn the_note_doesn_t_come_and_go_with_the_music() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        for second in 0..=5 {
+            watch.note(Some((0.0, 0.3)), at(second));
+        }
+        assert!(watch.note(Some((0.0, 0.0)), at(6)), "a quiet moment on the default");
+        assert!(watch.note(Some((0.0, 0.3)), at(7)));
+        assert!(watch.note(Some((0.0, 0.0)), at(11)));
+        assert!(!watch.note(Some((0.0, 0.0)), at(12)), "five seconds of nothing ends it");
+    }
+
+    #[test]
+    fn a_gap_on_the_default_while_counting_starts_the_count_again() {
+        let (mut watch, t) = (WrongOutput::default(), Instant::now());
+        let at = |seconds: u64| t + Duration::from_secs(seconds);
+        watch.note(Some((0.0, 0.3)), at(0));
+        watch.note(Some((0.0, 0.0)), at(3));
+        assert!(!watch.note(Some((0.0, 0.3)), at(5)), "it has to hold for the whole time");
+        assert!(watch.note(Some((0.0, 0.3)), at(10)));
+    }
+
+    #[test]
+    fn our_own_sound_on_the_default_is_not_windows_playing_there() {
+        let (a, b, c) = (Some("headset"), Some("speakers"), Some("hdmi"));
+        assert!(worth_comparing(false, a, b, b, false));
+        assert!(!worth_comparing(false, a, b, b, true), "receiving, and playing on the default");
+        assert!(worth_comparing(false, a, b, c, true), "receiving, but playing elsewhere");
+        assert!(!worth_comparing(true, a, b, b, false), "exclusion takes every output");
+        assert!(!worth_comparing(false, b, b, b, false), "the chosen output is the default");
+        assert!(!worth_comparing(false, None, b, b, false), "nothing is being sent");
+    }
+
+    #[test]
+    fn a_good_run_clears_the_wait_and_a_short_one_doesn_t() {
+        let (mut state, t) = (fresh_exclusion(), Instant::now());
+        for _ in 0..5 {
+            state.failed(&ExclusionError::Failed("x".into()), t);
+        }
+        let grown = state.backoff;
+        state.started(t);
+        state.note_running(t + EXCLUSION_PROVES_ITSELF - Duration::from_secs(1));
+        assert_eq!(state.backoff, grown, "it has yet to prove itself");
+        state.note_running(t + EXCLUSION_PROVES_ITSELF);
+        assert_eq!(state.backoff, None);
+        state.failed(&ExclusionError::Failed("x".into()), t);
+        assert_eq!(state.backoff, Some(FIRST_EXCLUSION_RETRY * 2), "starting from the first wait again");
+    }
+
+    #[test]
+    fn the_note_names_both_outputs() {
+        let lists = Lists {
+            outputs: vec![device("{1}", "Steam Streaming Speakers"), device("{2}", "Speakers (Realtek(R) Audio)")],
+            ..Default::default()
+        };
+        assert_eq!(
+            wrong_output_note(Some("{1}"), Some("{2}"), &lists).unwrap(),
+            "Nothing is playing on Steam Streaming Speakers. Windows is playing on Speakers (Realtek(R) Audio)."
+        );
+        assert_eq!(wrong_output_note(Some("{9}"), Some("{2}"), &lists), None);
+    }
+
+    #[test]
+    fn exclusion_not_working_says_why_nothing_is_muted() {
+        let note = no_mute_note(true, true, true).unwrap();
+        assert!(note.contains("isn't being muted"), "{note}");
+        assert_eq!(no_mute_note(true, true, false), None, "it's working");
+        assert_eq!(no_mute_note(false, true, true), None, "muting isn't wanted");
+        assert_eq!(no_mute_note(true, false, true), None, "no output is being sent");
     }
 
     #[test]
@@ -912,7 +1152,7 @@ mod tests {
     }
 
     fn fresh_exclusion() -> Exclusion {
-        Exclusion { unsupported: false, failing: false, next_try: None, backoff: None }
+        Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None }
     }
 
     #[test]
@@ -938,7 +1178,7 @@ mod tests {
     fn exclusion_coming_back_clears_the_warning_and_the_wait_after_a_good_run() {
         let (mut state, t) = (fresh_exclusion(), Instant::now());
         state.failed(&ExclusionError::Failed("x".into()), t);
-        state.started();
+        state.started(t);
         assert!(!state.failing);
         assert!(state.backoff.is_some(), "it has yet to prove itself");
         state.stopped_cleanly();

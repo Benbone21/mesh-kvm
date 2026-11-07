@@ -303,22 +303,21 @@ def sink_id(name, node):
 def mute_test():
     scene("play only on the other device: A sends its speakers to B")
     sid = sink_id("a", "test_speakers")
-    a = device("a", 24951, 24952, 27, MK_CHOOSE_OUTPUT="default", MK_MUTE="1")
+    a = device("a", 24951, 24952, 31, MK_CHOOSE_OUTPUT="default", MK_MUTE="1")
     ra = Reader(a)
     time.sleep(3)
     check("with nothing confirming it's heard, A isn't muted", not muted("a", sid))
-    b = device("b", 24952, 24951, 17)
+    b = device("b", 24952, 24951, 21)
     rb = Reader(b)
     time.sleep(2.5)
     check("B listening with nothing to hear doesn't mute A", not muted("a", sid))
-    pa = play("a", 1000, 8, "tone-a")
+    pa = play("a", 1000, 12, "tone-a")
     time.sleep(3)
     check("once B confirms it, A is muted", muted("a", sid))
     heard = level(record("b", 1), 1000)
     check("a muted output still sends", heard > -20, f"{heard:.1f} dB on B")
-    # Long enough to count as settled. Short of that, the hold is 3 seconds from about a second after
-    # the sound stops, which is when the check below comes, and which of them goes first is chance.
-    time.sleep(1.5)
+    # Long enough to be a settled mute: one that sound leaves within 5 seconds is let go on purpose.
+    time.sleep(3)
     pa.kill(); pa.wait()
     time.sleep(4)
     check("a pause in the sound doesn't bring the output back", muted("a", sid))

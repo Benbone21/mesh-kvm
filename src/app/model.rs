@@ -139,6 +139,8 @@ pub struct AudioStatus {
     pub outputs: Vec<AudioDevice>,
     /// Anything the person should know about these choices right now.
     pub notes: Vec<String>,
+    /// Something worth knowing about what's sent, with nothing wrong.
+    pub hint: String,
     /// What this device plays stays out of what it sends. Older services have no way to do that.
     pub echo_safe: bool,
     /// In kbit/s, with zero meaning uncompressed.

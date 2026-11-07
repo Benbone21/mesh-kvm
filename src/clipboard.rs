@@ -27,6 +27,14 @@ const KEEP_BATCHES: usize = 2;
 const CHUNK_BYTES: usize = 256 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(350);
 const CLIPBOARD_RETRY: Duration = Duration::from_secs(2);
+/// How long one look at the clipboard gets. On Wayland it's a pipe from the app that made the copy,
+/// read with no time limit of its own, and an app can simply not answer.
+const READ_LIMIT: Duration = Duration::from_secs(2);
+/// How often to look while reads go through the helper, as each one is a new process.
+const HELPER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The longest gap between asking a helper that can't finish, in read limits.
+const HELPER_GAP_LIMIT: u32 = 4;
+const STUCK_NOTE: &str = "An app is taking too long to hand over its clipboard, so this copy hasn't been sent yet.";
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Long enough for a lost connection request to be sent again on a poor link.
 const CONNECT_WAIT: Duration = Duration::from_secs(2);
@@ -73,6 +81,15 @@ fn set_note(note: impl Into<String>) {
 
 fn set_failure(note: impl Into<String>) {
     store_note(note.into(), true);
+}
+
+/// Takes the note down if it still says a read is stuck, as reads are working again.
+fn clear_stuck_note() {
+    if let Ok(mut current) = NOTE.lock() {
+        if current.0 == STUCK_NOTE {
+            *current = (String::new(), false);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,6 +276,218 @@ fn read_snapshot(cb: &mut Clipboard) -> Option<Snapshot> {
         }
     }
     cb.get_image().ok().filter(|i| !i.bytes.is_empty()).map(Snapshot::Image)
+}
+
+/// A snapshot on its way out of the helper.
+#[cfg(target_os = "linux")]
+#[derive(Serialize, Deserialize)]
+enum WireSnapshot {
+    /// As bytes, as a path on Linux needn't be text, and serialising one that isn't would fail.
+    Files(Vec<Vec<u8>>),
+    Text(String),
+    Image { width: usize, height: usize, bytes: Vec<u8> },
+}
+
+#[cfg(target_os = "linux")]
+impl From<Snapshot> for WireSnapshot {
+    fn from(snapshot: Snapshot) -> Self {
+        match snapshot {
+            Snapshot::Files(paths) => {
+                use std::os::unix::ffi::OsStringExt;
+                Self::Files(paths.into_iter().map(|path| path.into_os_string().into_vec()).collect())
+            }
+            Snapshot::Text(text) => Self::Text(text),
+            Snapshot::Image(image) => Self::Image { width: image.width, height: image.height, bytes: image.bytes.into_owned() },
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<WireSnapshot> for Snapshot {
+    fn from(wire: WireSnapshot) -> Self {
+        match wire {
+            WireSnapshot::Files(paths) => {
+                use std::os::unix::ffi::OsStringExt;
+                Self::Files(paths.into_iter().map(|path| std::ffi::OsString::from_vec(path).into()).collect())
+            }
+            WireSnapshot::Text(text) => Self::Text(text),
+            WireSnapshot::Image { width, height, bytes } => Self::Image(ImageData { width, height, bytes: Cow::Owned(bytes) }),
+        }
+    }
+}
+
+/// The helper's whole job: one look at the clipboard, written to stdout. It's a process so that it
+/// can be killed if the read never ends, and it ends itself in case nothing is left to do that.
+#[cfg(target_os = "linux")]
+pub fn print_snapshot() {
+    std::thread::spawn(|| {
+        std::thread::sleep(READ_LIMIT * 2);
+        std::process::exit(1);
+    });
+    let snapshot = Clipboard::new().ok().and_then(|mut cb| read_snapshot(&mut cb)).map(WireSnapshot::from);
+    if let Ok(bytes) = bincode::serialize(&snapshot) {
+        let _ = std::io::stdout().write_all(&bytes);
+    }
+}
+
+/// One look through the helper. An `Err` means it didn't finish, and was killed.
+#[cfg(target_os = "linux")]
+fn read_by_helper(helper: &Path) -> Result<Option<Snapshot>, ()> {
+    let mut command = std::process::Command::new(helper);
+    command.arg("--read-clipboard");
+    let output = crate::mute::platform::run_with_deadline(command, READ_LIMIT).ok_or(())?;
+    let snapshot: Option<WireSnapshot> = bincode::deserialize(&output.stdout).unwrap_or(None);
+    Ok(snapshot.map(Snapshot::from))
+}
+
+/// What came of a look at the clipboard.
+#[derive(Debug, PartialEq)]
+enum Look<T> {
+    Got(Option<T>),
+    /// It didn't finish in time.
+    Stuck,
+    /// A read from before is still going, and there's nothing to do but wait.
+    Waiting,
+}
+
+struct Worker<T> {
+    ask: std::sync::mpsc::Sender<()>,
+    answers: std::sync::mpsc::Receiver<Option<T>>,
+}
+
+/// The opening of a new reader, which happens on the thread that will use it.
+type OpenReader<T> = Arc<dyn Fn() -> Box<dyn FnMut() -> Option<T>> + Send + Sync>;
+
+/// Reads off the watching thread, so that a read that never ends can't stop the watching.
+///
+/// A thread stuck reading a pipe can't be got back, and the next read of the same app sticks too. So
+/// one stuck read is left behind, and from then until it ends, `helper` does the reading. That one
+/// can be stopped at the limit, so the next copy from anywhere else is noticed. The left-behind read
+/// may only be slow, as a big image from an app can be, so its answer is used when it comes, unless
+/// the helper has found something newer. Where there's no helper, the read isn't on a pipe, it will
+/// end, and that's all there is to do.
+struct TimedReader<T> {
+    open: OpenReader<T>,
+    helper: Option<Box<dyn FnMut() -> Result<Option<T>, ()>>>,
+    limit: Duration,
+    worker: Option<Worker<T>>,
+    abandoned: Option<Worker<T>>,
+    /// The helper has found something since the read was left behind.
+    helper_found: bool,
+    /// A helper that can't finish isn't asked again for this long, and longer each time.
+    helper_gap: Duration,
+    next_helper: Option<Instant>,
+}
+
+impl<T: Send + 'static> TimedReader<T> {
+    fn new(open: OpenReader<T>, helper: Option<Box<dyn FnMut() -> Result<Option<T>, ()>>>, limit: Duration) -> Self {
+        Self { open, helper, limit, worker: None, abandoned: None, helper_found: false, helper_gap: limit, next_helper: None }
+    }
+
+    fn start_worker(&self) -> Worker<T> {
+        let (ask, asked) = std::sync::mpsc::channel();
+        let (answer, answers) = std::sync::mpsc::channel();
+        let open = Arc::clone(&self.open);
+        let _ = std::thread::Builder::new().name("mesh-kvm-clip-read".to_string()).spawn(move || {
+            let mut read = open();
+            while asked.recv().is_ok() {
+                if answer.send(read()).is_err() {
+                    break;
+                }
+            }
+        });
+        Worker { ask, answers }
+    }
+
+    fn forget_abandoned(&mut self) {
+        self.abandoned = None;
+        self.helper_found = false;
+        self.helper_gap = self.limit;
+        self.next_helper = None;
+    }
+
+    fn ask_helper(&mut self) -> Look<T> {
+        let now = Instant::now();
+        let Some(helper) = &mut self.helper else { return Look::Waiting };
+        if self.next_helper.is_some_and(|at| now < at) {
+            return Look::Waiting;
+        }
+        match helper() {
+            Ok(found) => {
+                self.helper_found |= found.is_some();
+                self.helper_gap = self.limit;
+                self.next_helper = None;
+                Look::Got(found)
+            }
+            Err(()) => {
+                self.next_helper = Some(now + self.helper_gap);
+                self.helper_gap = (self.helper_gap * 2).min(self.limit * HELPER_GAP_LIMIT);
+                Look::Stuck
+            }
+        }
+    }
+
+    /// True while a stuck read is holding things up.
+    fn held_up(&self) -> bool {
+        self.abandoned.is_some()
+    }
+
+    fn read(&mut self) -> Look<T> {
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+        if let Some(old) = &self.abandoned {
+            match old.answers.try_recv() {
+                Ok(late) => {
+                    let superseded = self.helper_found;
+                    self.forget_abandoned();
+                    if !superseded {
+                        return Look::Got(late);
+                    }
+                }
+                Err(TryRecvError::Disconnected) => self.forget_abandoned(),
+                Err(TryRecvError::Empty) => return self.ask_helper(),
+            }
+        }
+        if self.worker.is_none() {
+            self.worker = Some(self.start_worker());
+        }
+        let Some(worker) = &self.worker else { return Look::Got(None) };
+        if worker.ask.send(()).is_err() {
+            self.worker = None;
+            return Look::Got(None);
+        }
+        match worker.answers.recv_timeout(self.limit) {
+            Ok(answer) => Look::Got(answer),
+            Err(RecvTimeoutError::Timeout) => {
+                self.abandoned = self.worker.take();
+                Look::Stuck
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.worker = None;
+                Look::Got(None)
+            }
+        }
+    }
+}
+
+/// A reader of the real clipboard, with its own handle, so that a fresh start is a fresh `Clipboard`.
+fn snapshot_reader(helper_exe: PathBuf) -> TimedReader<Snapshot> {
+    let open: OpenReader<Snapshot> = Arc::new(|| {
+        let mut cb = None;
+        Box::new(move || {
+            if cb.is_none() {
+                cb = Clipboard::new().ok();
+            }
+            read_snapshot(cb.as_mut()?)
+        })
+    });
+    #[cfg(target_os = "linux")]
+    let helper: Option<Box<dyn FnMut() -> Result<Option<Snapshot>, ()>>> = Some(Box::new(move || read_by_helper(&helper_exe)));
+    #[cfg(not(target_os = "linux"))]
+    let helper = {
+        let _ = helper_exe;
+        None
+    };
+    TimedReader::new(open, helper, READ_LIMIT)
 }
 
 fn file_count(entries: &[FileEntry]) -> String {
@@ -505,6 +734,10 @@ fn finish(mut stream: TcpStream, answer: u8) {
 
 fn receive(mut stream: TcpStream, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<(), String> {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    // Nothing was going to be sent, so nothing failed.
+    if stream.peek(&mut [0u8; 1]).is_ok_and(|got| got == 0) {
+        return Ok(());
+    }
     let taken = take_copy(&mut stream, tracker, inbox);
     finish(stream, *taken.as_ref().unwrap_or(&ANSWER_FAILED));
     taken.map(|_| ())
@@ -630,9 +863,10 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
             let inbox = inbox_dir();
 
             // The session may not be up yet when the service starts.
-            let mut cb = loop {
+            // Held for good: on X11, what mesh-kvm put on the clipboard goes with the last handle.
+            let _kept_open = loop {
                 match Clipboard::new() {
-                    Ok(c) => break c,
+                    Ok(cb) => break cb,
                     Err(e) => {
                         set_note(format!("Waiting for the clipboard: {e}"));
                         std::thread::sleep(CLIPBOARD_RETRY);
@@ -640,10 +874,29 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
                 }
             };
 
+            // The running program, even if a newer one has replaced the file.
+            let mut reader = snapshot_reader(PathBuf::from("/proc/self/exe"));
+            let mut said_stuck = false;
             loop {
-                std::thread::sleep(POLL_INTERVAL);
+                std::thread::sleep(if reader.held_up() { HELPER_POLL_INTERVAL } else { POLL_INTERVAL });
 
-                let Some(snapshot) = read_snapshot(&mut cb) else { continue };
+                let look = reader.read();
+                match look {
+                    Look::Waiting => continue,
+                    Look::Stuck => {
+                        if !said_stuck && CLIPBOARD_SEND.load(Ordering::SeqCst) {
+                            set_failure(STUCK_NOTE);
+                        }
+                        said_stuck = true;
+                        continue;
+                    }
+                    Look::Got(_) if said_stuck => {
+                        said_stuck = false;
+                        clear_stuck_note();
+                    }
+                    Look::Got(_) => {}
+                }
+                let Look::Got(Some(snapshot)) = look else { continue };
                 let fingerprint = snapshot.fingerprint();
                 let now = Instant::now();
                 let changed = tracker.lock().map(|mut t| t.is_new(fingerprint, now)).unwrap_or(false);
@@ -1323,5 +1576,291 @@ mod tests {
     fn file_order_does_not_change_the_fingerprint() {
         let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
         assert_eq!(hash_files(&[a.clone(), b.clone()]), hash_files(&[b, a]));
+    }
+}
+
+#[cfg(test)]
+mod reads {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc::{channel, Sender};
+
+    const LIMIT: Duration = Duration::from_millis(30);
+
+    /// Reads that answer at once, unless `hang` is on, when they wait to be let go.
+    struct Fake {
+        opened: Arc<AtomicU32>,
+        hang: Arc<AtomicBool>,
+        release: Arc<Mutex<Vec<Sender<()>>>>,
+        value: Arc<Mutex<Option<u32>>>,
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Self { opened: Arc::default(), hang: Arc::default(), release: Arc::default(), value: Arc::new(Mutex::new(Some(1))) }
+        }
+
+        fn open(&self) -> OpenReader<u32> {
+            let (opened, hang, release, value) =
+                (self.opened.clone(), self.hang.clone(), self.release.clone(), self.value.clone());
+            Arc::new(move || {
+                opened.fetch_add(1, Ordering::SeqCst);
+                let (hang, release, value) = (hang.clone(), release.clone(), value.clone());
+                Box::new(move || {
+                    if hang.load(Ordering::SeqCst) {
+                        let (let_go, wait) = channel();
+                        release.lock().unwrap().push(let_go);
+                        let _ = wait.recv();
+                    }
+                    *value.lock().unwrap()
+                })
+            })
+        }
+
+        fn let_go(&self) {
+            self.hang.store(false, Ordering::SeqCst);
+            self.release.lock().unwrap().clear();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        fn stuck_reads(&self) -> usize {
+            self.release.lock().unwrap().len()
+        }
+    }
+
+    #[test]
+    fn a_normal_read_stays_on_one_clipboard() {
+        let fake = Fake::new();
+        let mut reader = TimedReader::new(fake.open(), None, LIMIT);
+        for _ in 0..5 {
+            assert_eq!(reader.read(), Look::Got(Some(1)));
+        }
+        assert_eq!(fake.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_read_that_never_ends_doesn_t_stop_the_watching() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Ok(Some(2)))), LIMIT);
+        let started = Instant::now();
+        assert_eq!(reader.read(), Look::Stuck);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(reader.held_up());
+        assert_eq!(reader.read(), Look::Got(Some(2)), "the next copy is noticed, through the helper");
+        fake.let_go();
+    }
+
+    #[test]
+    fn stuck_reads_can_t_pile_up_however_long_the_app_stays_hung() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Err(()))), LIMIT);
+        for _ in 0..30 {
+            assert_ne!(reader.read(), Look::Got(None));
+        }
+        assert_eq!(fake.stuck_reads(), 1);
+        assert_eq!(fake.opened.load(Ordering::SeqCst), 1);
+        fake.let_go();
+    }
+
+    #[test]
+    fn a_helper_that_can_t_finish_is_asked_less_and_less() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let asked = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&asked);
+        let helper = Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(())
+        });
+        let mut reader = TimedReader::new(fake.open(), Some(helper), LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        assert_eq!(reader.read(), Look::Stuck, "the first go at the helper");
+        assert_eq!(reader.read(), Look::Waiting, "and it gets a rest");
+        let started = Instant::now();
+        while started.elapsed() < LIMIT * 8 {
+            reader.read();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Every 30, 60, then 120 ms, not every 2 ms.
+        let times = asked.load(Ordering::SeqCst);
+        assert!((2..=7).contains(&times), "{times}");
+        fake.let_go();
+    }
+
+    #[test]
+    fn a_helper_that_answers_is_not_held_back() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Ok(None))), LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        for _ in 0..5 {
+            assert_eq!(reader.read(), Look::Got(None));
+        }
+        fake.let_go();
+    }
+
+    #[test]
+    fn a_slow_read_is_used_when_it_finishes_if_nothing_newer_came() {
+        // A big image from an app: over the limit, the helper can't finish it either.
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Err(()))), LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        *fake.value.lock().unwrap() = Some(9);
+        fake.let_go();
+        assert_eq!(reader.read(), Look::Got(Some(9)));
+        assert!(!reader.held_up());
+    }
+
+    #[test]
+    fn a_slow_read_is_used_after_a_helper_that_found_nothing() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Ok(None))), LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        assert_eq!(reader.read(), Look::Got(None));
+        *fake.value.lock().unwrap() = Some(9);
+        fake.let_go();
+        assert_eq!(reader.read(), Look::Got(Some(9)));
+    }
+
+    #[test]
+    fn once_the_helper_has_found_something_the_stuck_read_s_answer_is_old_news() {
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), Some(Box::new(|| Ok(Some(2)))), LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        assert_eq!(reader.read(), Look::Got(Some(2)));
+        *fake.value.lock().unwrap() = Some(9);
+        fake.let_go();
+        *fake.value.lock().unwrap() = Some(3);
+        assert_eq!(reader.read(), Look::Got(Some(3)), "a fresh read, not the stale answer");
+        assert!(!reader.held_up());
+        assert_eq!(fake.opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_stuck_note_goes_on_recovery_and_no_other_note_does() {
+        // One test, as they share the note.
+        store_note(STUCK_NOTE.to_string(), true);
+        clear_stuck_note();
+        assert_eq!(clipboard_note(), (String::new(), false));
+        store_note("Sent 4 files.".to_string(), false);
+        clear_stuck_note();
+        assert_eq!(clipboard_note().0, "Sent 4 files.");
+        store_note(String::new(), false);
+    }
+
+    #[test]
+    fn with_no_helper_a_slow_read_is_waited_for_and_its_answer_used() {
+        // Windows: reads aren't on a pipe, so they end, and nothing else has read meanwhile.
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), None, LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        assert_eq!(reader.read(), Look::Waiting);
+        assert_eq!(reader.read(), Look::Waiting);
+        assert_eq!(fake.stuck_reads(), 1);
+        fake.let_go();
+        assert_eq!(reader.read(), Look::Got(Some(1)));
+        assert!(!reader.held_up());
+    }
+
+    #[test]
+    fn what_the_other_device_sends_doesn_t_wait_for_a_stuck_read() {
+        // A read holds nothing the receiving side needs: the tracker is only taken after it.
+        let fake = Fake::new();
+        fake.hang.store(true, Ordering::SeqCst);
+        let mut reader = TimedReader::new(fake.open(), None, LIMIT);
+        assert_eq!(reader.read(), Look::Stuck);
+        let tracker = Mutex::new(Tracker::default());
+        let written = write_clipboard(&tracker, 7, || Ok(()));
+        assert!(written.is_ok());
+        fake.let_go();
+    }
+
+    #[test]
+    fn a_connection_closed_without_a_word_is_not_a_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let knock = std::thread::spawn(move || drop(TcpStream::connect(address).unwrap()));
+        let (stream, _) = listener.accept().unwrap();
+        knock.join().unwrap();
+        let tracker = Mutex::new(Tracker::default());
+        assert_eq!(receive(stream, &tracker, Path::new("unused")), Ok(()));
+    }
+
+    #[test]
+    fn a_connection_that_stops_partway_still_is() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let knock = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&[1, 2]).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        knock.join().unwrap();
+        let tracker = Mutex::new(Tracker::default());
+        assert!(receive(stream, &tracker, Path::new("unused")).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn everything_comes_through_the_helper_as_it_went_in() {
+        let round_trip = |snapshot: Snapshot| {
+            let wire = WireSnapshot::from(snapshot);
+            let bytes = bincode::serialize(&Some(wire)).unwrap();
+            let back: Option<WireSnapshot> = bincode::deserialize(&bytes).unwrap();
+            Snapshot::from(back.unwrap())
+        };
+        assert!(matches!(round_trip(Snapshot::Text("hello".into())), Snapshot::Text(t) if t == "hello"));
+        let paths = vec![PathBuf::from("/a/b")];
+        assert!(matches!(round_trip(Snapshot::Files(paths.clone())), Snapshot::Files(p) if p == paths));
+        let image = ImageData { width: 1, height: 1, bytes: Cow::Owned(vec![1, 2, 3, 4]) };
+        assert!(matches!(round_trip(Snapshot::Image(image)), Snapshot::Image(i) if i.width == 1 && i.bytes.len() == 4));
+        use std::os::unix::ffi::OsStringExt;
+        let not_text = vec![PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe]))];
+        assert!(matches!(round_trip(Snapshot::Files(not_text.clone())), Snapshot::Files(p) if p == not_text));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod live {
+    use super::*;
+
+    /// Watches the real clipboard, as the service does, printing what it notices. For a script
+    /// beside an isolated compositor, as this would otherwise watch the real one.
+    #[test]
+    #[ignore = "run by hand beside an isolated compositor"]
+    fn watch_real_clipboard() {
+        let seconds = std::env::var("MK_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let end = Instant::now() + Duration::from_secs(seconds);
+        let mut reader = snapshot_reader(std::env::var("MK_HELPER").expect("MK_HELPER").into());
+        let mut last = 0;
+        let mut wrote = false;
+        let started = Instant::now();
+        while Instant::now() < end {
+            std::thread::sleep(if reader.held_up() { HELPER_POLL_INTERVAL } else { POLL_INTERVAL });
+            // As a copy from the other device would, with the hung app still holding its pipe.
+            if !wrote && std::env::var("MK_WRITE").is_ok() && started.elapsed() > Duration::from_secs(8) {
+                wrote = true;
+                let at = Instant::now();
+                let written = with_retries(|cb| cb.set_text("from the other device"));
+                println!("WROTE {written:?} in {} ms", at.elapsed().as_millis());
+            }
+            match reader.read() {
+                Look::Got(Some(snapshot)) if snapshot.fingerprint() != last => {
+                    last = snapshot.fingerprint();
+                    if let Snapshot::Text(text) = &snapshot {
+                        println!("SEEN {text}");
+                    }
+                }
+                Look::Stuck => println!("STUCK"),
+                _ => {}
+            }
+        }
+        println!("WATCH ENDED");
     }
 }

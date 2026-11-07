@@ -63,7 +63,8 @@ pub static AUDIO_PLAYER_LIVE: AtomicBool = AtomicBool::new(false);
 
 pub static AUDIO_TX_VOLUME_PCT: AtomicU32 = AtomicU32::new(100);
 pub static AUDIO_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
-/// Of those, the ones with real sound in them, not silence or word that the stream is alive.
+/// Of those, the ones with real sound from the output's capture in them, not silence, word that the
+/// stream is alive, or a microphone alone.
 pub static AUDIO_TX_SOUND_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static AUDIO_TX_PEAK_PCT: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
@@ -71,6 +72,10 @@ pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
 pub static AUDIO_TX_LOSS: AtomicU32 = AtomicU32::new(0);
 /// The capture of an output is running.
 pub static AUDIO_OUTPUT_CAPTURE_LIVE: AtomicBool = AtomicBool::new(false);
+/// Muting the output won't silence what's captured from it. On Linux that's always so, as capture
+/// comes straight from the apps. On Windows, ordinary loopback follows the endpoint's mute and volume
+/// exactly, so it's only so while process exclusion is really running.
+pub static AUDIO_CAPTURE_SURVIVES_MUTE: AtomicBool = AtomicBool::new(cfg!(not(target_os = "windows")));
 pub static AUDIO_PLAY_ONLY_ON_OTHER: AtomicBool = AtomicBool::new(true);
 /// Whether the link is up. Stored by the input loops, read by the mute thread.
 pub static AUDIO_PEER_ONLINE: AtomicBool = AtomicBool::new(false);
