@@ -137,6 +137,13 @@ pub enum Rejected {
     Unreadable(String),
 }
 
+impl Rejected {
+    /// True if this says something about the release, and not just about this moment here.
+    pub fn is_about_the_release(&self) -> bool {
+        !matches!(self, Self::NoKey | Self::Unreadable(_))
+    }
+}
+
 impl fmt::Display for Rejected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

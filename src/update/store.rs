@@ -93,8 +93,16 @@ impl Store {
     pub fn reject(&self, version: Version) {
         let _ = fs::remove_dir_all(self.version_dir(version));
         let mut record = self.read_record();
-        record.rejected.push(version.to_string());
+        if !record.rejected.contains(&version.to_string()) {
+            record.rejected.push(version.to_string());
+        }
         self.write_record(&record);
+    }
+
+    /// Deletes a downloaded file that turned out damaged, so that it's fetched again.
+    pub fn remove_download(&self, version: Version, name: &str) {
+        let _ = fs::remove_file(self.version_dir(version).join(name));
+        let _ = fs::remove_file(self.part_path(version, name));
     }
 
     fn versions(&self) -> Vec<Version> {

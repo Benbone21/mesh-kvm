@@ -28,8 +28,9 @@ pub struct Check<'a> {
     pub status: &'a Mutex<Status>,
     /// This device's file in a release.
     pub file_name: &'a dyn Fn(Version) -> String,
-    /// A copy that can't install only needs to know the version exists.
-    pub fetch_file: bool,
+    /// A copy that can't install only needs to know the version exists, and leaves the folder to
+    /// the copy that can. It may well have no key, so what it thinks of a release counts for nothing.
+    pub installed_copy: bool,
     pub gaps: &'a [Duration],
 }
 
@@ -49,7 +50,9 @@ impl Check<'_> {
 
     pub fn run(&self) {
         let Ok(tag) = self.source.latest_tag() else { return };
-        self.store.mark_good(now_seconds());
+        if self.installed_copy {
+            self.store.mark_good(now_seconds());
+        }
         self.status().stale = false;
         let ready = self.look_on_disk();
         let Some(version) = tag.strip_prefix('v').and_then(Version::parse) else { return };
@@ -57,7 +60,7 @@ impl Check<'_> {
             return;
         }
         let Some(manifest) = self.fetch_manifest(&tag, version) else { return };
-        if !self.fetch_file {
+        if !self.installed_copy {
             self.status().available = Some(version);
             return;
         }
@@ -70,8 +73,11 @@ impl Check<'_> {
     }
 
     /// Puts down a release that didn't pass. An old release isn't worth a word: it's just ignored.
+    /// Only something wrong with the release itself is remembered.
     fn turn_down(&self, version: Version, why: Rejected) {
-        self.store.reject(version);
+        if self.installed_copy && why.is_about_the_release() {
+            self.store.reject(version);
+        }
         super::log(&format!("Update {version} turned down: {why}"));
         if !matches!(why, Rejected::NotNewer(_)) {
             self.status().note = Some(why.to_string());
@@ -93,6 +99,9 @@ impl Check<'_> {
                 return None;
             }
         };
+        if !self.installed_copy {
+            return Some(manifest);
+        }
         let dir = self.store.version_dir(version);
         let saved = fs::create_dir_all(&dir)
             .and_then(|()| fs::write(dir.join(MANIFEST_NAME), json))
@@ -122,7 +131,6 @@ impl Check<'_> {
     fn fetch_release(&self, tag: &str, version: Version, manifest: &Manifest) {
         let name = (self.file_name)(version);
         let Ok(signed) = manifest.file(&name) else { return };
-        let part = self.store.part_path(version, &name);
         {
             let mut status = self.status();
             if !status.ready {
@@ -139,38 +147,68 @@ impl Check<'_> {
                 status.progress = Some((have * 100 / signed.size.max(1)).min(100) as u8);
             }
         };
+        // A bad byte on the way shouldn't cost a whole version, so it gets a second go from nothing.
+        let mut struck = false;
+        loop {
+            let why = match self.fetch_and_verify(tag, version, &name, signed.size, &show) {
+                Fetched::Good => return,
+                Fetched::Stopped => return,
+                Fetched::Bad(why) => why,
+            };
+            if struck || !matches!(why, Rejected::WrongHash | Rejected::WrongSize) {
+                return self.turn_down(version, why);
+            }
+            struck = true;
+            self.store.remove_download(version, &name);
+        }
+    }
+
+    fn fetch_and_verify(&self, tag: &str, version: Version, name: &str, size: u64, show: &dyn Fn(u64)) -> Fetched {
+        let part = self.store.part_path(version, name);
         let mut gaps = self.gaps.iter();
         loop {
             let before = fs::metadata(&part).map_or(0, |m| m.len());
-            match self.source.download(tag, &name, &part, signed.size, &show) {
+            match self.source.download(tag, name, &part, size, show) {
                 Ok(()) => break,
                 Err(Failure::Network(_)) => {}
-                Err(Failure::TooMuch) => return self.turn_down(version, Rejected::WrongSize),
-                Err(Failure::Disk(why)) => return self.disk_note(&why),
+                Err(Failure::TooMuch) => return Fetched::Bad(Rejected::WrongSize),
+                Err(Failure::Disk(why)) => {
+                    self.disk_note(&why);
+                    return Fetched::Stopped;
+                }
             }
             if fs::metadata(&part).map_or(0, |m| m.len()) > before {
                 gaps = self.gaps.iter();
             }
             match gaps.next() {
                 Some(gap) => std::thread::sleep(*gap),
-                None => return,
+                None => return Fetched::Stopped,
             }
         }
-        let finished = self.store.version_dir(version).join(&name);
-        if let Err(e) = fs::rename(&part, &finished) {
-            return self.disk_note(&e.to_string());
+        if let Err(e) = fs::rename(&part, self.store.version_dir(version).join(name)) {
+            self.disk_note(&e.to_string());
+            return Fetched::Stopped;
         }
-        match self.store.verify(self.key, self.running, version, &name) {
+        match self.store.verify(self.key, self.running, version, name) {
             Ok(_) => {
                 self.store.remove_older_than(version);
                 let mut status = self.status();
                 status.available = Some(version);
                 status.ready = true;
                 status.note = None;
+                Fetched::Good
             }
-            Err(why) => self.turn_down(version, why),
+            Err(why) => Fetched::Bad(why),
         }
     }
+}
+
+/// How one go at a release's file ended.
+enum Fetched {
+    Good,
+    /// It can't go on for now, and the next look carries on.
+    Stopped,
+    Bad(Rejected),
 }
 
 #[cfg(test)]
@@ -195,7 +233,8 @@ mod tests {
         dir: PathBuf,
         status: Mutex<Status>,
         key: VerifyingKey,
-        fetch_file: bool,
+        installed_copy: bool,
+        no_key: bool,
     }
 
     impl World {
@@ -205,7 +244,7 @@ mod tests {
             let behaviour = Arc::new(Mutex::new(Behaviour::default()));
             let source = Source::new(Server::local(&serve(behaviour.clone())));
             let key = signing_key(1).verifying_key();
-            Self { behaviour, source, store: Store::new(dir.clone()), dir, status: Mutex::default(), key, fetch_file: true }
+            Self { behaviour, source, store: Store::new(dir.clone()), dir, status: Mutex::default(), key, installed_copy: true, no_key: false }
         }
 
         /// A release with a good signature on the server.
@@ -229,11 +268,11 @@ mod tests {
             Check {
                 source: &self.source,
                 store: &self.store,
-                key: Some(&self.key),
+                key: (!self.no_key).then_some(&self.key),
                 running: v("0.6.1"),
                 status: &self.status,
                 file_name: &|_| FILE.to_string(),
-                fetch_file: self.fetch_file,
+                installed_copy: self.installed_copy,
                 gaps,
             }
             .run()
@@ -317,6 +356,46 @@ mod tests {
         world.publish("0.7.1", b"fixed");
         world.look(&[]);
         assert_eq!((world.status().ready, world.status().note), (true, None));
+    }
+
+    #[test]
+    fn one_damaged_download_is_fetched_again_from_nothing_before_it_counts() {
+        let world = World::new("second-go");
+        world.publish("0.7.0", b"the real one");
+        world.behaviour.lock().unwrap().damage_next = 1;
+        world.look(&[]);
+        let status = world.status();
+        assert_eq!((status.ready, status.note), (true, None));
+        assert!(!world.store.is_rejected(v("0.7.0")));
+        let fetched = world.behaviour.lock().unwrap().seen.iter().filter(|r| r.contains(FILE)).count();
+        assert_eq!(fetched, 2);
+    }
+
+    #[test]
+    fn a_copy_with_no_key_writes_nothing_others_share() {
+        let mut world = World::new("no-key");
+        world.installed_copy = false;
+        world.no_key = true;
+        world.publish("0.7.0", b"x");
+        world.look(&[]);
+        assert!(world.status().note.unwrap().contains("no release key"));
+        assert!(!world.store.is_rejected(v("0.7.0")));
+        assert!(!world.dir.join("check.json").exists(), "not even the time of the check");
+        assert!(!world.dir.join("0.7.0").exists());
+    }
+
+    #[test]
+    fn a_copy_that_can_not_install_never_rejects_or_deletes_for_the_installed_one() {
+        let mut world = World::new("dev-copy");
+        world.installed_copy = false;
+        let json = manifest_json("0.7.0", FILE, b"x");
+        world.publish_as("0.7.0", json.clone(), sign(&signing_key(2), &json), b"x");
+        fs::create_dir_all(world.dir.join("0.7.0")).unwrap();
+        fs::write(world.dir.join("0.7.0").join(FILE), b"the installed copy's download").unwrap();
+        world.look(&[]);
+        assert!(world.status().note.is_some(), "it still says");
+        assert!(!world.store.is_rejected(v("0.7.0")));
+        assert!(world.dir.join("0.7.0").join(FILE).exists());
     }
 
     #[test]
@@ -407,7 +486,7 @@ mod tests {
     #[test]
     fn a_copy_that_can_not_install_only_learns_the_version() {
         let mut world = World::new("view");
-        world.fetch_file = false;
+        world.installed_copy = false;
         world.publish("0.7.0", b"x");
         world.look(&[]);
         let status = world.status();

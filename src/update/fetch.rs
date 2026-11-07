@@ -4,9 +4,10 @@
 use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use ureq::{http::StatusCode, Agent};
+use ureq::http::{Response, StatusCode};
+use ureq::{Agent, Body};
 
 const REPOSITORY: &str = "Benbone21/mesh-kvm";
 #[cfg(feature = "test-hooks")]
@@ -16,14 +17,19 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one try at a body lasts. A stalled connection has to end somehow, and whatever
 /// arrived stays for the next try, so a slow link still gets there.
 const BODY_TIMEOUT: Duration = Duration::from_secs(120);
+/// GitHub sends a download to its storage in one hop.
+const MOST_REDIRECTS: u32 = 5;
+/// Beside a partial download: what the server called that file, to be sure a resume is the same one.
+const VALIDATOR_SUFFIX: &str = ".etag";
 
 /// Where releases come from. Only `github` is reachable from a shipped build.
 #[derive(Debug, Clone)]
 pub struct Server {
     api: String,
     downloads: String,
-    /// Refuses anything else, including on a redirect.
-    https_only: bool,
+    /// The one address that may be plain HTTP, for a local test server. Everything else, redirects
+    /// included, has to be HTTPS. A shipped build has none.
+    plain_address: Option<String>,
 }
 
 impl Server {
@@ -32,12 +38,17 @@ impl Server {
         if let Ok(address) = std::env::var(TEST_SERVER_ENV) {
             return Self::local(&address);
         }
-        Self { api: "https://api.github.com".into(), downloads: "https://github.com".into(), https_only: true }
+        Self { api: "https://api.github.com".into(), downloads: "https://github.com".into(), plain_address: None }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn local(address: &str) -> Self {
-        Self { api: address.into(), downloads: address.into(), https_only: false }
+        Self { api: address.into(), downloads: address.into(), plain_address: Some(address.into()) }
+    }
+
+    fn allows(&self, url: &str) -> bool {
+        let plain = self.plain_address.as_ref().is_some_and(|address| url.strip_prefix(address.as_str()).is_some_and(|rest| rest.starts_with('/')));
+        url.starts_with("https://") || plain
     }
 }
 
@@ -64,7 +75,7 @@ pub struct Source {
 impl Source {
     pub fn new(server: Server) -> Self {
         let agent = Agent::config_builder()
-            .https_only(server.https_only)
+            .max_redirects(0)
             .user_agent(concat!("mesh-kvm/", env!("CARGO_PKG_VERSION")))
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(ANSWER_TIMEOUT))
@@ -79,15 +90,31 @@ impl Source {
         format!("{}/{REPOSITORY}/releases/download/{tag}/{name}", self.server.downloads)
     }
 
+    /// One GET, following redirects here and not in the agent, so that every hop is looked at.
+    fn get(&self, url: &str, headers: &[(&str, String)]) -> Result<Response<Body>, Failure> {
+        let mut url = url.to_string();
+        for _ in 0..=MOST_REDIRECTS {
+            if !self.server.allows(&url) {
+                return Err(Failure::Network(format!("{url} isn't HTTPS")));
+            }
+            let mut request = self.agent.get(&url);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let reply = request.call().map_err(|e| Failure::Network(e.to_string()))?;
+            if !reply.status().is_redirection() {
+                return Ok(reply);
+            }
+            let location = reply.headers().get("location").and_then(|v| v.to_str().ok());
+            url = location.ok_or_else(|| Failure::Network("a redirect to nowhere".into()))?.to_string();
+        }
+        Err(Failure::Network("too many redirects".into()))
+    }
+
     /// The tag of the latest full release.
     pub fn latest_tag(&self) -> Result<String, Failure> {
         let url = format!("{}/repos/{REPOSITORY}/releases/latest", self.server.api);
-        let mut reply = self
-            .agent
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .call()
-            .map_err(|e| Failure::Network(e.to_string()))?;
+        let mut reply = self.get(&url, &[("Accept", "application/vnd.github+json".to_string())])?;
         if reply.status() != StatusCode::OK {
             return Err(Failure::Network(format!("status {}", reply.status())));
         }
@@ -98,7 +125,7 @@ impl Source {
 
     /// A small file of the release, whole. More than `cap` bytes is refused.
     pub fn small_file(&self, tag: &str, name: &str, cap: u64) -> Result<Vec<u8>, Failure> {
-        let mut reply = self.agent.get(&self.file_url(tag, name)).call().map_err(|e| Failure::Network(e.to_string()))?;
+        let mut reply = self.get(&self.file_url(tag, name), &[])?;
         if reply.status() != StatusCode::OK {
             return Err(Failure::Network(format!("status {}", reply.status())));
         }
@@ -116,24 +143,29 @@ impl Source {
     }
 
     /// Fetches into `part` until it holds `size` bytes, carrying on from whatever is there. Anything
-    /// that arrives stays, whether or not the connection lasts, so the next try picks it up.
+    /// that arrives stays, whether or not the connection lasts, so the next try picks it up. A file
+    /// that has changed on the server since then starts again, by way of `If-Range`.
     pub fn download(&self, tag: &str, name: &str, part: &Path, size: u64, progress: &dyn Fn(u64)) -> Result<(), Failure> {
         let mut have = fs::metadata(part).map_or(0, |m| m.len());
         if have > size {
-            let _ = fs::remove_file(part);
+            forget_part(part);
             have = 0;
         }
         if have == size {
+            forget_validator(part);
             return Ok(());
         }
-        let mut request = self.agent.get(&self.file_url(tag, name));
+        let mut headers = Vec::new();
         if have > 0 {
-            request = request.header("Range", format!("bytes={have}-"));
+            headers.push(("Range", format!("bytes={have}-")));
+            if let Ok(validator) = fs::read_to_string(validator_path(part)) {
+                headers.push(("If-Range", validator));
+            }
         }
-        let mut reply = request.call().map_err(|e| Failure::Network(e.to_string()))?;
+        let mut reply = self.get(&self.file_url(tag, name), &headers)?;
         let carries_on = reply.status() == StatusCode::PARTIAL_CONTENT && starts_at(&reply, have);
         if reply.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-            let _ = fs::remove_file(part);
+            forget_part(part);
             return Err(Failure::Network("the server has no such range".into()));
         }
         if !carries_on && reply.status() != StatusCode::OK {
@@ -143,18 +175,24 @@ impl Source {
             have = 0;
         }
         let mut file = open_part(part, carries_on).map_err(|e| disk_failure(part, e))?;
+        if !carries_on {
+            keep_validator(part, &reply);
+        }
         let mut body = reply.body_mut().as_reader();
         let mut buffer = [0u8; 32 * 1024];
         loop {
             let read = match body.read(&mut buffer) {
-                Ok(0) if have == size => return Ok(()),
+                Ok(0) if have == size => {
+                    forget_validator(part);
+                    return Ok(());
+                }
                 Ok(0) => return Err(Failure::Network("the connection ended early".into())),
                 Ok(read) => read,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(Failure::Network(e.to_string())),
             };
             if have + read as u64 > size {
-                let _ = fs::remove_file(part);
+                forget_part(part);
                 return Err(Failure::TooMuch);
             }
             file.write_all(&buffer[..read]).map_err(|e| disk_failure(part, e))?;
@@ -164,8 +202,31 @@ impl Source {
     }
 }
 
+fn validator_path(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_owned();
+    name.push(VALIDATOR_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Keeps what the server calls this file. A weak tag is no use, as `If-Range` needs a strong one.
+fn keep_validator(part: &Path, reply: &Response<Body>) {
+    match reply.headers().get("etag").and_then(|v| v.to_str().ok()).filter(|tag| !tag.starts_with("W/")) {
+        Some(tag) => drop(fs::write(validator_path(part), tag)),
+        None => forget_validator(part),
+    }
+}
+
+fn forget_validator(part: &Path) {
+    let _ = fs::remove_file(validator_path(part));
+}
+
+fn forget_part(part: &Path) {
+    let _ = fs::remove_file(part);
+    forget_validator(part);
+}
+
 /// True when a partial answer really does start where this download got to.
-fn starts_at(reply: &ureq::http::Response<ureq::Body>, have: u64) -> bool {
+fn starts_at(reply: &Response<Body>, have: u64) -> bool {
     let range = reply.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
     range.strip_prefix("bytes ").and_then(|r| r.split('-').next()).and_then(|s| s.parse::<u64>().ok()) == Some(have)
 }
@@ -178,7 +239,7 @@ fn open_part(part: &Path, carry_on: bool) -> std::io::Result<File> {
 }
 
 fn disk_failure(part: &Path, error: std::io::Error) -> Failure {
-    let _ = fs::remove_file(part);
+    forget_part(part);
     Failure::Disk(error.to_string())
 }
 
@@ -200,6 +261,14 @@ pub mod fake {
         pub cut_after: Vec<usize>,
         /// Ignores `Range` and sends the whole file.
         pub ignores_range: bool,
+        /// The next this many downloads of a file come back damaged.
+        pub damage_next: u32,
+        /// Sent as `ETag` with a file, and compared with `If-Range`.
+        pub etag: Option<String>,
+        /// Each request's `If-Range`, in turn.
+        pub if_range: Vec<Option<String>>,
+        /// Answers one path with a redirect to this address.
+        pub redirect: Option<(String, String)>,
         /// Every request, as `<path> <range>`.
         pub seen: Vec<String>,
     }
@@ -223,6 +292,7 @@ pub mod fake {
         reader.read_line(&mut first).unwrap();
         let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
         let mut range = None;
+        let mut if_range = None;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
@@ -231,9 +301,16 @@ pub mod fake {
             if let Some(value) = line.to_lowercase().strip_prefix("range: bytes=") {
                 range = value.trim().trim_end_matches('-').parse::<usize>().ok();
             }
+            if line.to_lowercase().starts_with("if-range:") {
+                if_range = Some(line["if-range:".len()..].trim().to_string());
+            }
         }
         let mut b = behaviour.lock().unwrap();
         b.seen.push(format!("{path} {range:?}"));
+        b.if_range.push(if_range.clone());
+        if let Some((_, to)) = b.redirect.clone().filter(|(from, _)| path.ends_with(from.as_str())) {
+            return reply(&mut stream, "302 Found", &format!("Location: {to}\r\n"), b"", None);
+        }
         if path.ends_with("/releases/latest") {
             let body = b.tag.as_ref().map(|t| format!(r#"{{"tag_name":"{t}","assets":[{{"browser_download_url":"http://evil.example/x"}}]}}"#));
             return match body {
@@ -241,17 +318,24 @@ pub mod fake {
                 None => reply(&mut stream, "503 Unavailable", "", b"", None),
             };
         }
-        let Some(file) = b.files.get(path.rsplit('/').next().unwrap()).cloned() else {
+        let name = path.rsplit('/').next().unwrap();
+        let Some(mut file) = b.files.get(name).cloned() else {
             return reply(&mut stream, "404 Not Found", "", b"", None);
         };
+        if b.damage_next > 0 && !name.starts_with("release.json") {
+            b.damage_next -= 1;
+            file[0] ^= 1;
+        }
         let cut = if file.len() > 1000 && !b.cut_after.is_empty() { Some(b.cut_after.remove(0)) } else { None };
-        match range.filter(|_| !b.ignores_range) {
+        let etag = b.etag.as_ref().map_or_else(String::new, |tag| format!("ETag: {tag}\r\n"));
+        let unchanged = if_range.is_none() || if_range == b.etag;
+        match range.filter(|_| !b.ignores_range && unchanged) {
             Some(start) if start >= file.len() => reply(&mut stream, "416 Range Not Satisfiable", "", b"", None),
             Some(start) => {
-                let header = format!("Content-Range: bytes {start}-{}/{}\r\n", file.len() - 1, file.len());
+                let header = format!("{etag}Content-Range: bytes {start}-{}/{}\r\n", file.len() - 1, file.len());
                 reply(&mut stream, "206 Partial Content", &header, &file[start..], cut)
             }
-            None => reply(&mut stream, "200 OK", "", &file, cut),
+            None => reply(&mut stream, "200 OK", &etag, &file, cut),
         }
     }
 
@@ -288,18 +372,77 @@ mod tests {
         Behaviour { files: [("file".to_string(), bytes)].into(), ..Default::default() }
     }
 
+    /// A real server the client would happily talk to, if it weren't told not to.
+    fn shipped_rules(address: &str) -> Source {
+        let mut server = Server::local(address);
+        server.plain_address = None;
+        Source::new(server)
+    }
+
     #[test]
     fn the_shipped_address_is_github_over_https() {
         let server = Server::github();
         assert_eq!((server.api.as_str(), server.downloads.as_str()), ("https://api.github.com", "https://github.com"));
-        assert!(server.https_only);
+        assert_eq!(server.plain_address, None);
     }
 
     #[test]
     fn a_shipped_client_refuses_plain_http() {
-        let mut server = Server::local("http://127.0.0.1:9");
-        server.https_only = true;
-        assert!(matches!(Source::new(server).latest_tag(), Err(Failure::Network(_))));
+        let shared = Arc::new(Mutex::new(Behaviour { tag: Some("v0.7.0".into()), ..Default::default() }));
+        let source = shipped_rules(&serve(shared.clone()));
+        assert!(matches!(source.latest_tag(), Err(Failure::Network(_))));
+        assert!(shared.lock().unwrap().seen.is_empty(), "it never got as far as asking");
+    }
+
+    #[test]
+    fn a_redirect_to_plain_http_is_refused() {
+        let elsewhere = Arc::new(Mutex::new(with_file(b"from elsewhere".to_vec())));
+        let to = format!("{}/x/file", serve(elsewhere.clone()));
+        let (source, _) = server(Behaviour { redirect: Some(("/file".into(), to)), ..with_file(b"file".to_vec()) });
+        assert!(matches!(source.small_file("v1", "file", 100), Err(Failure::Network(_))));
+        assert!(elsewhere.lock().unwrap().seen.is_empty(), "it never went there");
+    }
+
+    #[test]
+    fn a_redirect_within_what_is_allowed_is_followed_with_its_headers() {
+        let bytes = big();
+        let shared = Arc::new(Mutex::new(with_file(bytes.clone())));
+        let address = serve(shared.clone());
+        shared.lock().unwrap().redirect = Some(("/releases/download/v1/file".into(), format!("{address}/storage/file")));
+        let source = Source::new(Server::local(&address));
+        let path = part("redirect");
+        fs::write(&path, &bytes[..500]).unwrap();
+        source.download("v1", "file", &path, bytes.len() as u64, &|_| ()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(shared.lock().unwrap().seen[1].ends_with("Some(500)"), "the range went along");
+    }
+
+    #[test]
+    fn a_resume_asks_for_the_same_file_and_starts_again_if_it_changed() {
+        let bytes = big();
+        let (source, shared) = server(Behaviour { cut_after: vec![70_000], etag: Some("\"one\"".into()), ..with_file(bytes.clone()) });
+        let path = part("etag");
+        let size = bytes.len() as u64;
+        assert!(source.download("v1", "file", &path, size, &|_| ()).is_err());
+        {
+            let mut b = shared.lock().unwrap();
+            b.etag = Some("\"two\"".into());
+            b.files.insert("file".into(), vec![9; bytes.len()]);
+        }
+        source.download("v1", "file", &path, size, &|_| ()).unwrap();
+        assert_eq!(shared.lock().unwrap().if_range[1].as_deref(), Some("\"one\""));
+        assert_eq!(fs::read(&path).unwrap(), vec![9; bytes.len()], "no mix of the two");
+        assert!(!validator_path(&path).exists(), "nothing left beside it");
+    }
+
+    #[test]
+    fn a_weak_tag_is_not_used_to_resume() {
+        let bytes = big();
+        let (source, shared) = server(Behaviour { cut_after: vec![70_000], etag: Some("W/\"weak\"".into()), ..with_file(bytes.clone()) });
+        let path = part("weak");
+        let _ = source.download("v1", "file", &path, bytes.len() as u64, &|_| ());
+        let _ = source.download("v1", "file", &path, bytes.len() as u64, &|_| ());
+        assert_eq!(shared.lock().unwrap().if_range[1], None);
     }
 
     #[test]
