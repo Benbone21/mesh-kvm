@@ -81,6 +81,14 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_CLIPBOARD_PORT)]
     clipboard_port: u16,
 
+    /// Ask the running service to show a code for pairing, print it, and wait for the result
+    #[arg(long)]
+    pair_show: bool,
+
+    /// Enter the code the other device shows, through the running service
+    #[arg(long, value_name = "CODE")]
+    pair: Option<String>,
+
     /// Open the app window for the service on this device, and exit when it closes
     #[arg(long, alias = "studio")]
     app: bool,
@@ -270,6 +278,10 @@ fn main() {
         }
     }
 
+    if cli.pair_show || cli.pair.is_some() {
+        std::process::exit(run_pair_command(&cli));
+    }
+
     if cli.app {
         run_app_window();
         return;
@@ -316,6 +328,103 @@ fn wait_for_old_service() {
     }
 }
 
+/// Pairing as the running service does it. It needs no peer address, and no channels.
+fn pairing_service(secure: &secure::Services, pinned: bool) -> secure::pairing::PairingService {
+    use secure::pairing::{Hooks, PairingService, PAIRING_PORT, PEER_UNPAIRED_BODY};
+    let hooks = Hooks {
+        name: Box::new(settings::device_name),
+        peer_ip: Box::new(|| settings::peer_ip().and_then(|ip| ip.parse().ok())),
+        pinned: Box::new(move || pinned),
+        learn_address: Box::new(|ip| settings::learn_peer(&ip.to_string())),
+        tell_peer: Box::new(|| {
+            secure::control::peer_call("POST", "/api/local/action", PEER_UNPAIRED_BODY).map(|_| ())
+        }),
+        restart: Box::new(settings::request_restart),
+        security: Box::new(|| secure::services().input.security()),
+    };
+    PairingService::new(secure::keys::pairing_path(), secure.pairing.as_deref().cloned(), secure.problem.clone(), PAIRING_PORT, hooks)
+}
+
+/// How the pairing flags talk to the running service: one request, and what came back.
+type Call<'a> = &'a mut dyn FnMut(&str, &str, &str) -> Result<(u16, String), String>;
+
+/// How long to wait for the result, in polls. A code lasts 120 seconds.
+const PAIR_POLLS: u32 = 800;
+const PAIR_POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn run_pair_command(cli: &Cli) -> i32 {
+    let body = match &cli.pair {
+        Some(code) => serde_json::json!({ "action": "pair_enter", "code": code }),
+        None => serde_json::json!({ "action": "pair_show" }),
+    };
+    let mut call = |method: &str, path: &str, body: &str| webui::http_call("127.0.0.1", method, path, body);
+    let mut say = |line: &str| println!("{line}");
+    pair_through(&mut call, &body.to_string(), cli.pair.is_none(), &mut say, &|| std::thread::sleep(PAIR_POLL_EVERY))
+}
+
+fn said_paired(say: &mut dyn FnMut(&str), status: &serde_json::Value) -> i32 {
+    let name = status["peer_name"].as_str().unwrap_or("the other device");
+    say(&format!("Paired with {name}. Fingerprint {}.", status["fingerprint"].as_str().unwrap_or("")));
+    0
+}
+
+/// Asks the service to start, says what happens, and returns the exit status: 0 for a pairing.
+fn pair_through(call: Call, request: &str, showing: bool, say: &mut dyn FnMut(&str), wait: &dyn Fn()) -> i32 {
+    let started = match call("POST", "/api/local/action", request) {
+        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default(),
+        Ok((status, _)) => {
+            say(&format!("The service refused ({status})."));
+            return 1;
+        }
+        Err(_) => {
+            say("mesh-kvm isn't running on this device. Start it, then try again.");
+            return 1;
+        }
+    };
+    if started["ok"] != true {
+        say(started["error"].as_str().unwrap_or("The service couldn't start pairing."));
+        return 1;
+    }
+    let mut shown = false;
+    // The service starts again when a pairing is saved, and may do so before this hears of it.
+    let mut lost = false;
+    for _ in 0..PAIR_POLLS {
+        let status = match call("GET", "/api/pairing", "") {
+            Ok((200, body)) => serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default(),
+            _ => {
+                lost = true;
+                wait();
+                continue;
+            }
+        };
+        match status["state"].as_str().unwrap_or("") {
+            "showing" if showing => {
+                if !shown {
+                    shown = true;
+                    let code = status["code"].as_str().unwrap_or("");
+                    say(&format!("Code: {} {}", code.get(..3).unwrap_or(""), code.get(3..).unwrap_or("")));
+                    say("Enter it on the other device within 2 minutes.");
+                }
+            }
+            "paired" => return said_paired(say, &status),
+            "failed" => {
+                say(status["error"].as_str().unwrap_or("Pairing failed."));
+                return 1;
+            }
+            // A service that started again after saving has a peer and nothing going on.
+            "idle" if lost && status["peer_name"].is_string() => return said_paired(say, &status),
+            "idle" => {
+                say("Pairing was cancelled.");
+                return 1;
+            }
+            _ => {}
+        }
+        wait();
+    }
+    say("Gave up waiting for the result.");
+    1
+}
+
 /// Runs the service until it is told to stop.
 fn run_service(cli: Cli) {
     wait_for_old_service();
@@ -356,7 +465,8 @@ fn run_service(cli: Cli) {
     let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
     let displays = spatial::start_displays(state.clone(), platform.clone());
-    let handler = spatial::studio_handler(state.clone(), platform.clone(), displays);
+    let pairing = std::sync::Arc::new(pairing_service(secure, pinned));
+    let handler = spatial::studio_handler(state.clone(), platform.clone(), displays, pairing);
     if let Err(e) = webui::start(listener, peer_ip.clone(), handler.clone()) {
         fail(&e);
     }
@@ -552,6 +662,79 @@ mod tests {
             bare_launch_plan(true, true),
             BarePlan { install_exe: true, become_service: false }
         );
+    }
+
+    #[test]
+    fn the_pair_flags_are_parsed() {
+        let cli = Cli::try_parse_from(["mesh-kvm", "--pair-show"]).unwrap();
+        assert!(cli.pair_show && cli.pair.is_none());
+        let cli = Cli::try_parse_from(["mesh-kvm", "--pair", "482 917"]).unwrap();
+        assert_eq!(cli.pair.as_deref(), Some("482 917"));
+        assert!(!cli.pair_show);
+    }
+
+    /// Plays the service: `answers` are what `/api/pairing` says in turn, after the action's reply.
+    fn pair_run(action_reply: Result<(u16, String), String>, answers: &[Result<(u16, String), String>], showing: bool) -> (i32, Vec<String>) {
+        let mut queue = answers.to_vec().into_iter();
+        let mut call = |method: &str, path: &str, _: &str| match (method, path) {
+            ("POST", "/api/local/action") => action_reply.clone(),
+            ("GET", "/api/pairing") => queue.next().unwrap_or(Ok((200, r#"{"state":"idle","peer_name":null}"#.into()))),
+            _ => Err("unexpected".into()),
+        };
+        let mut said = Vec::new();
+        let status = super::pair_through(&mut call, "{}", showing, &mut |line| said.push(line.to_string()), &|| {});
+        (status, said)
+    }
+
+    fn ok(body: &str) -> Result<(u16, String), String> {
+        Ok((200, body.to_string()))
+    }
+
+    #[test]
+    fn pair_show_prints_the_code_once_and_exits_0_on_success() {
+        let showing = r#"{"state":"showing","code":"482917","seconds_left":100}"#;
+        let (status, said) = pair_run(
+            ok(r#"{"ok":true}"#),
+            &[ok(showing), ok(showing), ok(r#"{"state":"paired","peer_name":"Laptop","fingerprint":"4F2A-91C3"}"#)],
+            true,
+        );
+        assert_eq!(status, 0);
+        assert_eq!(said.iter().filter(|l| l.contains("482 917")).count(), 1, "{said:?}");
+        assert!(said.last().unwrap().contains("Laptop") && said.last().unwrap().contains("4F2A-91C3"));
+    }
+
+    #[test]
+    fn a_failed_pairing_exits_non_zero_with_the_reason() {
+        let (status, said) = pair_run(
+            ok(r#"{"ok":true}"#),
+            &[ok(r#"{"state":"entering"}"#), ok(r#"{"state":"failed","error":"The code was wrong."}"#)],
+            false,
+        );
+        assert_eq!(status, 1);
+        assert_eq!(said, ["The code was wrong."]);
+    }
+
+    #[test]
+    fn a_refusal_or_no_service_exits_non_zero() {
+        let (status, said) = pair_run(ok(r#"{"ok":false,"error":"Set the other device's address first."}"#), &[], false);
+        assert_eq!((status, said.as_slice()), (1, ["Set the other device's address first.".to_string()].as_slice()));
+        let (status, said) = pair_run(Err("refused".into()), &[], true);
+        assert_eq!(status, 1);
+        assert!(said[0].contains("isn't running"));
+    }
+
+    #[test]
+    fn a_service_that_restarts_after_saving_counts_as_paired() {
+        let showing = r#"{"state":"showing","code":"000123"}"#;
+        let (status, _) = pair_run(
+            ok(r#"{"ok":true}"#),
+            &[ok(showing), Err("gone".into()), Err("gone".into()), ok(r#"{"state":"idle","peer_name":"Laptop","fingerprint":"AAAA-BBBB"}"#)],
+            true,
+        );
+        assert_eq!(status, 0);
+        // Idle with no loss in between is a cancel.
+        let (status, _) = pair_run(ok(r#"{"ok":true}"#), &[ok(showing), ok(r#"{"state":"idle","peer_name":"Laptop"}"#)], true);
+        assert_eq!(status, 1);
     }
 
     #[test]

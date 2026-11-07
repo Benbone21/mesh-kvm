@@ -63,6 +63,10 @@ impl HttpRequest {
         }
     }
 
+    pub fn source(&self) -> Source {
+        self.source
+    }
+
     /// True if this request may change anything. Reading is open, as the layout sync needs it.
     /// Changes come from a program on this device, or from the other device. A web page never
     /// qualifies, wherever its browser runs.

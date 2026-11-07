@@ -67,6 +67,7 @@ fn serve(listener: TcpListener, peer: IpAddr, pairing: Arc<Pairing>, incoming: I
 }
 
 /// A connection to the peer's listener, with the handshake done inside `wait`.
+#[cfg(not(test))]
 pub fn open(target: SocketAddr, purpose: Purpose, wait: Duration) -> Result<SecureStream, String> {
     open_with(super::services().pairing.as_deref(), target, purpose, wait)
 }

@@ -290,7 +290,7 @@ pub fn restart_requested() -> bool {
 }
 
 /// Asks for a restart, after a moment so the reply to the request still gets out.
-fn request_restart() {
+pub fn request_restart() {
     let spawned = std::thread::Builder::new().name("mesh-kvm-restart".to_string()).spawn(|| {
         std::thread::sleep(RESTART_DELAY);
         RESTART_PENDING.store(true, Ordering::SeqCst);
@@ -298,6 +298,12 @@ fn request_restart() {
     if spawned.is_err() {
         RESTART_PENDING.store(true, Ordering::SeqCst);
     }
+}
+
+/// Keeps the address a pairing came from, when none was set. The caller restarts the service.
+pub fn learn_peer(ip: &str) {
+    *peer_slot() = ip.to_string();
+    save_current();
 }
 
 /// Who is asking `set_peer`, and what the service can say about the address.

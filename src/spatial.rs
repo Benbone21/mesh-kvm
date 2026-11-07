@@ -9,6 +9,7 @@
 use crate::displays::{DisplayManager, LayoutNews};
 use crate::platform::Platform;
 use crate::input::link::LinkQuality;
+use crate::secure::pairing::PairingService;
 pub use crate::protocol::MonitorRect;
 use crate::protocol::{NodeId, Payload, SwitchEdge};
 use crate::router::{EdgeSpan, EdgeTracker, KEEP_CURSOR};
@@ -944,9 +945,14 @@ pub fn studio_handler(
     state: Arc<RwLock<SharedSpatialState>>,
     platform: Arc<dyn Platform>,
     displays: Arc<DisplayManager>,
+    pairing: Arc<PairingService>,
 ) -> crate::webui::Handler {
     Arc::new(move |req: &crate::webui::HttpRequest| -> Option<String> {
         let path = req.path.split('?').next().unwrap_or("");
+        // Pairing decides by `Source` itself, as one of its actions is the peer's alone.
+        if let Some(reply) = pairing.api(req) {
+            return Some(reply);
+        }
         match (req.method.as_str(), path) {
             ("GET", "/api/state") => {
                 let g = state.read().ok()?;
@@ -954,7 +960,7 @@ pub fn studio_handler(
             }
             ("GET", "/api/local") => {
                 let g = state.read().ok()?;
-                Some(local_status(&g, platform.as_ref(), &displays).to_string())
+                Some(local_status(&g, platform.as_ref(), &displays, pairing.secure_label()).to_string())
             }
             ("GET", "/api/displays") => Some(displays.list_json()),
             ("POST", "/api/local/action") => {
@@ -1033,7 +1039,7 @@ pub fn studio_handler(
 }
 
 /// This device's `/api/local`.
-fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &DisplayManager) -> serde_json::Value {
+fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &DisplayManager, secure: &str) -> serde_json::Value {
     let peer_ip = g.telemetry.peer_addr.split(':').next().unwrap_or("").to_string();
     // With no peer yet, the address other devices would use is the one on the default route.
     let toward = if peer_ip.is_empty() { ANY_ROUTED_ADDRESS } else { peer_ip.as_str() };
@@ -1060,6 +1066,9 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "audio": crate::settings::audio_status_json(),
         "display_change": displays.status_json(),
         "link": crate::settings::link_status_json(&g.telemetry.link),
+        "secure": secure,
+        // The other device runs a version that doesn't encrypt, by what either channel heard.
+        "old_peer": g.telemetry.link.old_peer || crate::audio::other_version_arriving(std::time::Instant::now()),
     });
     crate::settings::add_toggle_status(&mut status, g.telemetry.main_conflict);
     status
@@ -1654,12 +1663,51 @@ mod tests {
         }
     }
 
+    fn test_pairing(name: &str) -> Arc<PairingService> {
+        let dir = std::env::temp_dir().join(format!("mk-spatial-{}-{name}", std::process::id()));
+        Arc::new(PairingService::for_test(dir.join("pairing.json")))
+    }
+
+    #[test]
+    fn the_code_is_never_in_the_status_the_peer_can_read() {
+        use crate::webui::{HttpRequest, Source};
+        let state = Arc::new(shared_at(0, NodeId::Debian, None));
+        let platform: Arc<dyn Platform> = Arc::new(NoScreens);
+        let pairing = test_pairing("code");
+        let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change(), pairing.clone());
+        let shown = handler(&HttpRequest::for_test("POST", "/api/local/action", r#"{"action":"pair_show"}"#, Source::Local));
+        assert_eq!(shown.unwrap(), crate::settings::OK_RESPONSE);
+        let mine = handler(&HttpRequest::for_test("GET", "/api/pairing", "", Source::Local)).unwrap();
+        let code = serde_json::from_str::<serde_json::Value>(&mine).unwrap()["code"].as_str().unwrap().to_string();
+        for source in [Source::Local, Source::Peer, Source::Browser] {
+            let status = handler(&HttpRequest::for_test("GET", "/api/local", "", source)).unwrap();
+            assert!(!status.contains(&code), "{source:?} can read the code");
+            assert!(!status.contains("\"code\""));
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value["secure"], "unpaired");
+            assert_eq!(value["old_peer"], false);
+        }
+        for source in [Source::Peer, Source::Browser] {
+            assert!(handler(&HttpRequest::for_test("GET", "/api/pairing", "", source)).is_none());
+        }
+        pairing.cancel();
+    }
+
+    #[test]
+    fn an_old_peer_is_in_the_status() {
+        let mut g = shared_at(0, NodeId::Debian, None).into_inner().unwrap();
+        g.telemetry.link.old_peer = true;
+        let status = local_status(&g, &NoScreens, &DisplayManager::for_test_with_waiting_change(), "connecting");
+        assert_eq!(status["old_peer"], true);
+        assert_eq!(status["secure"], "connecting");
+    }
+
     #[test]
     fn the_service_refuses_a_keep_from_the_other_device() {
         let state = Arc::new(shared_at(0, NodeId::Debian, None));
         let platform: Arc<dyn Platform> = Arc::new(NoScreens);
         let displays = DisplayManager::for_test_with_waiting_change();
-        let handler = studio_handler(state, platform, displays.clone());
+        let handler = studio_handler(state, platform, displays.clone(), test_pairing("keep"));
         let id = displays.status_json()["change"]["id"].clone();
         let body = serde_json::json!({ "action": "keep_display_mode", "change_id": id }).to_string();
         let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
@@ -1672,7 +1720,7 @@ mod tests {
     fn the_service_refuses_a_microphone_chosen_from_the_other_device() {
         let state = Arc::new(shared_at(0, NodeId::Debian, None));
         let platform: Arc<dyn Platform> = Arc::new(NoScreens);
-        let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change());
+        let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change(), test_pairing("mic"));
         let body = serde_json::json!({ "action": "set_audio_device", "role": "input", "id": "mic" }).to_string();
         let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
         assert!(handler(&from_peer).unwrap().contains("device it belongs to"));

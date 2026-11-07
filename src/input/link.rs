@@ -425,6 +425,8 @@ pub struct LinkQuality {
     /// Keys and buttons the other device has down here.
     pub held_here: u32,
     pub peer_version: PeerVersion,
+    /// Plain packets of an older version came from the peer lately.
+    pub old_peer: bool,
 }
 
 /// One device's side of the link to the other.
@@ -492,8 +494,6 @@ impl PeerLink {
 
     /// Plain packets came from the peer's address lately. This is for a note and nothing else: it
     /// must never reach `peer_version`, or a forged packet could turn off numbered presses.
-    // Nothing shows this yet; the task that adds it to `/api/local` removes this.
-    #[allow(dead_code)]
     pub fn old_peer(&self, now_ms: u64) -> bool {
         self.old_peer_at.is_some_and(|at| now_ms.saturating_sub(at) < UNREADABLE_FOR_MS)
     }
@@ -610,6 +610,7 @@ impl PeerLink {
             returning: router.returning(),
             held_here: router.held_here(),
             peer_version: self.peer_version(now_ms),
+            old_peer: self.old_peer(now_ms),
         }
     }
 }

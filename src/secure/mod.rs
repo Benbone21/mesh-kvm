@@ -1,7 +1,3 @@
-// Input, audio, the control listener, the clipboard and the peer API are wired in. `pairing`,
-// saving and fingerprints in `keys` aren't yet, and the tasks that finish them remove this.
-#![allow(dead_code)]
-
 pub mod control;
 pub mod datagram;
 pub mod keys;
