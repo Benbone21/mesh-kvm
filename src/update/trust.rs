@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn the_placeholder_is_no_key_and_nothing_verifies_without_one() {
-        assert_eq!(parse_key(RELEASE_KEY.lines().next().unwrap()), None);
+        assert_eq!(parse_key("PLACEHOLDER-NOT-A-REAL-KEY: run packaging/make-release-key.sh before the first release"), None);
         assert_eq!(parse_key(""), None);
         assert_eq!(parse_key(&"zz".repeat(32)), None);
         let json = manifest_json("0.7.0", "a", b"a");
