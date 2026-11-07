@@ -188,7 +188,7 @@ fn show_box(text: &str, icon: windows_sys::Win32::UI::WindowsAndMessaging::MESSA
 
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
 fn run_app_window() {
-    match app::single::claim(app::single::WINDOW_PORT) {
+    match app::single::claim_after_handover(app::single::WINDOW_PORT) {
         app::single::Instance::AlreadyRunning => {
             app::single::signal_show(app::single::WINDOW_PORT);
             return;

@@ -244,9 +244,28 @@ pub fn spawn_self(arg: &str) -> std::io::Result<()> {
     spawn_with(&[arg], &[])
 }
 
+/// Set on a window or tray started by the one it replaces, which still holds the port.
+pub const RELAUNCHED_ENV: &str = "MESH_KVM_RELAUNCHED";
+
+/// A running exe that an update moved aside still goes by the name it has now.
+fn without_old_suffix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|p| p.strip_suffix(".old")) {
+        Some(clean) => PathBuf::from(clean),
+        None => path,
+    }
+}
+
+/// Starts the new version of a window or tray, which waits for this old one to end.
+pub fn relaunch(arg: &str) -> std::io::Result<()> {
+    spawn_exe(without_old_suffix(running_exe()?), &[arg], &[(RELAUNCHED_ENV, "1")])
+}
+
 /// Starts this exe again with `args` and does not wait for it. It outlives this process.
 fn spawn_with(args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
-    let exe = running_exe()?;
+    spawn_exe(running_exe()?, args, envs)
+}
+
+fn spawn_exe(exe: PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     let mut command = Command::new(exe);
     command.args(args).envs(envs.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
@@ -782,6 +801,12 @@ mod tests {
             PathBuf::from("/opt/mesh-kvm")
         );
         assert_eq!(without_deleted_suffix(PathBuf::from("/opt/mesh-kvm")), PathBuf::from("/opt/mesh-kvm"));
+    }
+
+    #[test]
+    fn a_new_copy_starts_from_the_installed_name_and_not_the_one_moved_aside() {
+        assert_eq!(without_old_suffix(PathBuf::from(r"C:\a\mesh-kvm.exe.old")), PathBuf::from(r"C:\a\mesh-kvm.exe"));
+        assert_eq!(without_old_suffix(PathBuf::from("/usr/bin/mesh-kvm")), PathBuf::from("/usr/bin/mesh-kvm"));
     }
 
     #[test]

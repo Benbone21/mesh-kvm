@@ -4,6 +4,7 @@
 use super::client::Client;
 use super::launch::ServiceStarter;
 use super::model::{ServiceStart, Snapshot};
+use super::updates::VersionWatch;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,18 @@ fn current_text(client: &Client, shared: &SharedNotices, start: &ServiceStart) -
     notices(shared).text(base, now)
 }
 
+/// Starts the new version's tray and ends this one, once the service has moved on to it.
+fn follow_update(client: &Client, watch: &mut VersionWatch) {
+    let own = crate::update::trust::running_version().to_string();
+    let snapshot = client.snapshot();
+    if watch.moved_on(&own, snapshot.local.as_ref().map(|l| l.version.as_str())) {
+        match super::launch::relaunch("--tray") {
+            Ok(()) => std::process::exit(0),
+            Err(e) => crate::settings::log_note(&format!("Couldn't reopen the tray after updating: {e}")),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Action {
     Open,
@@ -87,7 +100,7 @@ fn perform(action: Action, client: &Client, shared: &SharedNotices) {
 
 /// Runs the tray until Quit. Quit ends only this process; the service keeps running.
 pub fn run_tray() -> Result<(), String> {
-    let _held = match super::single::claim(super::single::TRAY_PORT) {
+    let _held = match super::single::claim_after_handover(super::single::TRAY_PORT) {
         super::single::Instance::First(listener) => listener,
         super::single::Instance::AlreadyRunning => return Ok(()),
         super::single::Instance::Failed(e) => return Err(e),
@@ -189,8 +202,10 @@ mod platform {
             .assume_sni_available(true)
             .spawn()
             .map_err(|e| format!("The tray icon couldn't start: {e}"))?;
+        let mut watch = VersionWatch::default();
         while !quit.load(Ordering::SeqCst) && !handle.is_closed() {
             std::thread::sleep(Duration::from_millis(REFRESH_EVERY_MS));
+            follow_update(&client, &mut watch);
             let text = current_text(&client, &shared, &starter.state());
             handle.update(|tray| {
                 if tray.text != text {
@@ -269,11 +284,13 @@ mod platform {
         // A timer wakes the message loop, so the tooltip and menu clicks are handled promptly.
         unsafe { SetTimer(std::ptr::null_mut(), 0, REFRESH_EVERY_MS as u32, None) };
         let mut msg: MSG = unsafe { std::mem::zeroed() };
+        let mut watch = VersionWatch::default();
         while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            follow_update(&client, &mut watch);
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == *quit.id() {
                     return Ok(());

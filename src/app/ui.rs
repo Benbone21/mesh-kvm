@@ -6,7 +6,8 @@ use super::client::Client;
 use super::launch::ServiceStarter;
 use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, Light, ModeChange, ServiceStart, Snapshot};
 use super::panels::{self, Panels, Requests, Shared};
-use super::theme::{self, AMBER, DEEP, INK, PANEL, RED};
+use super::theme::{self, AMBER, DEEP, INK, PANEL, RAISED, RED};
+use super::updates::{self, Banner, VersionWatch};
 use super::widgets::{paint_light, paint_name_and_state, segment, slide_switch, slider_row, small};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
@@ -101,6 +102,7 @@ struct PeerPrompt {
 }
 
 const LICENCES_WIDTH: f32 = 600.0;
+const RELEASE_NOTES: &str = "Release notes";
 
 struct Window {
     client: Arc<Client>,
@@ -122,6 +124,11 @@ struct Window {
     /// The smallest size last given to the window.
     smallest_sent: Option<(f32, f32)>,
     settings_height: f32,
+    /// The last line about an update under way, for while its service can't be seen.
+    update_under_way: Option<Banner>,
+    /// The version the device that's behind was last told to look for.
+    nudged_for: Option<String>,
+    version_watch: VersionWatch,
 }
 
 impl eframe::App for Window {
@@ -158,6 +165,9 @@ impl Window {
             window_zoom: 1.0,
             smallest_sent: None,
             settings_height: 0.0,
+            update_under_way: None,
+            nudged_for: None,
+            version_watch: VersionWatch::default(),
         }
     }
 
@@ -203,7 +213,10 @@ impl Window {
             .show_separator_line(false)
             .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(theme::MARGIN, 10)))
             .show(ctx, |ui| self.header(ui, snapshot, &on));
-        if let Some(message) = model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)) {
+        let updating = self.follow_update(ctx, snapshot);
+        // A device dropping out is what an update looks like, and the line above says so.
+        let notice = if updating { None } else { model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)) };
+        if let Some(message) = notice {
             let fill = if model::notice_is_serious(snapshot, &start) { RED } else { AMBER };
             notice_strip(ctx, "notice", fill, |ui| {
                 ui.label(RichText::new(message).color(DEEP));
@@ -268,6 +281,76 @@ impl Window {
         }
         if start == ServiceStart::Starting {
             ctx.request_repaint_after(START_CHECK);
+        }
+    }
+
+    /// The update line, and what goes with it. A service that has just updated means this window
+    /// is the old version, so it starts again from the new exe. True while an update is under way.
+    fn follow_update(&mut self, ctx: &egui::Context, snapshot: &Snapshot) -> bool {
+        let own = crate::update::trust::running_version().to_string();
+        if self.version_watch.moved_on(&own, snapshot.local.as_ref().map(|l| l.version.as_str())) {
+            match super::launch::relaunch("--app") {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(e) => crate::settings::log_note(&format!("Couldn't reopen the window after updating: {e}")),
+            }
+        }
+        if let Some((device, version)) = updates::device_to_nudge(snapshot) {
+            if self.nudged_for.as_ref() != Some(&version) {
+                self.client.local_action(device, serde_json::json!({ "action": "check_update" }));
+                self.nudged_for = Some(version);
+            }
+        }
+        let carried = self.update_under_way.clone().filter(|_| snapshot.local.is_none());
+        let banner = updates::update_banner(snapshot).or(carried);
+        self.update_under_way = banner.clone().filter(|b| b.busy);
+        if let Some(banner) = &banner {
+            self.update_strip(ctx, snapshot, banner);
+        }
+        self.update_under_way.is_some()
+    }
+
+    /// One line at the top: what's happening, with the button and the release notes at its end.
+    fn update_strip(&self, ctx: &egui::Context, snapshot: &Snapshot, banner: &Banner) {
+        let quiet = banner.button.is_none() && !banner.busy && !banner.failed;
+        let (fill, ink) = match (banner.failed, quiet) {
+            (true, _) => (RED, DEEP),
+            (_, true) => (RAISED, INK),
+            _ => (AMBER, DEEP),
+        };
+        let mut pressed = None;
+        // A gap below keeps it apart from a notice of the same colour.
+        let frame = Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::MARGIN, 8)).outer_margin(Margin { bottom: 2, ..Default::default() });
+        egui::TopBottomPanel::top("update").show_separator_line(false).frame(frame).show(ctx, |ui| {
+            let text_size = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x;
+            let gap = ui.spacing().item_spacing.x;
+            let button = banner.button.map_or(0.0, |b| text_size(ui, b.label()) + 2.0 * ui.spacing().button_padding.x + gap);
+            let notes = banner.notes.as_ref().map_or(0.0, |_| text_size(ui, RELEASE_NOTES) + gap);
+            let text_width = (ui.available_width() - button - notes).max(0.0);
+            ui.horizontal(|ui| {
+                ui.allocate_ui(vec2(text_width, 0.0), |ui| {
+                    ui.set_width(text_width);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(RichText::new(&banner.text).color(ink));
+                        if let Some(detail) = &banner.detail {
+                            ui.label(small(detail).color(ink));
+                        }
+                    });
+                });
+                if let Some(button) = banner.button {
+                    let label = RichText::new(button.label()).color(INK);
+                    if ui.add(egui::Button::new(label).fill(DEEP)).clicked() {
+                        pressed = Some(button);
+                    }
+                }
+                if let Some(version) = &banner.notes {
+                    ui.visuals_mut().hyperlink_color = ink;
+                    ui.hyperlink_to(RELEASE_NOTES, updates::notes_url(version));
+                }
+            });
+        });
+        if let (Some(button), Some(here)) = (pressed, snapshot.this_device()) {
+            self.client.local_action(here, button.action());
         }
     }
 
@@ -515,6 +598,17 @@ impl Window {
                 ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
             }
         }
+        if let Some(update) = snapshot.local.as_ref().and_then(|l| l.update.as_ref()) {
+            ui.add_space(8.0);
+            ui.label("Updates");
+            ui.label(small(format!("This is version {}.", update.current)));
+            if ui.button("Check now").clicked() {
+                self.client.local_action(snapshot.in_order()[0], serde_json::json!({ "action": "check_update" }));
+            }
+            if let Some(note) = &update.note {
+                ui.label(small(note));
+            }
+        }
         ui.add_space(8.0);
         if ui.button("Licences").clicked() {
             self.show_licences = true;
@@ -713,6 +807,7 @@ mod tests {
     use crate::app::canvas::monitor_id;
     use crate::app::model::{Control, DeviceStatus, LayoutState};
     use crate::app::panels::device_details;
+    use crate::app::updates::UpdateStatus;
     use crate::platform::{DisplayInfo, DisplayMode};
     use eframe::egui::{Event, PointerButton, RawInput};
 
@@ -758,7 +853,39 @@ mod tests {
         with_modes.peer_displays = vec![display("Display 1")];
         let mut changing = with_modes.clone();
         changing.local.as_mut().unwrap().display_change.change = Some(waiting_change());
-        vec![Snapshot::default(), linked(), no_peer, laptop_alone, no_layout, split, older, with_modes, changing]
+        let mut all = vec![Snapshot::default(), linked(), no_peer, laptop_alone, no_layout, split, older, with_modes, changing];
+        all.extend(update_states());
+        all
+    }
+
+    fn update(state: &str, ready: bool) -> UpdateStatus {
+        UpdateStatus { current: "0.7.0".into(), available: Some("0.7.1".into()), ready, state: state.into(), progress: Some(45), ..Default::default() }
+    }
+
+    /// The window in each state the update line can be in.
+    fn update_states() -> Vec<Snapshot> {
+        let with = |here: UpdateStatus, there: Option<UpdateStatus>| {
+            let mut snapshot = linked();
+            snapshot.local.as_mut().unwrap().update = Some(here);
+            match there {
+                Some(there) => snapshot.peer.as_mut().unwrap().update = Some(there),
+                None => snapshot.peer = None,
+            }
+            snapshot
+        };
+        let ready = || update("ready", true);
+        let mut failed = update("failed", true);
+        failed.note = Some("A very long way of saying that SACBOOKPRO didn't come back on version 0.7.1 within 5 minutes, so this device stayed as it is.".into());
+        vec![
+            with(ready(), Some(ready())),
+            with(ready(), None),
+            with(ready(), Some(update("downloading", false))),
+            with(update("updating_peer", true), Some(ready())),
+            with(update("waiting_for_peer", true), None),
+            with(update("installing", true), Some(ready())),
+            with(update("view_only", false), Some(ready())),
+            with(failed, Some(ready())),
+        ]
     }
 
     fn mode(width: i32, height: i32, millihertz: u32) -> DisplayMode {
@@ -900,6 +1027,72 @@ mod tests {
             }
         }
         text
+    }
+
+    #[test]
+    fn the_update_line_fits_the_smallest_window_with_its_button_and_link() {
+        for snapshot in update_states() {
+            let (ctx, mut window) = (context(), window());
+            frame(&ctx, &mut window, &snapshot, MIN_WINDOW_SIZE, vec![], Instant::now());
+            let output = frame(&ctx, &mut window, &snapshot, MIN_WINDOW_SIZE, vec![], Instant::now());
+            let banner = updates::update_banner(&snapshot).unwrap();
+            let text = drawn_text(&output);
+            if let Some(button) = banner.button {
+                assert!(text.contains(button.label()), "{text}");
+            }
+            assert_eq!(text.contains(RELEASE_NOTES), banner.notes.is_some(), "{text}");
+            let strip = ctx.screen_rect().width();
+            let widest = output.shapes.iter().filter_map(|c| match &c.shape {
+                egui::Shape::Text(shape) if banner.text.starts_with(shape.galley.text().get(..4).unwrap_or("?")) => Some(shape.visual_bounding_rect().right()),
+                _ => None,
+            });
+            assert!(widest.fold(0.0, f32::max) <= strip, "{}", banner.text);
+        }
+    }
+
+    #[test]
+    fn the_line_stays_while_the_service_it_is_updating_is_gone() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        snapshot.local.as_mut().unwrap().update = Some(update("installing", true));
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let gone = Snapshot::default();
+        frame(&ctx, &mut window, &gone, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &gone, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("Updating this device"), "{text}");
+    }
+
+    #[test]
+    fn a_device_dropping_out_during_an_update_raises_no_alarm() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        snapshot.peer = None;
+        snapshot.local.as_mut().unwrap().update = Some(update("waiting_for_peer", true));
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("Waiting for it to come back"), "{text}");
+        assert!(!text.contains("out of reach"), "{text}");
+    }
+
+    #[test]
+    fn settings_shows_the_version_and_any_note() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        let mut status = update("idle", false);
+        status.available = None;
+        status.note = Some("mesh-kvm hasn't been able to check for updates for 3 days.".into());
+        snapshot.local.as_mut().unwrap().update = Some(status);
+        let mut text = String::new();
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, &snapshot));
+        });
+        let output = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, &snapshot));
+        });
+        text.push_str(&drawn_text(&output));
+        assert!(text.contains("This is version 0.7.0."), "{text}");
+        assert!(text.contains("Check now"), "{text}");
+        assert!(text.contains("hasn't been able to check for updates for 3 days"), "{text}");
     }
 
     #[test]

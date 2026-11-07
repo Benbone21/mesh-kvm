@@ -329,6 +329,8 @@ pub struct DeviceStatus {
     pub display_change: DisplayChanges,
     /// Missing from a service that doesn't measure the link.
     pub link: Option<LinkStatus>,
+    /// Missing from a service that can't update itself.
+    pub update: Option<super::updates::UpdateStatus>,
 }
 
 /// `link` in `/api/local`: how the link looks from one device.

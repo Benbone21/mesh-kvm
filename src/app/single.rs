@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Held by the running app window.
 pub const WINDOW_PORT: u16 = 24881;
@@ -13,6 +13,8 @@ pub const TRAY_PORT: u16 = 24882;
 
 const SHOW: &[u8] = b"show\n";
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a new copy waits for the old one it's replacing to let go of the port.
+const HANDOVER: Duration = Duration::from_secs(5);
 
 pub enum Instance {
     /// Nobody else holds the port. Keep this alive for as long as the process should own it.
@@ -25,6 +27,24 @@ pub enum Instance {
 /// Takes `port` on 127.0.0.1.
 pub fn claim(port: u16) -> Instance {
     classify(TcpListener::bind(("127.0.0.1", port)))
+}
+
+/// Takes `port`, and when this copy is replacing an old one, gives that one time to end. Otherwise
+/// it would ask the old window to come forward, just as that closes.
+pub fn claim_after_handover(port: u16) -> Instance {
+    let replacing = std::env::var_os(super::launch::RELAUNCHED_ENV).is_some();
+    std::env::remove_var(super::launch::RELAUNCHED_ENV);
+    wait_for_port(|| claim(port), if replacing { HANDOVER } else { Duration::ZERO })
+}
+
+fn wait_for_port(claim: impl Fn() -> Instance, patience: Duration) -> Instance {
+    let started = Instant::now();
+    loop {
+        match claim() {
+            Instance::AlreadyRunning if started.elapsed() < patience => std::thread::sleep(Duration::from_millis(50)),
+            other => return other,
+        }
+    }
 }
 
 /// A taken port means another instance holds it. Any other error is a real failure.
@@ -88,6 +108,24 @@ pub fn serve_focus(ctx: eframe::egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_that_replaces_another_waits_for_the_port_and_any_other_does_not() {
+        let looks = std::cell::Cell::new(0);
+        let frees_up = || {
+            looks.set(looks.get() + 1);
+            if looks.get() < 3 {
+                Instance::AlreadyRunning
+            } else {
+                Instance::Failed("free".into())
+            }
+        };
+        assert!(matches!(wait_for_port(&frees_up, HANDOVER), Instance::Failed(_)));
+        assert_eq!(looks.get(), 3);
+        looks.set(0);
+        assert!(matches!(wait_for_port(&frees_up, Duration::ZERO), Instance::AlreadyRunning));
+        assert_eq!(looks.get(), 1);
+    }
     use std::sync::mpsc;
 
     /// A port nobody holds right now.
