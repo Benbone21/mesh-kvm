@@ -39,7 +39,10 @@ const RETRY_JITTER_MS: u64 = 50;
 const REKEY_AFTER_MS: u64 = 10 * 60 * 1000;
 const DROP_AFTER_MS: u64 = 60 * 60 * 1000;
 const PREVIOUS_FOR_MS: u64 = 60_000;
-const ANSWERS_PER_SECOND: usize = 10;
+/// Handshake 1s let through to the key operations, valid or not.
+const HANDSHAKE_TRIES_PER_SECOND: usize = 200;
+/// Handshake 1s answered, of those that checked out.
+const VALID_ANSWERS_PER_SECOND: usize = 50;
 /// Enough tries in flight to cover a second of round trip at the quick pace, on either side.
 const MAX_OUTSTANDING: usize = 4;
 const MAX_PENDING: usize = 4;
@@ -255,7 +258,9 @@ struct Shake {
     /// Rule 2's second keepalive. The first goes back at once as an `Opened::Reply`, and this one
     /// on the next `tick`, so that one lost packet doesn't leave the responder pending.
     keepalive_owed: bool,
-    /// When handshake 1s were taken up in the last second.
+    /// When handshake 1s went to the key operations in the last second.
+    tried_ms: VecDeque<u64>,
+    /// When valid handshake 1s were taken up in the last second.
     answered_ms: VecDeque<u64>,
     handshake_heard_ms: Option<u64>,
     /// The last data or handshake 2 that checked out. A valid handshake 1 doesn't count, as a replay
@@ -287,6 +292,19 @@ pub struct Channel {
 // A panic while a lock is held is an abort in release builds, so what's behind one is always whole.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether another fits in the last second, which it joins if so. Only what is let through counts,
+/// so a flood past the limit can't hold it shut for longer.
+fn within_a_second(times: &mut VecDeque<u64>, limit: usize, now_ms: u64) -> bool {
+    while times.front().is_some_and(|&at| now_ms.saturating_sub(at) >= 1000) {
+        times.pop_front();
+    }
+    if times.len() >= limit {
+        return false;
+    }
+    times.push_back(now_ms);
+    true
 }
 
 fn random_u32() -> Option<u32> {
@@ -533,8 +551,9 @@ impl Channel {
         shake.retry = None;
     }
 
-    /// Rule 3: a valid handshake 1 gets an answer and a new pending session, and leaves current
-    /// alone, so that a replayed one can do nothing that lasts.
+    /// Rule 3: a valid handshake 1 gets an answer and a new pending session, and current is left
+    /// untouched. A replayed one can still push out a pending session or end a handshake here,
+    /// which the next retry or rule 9 repairs.
     fn answer<'a>(&self, datagram: &[u8], now_ms: u64, out: &'a mut Vec<u8>) -> Opened<'a> {
         if self.role == Role::Initiator || datagram.len() != HANDSHAKE_1_LEN {
             return Opened::Refused;
@@ -543,7 +562,7 @@ impl Channel {
             return Opened::Refused;
         };
         // Counted before the key operations, as those are what this limit is there to save.
-        if !self.may_answer(now_ms) {
+        if !within_a_second(&mut lock(&self.shake).tried_ms, HANDSHAKE_TRIES_PER_SECOND, now_ms) {
             return Opened::Refused;
         }
         let Some((noise, theirs)) = self.read_handshake_1(datagram, &peer) else {
@@ -551,6 +570,10 @@ impl Channel {
         };
         {
             let mut shake = lock(&self.shake);
+            // Counted only now, so that junk from the peer's address can't use up the real answers.
+            if !within_a_second(&mut shake.answered_ms, VALID_ANSWERS_PER_SECOND, now_ms) {
+                return Opened::Refused;
+            }
             shake.handshake_heard_ms = Some(now_ms);
             // Rule 5: both ends have one going, and only one of them can win.
             if !shake.outstanding.is_empty() {
@@ -567,18 +590,6 @@ impl Channel {
         let evicted = lock(&self.slots).add_pending(session);
         drop(evicted);
         Opened::Reply(out)
-    }
-
-    fn may_answer(&self, now_ms: u64) -> bool {
-        let mut shake = lock(&self.shake);
-        while shake.answered_ms.front().is_some_and(|&at| now_ms.saturating_sub(at) >= 1000) {
-            shake.answered_ms.pop_front();
-        }
-        if shake.answered_ms.len() >= ANSWERS_PER_SECOND {
-            return false;
-        }
-        shake.answered_ms.push_back(now_ms);
-        true
     }
 
     fn read_handshake_1(
@@ -1384,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_answers_are_limited_to_10_a_second() {
+    fn valid_handshakes_are_answered_at_most_50_times_a_second() {
         let (pa, pb) = paired_pair();
         let a = Channel::new(&pa, Label::Input, Role::Both);
         let b = Channel::new(&pb, Label::Input, Role::Both);
@@ -1392,13 +1403,61 @@ mod tests {
         let replies = |from: u64, to: u64| {
             (from..to).filter(|&now| opened_kind(&b, &h1, now) == "reply").count()
         };
-        assert_eq!(replies(1000, 1100), 10);
-        // Still inside the second those ten began.
+        assert_eq!(replies(1000, 1100), 50);
+        // Still inside the second those began.
         assert_eq!(replies(1100, 2000), 0);
-        assert_eq!(replies(2000, 2100), 10);
-        // Across any second, not only whole ones: 20 at the join of two would be 20 in a second.
-        assert_eq!(replies(3995, 4005), 10);
-        assert_eq!(replies(4005, 4995), 0);
+        assert_eq!(replies(2000, 2100), 50);
+        // Across any second, not only whole ones: 100 at the join of two would be 100 in a second.
+        assert_eq!(replies(3950, 4050), 50);
+        assert_eq!(replies(4050, 4950), 0);
+    }
+
+    fn junk_handshake() -> [u8; HANDSHAKE_1_LEN] {
+        let mut junk = [0x5A; HANDSHAKE_1_LEN];
+        junk[0] = HANDSHAKE_1;
+        junk
+    }
+
+    #[test]
+    fn ten_junk_packets_a_second_do_not_stop_a_real_handshake() {
+        let (pa, pb) = paired_pair();
+        let a = Channel::new(&pa, Label::Input, Role::Both);
+        let b = Channel::new(&pb, Label::Input, Role::Both);
+        let junk = junk_handshake();
+        for now in (1000..=6000).step_by(1000) {
+            for _ in 0..10 {
+                assert_eq!(opened_kind(&b, &junk, now), "refused");
+            }
+        }
+        // In the same second as the last ten.
+        let h1 = first_handshake(&a, 6000);
+        let mut h2 = Vec::new();
+        assert!(matches!(b.open(&h1, 6000, &mut h2), Opened::Reply(_)));
+        let mut keepalive = Vec::new();
+        assert!(matches!(a.open(&h2, 6000, &mut keepalive), Opened::Reply(_)));
+        assert_eq!(opened_kind(&b, &keepalive, 6000), "heard");
+        assert_eq!(b.security(), LinkSecurity::Encrypted);
+    }
+
+    #[test]
+    fn a_flood_of_junk_is_capped_before_key_work() {
+        let (pa, pb) = paired_pair();
+        let a = Channel::new(&pa, Label::Input, Role::Both);
+        let b = Channel::new(&pb, Label::Input, Role::Both);
+        let (junk, h1) = (junk_handshake(), first_handshake(&a, 1000));
+        for _ in 0..199 {
+            assert_eq!(opened_kind(&b, &junk, 1000), "refused");
+        }
+        assert_eq!(opened_kind(&b, &h1, 1000), "reply", "the 200th still gets to the key work");
+        // A valid packet that isn't heard can only have been stopped ahead of the key work.
+        assert_eq!(opened_kind(&b, &h1, 1500), "refused");
+        assert_eq!(b.handshake_heard_at(), Some(1000));
+        for _ in 0..1000 {
+            assert_eq!(opened_kind(&b, &junk, 1500), "refused");
+        }
+        // Refused tries don't count, so a flood past the cap can't hold it shut for longer.
+        assert_eq!(opened_kind(&b, &h1, 2000), "reply");
+        assert_eq!(b.handshake_heard_at(), Some(2000));
     }
 
     #[test]
