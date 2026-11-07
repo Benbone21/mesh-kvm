@@ -11,6 +11,7 @@ mod mute;
 mod platform;
 mod protocol;
 mod router;
+mod secure;
 mod settings;
 mod spatial;
 mod webui;
