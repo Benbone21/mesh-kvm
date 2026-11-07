@@ -25,6 +25,7 @@ import threading
 import time
 
 import numpy as np
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 RATE = 48000
 FMT = ["--raw", "--rate=48000", "--channels=2", "--format=f32", "--latency=10ms"]
@@ -71,6 +72,28 @@ WIREPLUMBER_CONF = """wireplumber.profiles = { main = {
   monitor.v4l2 = disabled
 } }
 """
+
+
+def write_pairing(path, private, public, peer_public, peer_name):
+    """A `pairing.json` as `src/secure/keys.rs` writes it, from raw keys."""
+    data = {"version": 1, "private_key": private.hex(), "public_key": public.hex(),
+            "peer": {"public_key": peer_public.hex(), "name": peer_name, "paired_at": 1}}
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def paired_files(folder):
+    """Two `pairing.json` files in `folder` that trust each other, made the first time this is asked
+    for. A device that restarts has the same key as it had, so it gets the same file."""
+    paths = [os.path.join(folder, f"pairing-{me}.json") for me in (0, 1)]
+    if not all(os.path.exists(path) for path in paths):
+        keys = [X25519PrivateKey.generate() for _ in paths]
+        private = [key.private_bytes_raw() for key in keys]
+        public = [key.public_key().public_bytes_raw() for key in keys]
+        for me, path in enumerate(paths):
+            write_pairing(path, private[me], public[me], public[1 - me], f"Device {1 - me}")
+        print(f"    device {public.index(min(public))} has the lower key", flush=True)
+    return paths
 
 
 def check(name, ok, detail=""):

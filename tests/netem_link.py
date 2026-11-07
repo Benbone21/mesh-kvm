@@ -8,16 +8,18 @@ Audio keeps playing. Control returns to the device that had it after a dropout, 
 moved on to the device in front of them, and the local keyboard is never swallowed while the link
 is gone.
 
-Input uses `input::live::whole_device`, which is the real router, link and sockets, with a recorder
-in place of the keyboard and mouse. Audio uses `audio::live::whole_device` beside private sound
-servers. Nothing here can reach your real desktop or audio, and all of it ends when this script does:
+Input uses `input::live::whole_device`, which is the real router, link, encryption and sockets, with
+a recorder in place of the keyboard and mouse, and a test pairing the two devices share. Audio uses
+`audio::live::whole_device` beside private sound servers. Nothing here can reach your real desktop
+or audio, and all of it ends when this script does:
 
     unshare -rnpf --kill-child --mount-proc python3 tests/netem_link.py path/to/test-binary [scenes]
 
 The test binary is what `cargo test --release --no-run` prints. The scenes are clean, loss, delay,
 reorder, mixed, dropout, reverse, flood, stay, stayreverse, oneway, oneway-start, outage,
 outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy and bursty. numpy must be importable. Set AUDIO_TMP
-to keep the sound servers' files somewhere other than /tmp.
+to keep the sound servers' files somewhere other than /tmp. Keep it under about 70 characters: past
+that their sockets don't fit in a socket path, the servers don't start, and every tone comes out silent.
 """
 import json
 import os
@@ -64,7 +66,8 @@ def clean():
 
 class Device:
     def __init__(self, me, listen, peer, seconds, main=0, seq=None):
-        env = dict(os.environ, MK_ME=str(me), MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds), MK_MAIN=str(main))
+        env = dict(os.environ, MK_ME=str(me), MK_LISTEN=str(listen), MK_PEER=str(peer), MK_SECONDS=str(seconds), MK_MAIN=str(main),
+                   MK_PAIRING=audio.paired_files(audio.BASE)[me])
         if seq is not None:
             env["MK_SEQ"] = str(seq)
         self.p = subprocess.Popen([audio.BIN, "--ignored", "--exact", "input::live::whole_device", "--nocapture"], env=env,
@@ -489,7 +492,9 @@ def one_way_from_the_start():
     block_port(PORT_B)
     source = Device(0, PORT_A, PORT_B, 20)
     target = Device(1, PORT_B, PORT_A, 20)
-    source.wait_for(lambda s: s["online"], 5)
+    # No session can form until both directions work, so it's the handshakes that say so.
+    heard = source.wait_for(lambda s: s["link"]["one_way"], 5)
+    check("hearing handshakes says one way, with the link still down", heard is not None and not source.last.get("online"), str(source.last.get("link")))
     source.do(cross=True)
     time.sleep(0.3)
     crossed = source.last.get("active") == 1

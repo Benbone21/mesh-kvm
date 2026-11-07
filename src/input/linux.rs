@@ -4,12 +4,13 @@ use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
 use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
-use super::{apply, from_peer, InputBackend, PeerSender};
+use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::protocol::{
-    HeldInput, NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
-    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
+    HeldInput, NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
+    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
+use crate::secure::datagram::{Channel, LinkSecurity};
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -1048,8 +1049,7 @@ impl InputBackend for LinuxBackend {
 }
 
 struct UdpPeer<'a> {
-    socket: &'a UdpSocket,
-    addr: SocketAddr,
+    socket: &'a PeerSocket,
     seq: u64,
     presses: PressLog,
     clock: Instant,
@@ -1060,7 +1060,7 @@ impl PeerSender for UdpPeer<'_> {
         let pkt = Packet::new(self.seq, NodeId::Debian, payload);
         self.seq = self.seq.wrapping_add(1);
         if let Ok(bytes) = pkt.encode() {
-            let _ = self.socket.send_to(&bytes, self.addr);
+            self.socket.send(&bytes);
         }
     }
 
@@ -1118,6 +1118,7 @@ impl Core<'_> {
 pub fn run_debian_node(
     spatial_state: Arc<RwLock<SharedSpatialState>>,
     peer_addr: SocketAddr,
+    channel: Arc<Channel>,
     listen_port: u16,
     override_width: Option<i32>,
     override_height: Option<i32>,
@@ -1162,6 +1163,8 @@ pub fn run_debian_node(
         .unwrap_or_default()
         .as_micros() as u64;
 
+    let peer_socket = PeerSocket::new(socket, peer_addr, channel);
+
     let clock = Instant::now();
     let now_ms = || clock.elapsed().as_millis() as u64;
 
@@ -1190,8 +1193,7 @@ pub fn run_debian_node(
             forwarded: HeldInput::default(),
         },
         peer: UdpPeer {
-            socket: &socket,
-            addr: peer_addr,
+            socket: &peer_socket,
             seq: init_seq,
             presses: PressLog::default(),
             clock,
@@ -1205,7 +1207,9 @@ pub fn run_debian_node(
     let mut last_telemetry_sync = Instant::now();
     let mut link = PeerLink::default();
 
-    let mut udp_buf = [0u8; MAX_PACKET_SIZE];
+    let mut udp_buf = [0u8; MAX_DATAGRAM];
+    let mut opened = Vec::new();
+    let mut handshake_known = None;
     let mut ev_buf = [InputEvent::default(); 64];
 
     unsafe {
@@ -1217,15 +1221,7 @@ pub fn run_debian_node(
         "[Debian] Spatial API ready on port 24880"
     );
 
-    // A laptop that outlived a Debian restart may still think it is active. A main laptop must
-    // not hear this: it would take it as a claim and forward to a Debian it may not reach.
-    if core.router.main() == DEBIAN {
-        apply(
-            &[Action::SendFocus { target: DEBIAN, x: KEEP_CURSOR, y: KEEP_CURSOR }],
-            &mut core.backend,
-            &mut core.peer,
-        );
-    }
+    let mut claim_due = true;
 
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || crate::settings::restart_requested() {
@@ -1286,14 +1282,8 @@ pub fn run_debian_node(
         }
 
         // 1. Drain incoming UDP packets on port 24850
-        while let Ok((len, src_addr)) = socket.recv_from(&mut udp_buf) {
-            if !from_peer(src_addr, peer_addr) {
-                continue;
-            }
-            let Ok(pkt) = Packet::decode(&udp_buf[..len]) else {
-                if udp_buf[..len].starts_with(&PACKET_MAGIC) {
-                    link.unreadable(now_ms());
-                }
+        while let Ok((len, src_addr)) = peer_socket.socket.recv_from(&mut udp_buf) {
+            let Some(pkt) = peer_socket.open(&udp_buf[..len], src_addr, now_ms(), &mut opened, &mut || link.unreadable(now_ms())) else {
                 continue;
             };
             core.route(Event::PeerAlive { now_ms: now_ms() });
@@ -1354,6 +1344,24 @@ pub fn run_debian_node(
         }
         for event in link.due_presses(now_ms()) {
             core.route(press_event(event));
+        }
+        peer_socket.tick(now_ms());
+        if let Some(at) = peer_socket.handshake_news(&mut handshake_known) {
+            link.handshake_heard(at);
+        }
+
+        // A laptop that outlived a Debian restart may still think it is active. This waits for a
+        // session, as it would go nowhere before that. A main laptop must not hear it: it would
+        // take it as a claim and forward to a Debian it may not reach.
+        if claim_due && peer_socket.channel.security() == LinkSecurity::Encrypted {
+            claim_due = false;
+            if core.router.main() == DEBIAN {
+                apply(
+                    &[Action::SendFocus { target: DEBIAN, x: KEEP_CURSOR, y: KEEP_CURSOR }],
+                    &mut core.backend,
+                    &mut core.peer,
+                );
+            }
         }
 
         // 2. Read local keyboards. Grabbing only hides events from the desktop, so hotkeys are

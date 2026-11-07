@@ -435,6 +435,8 @@ pub struct PeerLink {
     protocol: Option<u16>,
     first_packet: Option<u64>,
     unreadable_at: Option<u64>,
+    /// The last valid handshake heard from the peer.
+    handshake_at: Option<u64>,
     online: bool,
 }
 
@@ -468,6 +470,12 @@ impl PeerLink {
     /// A packet from the peer that starts right and can't be read.
     pub fn unreadable(&mut self, now_ms: u64) {
         self.unreadable_at = Some(now_ms);
+    }
+
+    /// The peer is trying to start a session. With the link down, that means it's being heard here
+    /// and isn't hearing back, as no session forms until both directions work.
+    pub fn handshake_heard(&mut self, now_ms: u64) {
+        self.handshake_at = Some(now_ms);
     }
 
     /// Takes in a `LinkState` that passed `arrived`, and returns what the router should hear of it.
@@ -565,12 +573,14 @@ impl PeerLink {
         let round_trip_ms = self.round_trip_ms.filter(|_| self.online && answered).map(|ms| ms.round() as u32);
         let loss_in = self.loss.percent.filter(|_| self.online);
         let waited = self.first_packet.is_some_and(|at| now_ms.saturating_sub(at) >= ANSWER_FOR_MS);
+        let unanswered = self.online && !answered && waited && self.protocol == Some(LINK_PROTOCOL);
+        let shaking = !self.online && self.handshake_at.is_some_and(|at| now_ms.saturating_sub(at) < ANSWER_FOR_MS);
         LinkQuality {
             measured: loss_in.is_some() || round_trip_ms.is_some(),
             loss_in,
             loss_out: self.loss_out.filter(|_| self.online && answered),
             round_trip_ms,
-            one_way: self.online && !answered && waited && self.protocol == Some(LINK_PROTOCOL),
+            one_way: unanswered || shaking,
             returning: router.returning(),
             held_here: router.held_here(),
             peer_version: self.peer_version(now_ms),
@@ -626,6 +636,26 @@ mod tests {
             Some(Payload::Presses { newest, events, .. }) => (newest, events),
             other => panic!("expected presses: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_heard_handshake_alone_says_one_way() {
+        let mut link = PeerLink::default();
+        assert!(!link.quality(&router(), 1000).one_way);
+        link.handshake_heard(1000);
+        let quality = link.quality(&router(), 1000);
+        assert!(quality.one_way);
+        assert_eq!(quality.round_trip_ms, None);
+        assert!(link.quality(&router(), 1000 + ANSWER_FOR_MS - 1).one_way, "retries come a second apart at worst");
+        assert!(!link.quality(&router(), 1000 + ANSWER_FOR_MS).one_way, "nothing has been heard for a while");
+    }
+
+    #[test]
+    fn a_heard_handshake_says_nothing_with_the_link_up() {
+        let mut link = PeerLink::default();
+        link.set_online(true);
+        link.handshake_heard(1000);
+        assert!(!link.quality(&router(), 1000).one_way, "a rotation looks just the same");
     }
 
     #[test]

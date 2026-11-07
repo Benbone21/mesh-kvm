@@ -2,13 +2,14 @@
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
 use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
-use super::{apply, from_peer, InputBackend, PeerSender};
+use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
-    NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
-    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE, PACKET_MAGIC,
+    NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
+    MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
+use crate::secure::datagram::Channel;
 use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
 use std::ptr;
@@ -70,12 +71,7 @@ const EDGE_SETTLE_MS: u64 = 250;
 const RX_IDLE_LINKED: Duration = Duration::from_millis(1);
 const RX_IDLE_ALONE: Duration = Duration::from_millis(10);
 
-struct GlobalNet {
-    socket: UdpSocket,
-    peer_addr: SocketAddr,
-}
-
-static NET_STATE: OnceLock<GlobalNet> = OnceLock::new();
+static NET_STATE: OnceLock<PeerSocket> = OnceLock::new();
 static ROUTER: OnceLock<Mutex<Router>> = OnceLock::new();
 /// Filled by `EdgeMap`, and from this laptop's layout until one arrives.
 static EDGE: Mutex<EdgeWatch> = Mutex::new(EdgeWatch::new());
@@ -272,8 +268,9 @@ fn is_windows_game_captive() -> bool {
 
 /// Safe from a hook: the socket is non-blocking, and a failed send is dropped.
 ///
-/// Every packet leaves through here. A poisoned router sends nothing, heartbeats included, so
-/// that Debian's link timeout takes its input back rather than forwarding to a frozen laptop.
+/// Every packet of input leaves through here. A poisoned router sends none, heartbeats included, so
+/// that Debian's link timeout takes its input back rather than forwarding to a frozen laptop. What
+/// the channel sends by itself doesn't hold the link up.
 #[inline]
 fn send_udp_payload(payload: Payload) {
     send_numbered(SEQ_COUNTER.fetch_add(1, Ordering::Relaxed), payload);
@@ -286,7 +283,7 @@ fn send_numbered(seq: u64, payload: Payload) {
     if let Some(net) = NET_STATE.get() {
         let pkt = Packet::new(seq, NodeId::Windows, payload);
         if let Ok(bytes) = pkt.encode() {
-            let _ = net.socket.send_to(&bytes, net.peer_addr);
+            net.send(&bytes);
         }
     }
 }
@@ -810,6 +807,7 @@ fn create_session_window() {
 pub fn run_windows_node(
     spatial_state: Arc<RwLock<SharedSpatialState>>,
     peer_addr: SocketAddr,
+    channel: Arc<Channel>,
     listen_port: u16,
     override_width: Option<i32>,
     override_height: Option<i32>,
@@ -863,10 +861,8 @@ pub fn run_windows_node(
             .map_err(|e| format!("Failed to make UDP socket non-blocking: {}", e))?;
     }
 
-    let _ = NET_STATE.set(GlobalNet {
-        socket,
-        peer_addr,
-    });
+    let _ = NET_STATE.set(PeerSocket::new(socket, peer_addr, Arc::clone(&channel)));
+    let rx_peer = PeerSocket::new(rx_socket, peer_addr, channel);
 
     crate::mute::start();
 
@@ -1003,18 +999,21 @@ pub fn run_windows_node(
     std::thread::Builder::new()
         .name("mesh-kvm-win-udp".to_string())
         .spawn(move || {
-            let mut buf = [0u8; MAX_PACKET_SIZE];
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let mut opened = Vec::new();
+            let mut handshake_known = None;
 
+            // Handshakes happen on this thread and no other. It comes round every poll gap at the
+            // longest, and every packet when they're coming fast.
             loop {
-                match rx_socket.recv_from(&mut buf) {
+                rx_peer.tick(now_ms());
+                if let Some(at) = rx_peer.handshake_news(&mut handshake_known) {
+                    link().handshake_heard(at);
+                }
+                match rx_peer.socket.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
-                        if !from_peer(src_addr, peer_addr) {
-                            continue;
-                        }
-                        let Ok(pkt) = Packet::decode(&buf[..len]) else {
-                            if buf[..len].starts_with(&PACKET_MAGIC) {
-                                link().unreadable(now_ms());
-                            }
+                        let unreadable = &mut || link().unreadable(now_ms());
+                        let Some(pkt) = rx_peer.open(&buf[..len], src_addr, now_ms(), &mut opened, unreadable) else {
                             continue;
                         };
                         route(Event::PeerAlive { now_ms: now_ms() });

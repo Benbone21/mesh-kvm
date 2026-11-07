@@ -11,9 +11,11 @@ pub mod win_logic;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use crate::protocol::{NodeId, Payload, PressEvent};
+use crate::protocol::{NodeId, Packet, Payload, PressEvent, PACKET_MAGIC};
 use crate::router::Action;
-use std::net::SocketAddr;
+use crate::secure::datagram::{Channel, Opened};
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
 
 /// Times focus and panic packets are sent, because the UDP link is lossy.
 const REPEAT_CRITICAL: usize = 3;
@@ -56,6 +58,73 @@ fn forward_press(peer: &mut dyn PeerSender, event: PressEvent, plain: Payload) {
 /// True for a packet from the configured peer's IP. Its source port may vary.
 pub fn from_peer(src: SocketAddr, peer: SocketAddr) -> bool {
     src.ip() == peer.ip()
+}
+
+/// The link's socket and what encrypts it, so that nothing goes over the network in the clear.
+pub struct PeerSocket {
+    pub socket: UdpSocket,
+    /// Input always goes to the peer's listening port, so nothing here follows where packets come from.
+    peer: SocketAddr,
+    pub channel: Arc<Channel>,
+}
+
+impl PeerSocket {
+    pub fn new(socket: UdpSocket, peer: SocketAddr, channel: Arc<Channel>) -> PeerSocket {
+        PeerSocket { socket, peer, channel }
+    }
+
+    /// With no session yet, this is a lost packet. Safe from a hook, on a non-blocking socket.
+    pub fn send(&self, bytes: &[u8]) {
+        let mut sealed = Vec::new();
+        if self.channel.seal(bytes, &mut sealed) {
+            let _ = self.socket.send_to(&sealed, self.peer);
+        }
+    }
+
+    /// Takes in a datagram, answering it if it needs that. Only a packet that checked out comes
+    /// back, so whatever counts as hearing the peer goes after this. `unreadable` is for something
+    /// from the peer's address that says it's on another version. Handshakes happen here, so this
+    /// is for the receive thread and never a hook.
+    pub fn open(&self, datagram: &[u8], from: SocketAddr, now_ms: u64, plain: &mut Vec<u8>, unreadable: &mut dyn FnMut()) -> Option<Packet> {
+        if !from_peer(from, self.peer) {
+            return None;
+        }
+        match self.channel.open(datagram, now_ms, plain) {
+            Opened::Data(bytes) => {
+                let packet = Packet::decode(bytes);
+                if packet.is_err() && bytes.starts_with(&PACKET_MAGIC) {
+                    unreadable();
+                }
+                packet.ok()
+            }
+            Opened::Reply(reply) => {
+                let _ = self.socket.send_to(reply, from);
+                None
+            }
+            Opened::OldPeer => {
+                unreadable();
+                None
+            }
+            Opened::Heard | Opened::Refused => None,
+        }
+    }
+
+    /// Sends what the channel has due. As with `open`, this is for the receive thread.
+    pub fn tick(&self, now_ms: u64) {
+        self.channel.tick(now_ms, &mut |packet| {
+            let _ = self.socket.send_to(packet, self.peer);
+        });
+    }
+
+    /// When a handshake was last heard, if that's news since `known`.
+    pub fn handshake_news(&self, known: &mut Option<u64>) -> Option<u64> {
+        let heard = self.channel.handshake_heard_at();
+        if heard == *known {
+            return None;
+        }
+        *known = heard;
+        heard
+    }
 }
 
 /// Runs router actions against the local backend and the peer link. `x`/`y` on a focus
@@ -106,7 +175,11 @@ pub fn apply(actions: &[Action], backend: &mut dyn InputBackend, peer: &mut dyn 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MAX_DATAGRAM;
     use crate::router::KEEP_CURSOR;
+    use crate::secure::datagram::{Label, Role};
+    use crate::secure::keys::{Pairing, PeerKey};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct FakeBackend(Vec<String>);
@@ -148,6 +221,141 @@ mod tests {
         assert!(from_peer("192.168.8.210:24850".parse().unwrap(), peer));
         assert!(from_peer("192.168.8.210:50000".parse().unwrap(), peer));
         assert!(!from_peer("192.168.8.211:24850".parse().unwrap(), peer));
+    }
+
+    fn bound(ip: &str) -> UdpSocket {
+        let socket = UdpSocket::bind((ip, 0)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+    }
+
+    fn peer_socket(pairing: &Pairing, socket: &UdpSocket, peer: &UdpSocket) -> PeerSocket {
+        let channel = Arc::new(Channel::new(pairing, Label::Input, Role::Both));
+        PeerSocket::new(socket.try_clone().unwrap(), peer.local_addr().unwrap(), channel)
+    }
+
+    /// Two ends that know each other, with sockets, and no session yet.
+    fn unlinked() -> (PeerSocket, PeerSocket) {
+        let (mut a, mut b) = (Pairing::fresh(), Pairing::fresh());
+        a.peer = Some(PeerKey { public: b.identity.public, name: "B".to_string(), paired_at: 1 });
+        b.peer = Some(PeerKey { public: a.identity.public, name: "A".to_string(), paired_at: 1 });
+        let (socket_a, socket_b) = (bound("127.0.0.1"), bound("127.0.0.1"));
+        (peer_socket(&a, &socket_a, &socket_b), peer_socket(&b, &socket_b, &socket_a))
+    }
+
+    /// The next datagram at `to`, and whether it was a packet for the caller, and whether it said
+    /// the other device is on another version.
+    fn take(to: &PeerSocket, now_ms: u64) -> (Option<Packet>, bool) {
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (len, from) = to.socket.recv_from(&mut buf).unwrap();
+        let mut unreadable = false;
+        let packet = to.open(&buf[..len], from, now_ms, &mut Vec::new(), &mut || unreadable = true);
+        (packet, unreadable)
+    }
+
+    /// Handshake 1, handshake 2, and the keepalive that confirms it.
+    fn linked() -> (PeerSocket, PeerSocket) {
+        let (a, b) = unlinked();
+        a.tick(1);
+        assert!(take(&b, 1).0.is_none());
+        assert!(take(&a, 1).0.is_none());
+        assert!(take(&b, 1).0.is_none());
+        (a, b)
+    }
+
+    fn heartbeat() -> Vec<u8> {
+        Packet::new(1, NodeId::Debian, Payload::Heartbeat).encode().unwrap()
+    }
+
+    #[test]
+    fn a_sealed_packet_comes_out_the_other_end() {
+        let (a, b) = linked();
+        a.send(&heartbeat());
+        let (packet, unreadable) = take(&b, 2);
+        assert!(matches!(packet.map(|p| p.payload), Some(Payload::Heartbeat)));
+        assert!(!unreadable);
+    }
+
+    #[test]
+    fn nothing_goes_out_with_no_session() {
+        let (a, b) = unlinked();
+        a.send(&heartbeat());
+        b.socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        assert!(b.socket.recv_from(&mut [0u8; MAX_DATAGRAM]).is_err());
+    }
+
+    #[test]
+    fn a_keepalive_is_no_packet() {
+        let (a, b) = linked();
+        let mut keepalive = Vec::new();
+        assert!(a.channel.seal(&[], &mut keepalive));
+        a.socket.send_to(&keepalive, a.peer).unwrap();
+        let (packet, unreadable) = take(&b, 2);
+        assert!(packet.is_none() && !unreadable);
+    }
+
+    #[test]
+    fn a_replayed_packet_comes_out_once() {
+        let (a, b) = linked();
+        let mut sealed = Vec::new();
+        assert!(a.channel.seal(&heartbeat(), &mut sealed));
+        a.socket.send_to(&sealed, a.peer).unwrap();
+        a.socket.send_to(&sealed, a.peer).unwrap();
+        assert!(take(&b, 2).0.is_some());
+        assert!(take(&b, 2).0.is_none());
+    }
+
+    #[test]
+    fn a_plain_packet_says_old_version_and_is_not_a_packet() {
+        let (a, b) = linked();
+        a.socket.send_to(&heartbeat(), a.peer).unwrap();
+        let (packet, unreadable) = take(&b, 2);
+        assert!(packet.is_none());
+        assert!(unreadable);
+    }
+
+    #[test]
+    fn a_session_packet_that_cant_be_read_says_other_version() {
+        let (a, b) = linked();
+        a.send(&PACKET_MAGIC);
+        let (packet, unreadable) = take(&b, 2);
+        assert!(packet.is_none());
+        assert!(unreadable);
+        a.send(b"not one of ours");
+        assert_eq!(take(&b, 2).1, false);
+    }
+
+    #[test]
+    fn a_stranger_is_not_listened_to_at_all() {
+        let (_a, b) = linked();
+        let mut unreadable = false;
+        let from = "192.0.2.1:24850".parse().unwrap();
+        assert!(b.open(&heartbeat(), from, 2, &mut Vec::new(), &mut || unreadable = true).is_none());
+        assert!(!unreadable);
+    }
+
+    #[test]
+    fn a_handshake_is_answered_to_where_it_came_from() {
+        let (a, b) = unlinked();
+        a.tick(1);
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let (len, _) = b.socket.recv_from(&mut buf).unwrap();
+        // From the peer's address, on another port.
+        let elsewhere = bound("127.0.0.1");
+        let from = elsewhere.local_addr().unwrap();
+        assert!(b.open(&buf[..len], from, 1, &mut Vec::new(), &mut || ()).is_none());
+        assert!(elsewhere.recv_from(&mut buf).is_ok());
+    }
+
+    #[test]
+    fn a_heard_handshake_is_news_once() {
+        let (a, b) = unlinked();
+        let mut known = None;
+        assert_eq!(b.handshake_news(&mut known), None);
+        a.tick(1);
+        take(&b, 5);
+        assert_eq!(b.handshake_news(&mut known), Some(5));
+        assert_eq!(b.handshake_news(&mut known), None);
     }
 
     #[derive(Default)]

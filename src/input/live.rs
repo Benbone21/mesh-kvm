@@ -4,12 +4,16 @@
 //! so the test can't reach the real desktop.
 
 use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
-use super::{apply, from_peer, InputBackend, PeerSender};
-use crate::protocol::{NodeId, Packet, Payload, PressEvent, MAX_PACKET_SIZE, PACKET_MAGIC};
+use super::{apply, InputBackend, PeerSender, PeerSocket};
+use crate::protocol::{NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM};
 use crate::router::{DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
+use crate::secure::datagram::{Channel, Label, LinkSecurity, Role};
+use crate::secure::keys::{Loaded, Pairing};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HEARTBEAT: Duration = Duration::from_millis(400);
@@ -71,8 +75,7 @@ impl InputBackend for Recorder {
 }
 
 struct Udp {
-    socket: UdpSocket,
-    peer: SocketAddr,
+    socket: PeerSocket,
     node: NodeId,
     seq: u64,
     presses: PressLog,
@@ -84,7 +87,7 @@ impl PeerSender for Udp {
         let packet = Packet::new(self.seq, self.node, payload);
         self.seq = self.seq.wrapping_add(1);
         if let Ok(bytes) = packet.encode() {
-            let _ = self.socket.send_to(&bytes, self.peer);
+            self.socket.send(&bytes);
         }
     }
 
@@ -99,6 +102,7 @@ struct Device {
     udp: Udp,
     link: PeerLink,
     start: Instant,
+    opened: Vec<u8>,
 }
 
 impl Device {
@@ -111,12 +115,10 @@ impl Device {
         apply(&actions, &mut self.recorder, &mut self.udp);
     }
 
-    fn receive(&mut self, bytes: &[u8]) {
+    fn receive(&mut self, datagram: &[u8], from: SocketAddr) {
         let now_ms = self.now_ms();
-        let Ok(packet) = Packet::decode(bytes) else {
-            if bytes.starts_with(&PACKET_MAGIC) {
-                self.link.unreadable(now_ms);
-            }
+        let link = &mut self.link;
+        let Some(packet) = self.udp.socket.open(datagram, from, now_ms, &mut self.opened, &mut || link.unreadable(now_ms)) else {
             return;
         };
         self.route(Event::PeerAlive { now_ms });
@@ -181,6 +183,14 @@ impl Device {
     }
 }
 
+fn channel_from_test_pairing() -> Arc<Channel> {
+    let path = std::env::var("MK_PAIRING").expect("MK_PAIRING names this device's pairing file");
+    match Pairing::load_from(Path::new(&path)) {
+        Loaded::Ready(pairing) => Arc::new(Channel::new(&pairing, Label::Input, Role::Both)),
+        Loaded::Damaged(problem) => panic!("{problem}"),
+    }
+}
+
 #[test]
 #[ignore = "run by tests/netem_link.py"]
 fn whole_device() {
@@ -200,13 +210,19 @@ fn whole_device() {
             pointer_speed: 1.0,
         }),
         recorder: Recorder::default(),
-        udp: Udp { socket: socket.try_clone().unwrap(), peer, node, seq: number("MK_SEQ", now_us), presses: PressLog::default(), start },
+        udp: Udp {
+            socket: PeerSocket::new(socket.try_clone().unwrap(), peer, channel_from_test_pairing()),
+            node,
+            seq: number("MK_SEQ", now_us),
+            presses: PressLog::default(),
+            start,
+        },
         link: PeerLink::default(),
         start,
+        opened: Vec::new(),
     };
-    if device.router.main() == me {
-        device.udp.send(Payload::FocusSwitchAt { target_node: node, x: KEEP_CURSOR, y: KEEP_CURSOR });
-    }
+    let mut claim_due = true;
+    let mut handshake_known = None;
 
     let (lines, read) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -217,7 +233,7 @@ fn whole_device() {
 
     let end = Instant::now() + Duration::from_secs(number("MK_SECONDS", 10));
     let (mut next_beat, mut next_status) = (Instant::now(), Instant::now());
-    let mut buf = [0u8; MAX_PACKET_SIZE];
+    let mut buf = [0u8; MAX_DATAGRAM];
     while Instant::now() < end {
         let now_ms = device.now_ms();
         device.route(Event::Tick { now_ms });
@@ -227,12 +243,20 @@ fn whole_device() {
             device.udp.presses.forget();
         }
         while let Ok((len, from)) = socket.recv_from(&mut buf) {
-            if from_peer(from, peer) {
-                device.receive(&buf[..len]);
-            }
+            device.receive(&buf[..len], from);
         }
         for event in device.link.due_presses(device.now_ms()) {
             device.route(press_event(event));
+        }
+        device.udp.socket.tick(device.now_ms());
+        if let Some(at) = device.udp.socket.handshake_news(&mut handshake_known) {
+            device.link.handshake_heard(at);
+        }
+        if claim_due && device.udp.socket.channel.security() == LinkSecurity::Encrypted {
+            claim_due = false;
+            if device.router.main() == me {
+                device.udp.send(Payload::FocusSwitchAt { target_node: node, x: KEEP_CURSOR, y: KEEP_CURSOR });
+            }
         }
         while let Ok(line) = read.try_recv() {
             device.act(&line);

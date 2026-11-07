@@ -320,6 +320,10 @@ fn run_service(cli: Cli) {
     };
 
     settings::load_and_apply();
+    let secure = secure::services();
+    if let Some(problem) = &secure.problem {
+        eprintln!("[Secure] Working alone: {problem}");
+    }
     let saved = settings::peer_ip().or_else(old_install_peer);
     let chosen = match choose_peer(cli.peer.as_deref(), saved.as_deref(), cli.port) {
         Ok(chosen) => chosen,
@@ -395,6 +399,7 @@ fn run_service(cli: Cli) {
         if let Err(e) = input::linux::run_debian_node(
             state,
             peer_addr,
+            secure.input.clone(),
             cli.port,
             cli.width,
             cli.height,
@@ -413,7 +418,7 @@ fn run_service(cli: Cli) {
                 cli.role
             );
         }
-        if let Err(e) = input::windows::run_windows_node(state, peer_addr, cli.port, cli.width, cli.height) {
+        if let Err(e) = input::windows::run_windows_node(state, peer_addr, secure.input.clone(), cli.port, cli.width, cli.height) {
             fail(&format!("[Windows] {e}"));
         }
     }

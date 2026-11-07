@@ -7,6 +7,8 @@ pub const DEFAULT_CLIPBOARD_PORT: u16 = 24852;
 pub const PACKET_MAGIC: [u8; 4] = *b"MKVM";
 /// The most a packet can be: 16 monitors with long names, under one Ethernet frame.
 pub const MAX_PACKET_SIZE: usize = 1400;
+/// The same packet as it goes over the network.
+pub const MAX_DATAGRAM: usize = MAX_PACKET_SIZE + crate::secure::datagram::OVERHEAD;
 /// What `LinkState` carries is understood by devices on the same number. Changes when packets
 /// change in a way both devices must update together for.
 pub const LINK_PROTOCOL: u16 = 2;
