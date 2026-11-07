@@ -2,46 +2,63 @@
 """End-to-end link test: the Windows exe under Wine, with this script as the other device.
 
 It sends the exe hand-made packets and reads the ones the exe sends back, so that input, EdgeMap,
-PeerDisplayInfo and the layout are all driven in both directions.
+PeerDisplayInfo and the layout are all driven in both directions. All of that goes through
+`noise_peer.py`, a separate Noise implementation, so the exe's encryption has to agree with it. Plain
+packets are the cases that must be refused. At the end the Linux build pairs with the exe for real.
 
 Run inside a network namespace, so that the daemon's ports are free:
 
     unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
 
-The exe path comes from the first argument, then $MESH_KVM_EXE, then the default below. The script
-makes a second namespace for the other device, joined to the first by a veth pair, as both sides
-serve the same API port.
+The exe path comes from the first argument, then $MESH_KVM_EXE, then the default below, and the Linux
+build from the second argument, then $MESH_KVM_LINUX, then its default. The script makes a second
+namespace for the other device, joined to the first by a veth pair, as both sides serve the same ports.
+
+Wine's prefix takes over a gigabyte, so it goes under target/ and not /tmp. WINE_LINK_PREFIX moves it.
+Wine and the Linux build each get a HOME of their own beside it.
+
+The Linux build has no input devices here, by design: it is run with /dev/input, /dev/snd and
+/run/user hidden and /dev/null in place of /dev/uinput, so it can't reach this desk's keyboard, mouse
+or sound. A small preloaded library says yes to the uinput calls, so the service carries on with
+nothing to drive.
 
 To also drive the laptop's own keyboard and mouse, set WINE_LINK_DISPLAY to a throwaway X display that
 xdotool can type on. Without it, that step is skipped and says so.
 """
 import contextlib
+import errno
 import glob
-import http.client
-import http.server
 import json
 import os
 import pathlib
+import re
 import shutil
+import signal
 import socket
-import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 
-DEFAULT_EXE = str(pathlib.Path(__file__).resolve().parent.parent
-                  / "target/x86_64-pc-windows-gnu/release/mesh-kvm.exe")
-PREFIX = os.environ.get("WINE_LINK_PREFIX", "/tmp/claude-1000/mk/wineprefix")
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from noise_peer import API, DATA, REPLY, Datagrams, Keys, Refused, Stream, fingerprint
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DEFAULT_EXE = str(ROOT / "target/x86_64-pc-windows-gnu/release/mesh-kvm.exe")
+DEFAULT_LINUX = str(ROOT / "target/release/mesh-kvm")
+PREFIX = os.environ.get("WINE_LINK_PREFIX", str(ROOT / "target/wine_link/wineprefix"))
 LAPTOP = "10.77.0.1"
 PEER = "10.77.0.2"
 STRANGER = "10.77.0.3"
 ANOTHER_PEER = "10.77.0.9"
 INPUT_PORT = 24850
 AUDIO_PORT = 24851
+CONTROL_PORT = 24852
 AUDIO_MAGIC = b"MKAU"
 AUDIO_VERSION = 2
 API_PORT = 24880
@@ -53,6 +70,9 @@ LEFT, RIGHT, TOP, BOTTOM = 0, 1, 2, 3
 (MOUSE_MOVE, MOUSE_BUTTON, MOUSE_WHEEL, KEY_EVENT, _FOCUS_SWITCH, _FOCUS_ACK, PANIC_RELEASE, HEARTBEAT,
  PEER_DISPLAY_INFO, EDGE_MAP, FOCUS_SWITCH_AT, GAME_LOCK, ACTIVE_VIEW, LAYOUT_REVISION, LINK_STATE, PRESSES) = range(16)
 LINK_PROTOCOL = 2
+
+# This script's device, and the exe's. The exe's are only here to put in its `pairing.json`.
+ME, EXE_KEYS = Keys.make(), Keys.make()
 
 failures = 0
 seq = 0
@@ -78,7 +98,7 @@ def run(*command):
 def make_other_device():
     """Returns the process holding the other device's namespace open."""
     global netns_file
-    holder = subprocess.Popen(["unshare", "-n", "sleep", "900"])
+    holder = subprocess.Popen(["unshare", "-n", "sleep", "3600"])
     own = os.readlink("/proc/self/ns/net")
     while os.readlink(f"/proc/{holder.pid}/ns/net") == own:
         time.sleep(0.01)
@@ -233,18 +253,26 @@ def parse(data):
 
 
 class Inbox:
-    """Everything the exe sends to the other device's input port."""
+    """Everything the exe sends to the other device's input port. Handshakes are answered here."""
 
-    def __init__(self, sock):
-        self.sock = sock
+    def __init__(self, sock, channel):
+        self.sock, self.channel = sock, channel
         self.seen = []
         self.lock = threading.Lock()
+        # Hears nothing until told to, so that the first steps run with no session.
+        self.deaf = True
         threading.Thread(target=self.listen, daemon=True).start()
 
     def listen(self):
         while True:
-            data, _ = self.sock.recvfrom(4096)
-            parsed = parse(data)
+            try:
+                data, sender = self.sock.recvfrom(4096)
+                kind, body = (None, b"") if self.deaf else self.channel.open(data)
+                if kind == REPLY:
+                    self.sock.sendto(body, sender)
+            except OSError:
+                return
+            parsed = parse(body) if kind == DATA else None
             if parsed:
                 with self.lock:
                     self.seen.append(parsed)
@@ -269,9 +297,9 @@ class Inbox:
 
 # ---- The exe's API ----
 
-def call(path, body=None, headers=None, base=LOCAL):
+def call(path, body=None, headers=None):
     data = None if body is None else json.dumps(body).encode()
-    request = urllib.request.Request(base + path, data=data, headers=headers or {})
+    request = urllib.request.Request(LOCAL + path, data=data, headers=headers or {})
     try:
         with urllib.request.urlopen(request, timeout=3) as r:
             return json.load(r)
@@ -279,15 +307,63 @@ def call(path, body=None, headers=None, base=LOCAL):
         return json.load(e)
 
 
-def post_from(source, path, body):
-    """A POST to the laptop's API from `source`, on the other device's side. Returns the status."""
+def bincode_text(text):
+    raw = text.encode()
+    return struct.pack("<Q", len(raw)) + raw
+
+
+class ApiWire:
+    """The peer API on a secure stream: a big-endian u32 length, then bincode. A message can span
+    frames, and a frame can hold more than one."""
+
+    def __init__(self, stream):
+        self.stream, self.held = stream, b""
+
+    def take(self, count):
+        while len(self.held) < count:
+            more = self.stream.recv()
+            if not more:
+                raise EOFError("the stream ended")
+            self.held += more
+        taken, self.held = self.held[:count], self.held[count:]
+        return taken
+
+    def read(self):
+        (length,) = struct.unpack(">I", self.take(4))
+        return Reader(self.take(length))
+
+    def write(self, body):
+        self.stream.send(struct.pack(">I", len(body)) + body)
+
+
+def control_connection(source, keys):
+    """A secure stream for the API to the laptop's control port, from `source` on the other side."""
     with other_device():
-        connection = http.client.HTTPConnection(LAPTOP, API_PORT, timeout=3, source_address=(source, 0))
-        connection.connect()
-    connection.request("POST", path, json.dumps(body))
-    status = connection.getresponse().status
-    connection.close()
-    return status
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.settimeout(3)
+        tcp.bind((source, 0))
+        tcp.connect((LAPTOP, CONTROL_PORT))
+    return Stream(tcp, keys, EXE_KEYS.public, API)
+
+
+def api_from(source, method, path, body="", keys=ME):
+    """One request to the laptop as `peer_call` makes it: its (status, body), or None if nothing answered."""
+    try:
+        stream = control_connection(source, keys)
+        wire = ApiWire(stream)
+        wire.write(bincode_text(method) + bincode_text(path) + bincode_text(body))
+        answer = wire.read()
+        status, text = answer.take("H"), answer.text()
+        stream.close()
+    except (OSError, EOFError, Refused):
+        return None
+    return status, text
+
+
+def post_from(source, path, body):
+    """A POST to the laptop from `source`, on the other device's side: the status, or None."""
+    answer = api_from(source, "POST", path, json.dumps(body))
+    return answer and answer[0]
 
 
 def local():
@@ -325,14 +401,29 @@ def view(st):
 
 
 class Peer:
-    def __init__(self, sock, stranger):
-        self.sock, self.stranger = sock, stranger
+    def __init__(self, sock, stranger, channel):
+        self.sock, self.stranger, self.channel = sock, stranger, channel
 
     def send(self, data):
-        self.sock.sendto(data, (LAPTOP, INPUT_PORT))
+        self.sock.sendto(self.channel.seal(data), (LAPTOP, INPUT_PORT))
 
     def send_as_stranger(self, data):
+        self.stranger.sendto(self.channel.seal(data), (LAPTOP, INPUT_PORT))
+
+    def send_plain(self, data):
+        self.sock.sendto(data, (LAPTOP, INPUT_PORT))
+
+    def send_plain_as_stranger(self, data):
         self.stranger.sendto(data, (LAPTOP, INPUT_PORT))
+
+    def connect(self, inbox, timeout=5):
+        """Both ends try at once, as two devices do, and which one's handshake wins goes by the keys."""
+        inbox.deaf = False
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self.channel.ready():
+            self.sock.sendto(self.channel.handshake(), (LAPTOP, INPUT_PORT))
+            time.sleep(0.25)
+        return self.channel.ready()
 
     def pump(self, seconds, *builders, sender=None):
         """Send the given packets every 200 ms for a while."""
@@ -390,38 +481,88 @@ class Exe:
         subprocess.run(["wineserver", "-w"], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def exe_folder():
+    return os.path.join(glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Local")[0], "mesh-kvm")
+
+
 def settings_file():
-    found = glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Local/mesh-kvm/local-settings.json")
-    return found[0] if found else None
+    path = os.path.join(exe_folder(), "local-settings.json")
+    return path if os.path.exists(path) else None
+
+
+def pairing_file():
+    return os.path.join(exe_folder(), "pairing.json")
+
+
+def answer_api(tcp, holder):
+    """Answers the exe on one connection: `holder["state"]` is what this device says at /api/state."""
+    try:
+        stream = Stream(tcp, ME, EXE_KEYS.public, None)
+        wire = ApiWire(stream)
+        while stream.purpose == API:
+            request = wire.read()
+            _, path = request.text(), request.text()
+            text = json.dumps(holder["state"]) if path == "/api/state" else "{}"
+            wire.write(struct.pack("<H", 200) + bincode_text(text))
+    except (OSError, EOFError, Refused):
+        pass
+    tcp.close()
 
 
 def serve_layout(holder):
-    """The other device's API: `holder["state"]` is what it says at /api/state."""
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            body = json.dumps(holder["state"]).encode() if self.path == "/api/state" else b"{}"
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            pass
-
-    class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-        daemon_threads = True
-        allow_reuse_address = True
-
+    """The other device's control port. Returns what stops it, as the Linux build needs the port."""
     with other_device():
-        server = Server((PEER, API_PORT), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((PEER, CONTROL_PORT))
+        listener.listen()
+    connections = []
+
+    def accept():
+        while True:
+            try:
+                tcp, _ = listener.accept()
+            except OSError:
+                return
+            connections.append(tcp)
+            threading.Thread(target=answer_api, args=(tcp, holder), daemon=True).start()
+
+    def stop():
+        for sock in (listener, *connections):
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        listener.close()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return stop
 
 
-def link_checks(peer):
-    # a. Packets from an unknown address are ignored.
+def link_checks(peer, inbox):
+    # a. Plain packets are refused, from anywhere. From the peer's address they say it needs updating.
+    peer.pump(1.0, heartbeat, lambda: active_view(DEBIAN), sender=peer.send_plain_as_stranger)
+    st = wait_for(lambda s: True, 2)
+    online, active = view(st)
+    check("plain packets from a stranger leave peer_online false, active Windows",
+          online is False and active == "Windows", f"{online}, {active}")
+    check("and say nothing of an old peer", st["old_peer"] is False, str(st["old_peer"]))
+    peer.pump(1.0, heartbeat, lambda: active_view(DEBIAN), sender=peer.send_plain)
+    st = wait_for(lambda s: True, 2)
+    online, active = view(st)
+    check("plain packets from the peer's address leave peer_online false, active Windows",
+          online is False and active == "Windows", f"{online}, {active}")
+    check("but do say the peer is on an old version", st["old_peer"] is True, str(st["old_peer"]))
+    check("the exe is still trying to connect", st["secure"] == "connecting", st["secure"])
+
+    # A handshake with an independent Noise implementation, and it counts for nothing on its own.
+    check("the exe and noise_peer.py agree on a handshake", peer.connect(inbox))
+    st = wait_for(lambda s: s["secure"] == "encrypted", 3)
+    check("the exe says the link is encrypted", (st or {}).get("secure") == "encrypted", str(st and st["secure"]))
+    check("but a session isn't a peer that's online", view(st)[0] is False, str(view(st)))
+
+    # Sealed packets from an unknown address are ignored too, with a good session behind them.
     peer.pump(1.0, heartbeat, lambda: active_view(DEBIAN), sender=peer.send_as_stranger)
     online, active = view(wait_for(lambda s: True, 2))
-    check("packets from a stranger leave peer_online false, active Windows",
+    check("sealed packets from a stranger leave peer_online false, active Windows",
           online is False and active == "Windows", f"{online}, {active}")
 
     # b. Heartbeats alone bring the link up, but the laptop stays active.
@@ -677,10 +818,14 @@ def link_state_checks(peer, inbox):
     wait_for(lambda s: s["link"]["held_here"] == 0, 2)
     beats.pump(0.5)
 
-    # Packets from a version this one can't read.
-    peer.send(b"MKVM" + struct.pack("<QII", 1 << 30, DEBIAN, 99))
+    # Packets from a version this one can't read. Plain, they don't count as hearing from anyone.
+    unreadable = b"MKVM" + struct.pack("<QII", 1 << 30, DEBIAN, 99)
+    peer.send_plain(unreadable)
     time.sleep(0.2)
-    check("a packet that can't be read means another version", local()["link"]["peer_version"] == "other", str(local()["link"]))
+    check("a plain packet that can't be read changes no version", local()["link"]["peer_version"] != "other", str(local()["link"]))
+    peer.send(unreadable)
+    time.sleep(0.2)
+    check("a sealed packet that can't be read means another version", local()["link"]["peer_version"] == "other", str(local()["link"]))
 
 
 def dropout_checks(peer, inbox):
@@ -760,25 +905,70 @@ def api_checks(peer, inbox):
     call("/api/action", {"action": "toggle_focus"})
 
 
+class AudioPeer:
+    """The other device's audio port. Audio is two sessions: this device's sender starts one with
+    the exe's listener, and the exe's sender, from a port of its own, starts one with this device."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.to_listener = Datagrams(ME, EXE_KEYS.public, "audio")
+        self.from_sender = Datagrams(ME, EXE_KEYS.public, "audio")
+
+    def read(self):
+        """The next plaintext and where it came from, or None if the wait ran out or it was a handshake."""
+        try:
+            data, sender = self.sock.recvfrom(2048)
+        except socket.timeout:
+            return None
+        channel = self.to_listener if sender == (LAPTOP, AUDIO_PORT) else self.from_sender
+        kind, body = channel.open(data)
+        if kind == REPLY:
+            self.sock.sendto(body, sender)
+        return (body, sender) if kind == DATA else None
+
+    def connect(self, timeout=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self.to_listener.ready():
+            self.sock.sendto(self.to_listener.handshake(), (LAPTOP, AUDIO_PORT))
+            self.read()
+        return self.to_listener.ready()
+
+    def to_exe(self, plain):
+        self.sock.sendto(self.to_listener.seal(plain), (LAPTOP, AUDIO_PORT))
+
+
 def audio_checks():
     # s. The audio bus: quiet about other versions, live both ways, and a fallback that works.
     with other_device():
         ours = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         ours.bind((PEER, AUDIO_PORT))
-        ours.settimeout(1)
+        ours.settimeout(0.1)
+    peer = AudioPeer(ours)
     audio = local()["audio"]
     check("audio reports its device lists", isinstance(audio["inputs"], list) and isinstance(audio["outputs"], list),
           str(audio))
     check("nothing is chosen, so nothing is sent", audio["tx_enabled"] is False and audio["input"] == "")
 
-    old = b"MKVA" + struct.pack("<Q", 2) + b"\x55" * 960
+    # The format from before versions were numbered is refused without a word, plain as it is.
+    older = b"MKVA" + struct.pack("<Q", 2) + b"\x55" * 960
     for _ in range(5):
-        ours.sendto(old, (LAPTOP, AUDIO_PORT))
+        ours.sendto(older, (LAPTOP, AUDIO_PORT))
+    time.sleep(1)
+    audio = local()["audio"]
+    check("a plain MKVA packet is refused, and raises no note", audio["rx_other_version"] is False, str(audio))
+    check("and none of it is played", audio["rx_peak"] == 0 and audio["rx_packets"] == 0, str(audio))
+
+    # What v0.6 sends is plain MKAU, and that does raise the note.
+    plain = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3]) + struct.pack("<HI", 76, 0)
+    for _ in range(5):
+        ours.sendto(plain, (LAPTOP, AUDIO_PORT))
     seen = wait_for(lambda s: s["audio"]["rx_other_version"], 5)
-    check("the old packet format is noticed", seen is not None)
-    check("and none of it is played", local()["audio"]["rx_peak"] == 0)
-    garbage = b"MKAU\x09\x01" + b"\xff" * 300
-    ours.sendto(garbage, (LAPTOP, AUDIO_PORT))
+    check("a plain MKAU packet says the peer is on an old version", seen is not None and seen["old_peer"] is True, str(seen and seen["audio"]))
+    check("and none of it is taken", local()["audio"]["rx_packets"] == 0)
+
+    check("the exe's listener answers a handshake", peer.connect())
+    peer.to_exe(b"MKAU\x09\x01" + b"\xff" * 300)
+    time.sleep(0.2)
     check("a later version is left alone too", local()["audio"]["rx_packets"] == 0)
 
     chosen = {"action": "set_audio_device", "role": "input", "id": "default"}
@@ -791,12 +981,9 @@ def audio_checks():
     packets = []
     deadline = time.time() + 4
     while time.time() < deadline and not packets:
-        try:
-            data, sender = ours.recvfrom(2048)
-        except socket.timeout:
-            continue
-        if data[:4] == AUDIO_MAGIC:
-            packets.append((data, sender))
+        got = peer.read()
+        if got and got[0][:4] == AUDIO_MAGIC:
+            packets.append(got)
     check("the sender says it's alive even with nothing playing", bool(packets))
     if packets:
         data, sender = packets[0]
@@ -806,16 +993,11 @@ def audio_checks():
         quiet = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3]) + struct.pack("<HI", 77, 0)
         deadline = time.time() + 4
         answered = False
-        ours.settimeout(0.1)
         while time.time() < deadline:
-            ours.sendto(report, sender)
-            ours.sendto(quiet, (LAPTOP, AUDIO_PORT))
-            try:
-                while True:
-                    back, _ = ours.recvfrom(2048)
-                    answered = answered or back[:6] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4])
-            except socket.timeout:
-                pass
+            ours.sendto(peer.from_sender.seal(report), sender)
+            peer.to_exe(quiet)
+            while got := peer.read():
+                answered = answered or got[0][:6] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4])
         audio = local()["audio"]
         check("an open output on the other device counts as connected", audio["tx_connected"] is True, str(audio))
         check("but not as playing, with nothing to hear", audio["tx_reaching"] is False, str(audio))
@@ -870,8 +1052,8 @@ def layout_checks(peer, inbox, holder):
     check("an older revision from Debian changes nothing", state()["config"]["revision"] == theirs["revision"])
 
 
-def peer_change_refused(body, headers=None, base=LOCAL):
-    return call("/api/local/action", {"action": "set_peer", **body}, headers, base)
+def peer_change_refused(body, headers=None):
+    return call("/api/local/action", {"action": "set_peer", **body}, headers)
 
 
 def display_checks():
@@ -892,11 +1074,19 @@ def display_checks():
 
 def security_checks(pinned_peer):
     # q. Only the app on this device can pair it with something else.
-    with other_device():
-        reply = peer_change_refused({"peer": STRANGER}, base=f"http://{LAPTOP}:{API_PORT}")
-    check("set_peer from the network is refused", reply.get("ok") is False, str(reply))
+    answer = api_from(PEER, "POST", "/api/local/action", json.dumps({"action": "set_peer", "peer": STRANGER}))
+    check("set_peer from the other device is refused", answer is not None and json.loads(answer[1]).get("ok") is False, str(answer))
     reply = peer_change_refused({"peer": STRANGER}, {"Origin": "http://evil.example"})
     check("set_peer from a web page on this device is refused", reply.get("ok") is False, str(reply))
+
+    # The local API has left the network, so the other device's side can't even connect to it.
+    with other_device():
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.settimeout(3)
+        tcp.bind((PEER, 0))
+        refused = tcp.connect_ex((LAPTOP, API_PORT))
+    tcp.close()
+    check(f"{LAPTOP}:{API_PORT} is refused from the other namespace", refused == errno.ECONNREFUSED, errno.errorcode.get(refused, str(refused)))
 
     # r. Changes come from this device or the other one, and from no one else.
     before = state()["config"]
@@ -906,8 +1096,11 @@ def security_checks(pinned_peer):
                        ("/api/local/action", {"action": "set_display_mode", "output": "Display 1"}),
                        ("/api/local/action", {"action": "set_device_name", "name": "Stranger"}),
                        ("/api/peer/api/action", {"action": "panic"})):
+        # The key is the right one here, so it is the address alone that turns this away.
         status = post_from(STRANGER, path, body)
-        check(f"POST {path} from a stranger is refused", status == 403, str(status))
+        check(f"POST {path} from a stranger gets no answer", status is None, str(status))
+    answer = api_from(PEER, "POST", "/api/layout", json.dumps(hostile), keys=Keys.make())
+    check("a key the exe doesn't know gets no answer from the peer's address", answer is None, str(answer))
     check("the stranger changed nothing", state()["config"] == before and local()["sharing"]["mouse"] is True)
     check("the other device can still change the layout", post_from(PEER, "/api/layout", hostile) == 200)
     now = state()["config"]
@@ -1035,37 +1228,237 @@ def held_keyboard_checks(peer, inbox, exe):
     check("focus goes back to Debian", view(st) == (True, "Debian"), str(view(st)))
 
 
-def test(exe_path):
+# Says yes to anything on uinput, which here is /dev/null.
+UINPUT_SHIM = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdarg.h>
+
+int ioctl(int fd, unsigned long request, ...) {
+    va_list args;
+    va_start(args, request);
+    void *arg = va_arg(args, void *);
+    va_end(args);
+    if (((request >> 8) & 0xff) == 'U') {
+        return 0;
+    }
+    int (*real)(int, unsigned long, void *) = dlsym(RTLD_NEXT, "ioctl");
+    return real(fd, request, arg);
+}
+"""
+
+# Stops at the first thing that doesn't work, before anything of the service runs.
+SANDBOX = """set -e
+mount -t tmpfs tmpfs /dev/input
+if [ -d /dev/snd ]; then mount -t tmpfs tmpfs /dev/snd; fi
+mount --bind /dev/null /dev/uinput
+mount -t tmpfs tmpfs /run/user
+exec "$@"
+"""
+
+
+class LinuxDevice:
+    """The real Linux build on the other device's side, with its own HOME and nothing to reach
+    this machine's keyboard, mouse or sound with."""
+
+    def __init__(self, binary, holder, folder, log):
+        self.binary, self.log, self.proc = binary, log, None
+        self.enter_namespace = ["nsenter", f"--net=/proc/{holder.pid}/ns/net"]
+        self.home = os.path.join(folder, "linux_home")
+        run_dir = os.path.join(folder, "linux_run")
+        shutil.rmtree(self.home, ignore_errors=True)
+        os.makedirs(self.home)
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        shim = os.path.join(folder, "uinput_shim.so")
+        source = shim + ".c"
+        with open(source, "w") as f:
+            f.write(UINPUT_SHIM)
+        run("cc", "-shared", "-fPIC", "-o", shim, source, "-ldl")
+        gone = ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+        self.env = {k: v for k, v in os.environ.items() if k not in gone}
+        self.env.update(HOME=self.home, XDG_RUNTIME_DIR=run_dir, LD_PRELOAD=shim)
+
+    def start(self):
+        command = [*self.enter_namespace, "unshare", "-m", "--propagation", "private", "sh", "-c", SANDBOX, "sh",
+                   self.binary, "--role", "debian", "--mouse-device", "/dev/null", "--width", "1920", "--height", "1080"]
+        self.proc = subprocess.Popen(command, env=self.env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+
+    def stop(self):
+        if self.proc:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            self.proc.wait(timeout=5)
+
+    def client(self, *args):
+        """`--pair-show` or `--pair`, as someone at this device would run it."""
+        return subprocess.Popen([*self.enter_namespace, self.binary, *args], env=self.env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def call(self, path):
+        with other_device():
+            return call(path)
+
+    def wait_for(self, cond, timeout):
+        deadline = time.time() + timeout
+        st = None
+        while time.time() < deadline:
+            with contextlib.suppress(Exception):
+                st = self.call("/api/local")
+                if cond(st):
+                    return st
+            time.sleep(0.1)
+        return st
+
+    def pairing(self):
+        with open(os.path.join(self.home, ".config/mesh-kvm/pairing.json")) as f:
+            return json.load(f)
+
+
+def read_code(process):
+    """The code from `--pair-show`'s output, which goes on running. None if it ends without one."""
+    lines = []
+    for line in process.stdout:
+        lines.append(line)
+        found = re.search(r"Code: (\d{3} \d{3})", line)
+        if found:
+            return found.group(1)
+    print("    said: " + "".join(lines), flush=True)
+    return None
+
+
+def shown_fingerprint(text):
+    found = re.search(r"Fingerprint ([0-9A-F]{4}-[0-9A-F]{4})", text or "")
+    return found.group(1) if found else None
+
+
+def finish(process):
+    """What's left of a pairing command's output, and its exit status."""
+    try:
+        text, _ = process.communicate(timeout=90)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        text, _ = process.communicate()
+    return text, process.returncode
+
+
+def after_pairing(way, linux, shown, entered):
+    """What must hold once a pairing has run: `shown` and `entered` are each (output, status)."""
+    check(f"{way}: both commands end well", shown[1] == 0 and entered[1] == 0, f"{shown}, {entered}")
+    fingerprints = shown_fingerprint(shown[0]), shown_fingerprint(entered[0])
+    theirs = linux.pairing()
+    with open(pairing_file()) as f:
+        mine = json.load(f)
+    check(f"{way}: each saved the other's key",
+          theirs["peer"]["public_key"] == mine["public_key"] and mine["peer"]["public_key"] == theirs["public_key"],
+          f"{theirs['peer']}, {mine['peer']}")
+    expected = fingerprint(bytes.fromhex(theirs["public_key"]), bytes.fromhex(mine["public_key"]))
+    check(f"{way}: both print the fingerprint this script works out", fingerprints == (expected, expected), f"{fingerprints}, {expected}")
+    st = wait_for(lambda s: s["secure"] == "encrypted" and s["peer_online"], 30)
+    other = linux.wait_for(lambda s: s["secure"] == "encrypted" and s["peer_online"], 10)
+    check(f"{way}: the link comes up on the exe", bool(st) and st["secure"] == "encrypted" and st["peer_online"], str(st and (st["secure"], st["peer_online"])))
+    check(f"{way}: and on the Linux build", bool(other) and other["secure"] == "encrypted" and other["peer_online"], str(other and (other["secure"], other["peer_online"])))
+    check(f"{way}: the peer API works from the exe", call("/api/peer/api/local").get("node") == "debian", "")
+    check(f"{way}: and from the Linux build", linux.call("/api/peer/api/local").get("node") == "windows", "")
+    return expected
+
+
+def real_input_devices():
+    """What this machine's kernel has by the service's name. This file ignores namespaces."""
+    with open("/proc/bus/input/devices") as f:
+        return sorted(line for line in f if line.startswith("N:") and "mesh-kvm" in line.lower())
+
+
+def pairing_checks(exe, linux):
+    # y. The two builds pair for real. The exe has an address for the other device, and the Linux
+    # build has nothing at all, so this also shows it learning the address.
+    devices = real_input_devices()
+    linux.start()
+    st = linux.wait_for(lambda s: True, 20)
+    check("the Linux build runs beside the exe, unpaired and with no peer",
+          bool(st) and st["secure"] == "unpaired" and st["paired"] is False, str(st and (st["secure"], st["paired"])))
+
+    way = "Linux shows, exe enters"
+    showing = linux.client("--pair-show")
+    code = read_code(showing)
+    check(f"{way}: --pair-show prints a code", code is not None)
+    entering = subprocess.run(["wine", exe.exe, "--pair", code or ""], env=exe.env, timeout=120, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    first = after_pairing(way, linux, finish(showing), (entering.stdout, entering.returncode))
+    check(f"{way}: the Linux build learned the exe's address", linux.call("/api/local")["peer_ip"] == LAPTOP)
+
+    way = "exe shows, Linux enters"
+    showing = subprocess.Popen(["wine", exe.exe, "--pair-show"], env=exe.env, text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    code = read_code(showing)
+    check(f"{way}: the exe's --pair-show prints a code into a pipe", code is not None)
+    entering = linux.client("--pair", code or "")
+    done = finish(entering)
+    second = after_pairing(way, linux, finish(showing), done)
+    check(f"{way}: keys survive pairing again, so the fingerprint is the same", second == first, f"{first}, {second}")
+    check("the Linux build made no input device on this machine", real_input_devices() == devices, str(real_input_devices()))
+
+
+def damaged_file_checks(exe):
+    # z. A pairing file that can't be read leaves the service up, alone, and the file as it was.
+    exe.stop()
+    damaged = '{ "version": 1, "private_key": "not hex'
+    with open(pairing_file(), "w") as f:
+        f.write(damaged)
+    exe.start()
+    st = wait_for(lambda s: True, 60)
+    check("with a damaged pairing.json the exe still runs", bool(st))
+    check("and it is unpaired", bool(st) and st["secure"] == "unpaired", str(st and st["secure"]))
+    status = call("/api/pairing")
+    check("and it says what's wrong", bool(status.get("problem")), str(status))
+    with open(pairing_file()) as f:
+        check("and the file is left as it was", f.read() == damaged)
+
+
+def test(exe_path, linux_path):
     if not os.path.exists(exe_path):
         sys.exit(f"exe not found: {exe_path}")
+    if not os.path.exists(linux_path):
+        sys.exit(f"Linux build not found: {linux_path}")
     shutil.rmtree(PREFIX, ignore_errors=True)
     os.makedirs(PREFIX, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
-    env.update(WINEPREFIX=PREFIX, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
-    # Wine looks for the desktop's Wayland socket here, and setting up a prefix can hang on it.
-    env["XDG_RUNTIME_DIR"] = os.path.join(os.path.dirname(PREFIX), "wine_link_run")
-    os.makedirs(env["XDG_RUNTIME_DIR"], mode=0o700, exist_ok=True)
+    folder = os.path.dirname(PREFIX)
+    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")}
+    env.update(WINEPREFIX=PREFIX, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d")
+    # Wine writes under HOME, and the real one isn't for this.
+    env["HOME"] = os.path.join(folder, "wine_link_home")
+    os.makedirs(env["HOME"], exist_ok=True)
+    # Wine looks for the desktop's Wayland socket here, and setting up a prefix can hang on it. A
+    # socket's path has to be short, so this one can't go beside the prefix.
+    env["XDG_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="wine_link.")
     if os.environ.get("WINE_LINK_DISPLAY"):
         env["DISPLAY"] = os.environ["WINE_LINK_DISPLAY"]
-    log = open(os.path.join(os.path.dirname(PREFIX), "wine_link.log"), "w")
+    log = open(os.path.join(folder, "wine_link.log"), "w")
     holder = make_other_device()
     exe = Exe(exe_path, env, log)
+    linux = LinuxDevice(linux_path, holder, folder, log)
     try:
+        # The prefix has to be there for the exe's pairing file to go in it.
+        subprocess.run(["wine", "wineboot", "-i"], env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(["wineserver", "-w"], env=env, check=True)
+        os.makedirs(exe_folder())
+        EXE_KEYS.write_pairing(pairing_file(), ME.public, "Debian")
+
         with other_device():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind((PEER, INPUT_PORT))
             stranger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             stranger.bind((STRANGER, 0))
-        peer, inbox = Peer(sock, stranger), Inbox(sock)
+        channel = Datagrams(ME, EXE_KEYS.public, "input")
+        peer, inbox = Peer(sock, stranger, channel), Inbox(sock, channel)
         layout = {"state": {}}
-        serve_layout(layout)
+        stop_layout = serve_layout(layout)
 
         exe.start("--peer", PEER)
         if wait_for(lambda s: True, 90) is None:
             check("daemon answers on /api/local", False, "see wine_link.log")
             return 1
 
-        link_checks(peer)
+        link_checks(peer, inbox)
         heartbeat_checks(peer, inbox)
         reported_monitors_check(peer)
         crossing = input_checks(peer, inbox)
@@ -1087,14 +1480,25 @@ def test(exe_path):
         second_service_check(exe)
         saved_peer_checks(exe)
         unpaired_checks(exe)
+
+        # This script stops being the other device, so that the Linux build can have its ports.
+        stop_layout()
+        sock.close()
+        stranger.close()
+        pairing_checks(exe, linux)
+        linux.stop()
+        damaged_file_checks(exe)
     finally:
+        linux.stop()
         exe.stop()
         holder.kill()
+        shutil.rmtree(env["XDG_RUNTIME_DIR"], ignore_errors=True)
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MESH_KVM_EXE", DEFAULT_EXE)
-    code = test(path)
+    linux_path = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("MESH_KVM_LINUX", DEFAULT_LINUX)
+    code = test(path, linux_path)
     print("ALL PASS" if code == 0 else f"{failures} FAILED")
     sys.exit(code)
