@@ -366,7 +366,7 @@ fn run_service(cli: Cli) {
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
     let displays = spatial::start_displays(state.clone(), platform.clone());
     let trial = displays.clone();
-    update::start(peer_ip.clone(), Box::new(move || trial.trial_running()));
+    update::start(Box::new(move || trial.trial_running()));
     let handler = spatial::studio_handler(state.clone(), platform.clone(), displays);
     if let Err(e) = webui::start(listener, peer_ip.clone(), handler) {
         fail(&e);

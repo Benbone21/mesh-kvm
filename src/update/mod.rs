@@ -7,6 +7,7 @@ mod check;
 pub mod fetch;
 #[cfg(target_os = "linux")]
 mod linux;
+mod peer;
 pub mod status;
 pub mod store;
 pub mod swap;
@@ -18,7 +19,8 @@ use both::{Devices, PeerLook, Step};
 use check::Check;
 use ed25519_dalek::VerifyingKey;
 use fetch::{Server, Source};
-use serde_json::{json, Value};
+use peer::{PeerApi, PeerLink};
+use serde_json::Value;
 use status::{Stage, Status, STALE_AFTER};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -82,41 +84,6 @@ pub struct Updater {
     /// Only one update at a time.
     busy: AtomicBool,
     wake: Mutex<Option<Sender<()>>>,
-}
-
-/// Reaching the other device.
-pub trait PeerLink: Send + Sync {
-    fn look(&self) -> Option<PeerLook>;
-    fn install(&self) -> Result<(), String>;
-}
-
-struct PeerApi(String);
-
-impl PeerLink for PeerApi {
-    fn look(&self) -> Option<PeerLook> {
-        match crate::webui::http_call(&self.0, "GET", "/api/local", "") {
-            Ok((200, body)) => Some(read_peer(&serde_json::from_str(&body).ok()?)),
-            _ => None,
-        }
-    }
-
-    fn install(&self) -> Result<(), String> {
-        let body = json!({ "action": "install_update" }).to_string();
-        let (status, reply) = crate::webui::http_call(&self.0, "POST", "/api/local/action", &body)?;
-        let reply: Value = serde_json::from_str(&reply).unwrap_or_default();
-        if status == 200 && reply["ok"] == true {
-            return Ok(());
-        }
-        Err(reply["error"].as_str().unwrap_or("It didn't accept the request.").to_string())
-    }
-}
-
-/// What matters here in the other device's `/api/local`.
-fn read_peer(status: &Value) -> PeerLook {
-    let text = |key: &str| status[key].as_str().unwrap_or("");
-    let name = [text("device_name"), text("hostname")].into_iter().find(|n| !n.is_empty()).unwrap_or("The other device");
-    let failed = (status["update"]["state"] == "failed").then(|| status["update"]["note"].as_str().unwrap_or("").to_string());
-    PeerLook { name: name.to_string(), version: Version::parse(text("version")), failed }
 }
 
 impl Updater {
@@ -307,16 +274,15 @@ impl Devices for Updater {
 
 static UPDATER: OnceLock<Arc<Updater>> = OnceLock::new();
 
-/// Starts checking for updates. `peer_ip` is empty with no other device yet, and a change of
-/// address restarts the service, so this never needs to hear of one.
-pub fn start(peer_ip: String, trial_running: Box<dyn Fn() -> bool + Send + Sync>) {
+/// Starts checking for updates.
+pub fn start(trial_running: Box<dyn Fn() -> bool + Send + Sync>) {
     let updater = Arc::new(Updater::new(
         Store::new(store::folder()),
         trust::built_in_key(),
         running_version(),
         installer(),
         trial_running,
-        Arc::new(PeerApi(peer_ip)),
+        Arc::new(PeerApi),
     ));
     #[cfg(target_os = "windows")]
     windows::after_start(&updater);
@@ -540,14 +506,6 @@ mod tests {
         // The action has no way to name a file or a version: `answer` only ever sees its name.
         let (updater, _, _) = updater("names", FakeInstaller::default(), no_trial());
         assert_eq!(updater.answer("set_something_else", true), None);
-    }
-
-    #[test]
-    fn a_peer_reports_its_name_version_and_failure() {
-        let look = read_peer(&json!({ "device_name": "SACBOOKPRO", "version": "0.7.0", "update": { "state": "failed", "note": "No." } }));
-        assert_eq!(look, PeerLook { name: "SACBOOKPRO".into(), version: Some(v("0.7.0")), failed: Some("No.".into()) });
-        let look = read_peer(&json!({ "hostname": "laptop", "version": "0.6.1" }));
-        assert_eq!(look, PeerLook { name: "laptop".into(), version: Some(v("0.6.1")), failed: None });
     }
 
     #[test]
