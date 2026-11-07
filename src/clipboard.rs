@@ -715,7 +715,7 @@ fn age_ms(copied_at: Instant, now: Instant) -> u64 {
     now.saturating_duration_since(copied_at).as_millis() as u64
 }
 
-/// Reads what starts a copy. One with no stamp comes from an older device, and counts as just made.
+/// Reads what starts a copy. Every sender stamps it, and one with no stamp counts as just made.
 fn read_copy<R: Read>(reader: &mut R) -> Result<(u64, ClipboardPayload), String> {
     match read_frame(reader)? {
         ClipboardPayload::Stamp { age_ms } => Ok((age_ms, read_frame(reader)?)),
@@ -1166,10 +1166,10 @@ mod tests {
     #[test]
     fn a_copy_without_a_stamp_counts_as_just_made() {
         let mut wire = Vec::new();
-        write_frame(&mut wire, &ClipboardPayload::Text("old device".into())).unwrap();
+        write_frame(&mut wire, &ClipboardPayload::Text("no stamp".into())).unwrap();
         let (age, payload) = read_copy(&mut Cursor::new(wire)).unwrap();
         assert_eq!(age, 0);
-        assert!(matches!(payload, ClipboardPayload::Text(text) if text == "old device"));
+        assert!(matches!(payload, ClipboardPayload::Text(text) if text == "no stamp"));
     }
 
     #[test]

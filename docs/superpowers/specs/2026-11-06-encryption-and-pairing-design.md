@@ -220,8 +220,8 @@ Rules:
 6. A device whose current session is 10 minutes old starts a new handshake and keeps
    using the old one until the new one is confirmed.
 7. A session is dropped at 1 hour, so keys can't outlive a failing rotation for long.
-8. At most 200 handshake 1s a second reach the key operations, junk included, as each one costs
-   those. At most 50 valid ones a second are answered, counted only once one has checked out, so
+8. Each channel has its own limits. At most 200 handshake 1s a second reach the key operations,
+   junk included, as each one costs those. At most 50 valid ones a second are answered, counted only once one has checked out, so
    that junk from the peer's address can't use up real answers. A flood past 200 a second can still
    hold off real handshakes, which is the flooding the threat model leaves out.
 9. A device able to initiate that has sealed something since it last opened anything

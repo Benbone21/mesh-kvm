@@ -356,7 +356,7 @@ fn explain(e: PairError) -> String {
         PairError::Expired => "The code ran out. Show a new one.".into(),
         PairError::Unreachable(e) => format!("The other device isn't showing a code: {e}"),
         PairError::NotAccepted => {
-            "The other device didn't accept this address. Check the address saved on it, then try again. Its code is still good.".into()
+            "The other device hung up without answering. It may have a different address saved for this device, so check that, then try again. If it's still showing a code, that code is still good.".into()
         }
         PairError::Failed(e) => format!("Pairing failed: {e}"),
         PairError::Cancelled => "Pairing was cancelled.".into(),
@@ -752,8 +752,8 @@ mod tests {
         // Turned away twice, where a spent code would have closed the port on the second.
         for _ in 0..2 {
             let why = explain(enter("123456", &b, "Laptop", addr).unwrap_err());
-            assert!(why.contains("didn't accept this address"), "{why}");
-            assert!(why.contains("address saved on it"), "{why}");
+            assert!(why.contains("hung up without answering"), "{why}");
+            assert!(why.contains("different address saved for this device"), "{why}");
         }
         assert!(matches!(t.join().unwrap(), Err(PairError::Expired)));
     }
@@ -1072,7 +1072,7 @@ mod tests {
         let (b, _) = entering_side("away-b", &pb, a.listening_port().unwrap());
         b.enter_code(&code).unwrap();
         let status = wait_for(&b, "failed");
-        assert!(status["error"].as_str().unwrap().contains("didn't accept this address"), "{status}");
+        assert!(status["error"].as_str().unwrap().contains("hung up without answering"), "{status}");
         assert_eq!(state_of(&a)["state"], "showing");
         assert_eq!(code_of(&a), code);
         a.cancel();
