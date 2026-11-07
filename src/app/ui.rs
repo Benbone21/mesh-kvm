@@ -666,8 +666,9 @@ impl Window {
             }
             return;
         }
-        ui.label(format!("Paired with {}", snapshot.title(snapshot.in_order()[1])));
-        ui.label(small("Everything between these devices is encrypted."));
+        let other = snapshot.title(snapshot.in_order()[1]);
+        ui.label(format!("Paired with {other}"));
+        ui.label(small(model::paired_line(&local.secure, &other)));
         if let Some(fingerprint) = snapshot.pairing.as_ref().and_then(|p| p.fingerprint.as_deref()) {
             ui.label(small(format!("Fingerprint, the same on both: {fingerprint}")));
         }

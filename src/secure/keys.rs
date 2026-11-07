@@ -9,10 +9,20 @@ pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const FINGERPRINT_LABEL: &[u8] = b"mesh-kvm fingerprint 1";
 const FILE_VERSION: u32 = 1;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Identity {
     pub private: [u8; 32],
     pub public: [u8; 32],
+}
+
+// By hand, so that no log line or failed assert can print the private key.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("private", &format_args!("<hidden>"))
+            .field("public", &self.public)
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -197,6 +207,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_private_key() {
+        let pairing = paired();
+        let private = &pairing.identity.private;
+        for text in [format!("{:?}", pairing.identity), format!("{pairing:?}"), format!("{pairing:#?}")] {
+            assert!(text.contains("public"), "{text}");
+            assert!(!text.contains(&format!("{private:?}")), "{text}");
+            assert!(!text.contains(&format!("{private:#?}")), "{text}");
+            assert!(!text.contains(&to_hex(private)), "{text}");
+        }
     }
 
     fn paired() -> Pairing {

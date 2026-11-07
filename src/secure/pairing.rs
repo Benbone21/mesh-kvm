@@ -33,6 +33,8 @@ pub enum PairError {
     WrongCode,
     Expired,
     Unreachable(String),
+    /// The showing device hung up without a word, as its address filter does.
+    NotAccepted,
     Failed(String),
     /// The person asked for a new code, or none.
     Cancelled,
@@ -262,8 +264,9 @@ pub fn enter(code: &str, me: &Pairing, my_name: &str, target: SocketAddr) -> Res
     let _ = tcp.set_nodelay(true);
     let mut ex = Exchange { tcp, raw: Vec::new(), deadline: Instant::now() + READ_LIMIT };
     let (spake, my_spake) = spake_pair(&code, false);
-    ex.send(&my_spake).map_err(|e| failed("code exchange", e))?;
-    let their_spake = ex.recv().map_err(|e| failed("code exchange", e))?;
+    let no_reply = |e: io::Error| if closed(&e) { PairError::NotAccepted } else { failed("code exchange", e) };
+    ex.send(&my_spake).map_err(no_reply)?;
+    let their_spake = ex.recv().map_err(no_reply)?;
     let mut noise = start(me, false, &their_spake, &my_spake, spake)?;
     let mut buf = vec![0u8; 65535];
     let n = noise.write_message(&[], &mut buf).map_err(|e| failed("handshake", e))?;
@@ -323,6 +326,9 @@ struct Shared {
     problem: Option<String>,
     phase: Phase,
     error: Option<String>,
+    /// A pairing finished since this service started, and the restart that follows is yet to come.
+    /// The channels still trust whoever they started with, and that device has no say over this one.
+    repaired: bool,
     /// Which attempt is current. A thread that finds it moved on drops its result.
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
@@ -349,6 +355,9 @@ fn explain(e: PairError) -> String {
         PairError::WrongCode => "The code was wrong. Show a new code and try again.".into(),
         PairError::Expired => "The code ran out. Show a new one.".into(),
         PairError::Unreachable(e) => format!("The other device isn't showing a code: {e}"),
+        PairError::NotAccepted => {
+            "The other device didn't accept this address. Check the address saved on it, then try again. Its code is still good.".into()
+        }
         PairError::Failed(e) => format!("Pairing failed: {e}"),
         PairError::Cancelled => "Pairing was cancelled.".into(),
     }
@@ -363,6 +372,7 @@ impl PairingService {
             problem,
             phase: Phase::Idle,
             error: None,
+            repaired: false,
             generation: 0,
             cancel: None,
             thread: None,
@@ -586,6 +596,9 @@ impl PairingService {
                 if req.source() != Source::Peer {
                     return Some(reply(Err("Only the paired device can say that it unpaired.".into())));
                 }
+                if self.core.lock().repaired {
+                    return Some(reply(Err("This device has paired since then.".into())));
+                }
                 Some(reply(self.remove_peer(false)))
             }
             "pair_show" | "pair_enter" | "pair_cancel" | "unpair" => {
@@ -655,6 +668,7 @@ impl Core {
                 Ok(()) => {
                     g.me = next;
                     g.problem = None;
+                    g.repaired = true;
                     g.phase = Phase::Paired;
                     g.error = None;
                 }
@@ -735,7 +749,12 @@ mod tests {
         let (l, addr) = listener();
         let only = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
         let t = thread::spawn(move || show("123456", &a, "Desk", l, only, soon(2)));
-        assert!(enter("123456", &b, "Laptop", addr).is_err());
+        // Turned away twice, where a spent code would have closed the port on the second.
+        for _ in 0..2 {
+            let why = explain(enter("123456", &b, "Laptop", addr).unwrap_err());
+            assert!(why.contains("didn't accept this address"), "{why}");
+            assert!(why.contains("address saved on it"), "{why}");
+        }
         assert!(matches!(t.join().unwrap(), Err(PairError::Expired)));
     }
 
@@ -1012,6 +1031,51 @@ mod tests {
         assert!(loaded(&path).peer.is_none());
         assert_eq!(probe.told.load(Ordering::SeqCst), 0);
         assert_eq!(probe.restarts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_old_peers_goodbye_does_not_undo_a_new_pairing() {
+        let (pa, pb) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
+        let path = dir("repaired-a").join("pairing.json");
+        let mut paired = Pairing::fresh();
+        paired.peer = Some(PeerKey { public: [5; 32], name: "Old".into(), paired_at: 1 });
+        paired.save_to(&path).unwrap();
+        let a = PairingService::new(path.clone(), Some(paired), None, 0, hooks(&pa, LOCALHOST, false, true));
+        a.show_code().unwrap();
+        let (b, b_path) = entering_side("repaired-b", &pb, a.listening_port().unwrap());
+        b.enter_code(&code_of(&a)).unwrap();
+        wait_for(&a, "paired");
+        let new_peer = loaded(&b_path).identity.public;
+        let goodbye = || a.api(&HttpRequest::for_test("POST", "/api/local/action", PEER_UNPAIRED_BODY, Source::Peer)).unwrap();
+
+        // The channels still trust the old key until the restart.
+        assert!(goodbye().contains("\"ok\":false"));
+        assert_eq!(loaded(&path).peer.unwrap().public, new_peer);
+        assert_eq!(state_of(&a)["state"], "paired");
+
+        // A new code moves the state on, and the restart is still to come.
+        a.show_code().unwrap();
+        assert!(goodbye().contains("\"ok\":false"));
+        assert_eq!(loaded(&path).peer.unwrap().public, new_peer);
+        assert_eq!(state_of(&a)["state"], "showing");
+        a.cancel();
+        assert_eq!(pa.restarts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_device_turned_away_is_told_to_check_the_address_and_the_code_stays_good() {
+        let (pa, pb) = (Arc::new(Probe::default()), Arc::new(Probe::default()));
+        let elsewhere = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+        let (a, _) = service("away-a", &pa, elsewhere, false);
+        a.show_code().unwrap();
+        let code = code_of(&a);
+        let (b, _) = entering_side("away-b", &pb, a.listening_port().unwrap());
+        b.enter_code(&code).unwrap();
+        let status = wait_for(&b, "failed");
+        assert!(status["error"].as_str().unwrap().contains("didn't accept this address"), "{status}");
+        assert_eq!(state_of(&a)["state"], "showing");
+        assert_eq!(code_of(&a), code);
+        a.cancel();
     }
 
     #[test]

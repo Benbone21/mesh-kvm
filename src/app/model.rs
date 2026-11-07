@@ -1324,6 +1324,15 @@ pub fn merge_poll(
     }
 }
 
+/// What Settings says about a paired link, which is encrypted only once a session is up.
+pub fn paired_line(secure: &str, other: &str) -> String {
+    if secure == "encrypted" {
+        "Everything between these devices is encrypted.".to_string()
+    } else {
+        format!("Connecting to {other}.")
+    }
+}
+
 /// What to tell the person when something is wrong, or `None` when all is well.
 pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     let Some(local) = &snapshot.local else {
@@ -1337,8 +1346,9 @@ pub fn status_message(snapshot: &Snapshot) -> Option<String> {
     }
     let other = snapshot.title(snapshot.in_order()[1]);
     let link = local.link.as_ref();
-    // An older device never links, so these can't wait for the link branches below.
-    if local.old_peer {
+    // An older device never links, so these can't wait for the link branches below. A plain packet
+    // is easy to forge, so a link that works says more than one does.
+    if local.old_peer && (local.secure != "encrypted" || !local.peer_online) {
         return Some(format!(
             "{other} is running an older mesh-kvm that can't encrypt. Update it, then pair. Nothing from it is being used."
         ));
@@ -2352,6 +2362,25 @@ mod tests {
         // Paired already, and still the older device is the thing to say.
         let paired = encrypted_snapshot("connecting", true);
         assert!(status_message(&paired).unwrap().contains("older mesh-kvm that can't encrypt"));
+    }
+
+    #[test]
+    fn settings_only_says_encrypted_once_it_is() {
+        assert_eq!(paired_line("encrypted", "Laptop"), "Everything between these devices is encrypted.");
+        assert_eq!(paired_line("connecting", "Laptop"), "Connecting to Laptop.");
+    }
+
+    #[test]
+    fn a_forged_plain_packet_does_not_repaint_a_healthy_link() {
+        let old_note = |secure: &str, online: bool| {
+            let mut snap = encrypted_snapshot(secure, true);
+            snap.local.as_mut().unwrap().peer_online = online;
+            status_message(&snap).unwrap_or_default().contains("older mesh-kvm")
+        };
+        assert!(!old_note("encrypted", true));
+        assert!(old_note("encrypted", false), "the session stays after the peer goes");
+        assert!(old_note("connecting", true));
+        assert!(old_note("unpaired", true));
     }
 
     #[test]
