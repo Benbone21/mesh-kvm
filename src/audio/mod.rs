@@ -103,8 +103,23 @@ fn note_heard_back(report: packet::Report, now: Instant) {
     AUDIO_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
 }
 
+/// What the sender last heard back about the microphone stream.
+static MIC_HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false, sounding: false, ready: false });
+/// What the other device says it is losing of the microphone stream, in percent.
+pub static AUDIO_MIC_TX_LOSS: AtomicU32 = AtomicU32::new(0);
+
+fn note_mic_heard_back(report: packet::Report, now: Instant) {
+    *MIC_HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner) =
+        HeardBack { at: Some(now), playing: report.playing, sounding: report.sounding, ready: report.ready };
+    AUDIO_MIC_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
+}
+
 fn heard_back(now: Instant, within: Duration) -> HeardBack {
-    let heard = *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner);
+    heard_within(&HEARD_BACK, now, within)
+}
+
+fn heard_within(heard: &Mutex<HeardBack>, now: Instant, within: Duration) -> HeardBack {
+    let heard = *heard.lock().unwrap_or_else(PoisonError::into_inner);
     if heard.at.is_some_and(|at| now.duration_since(at) < within) {
         heard
     } else {
@@ -128,6 +143,12 @@ pub fn peer_ready(now: Instant, within: Duration) -> bool {
     heard_back(now, within).ready
 }
 
+#[allow(dead_code)] // read by the sending side's mic warning, which comes later
+/// True while the other device says it would take a microphone stream: it has somewhere to put it.
+pub fn peer_mic_ready(now: Instant, within: Duration) -> bool {
+    heard_within(&MIC_HEARD_BACK, now, within).ready
+}
+
 /// True while reports are coming from the other device at all.
 pub fn peer_reporting(now: Instant, within: Duration) -> bool {
     heard_back(now, within).at.is_some()
@@ -147,7 +168,8 @@ pub static HUB: LazyLock<Hub> = LazyLock::new(Hub::default);
 impl Hub {
     /// Hands over captured audio, at the volume chosen for sending.
     pub fn capture(&self, source: &mix::Source, samples: &mut [f32]) {
-        let volume = AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed);
+        // The send volume is for what's played here; a microphone has its own level.
+        let volume = if std::ptr::eq(source, &self.mic) { 100 } else { AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed) };
         if volume != 100 {
             let gain = volume as f32 / 100.0;
             samples.iter_mut().for_each(|sample| *sample *= gain);

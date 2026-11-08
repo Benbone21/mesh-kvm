@@ -1,9 +1,9 @@
 //! Mixes what's being sent and puts it on the wire.
 
 use super::codec::{Format, OpusEncoder, MAX_PACKET};
-use super::mix::{Activity, Limiter, Mixer};
+use super::mix::{self, Activity, Limiter, Mixer};
 use super::packet::{self, Body, Stream};
-use super::{devices, note_heard_back, note_other_version, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
+use super::{devices, note_heard_back, note_mic_heard_back, note_other_version, AUDIO_MIC_TX_LOSS, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
 use super::{CHANNELS, OPUS_FRAME, PCM_FRAME};
 use crate::secure::datagram::{Channel, Opened, OVERHEAD};
 use std::net::{SocketAddr, UdpSocket};
@@ -26,6 +26,8 @@ const QUIET_EVERY: Duration = Duration::from_millis(100);
 /// How long a capture can deliver nothing before that counts as quiet. Captures deliver nothing
 /// at all when nothing is playing.
 const QUIET_AFTER: Duration = Duration::from_millis(30);
+/// Pushed to this recently, the chime counts as playing.
+const CHIME_WITHIN: Duration = Duration::from_millis(200);
 const WAIT_WHEN_SENDING: Duration = Duration::from_millis(20);
 /// `tick` runs after this, so it stays well inside the 250 ms that handshakes go by.
 const WAIT_WHEN_IDLE: Duration = Duration::from_millis(100);
@@ -59,6 +61,7 @@ pub enum Sent {
 
 /// Turns frames of audio into numbered packets.
 pub struct Packetizer {
+    stream: Stream,
     epoch: u16,
     seq: u32,
     kbps: u32,
@@ -69,8 +72,9 @@ pub struct Packetizer {
 }
 
 impl Packetizer {
-    pub fn new(kbps: u32) -> Self {
+    pub fn new(kbps: u32, stream: Stream) -> Self {
         Self {
+            stream,
             epoch: new_epoch(),
             seq: 0,
             kbps,
@@ -79,6 +83,12 @@ impl Packetizer {
             out: Vec::with_capacity(packet::HEADER + MAX_PACKET),
             encoded: vec![0; MAX_PACKET],
         }
+    }
+
+    /// Numbers under `epoch`, so that the streams of one run share it.
+    pub fn with_epoch(mut self, epoch: u16) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// Follows the bitrate setting and the loss the other device reports.
@@ -102,7 +112,7 @@ impl Packetizer {
         }
         let Some(encoder) = self.encoder.as_mut() else { return };
         if let Some(len) = encoder.encode(pcm, &mut self.encoded) {
-            packet::write_audio(&mut self.out, Format::Opus, Stream::Sound, self.epoch, self.seq, &self.encoded[..len]);
+            packet::write_audio(&mut self.out, Format::Opus, self.stream, self.epoch, self.seq, &self.encoded[..len]);
             self.seq += 1;
             send(&self.out);
         }
@@ -115,7 +125,7 @@ impl Packetizer {
                 let value = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                 self.encoded.extend_from_slice(&value.to_le_bytes());
             }
-            packet::write_audio(&mut self.out, Format::Pcm, Stream::Sound, self.epoch, self.seq, &self.encoded);
+            packet::write_audio(&mut self.out, Format::Pcm, self.stream, self.epoch, self.seq, &self.encoded);
             self.seq += 1;
             send(&self.out);
         }
@@ -149,7 +159,7 @@ impl Packetizer {
 
     /// Says the stream is alive with nothing in it.
     pub fn quiet(&mut self, send: &mut dyn FnMut(&[u8])) {
-        packet::write_quiet(&mut self.out, Stream::Sound, self.epoch, self.seq);
+        packet::write_quiet(&mut self.out, self.stream, self.epoch, self.seq);
         send(&self.out);
     }
 }
@@ -168,8 +178,11 @@ fn read_reports(socket: &UdpSocket, target: SocketAddr, channel: &Channel, now_m
         }
         match channel.open(&buf[..len], now_ms, &mut opened) {
             Opened::Data(plain) => {
-                if let Ok(packet::Packet { body: Body::Report(report), .. }) = packet::parse(plain) {
-                    note_heard_back(report, Instant::now());
+                if let Ok(packet::Packet { stream, body: Body::Report(report), .. }) = packet::parse(plain) {
+                    match stream {
+                        Stream::Sound => note_heard_back(report, Instant::now()),
+                        Stream::Mic => note_mic_heard_back(report, Instant::now()),
+                    }
                     taken += 1;
                 }
             }
@@ -217,9 +230,9 @@ impl<'a> Wire<'a> {
 
 /// Sends one frame. `Sent::Nothing` if none of it went, as nothing else may think sound is leaving:
 /// the mute decision reads what comes of this.
-fn send_frame(packetizer: &mut Packetizer, wire: &mut Wire, pcm: &[f32]) -> Sent {
+fn send_frame(packetizer: &mut Packetizer, send: &mut dyn FnMut(&[u8]) -> bool, pcm: &[f32]) -> Sent {
     let mut went = false;
-    let sent = packetizer.frame(pcm, &mut |data| went |= wire.send(data));
+    let sent = packetizer.frame(pcm, &mut |data| went |= send(data));
     if went {
         sent
     } else {
@@ -227,16 +240,78 @@ fn send_frame(packetizer: &mut Packetizer, wire: &mut Wire, pcm: &[f32]) -> Sent
     }
 }
 
+/// One stream going out: what it mixes, and how it's doing.
+struct Outgoing {
+    packetizer: Packetizer,
+    mixer: Mixer,
+    /// Only what's played on the other device is limited; a microphone is sent as it is.
+    limiter: Option<Limiter>,
+    frame: Vec<f32>,
+    last_sent: Instant,
+    said_quiet: bool,
+}
+
+impl Outgoing {
+    fn new(packetizer: Packetizer, limiter: Option<Limiter>) -> Self {
+        Self {
+            packetizer,
+            mixer: Mixer::default(),
+            limiter,
+            frame: vec![0.0; OPUS_FRAME * CHANNELS],
+            last_sent: Instant::now(),
+            said_quiet: false,
+        }
+    }
+
+    /// Sends every frame that's due, then the quiet marker if it's time and `selected`. `framed` is
+    /// told of each frame mixed and what became of it.
+    fn pass(
+        &mut self,
+        sources: &[&mix::Source],
+        selected: bool,
+        send: &mut dyn FnMut(&[u8]) -> bool,
+        framed: &mut dyn FnMut(&[f32], Sent, Instant),
+    ) {
+        let mut now = Instant::now();
+        while self.mixer.ready(sources, now) {
+            self.mixer.mix(sources, &mut self.frame);
+            if let Some(limiter) = &mut self.limiter {
+                limiter.process(&mut self.frame);
+            }
+            let sent = send_frame(&mut self.packetizer, send, &self.frame);
+            if sent != Sent::Nothing {
+                self.last_sent = now;
+                self.said_quiet = false;
+            }
+            framed(&self.frame, sent, now);
+            now = Instant::now();
+        }
+        let wait = if self.said_quiet { QUIET_EVERY } else { QUIET_AFTER };
+        if selected && now.duration_since(self.last_sent) >= wait {
+            self.packetizer.quiet(&mut |data| {
+                send(data);
+            });
+            self.last_sent = now;
+            self.said_quiet = true;
+        }
+    }
+}
+
+/// The chime is playing: it was pushed to a moment ago.
+fn chime_playing(hub: &Hub, now: Instant) -> bool {
+    hub.chime.activity().data.is_some_and(|at| now.saturating_duration_since(at) < CHIME_WITHIN)
+}
+
 /// Runs until `stop`. Frames go out the moment a source has one, so this adds no delay of its own.
 pub fn send_loop(socket: &UdpSocket, target: SocketAddr, channel: &Channel, hub: &Hub, stop: &AtomicBool) {
     let _ = socket.set_nonblocking(true);
     let clock = Instant::now();
-    let mut packetizer = Packetizer::new(AUDIO_BITRATE_KBPS.load(Ordering::Relaxed));
-    let (mut mixer, mut limiter) = (Mixer::default(), Limiter::default());
-    let mut frame = vec![0.0f32; OPUS_FRAME * CHANNELS];
-    let mut last_sent = Instant::now();
-    let mut said_quiet = false;
-    let sources = [&hub.output, &hub.mic, &hub.chime];
+    let epoch = new_epoch();
+    let kbps = AUDIO_BITRATE_KBPS.load(Ordering::Relaxed);
+    let mut sound = Outgoing::new(Packetizer::new(kbps, Stream::Sound).with_epoch(epoch), Some(Limiter::default()));
+    let mut mic = Outgoing::new(Packetizer::new(kbps, Stream::Mic).with_epoch(epoch), None);
+    let sound_sources = [&hub.output, &hub.chime];
+    let mic_sources = [&hub.mic];
     let mut wire = Wire::new(socket, target, channel);
     while !stop.load(Ordering::Relaxed) {
         let sending = devices::sending();
@@ -247,33 +322,22 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, channel: &Channel, hub:
         channel.tick(now_ms, &mut |packet| {
             put(socket, packet, target);
         });
-        packetizer.set_quality(AUDIO_BITRATE_KBPS.load(Ordering::Relaxed), AUDIO_TX_LOSS.load(Ordering::Relaxed));
-        let mut now = Instant::now();
-        while mixer.ready(&sources, now) {
-            mixer.mix(&sources, &mut frame);
-            limiter.process(&mut frame);
-            AUDIO_TX_PEAK_PCT.store(peak_pct(&frame), Ordering::Relaxed);
-            let sent = send_frame(&mut packetizer, &mut wire, &frame);
-            if sent != Sent::Nothing {
-                last_sent = now;
-                said_quiet = false;
-            }
+        let kbps = AUDIO_BITRATE_KBPS.load(Ordering::Relaxed);
+        sound.packetizer.set_quality(kbps, AUDIO_TX_LOSS.load(Ordering::Relaxed));
+        mic.packetizer.set_quality(kbps, AUDIO_MIC_TX_LOSS.load(Ordering::Relaxed));
+        let choice = devices::choice();
+        let sound_selected = choice.output != devices::NONE || chime_playing(hub, Instant::now());
+        let mic_selected = choice.input != devices::NONE;
+        sound.pass(&sound_sources, sound_selected, &mut |data| wire.send(data), &mut |frame, sent, now| {
+            AUDIO_TX_PEAK_PCT.store(peak_pct(frame), Ordering::Relaxed);
             if sent == Sent::Sound && output_sounding(hub.output.activity(), now) {
                 AUDIO_TX_SOUND_PACKETS.fetch_add(1, Ordering::Relaxed);
             }
-            now = Instant::now();
-        }
-        let wait = if said_quiet { QUIET_EVERY } else { QUIET_AFTER };
-        if now.duration_since(last_sent) >= wait {
+        });
+        if sound.last_sent.elapsed() >= QUIET_AFTER {
             AUDIO_TX_PEAK_PCT.store(0, Ordering::Relaxed);
-            if sending {
-                packetizer.quiet(&mut |data| {
-                    wire.send(data);
-                });
-                last_sent = now;
-                said_quiet = true;
-            }
         }
+        mic.pass(&mic_sources, mic_selected, &mut |data| wire.send(data), &mut |_, _, _| {});
     }
 }
 
@@ -296,7 +360,7 @@ mod tests {
 
     #[test]
     fn opus_goes_out_one_numbered_packet_per_frame() {
-        let mut packetizer = Packetizer::new(96);
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
         for expected in 0..5 {
             let sent = collected(&mut packetizer, &tone(0.3));
             assert_eq!(sent.len(), 1);
@@ -308,7 +372,7 @@ mod tests {
 
     #[test]
     fn uncompressed_goes_out_in_two_packets_that_fit_a_frame_on_the_network() {
-        let mut packetizer = Packetizer::new(0);
+        let mut packetizer = Packetizer::new(0, Stream::Sound);
         let sent = collected(&mut packetizer, &tone(0.3));
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(|data| data.len() < 1400));
@@ -318,7 +382,7 @@ mod tests {
 
     #[test]
     fn changing_the_bitrate_carries_on_the_numbering_with_the_new_format() {
-        let mut packetizer = Packetizer::new(96);
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
         collected(&mut packetizer, &tone(0.3));
         packetizer.set_quality(0, 0);
         let sent = collected(&mut packetizer, &tone(0.3));
@@ -331,7 +395,7 @@ mod tests {
 
     #[test]
     fn silence_stops_the_packets_after_a_moment_and_sound_starts_them_at_once() {
-        let mut packetizer = Packetizer::new(96);
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
         let silence = vec![0.0; OPUS_FRAME * CHANNELS];
         for _ in 0..SILENCE_HOLD_FRAMES {
             assert_eq!(collected(&mut packetizer, &silence).len(), 1, "the tail still goes out");
@@ -344,7 +408,7 @@ mod tests {
 
     #[test]
     fn only_a_frame_with_something_in_it_counts_as_sound() {
-        let mut packetizer = Packetizer::new(96);
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
         let mut ignore = |_: &[u8]| {};
         assert_eq!(packetizer.frame(&tone(0.3), &mut ignore), Sent::Sound);
         let silence = vec![0.0; OPUS_FRAME * CHANNELS];
@@ -365,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_quiet_marker_names_the_packet_that_comes_next() {
-        let mut packetizer = Packetizer::new(96);
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
         collected(&mut packetizer, &tone(0.3));
         let mut sent = Vec::new();
         packetizer.quiet(&mut |data| sent.push(data.to_vec()));
@@ -461,14 +525,14 @@ mod tests {
 
         let (no_session, _) = paired_channels();
         let mut wire = Wire::new(&sending, target, &no_session);
-        let mut packetizer = Packetizer::new(96);
-        assert_eq!(send_frame(&mut packetizer, &mut wire, &tone(0.3)), Sent::Nothing, "dropped, as a lost packet is");
+        let mut packetizer = Packetizer::new(96, Stream::Sound);
+        assert_eq!(send_frame(&mut packetizer, &mut |data| wire.send(data), &tone(0.3)), Sent::Nothing, "dropped, as a lost packet is");
         assert_eq!(counts(), before);
         assert!(socket.recv_from(&mut [0u8; 16]).is_err());
 
         let (channel, far_end) = linked_channels();
         let mut wire = Wire::new(&sending, target, &channel);
-        assert_eq!(send_frame(&mut packetizer, &mut wire, &tone(0.3)), Sent::Sound);
+        assert_eq!(send_frame(&mut packetizer, &mut |data| wire.send(data), &tone(0.3)), Sent::Sound);
         std::thread::sleep(Duration::from_millis(10));
         let mut buf = [0u8; 2048];
         let (len, _) = socket.recv_from(&mut buf).unwrap();
@@ -478,10 +542,96 @@ mod tests {
         assert!(matches!(parse(bytes).unwrap().body, Body::Audio(Format::Opus, _)));
     }
 
+    fn report_of(stream: Stream, ready: bool) -> Vec<u8> {
+        let mut report = Vec::new();
+        packet::write_report(&mut report, stream, 1, packet::Report { ready, ..packet::Report::default() });
+        report
+    }
+
+    /// One pass of each stream over `hub`, everything that went out parsed as (stream, seq, body kind).
+    fn one_pass(hub: &Hub, sound: &mut Outgoing, mic: &mut Outgoing, sound_selected: bool, mic_selected: bool) -> Vec<(Stream, u32, bool)> {
+        let mut went: Vec<Vec<u8>> = Vec::new();
+        let mut send = |data: &[u8]| {
+            went.push(data.to_vec());
+            true
+        };
+        sound.pass(&[&hub.output, &hub.chime], sound_selected, &mut send, &mut |_, _, _| {});
+        mic.pass(&[&hub.mic], mic_selected, &mut send, &mut |_, _, _| {});
+        went.iter()
+            .map(|data| {
+                let packet = parse(data).unwrap();
+                (packet.stream, packet.seq, matches!(packet.body, Body::Audio(..)))
+            })
+            .collect()
+    }
+
+    fn streams() -> (Outgoing, Outgoing) {
+        (
+            Outgoing::new(Packetizer::new(96, Stream::Sound), Some(Limiter::default())),
+            Outgoing::new(Packetizer::new(96, Stream::Mic), None),
+        )
+    }
+
+    #[test]
+    fn mic_and_sound_go_out_as_separate_streams() {
+        let hub = Hub::default();
+        let (mut sound, mut mic) = streams();
+        hub.mic.push(&tone(0.3), &hub.signal);
+        hub.output.push(&tone(0.3), &hub.signal);
+        let went = one_pass(&hub, &mut sound, &mut mic, true, true);
+        assert_eq!(went, vec![(Stream::Sound, 0, true), (Stream::Mic, 0, true)]);
+    }
+
+    #[test]
+    fn a_mic_alone_sends_no_sound_stream() {
+        let hub = Hub::default();
+        let (mut sound, mut mic) = streams();
+        hub.mic.push(&tone(0.3), &hub.signal);
+        let went = one_pass(&hub, &mut sound, &mut mic, false, true);
+        assert_eq!(went, vec![(Stream::Mic, 0, true)]);
+        // The quiet markers: only the stream whose sources are selected speaks up.
+        std::thread::sleep(QUIET_AFTER + Duration::from_millis(20));
+        let went = one_pass(&hub, &mut sound, &mut mic, false, true);
+        assert_eq!(went, vec![(Stream::Mic, 1, false)]);
+    }
+
+    #[test]
+    fn send_volume_leaves_the_mic_alone() {
+        let _figures = figures_to_myself();
+        let before = crate::audio::AUDIO_TX_VOLUME_PCT.swap(50, Ordering::SeqCst);
+        let hub = Hub::default();
+        hub.capture(&hub.mic, &mut vec![0.5; OPUS_FRAME * CHANNELS]);
+        hub.capture(&hub.output, &mut vec![0.5; OPUS_FRAME * CHANNELS]);
+        crate::audio::AUDIO_TX_VOLUME_PCT.store(before, Ordering::SeqCst);
+        let (mut from_mic, mut from_output) = (vec![0.0; OPUS_FRAME * CHANNELS], vec![0.0; OPUS_FRAME * CHANNELS]);
+        Mixer::default().mix(&[&hub.mic], &mut from_mic);
+        Mixer::default().mix(&[&hub.output], &mut from_output);
+        assert!(from_mic.iter().all(|&sample| sample == 0.5));
+        assert!(from_output.iter().all(|&sample| sample == 0.25));
+    }
+
+    #[test]
+    fn a_mic_report_only_moves_mic_readiness() {
+        let _figures = figures_to_myself();
+        let (socket, to) = receiving();
+        let (channel, far_end) = linked_channels();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        note_heard_back(packet::Report::default(), Instant::now());
+        note_mic_heard_back(packet::Report::default(), Instant::now());
+        let within = Duration::from_secs(5);
+        assert!(!crate::audio::peer_ready(Instant::now(), within) && !crate::audio::peer_mic_ready(Instant::now(), within));
+
+        peer.send_to(&sealed(&far_end, &report_of(Stream::Mic, true)), to).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(read_reports(&socket, peer.local_addr().unwrap(), &channel, 1), 1);
+        assert!(crate::audio::peer_mic_ready(Instant::now(), within));
+        assert!(!crate::audio::peer_ready(Instant::now(), within), "the sound stream wasn't heard from");
+    }
+
     #[test]
     fn each_run_gets_its_own_epoch() {
-        let first = Packetizer::new(96).epoch;
+        let first = Packetizer::new(96, Stream::Sound).epoch;
         std::thread::sleep(Duration::from_millis(2));
-        assert_ne!(first, Packetizer::new(96).epoch);
+        assert_ne!(first, Packetizer::new(96, Stream::Sound).epoch);
     }
 }
