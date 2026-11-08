@@ -174,8 +174,14 @@ def tampering(helper, signer):
     package = f"mesh-kvm_{NEW}_amd64.deb"
 
     place(signer)
+    pairing = HOME / ".config/mesh-kvm/pairing.json"
+    paired = b'{"version":1,"private_key":"' + b"11" * 32 + b'","public_key":"' + b"22" * 32 + b'"}'
+    write_as_user(pairing, paired)
+    pairing.chmod(0o600)
     result = run(helper, [NEW], env)
     installed("a good release installs", result)
+    check("and leaves the pairing as it was, the user's own", pairing.read_bytes() == paired
+          and (pairing.stat().st_uid, pairing.stat().st_mode & 0o777) == (USER, 0o600))
     lines, _ = record()
     check("apt gets the checked copy, not the user's file", f"{CACHE}/staging/{package}" in lines["args"], lines)
     check("the copy apt gets is root's and private", lines["owner"] == "0 600", lines)

@@ -189,6 +189,16 @@ def test(setup):
         settings = folder / "layout.json"
         wait_until(settings.exists, 30)
         check("the service keeps its settings beside the exe", settings.exists())
+        pairing = folder / "pairing.json"
+        paired = wait_until(pairing.exists, 30) and pairing.read_bytes()
+        check("a fresh install starts unpaired, with its own key", bool(paired) and json.loads(paired).get("peer") is None, str(paired))
+        # As if it had been paired: the file must come through every install untouched.
+        paired = json.dumps({**json.loads(paired or b"{}"), "peer": {"public_key": "ab" * 32, "name": "Debian", "paired_at": 1}}).encode()
+        wine.run(str(installed), "--quit", timeout=60)
+        silent(10)
+        pairing.write_bytes(paired)
+        wine.start(str(installed), "--tray")
+        check("the pairing is read back", answers(90) is not None and local().get("paired") is True, str(local()))
         (folder / "autostart-disabled").unlink(missing_ok=True)
 
         # Again, over the running copy.
@@ -203,6 +213,7 @@ def test(setup):
         check("it was asked to quit, which gives back its mutes", "Quit on this device" in logged, logged[-600:])
         check("the log says when", any(line[:4].isdigit() and line[4] == "-" for line in logged.splitlines()), logged[-300:])
         check("the settings are kept", settings.exists())
+        check("the pairing is kept", pairing.read_bytes() == paired)
         st = answers(90)
         check("and it's running again", st is not None, "see wine_setup.log")
 
@@ -250,6 +261,7 @@ def test(setup):
         check("the login script is gone", not startup(), str(startup()))
         check("it's no longer among the installed apps", registry(wine) == {}, str(registry(wine)))
         check("the settings stay", settings.exists(), str(list(folder.iterdir()) if folder.exists() else None))
+        check("the pairing stays", pairing.exists() and pairing.read_bytes() == paired)
         check("downloaded updates go", not (folder / "updates").exists())
         check("nothing of it is running", not processes(), str(processes()))
 
@@ -262,6 +274,17 @@ def test(setup):
               str(list(folder.iterdir())))
         wine.run(stray_path, "--quit", timeout=60)
         check("and quits like any other", silent(10))
+
+        # Uninstalling and deleting the settings takes the pairing with them.
+        result = wine.run(again_path, "/S", "/AUTOSTART=off")
+        check("it installs again over the kept settings", result.returncode == 0 and pairing.read_bytes() == paired)
+        wine.run(str(installed), "--quit", timeout=60)
+        wine.stop_all()
+        result = wine.run(f"{windows_folder}\\uninstall.exe", "/S", "/DELETESETTINGS")
+        wait_until(lambda: not folder.exists(), 30)
+        check("an uninstall that deletes the settings finishes", result.returncode == 0, str(result.returncode))
+        check("and the pairing is gone with them", not pairing.exists() and not folder.exists(),
+              str(list(folder.iterdir()) if folder.exists() else None))
     finally:
         wine.stop_all()
         log.close()

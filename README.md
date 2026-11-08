@@ -21,7 +21,7 @@ The outputs are `target/release/mesh-kvm` for Debian and `target/x86_64-pc-windo
 
 ## Install
 
-On Windows, run `mesh-kvm-setup.exe`. It installs mesh-kvm for you only, so it needs no admin rights, into `%LOCALAPPDATA%\mesh-kvm`, where the settings are kept too. It adds a Start menu entry, and asks whether to start mesh-kvm when you sign in, which is on unless you turned it off before. If mesh-kvm is running, it's stopped first. At the end it offers to open mesh-kvm. It appears in Installed apps in Windows' settings, with its version, and is removed from there. Removing it asks whether to delete your settings as well, and keeps them unless you say yes. `mesh-kvm-setup.exe /S` installs without asking, and `/AUTOSTART=off` turns starting at sign-in off.
+On Windows, run `mesh-kvm-setup.exe`. It installs mesh-kvm for you only, so it needs no admin rights, into `%LOCALAPPDATA%\mesh-kvm`, where the settings are kept too. It adds a Start menu entry, and asks whether to start mesh-kvm when you sign in, which is on unless you turned it off before. If mesh-kvm is running, it's stopped first. At the end it offers to open mesh-kvm. It appears in Installed apps in Windows' settings, with its version, and is removed from there. Removing it asks whether to delete your settings as well, and keeps them unless you say yes. `mesh-kvm-setup.exe /S` installs without asking, and `/AUTOSTART=off` turns starting at sign-in off. `uninstall.exe /S` removes it and keeps the settings, and `/DELETESETTINGS` deletes them as well.
 
 A `mesh-kvm.exe` run from anywhere else, such as Downloads, doesn't install itself. With mesh-kvm installed, it opens the installed one's window and closes. With nothing installed, it runs as it is, and the window says to use `mesh-kvm-setup.exe` to install.
 
@@ -195,7 +195,13 @@ Your settings carry over. The first start finds the address in the `--peer` your
 
 ### Updating to the encrypted release
 
-Going from 0.7.x to the encrypted release is done by hand on both devices too, as a device still on 0.7.x can't follow the other once it encrypts. The encrypted release can't talk to older versions at all, so update both devices together and then pair them. Until they're paired each device works alone, which is why the code has to be typed on the laptop's own keyboard.
+0.8.0 is the first version that encrypts. On two devices running 0.7.2, Update both devices gets 0.8.0 onto both, but it takes a second click, and the first one ends in a message that looks like a failure:
+
+1. Click Update both devices on either device. The other device installs 0.8.0 and restarts. The device you clicked can't see it come back, because 0.8.0 only answers the device it's paired with, so its line shows Waiting for it to come back for 5 minutes.
+2. Then the line says the other device didn't come back on version 0.8.0 within 5 minutes, so this device stayed as it is, with an Update this device button. The other device is fine: it's on 0.8.0. Click Update this device.
+3. Once both are on 0.8.0, pair them, as under [Pairing](#pairing). Until then each device works alone, so type the code on the laptop's own keyboard.
+
+From 0.8.0 on, Update both devices takes one click again, over the encrypted link. Updating, by either way, keeps the pairing: `pairing.json` is left alone by the `.deb`, by `mesh-kvm-setup.exe` and by the self-update. A fresh install starts unpaired, and uninstalling on Windows and choosing to delete the settings removes the pairing too.
 
 If only one device is updated, it ignores the other's plaintext and the app says that device needs updating. The older device drops what the new one sends, as it can't read it.
 

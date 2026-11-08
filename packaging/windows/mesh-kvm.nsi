@@ -221,7 +221,14 @@ Section "Uninstall"
   Delete "$SMSTARTUP\mesh-kvm-autostart.vbs"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
 
-  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Also delete your mesh-kvm settings?$\r$\n$\r$\nThat's the other device's address, the layout of your screens, and your choices in the app. Keep them if you might install mesh-kvm again." /SD IDNO IDYES forget
+  ; /DELETESETTINGS answers yes for a silent uninstall.
+  ${un.GetParameters} $R0
+  ClearErrors
+  ${un.GetOptions} $R0 "/DELETESETTINGS" $R1
+  ${IfNot} ${Errors}
+    Goto forget
+  ${EndIf}
+  MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Also delete your mesh-kvm settings?$\r$\n$\r$\nThat's the other device's address, the pairing with it, the layout of your screens, and your choices in the app. Keep them if you might install mesh-kvm again." /SD IDNO IDYES forget
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
   Goto done

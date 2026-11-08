@@ -1577,6 +1577,7 @@ def update_checks(hooks_exe, env, log, layout):
     base = pathlib.Path(hooks_exe).read_bytes()
     first, second = as_version(base, "0.7.0"), as_version(base, "0.7.1")
     EXE_KEYS.write_pairing(str(folder / "pairing.json"), ME.public, "Debian")
+    paired = (folder / "pairing.json").read_bytes()
     installed.write_bytes(first)
     windows_path = "C:\\users\\" + folder.parent.parent.parent.name + "\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe"
     exe = Exe(windows_path, env, log)
@@ -1633,6 +1634,8 @@ def update_checks(hooks_exe, env, log, layout):
         check("the new version answers from the installed place", st is not None and st["version"] == "0.7.1", str(st and st.get("version")))
         check("the old exe stays beside it", aside.exists() and aside.read_bytes() == first)
         check("the installed file is the new one", installed.read_bytes() == second)
+        check("the swap keeps the pairing", (folder / "pairing.json").read_bytes() == paired)
+        check("and the new version is still paired", st["paired"] is True and st["secure"] != "unpaired", str((st["paired"], st["secure"])))
         check("a marker waits for it to prove itself", marker.exists())
         check("the status says it's proving", st["update"]["proving"] is True, str(st["update"]))
         reply = action("install_update")
