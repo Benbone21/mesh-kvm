@@ -20,8 +20,6 @@ const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 /// How long a new name stays on show before the polled one takes over.
 const NAME_HOLD: Duration = Duration::from_secs(3);
 const NAME_BOX_ROOM: f32 = 2.0;
-/// How long a picked device stays on show before the polled choice takes over.
-
 const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 
 /// A device's name while it is being changed.

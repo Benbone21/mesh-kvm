@@ -862,14 +862,25 @@ impl Edits {
         }
     }
 
+    // Task 7's rows read this; until then only tests do.
+    #[allow(dead_code)]
     /// Whether `key` has a value the person set that the poll hasn't shown yet.
     pub fn is_saving(&self, key: (Device, Control), polled: f64, now: Instant) -> bool {
         self.entries.get(&key).is_some_and(|e| (e.unsent || now < e.held_until) && e.value != polled)
     }
 
+    // Task 7's rows use this; `send_changes` uses `forget_sent` until then.
+    #[allow(dead_code)]
     /// Drops an edit, for a change the service refused, so the control shows the polled value again.
     pub fn forget(&mut self, key: (Device, Control)) {
         self.entries.remove(&key);
+    }
+
+    /// `forget`, but only for an edit already sent, so a newer one the person made since waits.
+    pub fn forget_sent(&mut self, key: (Device, Control)) {
+        if self.entries.get(&key).is_some_and(|e| !e.unsent) {
+            self.entries.remove(&key);
+        }
     }
 
     /// The edits ready to send. A value edited again within the gap waits, and only its latest
@@ -907,10 +918,12 @@ pub struct Picks {
 }
 
 impl Picks {
+    /// Remembers a device the person just picked.
     pub fn set(&mut self, key: (Device, DeviceRole), id: String, now: Instant) {
         self.picked.insert(key, (id, now));
     }
 
+    /// The device to show: a recent pick, else what the poll says.
     pub fn shown(&self, key: (Device, DeviceRole), polled: &str, now: Instant) -> String {
         match self.picked.get(&key) {
             Some((id, at)) if now.saturating_duration_since(*at) < PICK_HOLD => id.clone(),
@@ -1484,6 +1497,17 @@ mod tests {
         edits.forget(key);
         assert_eq!(edits.shown(key, 0.0, t), 0.0);
         assert!(edits.take_due(t).is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_sent_edit_leaves_a_newer_unsent_one() {
+        let (mut edits, t, key) = (Edits::default(), Instant::now(), (Device::Debian, Control::Autostart));
+        edits.set(key, 1.0, t);
+        edits.forget_sent(key);
+        assert_eq!(edits.shown(key, 0.0, t), 1.0, "unsent stays");
+        edits.take_due(t);
+        edits.forget_sent(key);
+        assert_eq!(edits.shown(key, 0.0, t), 0.0);
     }
 
     #[test]

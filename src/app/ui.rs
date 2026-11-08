@@ -583,7 +583,7 @@ impl Window {
 
     fn send_changes(&mut self, now: Instant) {
         for key in self.client.take_refused() {
-            self.edits.forget(key);
+            self.edits.forget_sent(key);
         }
         for ((device, control), value) in self.edits.take_due(now) {
             self.client.send_control(device, control, value);

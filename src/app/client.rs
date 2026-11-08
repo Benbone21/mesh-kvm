@@ -1,8 +1,8 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
-use super::model::{older_message, Control, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
-use crate::platform::DisplayInfo;
+use super::model::{older_message, release_route, Control, Device, DeviceStatus, LayoutState, Release, Snapshot};
 use super::pairing::PairingStatus;
+use crate::platform::DisplayInfo;
 use crate::webui::{http_call_port, http_call_port_waiting, UI_PORT};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -228,6 +228,8 @@ impl Client {
         lock(&self.shared.last_error).as_ref().map(|(m, _)| m.clone())
     }
 
+    // Task 7's rows read this; until then only tests do.
+    #[allow(dead_code)]
     /// Why the last change to one setting didn't go through, for that setting's row.
     pub fn row_error(&self, key: (Device, Control)) -> Option<String> {
         lock(&self.shared.row_errors).get(&key).map(|(m, _)| m.clone())
