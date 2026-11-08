@@ -521,6 +521,7 @@ mod tests {
     use super::super::codec::{Format, OpusEncoder, MAX_PACKET};
     use super::super::{OPUS_FRAME, PCM_FRAME, RATE};
     use super::*;
+    use super::super::packet::Stream;
 
     const FRAME: Duration = Duration::from_millis(10);
 
@@ -856,7 +857,7 @@ mod tests {
     }
 
     fn audio<'a>(epoch: u16, seq: u32, format: Format, payload: &'a [u8]) -> Packet<'a> {
-        Packet { epoch, seq, body: Body::Audio(format, payload) }
+        Packet { epoch, seq, stream: Stream::Sound, body: Body::Audio(format, payload) }
     }
 
     fn level(pcm: &[f32]) -> f32 {
@@ -929,7 +930,7 @@ mod tests {
     fn a_quiet_marker_keeps_the_stream_alive_before_any_audio() {
         let mut stream = RxStream::default();
         let t = Instant::now();
-        stream.push(&Packet { epoch: 1, seq: 0, body: Body::Quiet }, t);
+        stream.push(&Packet { epoch: 1, seq: 0, stream: Stream::Sound, body: Body::Quiet }, t);
         assert!(stream.alive(t));
         assert!(!stream.alive(t + ALIVE_FOR));
     }

@@ -2,7 +2,7 @@
 
 use super::codec::{Format, OpusEncoder, MAX_PACKET};
 use super::mix::{Activity, Limiter, Mixer};
-use super::packet::{self, Body};
+use super::packet::{self, Body, Stream};
 use super::{devices, note_heard_back, note_other_version, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
 use super::{CHANNELS, OPUS_FRAME, PCM_FRAME};
 use crate::secure::datagram::{Channel, Opened, OVERHEAD};
@@ -102,7 +102,7 @@ impl Packetizer {
         }
         let Some(encoder) = self.encoder.as_mut() else { return };
         if let Some(len) = encoder.encode(pcm, &mut self.encoded) {
-            packet::write_audio(&mut self.out, Format::Opus, self.epoch, self.seq, &self.encoded[..len]);
+            packet::write_audio(&mut self.out, Format::Opus, Stream::Sound, self.epoch, self.seq, &self.encoded[..len]);
             self.seq += 1;
             send(&self.out);
         }
@@ -115,7 +115,7 @@ impl Packetizer {
                 let value = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                 self.encoded.extend_from_slice(&value.to_le_bytes());
             }
-            packet::write_audio(&mut self.out, Format::Pcm, self.epoch, self.seq, &self.encoded);
+            packet::write_audio(&mut self.out, Format::Pcm, Stream::Sound, self.epoch, self.seq, &self.encoded);
             self.seq += 1;
             send(&self.out);
         }
@@ -149,7 +149,7 @@ impl Packetizer {
 
     /// Says the stream is alive with nothing in it.
     pub fn quiet(&mut self, send: &mut dyn FnMut(&[u8])) {
-        packet::write_quiet(&mut self.out, self.epoch, self.seq);
+        packet::write_quiet(&mut self.out, Stream::Sound, self.epoch, self.seq);
         send(&self.out);
     }
 }
@@ -375,7 +375,7 @@ mod tests {
 
     fn report() -> Vec<u8> {
         let mut report = Vec::new();
-        packet::write_report(&mut report, 1, packet::Report::default());
+        packet::write_report(&mut report, Stream::Sound, 1, packet::Report::default());
         report
     }
 

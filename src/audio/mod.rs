@@ -331,7 +331,7 @@ impl<'a> Receiver<'a> {
             (publish_received(&mut stream, now), stream.alive(now))
         };
         if let (Some(to), Some(epoch), true) = (self.last_source, self.epoch, alive) {
-            packet::write_report(&mut self.report, epoch, report);
+            packet::write_report(&mut self.report, packet::Stream::Sound, epoch, report);
             if self.channel.seal(&self.report, &mut self.sealed) {
                 let _ = self.socket.send_to(&self.sealed, to);
             }
@@ -467,7 +467,7 @@ mod tests {
 
     fn audio_packet() -> Vec<u8> {
         let mut out = Vec::new();
-        packet::write_audio(&mut out, codec::Format::Opus, 1, 0, &[0xfc, 0xff, 0xfe]);
+        packet::write_audio(&mut out, codec::Format::Opus, packet::Stream::Sound, 1, 0, &[0xfc, 0xff, 0xfe]);
         out
     }
 
@@ -642,7 +642,7 @@ mod tests {
         let data = audio_packet();
         stream.push(&packet::parse(&data).unwrap(), t);
         let mut late = audio_packet();
-        late[8..12].copy_from_slice(&100u32.to_le_bytes());
+        late[9..13].copy_from_slice(&100u32.to_le_bytes());
         stream.report(true);
         stream.push(&packet::parse(&late).unwrap(), t);
         publish_received(&mut stream, t);
