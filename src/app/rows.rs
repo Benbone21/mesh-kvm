@@ -1,11 +1,13 @@
 //! The settings table as plain values: each row's label and what each device's cell says and
 //! does. No egui types in here, only `Tone`.
 
+use super::ui::UI_SCALES;
 use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutState, Picks, Placement, Snapshot};
 use super::theme::Tone;
 use super::view::fit_name;
 use crate::audio::BITRATES;
 use crate::platform::{DisplayInfo, DisplayMode};
+use crate::webui::UNKNOWN_ADDRESS;
 use std::ops::RangeInclusive;
 use std::time::Instant;
 
@@ -14,6 +16,10 @@ pub const MAX_POINTER_SPEED: f64 = 2.0;
 pub const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 pub const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 const WAIT_FOR_SCREEN: &str = "Wait for the screen change to finish.";
+const NAME_TIP: &str = "Type here to rename this device. Leave it empty to use its network name.";
+const MAIN_NEEDS_LINK: &str = "The main device can be chosen while the devices are linked and on the same version.";
+const ADDRESS_PINNED: &str = "How mesh-kvm starts on this device sets the address, so it can't be changed here.";
+const NO_LAYOUT: &str = "The layout shows up once mesh-kvm is running on this device.";
 const DROPDOWN: &str = " \u{25be}";
 
 /// A heading in the settings table.
@@ -61,6 +67,8 @@ pub struct GroupRows {
 pub struct Note {
     pub text: String,
     pub tone: Tone,
+    /// More detail, for the person to hover over the note for.
+    pub tooltip: Option<String>,
 }
 
 /// One setting, with this device's cell first.
@@ -185,7 +193,7 @@ pub struct RowsInput<'a> {
 /// Every group's rows, in `ORDER`.
 pub fn groups(input: &RowsInput) -> Vec<GroupRows> {
     let rows = Rows { input, order: input.snapshot.in_order() };
-    vec![rows.input_group(), rows.screens(), rows.clipboard(), rows.audio(), rows.games(), rows.startup()]
+    vec![rows.input_group(), rows.screens(), rows.clipboard(), rows.audio(), rows.games(), rows.startup(), rows.both_devices(), rows.updates()]
 }
 
 /// The rows of each group, worked out from one input.
@@ -248,7 +256,7 @@ impl Rows<'_, '_> {
     }
 
     fn note(&self, device: Device, text: &str, tone: Tone) -> Note {
-        Note { text: format!("{}: {text}", self.input.snapshot.title(device)), tone }
+        Note { text: format!("{}: {text}", self.input.snapshot.title(device)), tone, tooltip: None }
     }
 
     fn input_group(&self) -> GroupRows {
@@ -447,6 +455,176 @@ impl Rows<'_, '_> {
         GroupRows { group: Group::Games, rows, notes }
     }
 
+    /// What both devices share: their names, how they find each other, and the app itself.
+    fn both_devices(&self) -> GroupRows {
+        let mut rows = vec![self.name_row(), self.main_row(), self.address_row(), self.position_row()];
+        rows.extend(self.edge_push_row());
+        rows.extend(self.real_sizes_row());
+        let mut notes = Vec::new();
+        rows.extend(self.pairing_row(&mut notes));
+        rows.push(self.app_size_row());
+        notes.extend(self.link_notes());
+        GroupRows { group: Group::BothDevices, rows, notes }
+    }
+
+    fn name_row(&self) -> Row {
+        self.row("Name", |device, _| {
+            Cell { tooltip: Some(NAME_TIP.into()), ..Cell::new(self.input.snapshot.title(device), Tone::Text, CellKind::Name) }
+        })
+    }
+
+    fn main_row(&self) -> Row {
+        let main = self.input.snapshot.main_device();
+        let row = self.row("Main device", |device, _| {
+            if main == Some(device) {
+                return Cell::new("MAIN".into(), Tone::Accent, CellKind::Plain);
+            }
+            let cell = action("Make main", Tone::Dim, ActionKind::MakeMain);
+            if !self.input.on.main_device {
+                cell.read_only(MAIN_NEEDS_LINK)
+            } else if self.input.main_changing {
+                Cell { value: "Changing\u{2026}".into(), saving: true, ..cell }
+            } else {
+                cell
+            }
+        });
+        Row { error: self.input.main_error.map(str::to_string), ..row }
+    }
+
+    /// This device's own address, and the one it has for the other device.
+    fn address_row(&self) -> Row {
+        let local = self.status(self.order[0]);
+        let this = local.map_or_else(Cell::blank, |s| Cell::new(s.ip.clone(), Tone::Text, CellKind::Plain));
+        let other = local.map_or_else(Cell::blank, |s| {
+            let known = !s.peer_ip.is_empty() && s.peer_ip != UNKNOWN_ADDRESS;
+            let cell = if known {
+                action(&s.peer_ip, Tone::Text, ActionKind::ChangeAddress)
+            } else {
+                action("Not set", Tone::Warn, ActionKind::ChangeAddress)
+            };
+            if s.peer_pinned { cell.read_only(ADDRESS_PINNED) } else { cell }
+        });
+        Row { label: "Address".into(), cells: [this, other], error: None }
+    }
+
+    fn layout_config(&self) -> Option<&model::LayoutConfig> {
+        self.input.layout.map(|l| &l.config)
+    }
+
+    /// Where the Windows device sits against the Debian one, which only the Debian screens decide.
+    fn position_row(&self) -> Row {
+        let snapshot = self.input.snapshot;
+        let label = format!("Where {} sits", snapshot.name(Device::Windows));
+        let cell = match self.layout_config() {
+            Some(cfg) => {
+                let placements = model::placements(cfg, snapshot.displays(Device::Debian));
+                let selected = model::position_label(cfg, &placements);
+                let options = placements
+                    .into_iter()
+                    .map(|place| Choice { label: place.label.clone(), selected: place.label == selected, value: ChoiceValue::Placement(place) })
+                    .collect();
+                Cell::new(format!("{selected}{DROPDOWN}"), Tone::Text, CellKind::Dropdown { pick: Pick::Placement, options })
+            }
+            None => Cell::new("Not available".into(), Tone::Text, CellKind::Plain).read_only(NO_LAYOUT),
+        };
+        Row { label, cells: [cell, Cell::blank()], error: None }
+    }
+
+    fn edge_push_row(&self) -> Option<Row> {
+        let push = f64::from(self.layout_config()?.edge_resistance);
+        let kind = CellKind::Number { setting: Setting::EdgePush, value: push, range: 10.0..=180.0, step: 5.0 };
+        let cell = Cell::new(format!("{push:.0}"), Tone::Text, kind);
+        Some(Row { label: "Push needed to cross".into(), cells: [cell, Cell::blank()], error: None })
+    }
+
+    fn real_sizes_row(&self) -> Option<Row> {
+        self.layout_config().filter(|cfg| cfg.has_custom_size())?;
+        let cell = action("Reset", Tone::Text, ActionKind::ResetSizes);
+        Some(Row { label: "Use the real screen sizes".into(), cells: [cell, Cell::blank()], error: None })
+    }
+
+    /// Whether the devices are paired. A service that doesn't encrypt has nothing here. A
+    /// pairing still connecting adds its line to `notes`.
+    fn pairing_row(&self, notes: &mut Vec<Note>) -> Option<Row> {
+        let here = self.order[0];
+        let local = self.status(here).filter(|l| !l.secure.is_empty())?;
+        let cells = match local.secure.as_str() {
+            "encrypted" | "connecting" => {
+                let other = self.input.snapshot.name(self.order[1]);
+                if local.secure == "connecting" {
+                    notes.push(self.note(here, &model::paired_line(&local.secure, &other), Tone::Dim));
+                }
+                let fingerprint = self.input.snapshot.pairing.as_ref().and_then(|p| p.fingerprint.clone());
+                let print = match fingerprint {
+                    Some(print) => Cell::new(print, Tone::Text, CellKind::Plain),
+                    None => Cell::new("--".into(), Tone::Dim, CellKind::Plain),
+                };
+                let unpair = if self.input.unpairing {
+                    Cell { saving: true, ..action("Unpairing\u{2026}", Tone::Text, ActionKind::Unpair) }
+                } else {
+                    action("Unpair", Tone::Text, ActionKind::Unpair)
+                };
+                return Some(Row { label: "Paired, fingerprint".into(), cells: [print, unpair], error: None });
+            }
+            _ => [action("Pair", Tone::Accent, ActionKind::Pair), Cell::blank()],
+        };
+        Some(Row { label: "Not paired".into(), cells, error: None })
+    }
+
+    fn app_size_row(&self) -> Row {
+        let percent = |scale: f32| format!("{:.0}%", scale * 100.0);
+        let options = UI_SCALES
+            .iter()
+            .map(|&scale| Choice { label: percent(scale), value: ChoiceValue::Scale(scale), selected: scale == self.input.ui_scale })
+            .collect();
+        let kind = CellKind::Dropdown { pick: Pick::UiScale, options };
+        let cell = Cell {
+            tooltip: Some("Ctrl and plus or minus do the same.".into()),
+            ..Cell::new(format!("{}{DROPDOWN}", percent(self.input.ui_scale)), Tone::Text, kind)
+        };
+        Row { label: "App size".into(), cells: [cell, Cell::blank()], error: None }
+    }
+
+    /// How the link looks from each device, when that says something.
+    fn link_notes(&self) -> Vec<Note> {
+        let mut notes = Vec::new();
+        for device in self.order {
+            let Some(status) = self.status(device) else { continue };
+            let Some((text, poor)) = model::link_line(status, &self.input.snapshot.name(device.other())) else { continue };
+            let detail = status.link.as_ref().filter(|l| l.measured && status.peer_online).map(model::link_detail);
+            notes.push(Note { tooltip: detail, ..self.note(device, &text, if poor { Tone::Warn } else { Tone::Dim }) });
+        }
+        notes
+    }
+
+    fn updates(&self) -> GroupRows {
+        let version = self.row("Version", |_, s| {
+            let current = s.update.as_ref().map(|u| u.current.as_str()).filter(|v| !v.is_empty());
+            Cell::new(current.unwrap_or(&s.version).to_string(), Tone::Text, CellKind::Plain)
+        });
+        let check = Row {
+            label: "Check for updates".into(),
+            cells: [self.this_device_only(|s| s.update.is_some(), || action("Check now", Tone::Text, ActionKind::CheckUpdate)), Cell::blank()],
+            error: None,
+        };
+        let licences = Row {
+            label: "Licences".into(),
+            cells: [self.this_device_only(|_| true, || action("Show", Tone::Text, ActionKind::ShowLicences)), Cell::blank()],
+            error: None,
+        };
+        let mut notes = Vec::new();
+        for device in self.order {
+            let note = self.status(device).and_then(|s| s.update.as_ref()).and_then(|u| u.note.as_deref());
+            notes.extend(note.map(|text| self.note(device, text, Tone::Dim)));
+        }
+        GroupRows { group: Group::Updates, rows: vec![version, check, licences], notes }
+    }
+
+    /// A cell for this device alone, blank when its service is not answering or `when` says no.
+    fn this_device_only(&self, when: impl Fn(&DeviceStatus) -> bool, cell: impl Fn() -> Cell) -> Cell {
+        self.status(self.order[0]).filter(|s| when(s)).map_or_else(Cell::blank, |_| cell())
+    }
+
     fn startup(&self) -> GroupRows {
         let rows = vec![self.control_row("Start when this device boots", Control::Autostart, |d, s| self.toggle(d, s, Control::Autostart))];
         GroupRows { group: Group::Startup, rows, notes: Vec::new() }
@@ -504,6 +682,7 @@ mod tests {
     use super::*;
     use crate::app::fixtures::*;
     use crate::app::model::{Device::*, Sharing};
+    use crate::app::pairing::PairingStatus;
 
     fn input(snapshot: &Snapshot) -> RowsInput<'_> {
         RowsInput {
@@ -540,7 +719,7 @@ mod tests {
     #[test]
     fn every_device_setting_has_a_row_in_the_boards_order() {
         let g = groups(&input(&linked()));
-        assert_eq!(g.iter().map(|g| g.group).collect::<Vec<_>>(), ORDER[..6]);
+        assert_eq!(g.iter().map(|g| g.group).collect::<Vec<_>>(), ORDER);
         assert_eq!(labels(&g, Group::Input), ["Share mouse", "Share keyboard", "Pointer speed on the other device"]);
         assert_eq!(labels(&g, Group::Clipboard), ["Send clipboard", "Receive clipboard"]);
         assert_eq!(labels(&g, Group::Audio), [
@@ -667,7 +846,7 @@ mod tests {
                 assert_eq!(r.cells[1], Cell::blank(), "{}", r.label);
             }
         }
-        let note = Note { text: "windows-host: Update mesh-kvm on it before its audio can be changed here.".into(), tone: Tone::Dim };
+        let note = Note { text: "windows-host: Update mesh-kvm on it before its audio can be changed here.".into(), tone: Tone::Dim, tooltip: None };
         assert!(notes(&g, Group::Audio).contains(&note));
     }
 
@@ -771,10 +950,10 @@ mod tests {
         s.local.as_mut().unwrap().audio.tx_enabled = true;
         s.local.as_mut().unwrap().audio.notes = vec!["The output to send is missing.".into()];
         let g = groups(&input(&s));
-        assert_eq!(notes(&g, Group::Clipboard), [Note { text: "windows-host: Couldn't read the clipboard".into(), tone: Tone::Warn }]);
+        assert_eq!(notes(&g, Group::Clipboard), [Note { text: "windows-host: Couldn't read the clipboard".into(), tone: Tone::Warn, tooltip: None }]);
         assert_eq!(notes(&g, Group::Audio), [
-            Note { text: "debian-host: The output to send is missing.".into(), tone: Tone::Warn },
-            Note { text: "debian-host: Not reaching windows-host yet.".into(), tone: Tone::Dim },
+            Note { text: "debian-host: The output to send is missing.".into(), tone: Tone::Warn, tooltip: None },
+            Note { text: "debian-host: Not reaching windows-host yet.".into(), tone: Tone::Dim, tooltip: None },
         ]);
     }
 
@@ -796,7 +975,7 @@ mod tests {
     fn the_game_lock_hint_is_a_note_for_this_device() {
         let mut s = linked();
         s.layout.as_mut().unwrap().telemetry.game_captive_active = true;
-        assert_eq!(notes(&groups(&input(&s)), Group::Games), [Note { text: "debian-host: The mouse is being held on this screen.".into(), tone: Tone::Dim }]);
+        assert_eq!(notes(&groups(&input(&s)), Group::Games), [Note { text: "debian-host: The mouse is being held on this screen.".into(), tone: Tone::Dim, tooltip: None }]);
     }
 
     #[test]
@@ -815,5 +994,186 @@ mod tests {
         assert_eq!(keyboard.cells[1].value, "ON");
         assert_eq!(keyboard.error.as_deref(), Some(refused));
         assert_eq!(row(&g, "Share mouse").error, None);
+    }
+
+    #[test]
+    fn every_setting_has_a_row() {
+        let mut s = secure(linked(), "encrypted");
+        s.pairing = Some(PairingStatus { state: "paired".into(), fingerprint: Some("4F2A-91C3".into()), ..Default::default() });
+        let g = groups(&input(&s));
+        assert_eq!(g.iter().map(|g| g.group).collect::<Vec<_>>(), ORDER);
+        assert_eq!(
+            labels(&g, Group::BothDevices),
+            ["Name", "Main device", "Address", "Where windows-host sits", "Push needed to cross", "Paired, fingerprint", "App size"]
+        );
+        assert_eq!(labels(&g, Group::Updates), ["Version", "Check for updates", "Licences"]);
+        let paired = row(&g, "Paired, fingerprint");
+        assert_eq!((paired.cells[0].value.as_str(), paired.cells[1].value.as_str()), ("4F2A-91C3", "Unpair"));
+        let name = row(&g, "Name");
+        assert_eq!(values(name), ["debian-host", "windows-host"]);
+        assert!(name.cells.iter().all(|c| c.kind == CellKind::Name && c.tooltip.as_deref().is_some_and(|t| t.starts_with("Type here to rename"))));
+        let push = row(&g, "Push needed to cross");
+        assert_eq!(push.cells[0].kind, CellKind::Number { setting: Setting::EdgePush, value: 55.0, range: 10.0..=180.0, step: 5.0 });
+        assert_eq!(push.cells[1].kind, CellKind::Blank);
+        let size = row(&g, "App size");
+        assert_eq!(size.cells[0].value, format!("100%{DROPDOWN}"));
+        assert_eq!(size.cells[0].tooltip.as_deref(), Some("Ctrl and plus or minus do the same."));
+        let CellKind::Dropdown { options, .. } = &size.cells[0].kind else { panic!("{:?}", size.cells[0].kind) };
+        assert_eq!(options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), ["80%", "90%", "100%", "110%", "125%", "140%", "150%"]);
+        assert_eq!(options.iter().filter(|o| o.selected).count(), 1);
+        let place = row(&g, "Where windows-host sits");
+        let CellKind::Dropdown { pick: Pick::Placement, options } = &place.cells[0].kind else { panic!("{:?}", place.cells[0].kind) };
+        assert!(options.iter().any(|o| o.selected), "{options:?}");
+        assert_eq!(place.cells[1].kind, CellKind::Blank);
+    }
+
+    #[test]
+    fn without_a_layout_the_position_is_not_available() {
+        let mut s = linked();
+        s.layout = None;
+        let g = groups(&input(&s));
+        let place = row(&g, "Where windows-host sits");
+        assert_eq!(place.cells[0].value, "Not available");
+        assert_eq!(place.cells[0].read_only.as_deref(), Some("The layout shows up once mesh-kvm is running on this device."));
+        assert!(!labels(&g, Group::BothDevices).contains(&"Push needed to cross".to_string()));
+    }
+
+    #[test]
+    fn unpaired_offers_pair_with_the_other_column_empty() {
+        let g = groups(&input(&secure(unpaired(), "unpaired")));
+        let r = row(&g, "Not paired");
+        assert!(matches!(r.cells[0].kind, CellKind::Action(ActionKind::Pair)));
+        assert_eq!(r.cells[0].tone, Tone::Accent);
+        assert!(matches!(r.cells[1].kind, CellKind::Blank));
+    }
+
+    #[test]
+    fn a_pairing_that_is_connecting_says_so_and_unpairing_shows_progress() {
+        let mut s = secure(linked(), "connecting");
+        let mut i = input(&s);
+        let g = groups(&i);
+        let r = row(&g, "Paired, fingerprint");
+        assert_eq!((r.cells[0].value.as_str(), r.cells[0].tone), ("--", Tone::Dim));
+        assert_eq!(notes(&g, Group::BothDevices)[0].text, "debian-host: Connecting to windows-host.");
+        i.unpairing = true;
+        let g = groups(&i);
+        let unpair = &row(&g, "Paired, fingerprint").cells[1];
+        assert_eq!((unpair.value.as_str(), unpair.saving), ("Unpairing\u{2026}", true));
+        s.local.as_mut().unwrap().secure = "encrypted".into();
+        assert!(notes(&groups(&input(&s)), Group::BothDevices).is_empty());
+    }
+
+    #[test]
+    fn the_main_device_reads_main_and_the_other_can_be_made_main() {
+        let mut s = linked();
+        s.local.as_mut().unwrap().main_device = 0;
+        s.peer.as_mut().unwrap().main_device = 0;
+        let g = groups(&input(&s));
+        let main = row(&g, "Main device");
+        assert_eq!((main.cells[0].value.as_str(), main.cells[0].tone), ("MAIN", Tone::Accent));
+        assert_eq!((main.cells[1].value.as_str(), main.cells[1].tone), ("Make main", Tone::Dim));
+        assert!(matches!(main.cells[1].kind, CellKind::Action(ActionKind::MakeMain)));
+        assert_eq!(main.cells[1].read_only, None);
+        assert_eq!(main.error, None);
+
+        let mut i = input(&s);
+        i.main_changing = true;
+        i.main_error = Some("It didn't take.");
+        let g = groups(&i);
+        let main = row(&g, "Main device");
+        assert_eq!((main.cells[1].value.as_str(), main.cells[1].saving), ("Changing\u{2026}", true));
+        assert_eq!(main.error.as_deref(), Some("It didn't take."));
+
+        s.peer = None;
+        s.local.as_mut().unwrap().peer_online = false;
+        let g = groups(&input(&s));
+        let why = "The main device can be chosen while the devices are linked and on the same version.";
+        assert!(row(&g, "Main device").cells.iter().all(|c| c.read_only.as_deref().is_none_or(|r| r == why)));
+        let mut s = linked();
+        s.layout.as_mut().unwrap().telemetry.peer_online = false;
+        assert_eq!(row(&groups(&input(&s)), "Main device").cells[1].read_only.as_deref(), Some(why));
+    }
+
+    #[test]
+    fn a_missing_address_says_not_set_and_a_pinned_one_says_why() {
+        let mut s = linked();
+        s.local.as_mut().unwrap().peer_ip = "192.168.8.9".into();
+        let r = groups(&input(&s));
+        let address = row(&r, "Address");
+        assert_eq!(values(address), ["192.168.8.2", "192.168.8.9"]);
+        assert!(matches!(address.cells[1].kind, CellKind::Action(ActionKind::ChangeAddress)));
+        assert_eq!(address.cells[1].read_only, None);
+
+        for missing in ["", UNKNOWN_ADDRESS] {
+            s.local.as_mut().unwrap().peer_ip = missing.into();
+            let g = groups(&input(&s));
+            let cell = &row(&g, "Address").cells[1];
+            assert_eq!((cell.value.as_str(), cell.tone), ("Not set", Tone::Warn));
+        }
+        s.local.as_mut().unwrap().peer_pinned = true;
+        let g = groups(&input(&s));
+        let why = "How mesh-kvm starts on this device sets the address, so it can't be changed here.";
+        assert_eq!(row(&g, "Address").cells[1].read_only.as_deref(), Some(why));
+    }
+
+    #[test]
+    fn custom_screen_sizes_offer_the_real_ones() {
+        let g = groups(&input(&unpaired()));
+        assert!(!labels(&g, Group::BothDevices).contains(&"Use the real screen sizes".to_string()));
+        let mut s = secure(linked(), "encrypted");
+        s.layout.as_mut().unwrap().config.devices[1].custom_size = Some((1280, 800));
+        let g = groups(&input(&s));
+        let both = labels(&g, Group::BothDevices);
+        let at = both.iter().position(|l| l == "Use the real screen sizes").expect("offered");
+        assert_eq!(both[at + 1], "Paired, fingerprint");
+        assert!(matches!(row(&g, "Use the real screen sizes").cells[0].kind, CellKind::Action(ActionKind::ResetSizes)));
+    }
+
+    #[test]
+    fn a_service_that_does_not_encrypt_has_no_pairing_row() {
+        let g = groups(&input(&linked()));
+        let both = labels(&g, Group::BothDevices);
+        assert!(!both.iter().any(|l| l.contains("aired")), "{both:?}");
+        assert_eq!(both.last().map(String::as_str), Some("App size"));
+    }
+
+    #[test]
+    fn updates_show_each_version_and_the_note() {
+        let mut s = linked();
+        let mut status = update("idle", false);
+        status.available = None;
+        status.note = Some("mesh-kvm hasn't been able to check for updates for 3 days.".into());
+        s.local.as_mut().unwrap().update = Some(status);
+        s.peer.as_mut().unwrap().version = "0.6.0".into();
+        let g = groups(&input(&s));
+        assert_eq!(values(row(&g, "Version")), ["0.7.0", "0.6.0"]);
+        let check = row(&g, "Check for updates");
+        assert!(matches!(check.cells[0].kind, CellKind::Action(ActionKind::CheckUpdate)));
+        assert_eq!(check.cells[0].value, "Check now");
+        let licences = row(&g, "Licences");
+        assert!(matches!(licences.cells[0].kind, CellKind::Action(ActionKind::ShowLicences)));
+        assert_eq!(licences.cells[0].value, "Show");
+        let texts: Vec<String> = notes(&g, Group::Updates).into_iter().map(|n| n.text).collect();
+        assert_eq!(texts, ["debian-host: mesh-kvm hasn't been able to check for updates for 3 days."]);
+    }
+
+    #[test]
+    fn the_link_line_is_a_note_with_its_detail_on_hover() {
+        let g = groups(&input(&link(linked(), 12, 0.5)));
+        let both = notes(&g, Group::BothDevices);
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert_eq!(both[0].text, "debian-host: Link: 0.5% lost, 12 ms round trip.");
+        assert_eq!(both[0].tone, Tone::Dim);
+        assert_eq!(both[0].tooltip.as_deref(), Some("Input: 0.5% lost on the way here, 0.5% on the way there."));
+
+        let g = groups(&input(&link(linked(), 300, 8.0)));
+        assert_eq!(notes(&g, Group::BothDevices)[0].tone, Tone::Warn);
+
+        let g = groups(&input(&link_down(link(linked(), 12, 0.5))));
+        let down = &notes(&g, Group::BothDevices)[0];
+        assert_eq!((down.tone, down.tooltip.as_deref()), (Tone::Warn, None));
+        assert!(down.text.starts_with("debian-host: Link is down"), "{}", down.text);
+
+        assert!(notes(&groups(&input(&linked())), Group::BothDevices).is_empty());
     }
 }

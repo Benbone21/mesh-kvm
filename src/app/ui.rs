@@ -36,7 +36,7 @@ const MODE_PROMPT_WIDTH: f32 = 420.0;
 const MODE_PROMPT_SECONDS: f32 = crate::displays::REVERT_AFTER.as_secs() as f32;
 
 /// The app size a person can choose, on top of what the window's size does by itself.
-const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.5];
+pub(super) const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.5];
 const UI_SCALE_KEY: &str = "ui_scale";
 const DEFAULT_UI_SCALE: f32 = 1.0;
 /// How far the window's own zoom has to move before it changes, so a resize doesn't flicker.
