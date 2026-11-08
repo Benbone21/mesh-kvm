@@ -46,6 +46,11 @@ const ZOOM_SLACK: f32 = 0.04;
 
 /// Opens the window and returns when it closes. `starter` is getting the service running.
 ///
+/// The window is an ordinary top-level window, so it shows in the taskbar with mesh-kvm's icon;
+/// on Wayland the panel finds that icon through the app id, which names `mesh-kvm.desktop`.
+/// Closing it ends only this process: the service keeps sharing and the tray keeps running, and
+/// the tray's Open starts a new window.
+///
 /// eframe remembers the window's size, and its place where the desktop allows that: Windows and
 /// X11 do, and Wayland leaves it to the compositor. It also keeps egui's zoom, without which the
 /// remembered size would come back divided by the zoom.
@@ -53,7 +58,8 @@ pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mesh-kvm")
-            .with_app_id("mesh-kvm")
+            .with_app_id(super::launch::APP_ID)
+            .with_taskbar(true)
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE)
             .with_icon(super::icon::egui_icon()),

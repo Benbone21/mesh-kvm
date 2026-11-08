@@ -1,5 +1,6 @@
 //! Starting mesh-kvm's own pieces: the tray and the window run as separate processes of this exe.
 
+use super::icon::ICON_SIZES;
 use super::model::ServiceStart;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
@@ -151,6 +152,9 @@ fn exec_path(exe: &str) -> String {
     }
 }
 
+/// The window's app id on Wayland, and so the name of the menu entry the panel matches it to.
+pub const APP_ID: &str = "mesh-kvm";
+
 /// A freedesktop launcher that runs `exe args`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn linux_desktop_entry(exe: &str, args: &str) -> String {
@@ -163,26 +167,31 @@ pub fn linux_desktop_entry(exe: &str, args: &str) -> String {
          Icon=mesh-kvm\n\
          Terminal=false\n\
          Categories=Utility;\n\
-         StartupWMClass=mesh-kvm\n",
+         StartupWMClass={APP_ID}\n",
         exec_path(exe)
     )
 }
 
-/// Writes the menu entry, the tray's autostart entry, and the icon under `home`. Returns the
-/// files written.
+/// Writes the menu entry, the tray's autostart entry, and the icon in each of `ICON_SIZES` under
+/// `home`. Returns the files written.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn write_linux_launchers(home: &Path, exe: &str) -> std::io::Result<Vec<PathBuf>> {
-    let files = [
+    let mut files = vec![
         (
-            home.join(".local/share/applications/mesh-kvm.desktop"),
+            home.join(format!(".local/share/applications/{APP_ID}.desktop")),
             linux_desktop_entry(exe, "--app").into_bytes(),
         ),
         (
             home.join(".config/autostart/mesh-kvm-tray.desktop"),
             linux_desktop_entry(exe, "--tray").into_bytes(),
         ),
-        (home.join(".local/share/icons/hicolor/32x32/apps/mesh-kvm.png"), super::icon::png()),
     ];
+    for size in ICON_SIZES {
+        files.push((
+            home.join(format!(".local/share/icons/hicolor/{size}x{size}/apps/mesh-kvm.png")),
+            super::icon::png_scaled(size),
+        ));
+    }
     let mut written = Vec::new();
     for (path, bytes) in files {
         if let Some(dir) = path.parent() {
@@ -820,13 +829,27 @@ mod tests {
     fn linux_launchers_are_written_under_home() {
         let home = temp("linux");
         let written = write_linux_launchers(&home, "/opt/mesh-kvm").unwrap();
-        assert_eq!(written.len(), 3);
+        assert_eq!(written.len(), 2 + ICON_SIZES.len());
         let menu = std::fs::read_to_string(home.join(".local/share/applications/mesh-kvm.desktop")).unwrap();
         assert!(menu.contains("Exec=/opt/mesh-kvm --app"));
         let tray = std::fs::read_to_string(home.join(".config/autostart/mesh-kvm-tray.desktop")).unwrap();
         assert!(tray.contains("Exec=/opt/mesh-kvm --tray"));
         let png = std::fs::read(home.join(".local/share/icons/hicolor/32x32/apps/mesh-kvm.png")).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn the_menu_entry_matches_the_windows_app_id() {
+        let home = temp("app-id");
+        write_linux_launchers(&home, "/opt/mesh-kvm").unwrap();
+        let entry = std::fs::read_to_string(home.join(format!(".local/share/applications/{APP_ID}.desktop"))).unwrap();
+        assert!(entry.contains(&format!("\nStartupWMClass={APP_ID}\n")));
+        assert!(entry.contains("\nIcon=mesh-kvm\n"));
+        for size in ICON_SIZES {
+            let png = std::fs::read(home.join(format!(".local/share/icons/hicolor/{size}x{size}/apps/mesh-kvm.png"))).unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        }
         let _ = std::fs::remove_dir_all(home);
     }
 

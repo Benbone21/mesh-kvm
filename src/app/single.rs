@@ -76,6 +76,11 @@ impl Word {
     }
 }
 
+/// True while some process holds `port`, such as a running tray.
+pub fn is_held(port: u16) -> bool {
+    TcpStream::connect_timeout(&(std::net::Ipv4Addr::LOCALHOST, port).into(), IO_TIMEOUT).is_ok()
+}
+
 /// Asks the process holding `port` to bring its window forward.
 pub fn signal_show(port: u16) {
     signal(port, Word::Show);
@@ -212,6 +217,15 @@ mod tests {
         });
         signal(port, Word::Quit);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(Word::Quit));
+    }
+
+    #[test]
+    fn a_held_port_is_seen_and_a_free_one_is_not() {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        assert!(is_held(port));
+        drop(listener);
+        assert!(!is_held(port));
     }
 
     #[test]

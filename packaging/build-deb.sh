@@ -13,7 +13,7 @@ rm -rf "$out"
 mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/mesh-kvm" "$root/usr/lib/systemd/user" "$root/usr/lib/udev/rules.d" \
     "$root/usr/share/applications" "$root/etc/xdg/autostart" \
     "$root/usr/share/polkit-1/actions" "$root/usr/share/polkit-1/rules.d" \
-    "$root/usr/share/icons/hicolor/32x32/apps" "$root/usr/share/doc/mesh-kvm"
+    "$root/usr/share/doc/mesh-kvm"
 
 install -m 755 "$exe" "$root/usr/bin/mesh-kvm"
 install -m 755 "$target/release/apply-update" "$root/usr/lib/mesh-kvm/apply-update"
@@ -36,9 +36,11 @@ sed "s|^Exec=.*mesh-kvm |Exec=/usr/bin/mesh-kvm |" "$home/.local/share/applicati
     >"$root/usr/share/applications/mesh-kvm.desktop"
 sed "s|^Exec=.*mesh-kvm |Exec=/usr/bin/mesh-kvm |" "$home/.config/autostart/mesh-kvm-tray.desktop" \
     >"$root/etc/xdg/autostart/mesh-kvm-tray.desktop"
-cp "$home/.local/share/icons/hicolor/32x32/apps/mesh-kvm.png" "$root/usr/share/icons/hicolor/32x32/apps/"
-chmod 644 "$root/usr/share/applications/mesh-kvm.desktop" "$root/etc/xdg/autostart/mesh-kvm-tray.desktop" \
-    "$root/usr/share/icons/hicolor/32x32/apps/mesh-kvm.png"
+for icon in "$home"/.local/share/icons/hicolor/*/apps/mesh-kvm.png; do
+    icon_size=$(basename "$(dirname "$(dirname "$icon")")")
+    install -D -m 644 "$icon" "$root/usr/share/icons/hicolor/$icon_size/apps/mesh-kvm.png"
+done
+chmod 644 "$root/usr/share/applications/mesh-kvm.desktop" "$root/etc/xdg/autostart/mesh-kvm-tray.desktop"
 
 find "$root" -type d -exec chmod 755 {} +
 size=$(du -sk "$root" | cut -f1)

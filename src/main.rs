@@ -206,9 +206,17 @@ fn show_box(text: &str, icon: windows_sys::Win32::UI::WindowsAndMessaging::MESSA
 }
 
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
+/// It starts the tray if none is running, so there is a way back once the window is closed.
 fn run_app_window() {
     match app::single::claim_after_handover(app::single::WINDOW_PORT) {
         app::single::Instance::AlreadyRunning => {
+            // Windows lets only the foreground process hand the foreground on, and that is this one.
+            #[cfg(target_os = "windows")]
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                    windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+                )
+            };
             app::single::signal_show(app::single::WINDOW_PORT);
             return;
         }
@@ -217,6 +225,11 @@ fn run_app_window() {
             eprintln!("Error: {}", e);
             settings::log_fatal(&e);
             std::process::exit(1);
+        }
+    }
+    if !app::single::is_held(app::single::TRAY_PORT) {
+        if let Err(e) = app::launch::spawn_self("--tray") {
+            settings::log_fatal(&format!("Couldn't start mesh-kvm --tray: {e}"));
         }
     }
     if let Err(e) = app::ui::run_window(app::launch::ServiceStarter::begin()) {

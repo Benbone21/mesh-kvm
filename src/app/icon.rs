@@ -38,25 +38,45 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.to_be_bytes());
 }
 
-/// The icon as a PNG file, for the desktop entry. The pixels are stored uncompressed.
+/// The sizes the desktop entry's icon is written in, so a panel or menu never has to blur one.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const ICON_SIZES: [u32; 5] = [32, 48, 64, 128, 256];
+
+/// The icon at its own 32px size as a PNG file.
+#[cfg(test)]
 pub fn png() -> Vec<u8> {
-    let row = (SIZE * 4) as usize;
-    let mut raw = Vec::with_capacity((row + 1) * SIZE as usize);
-    for line in rgba().chunks_exact(row) {
+    png_scaled(SIZE)
+}
+
+/// The icon at `size` by `size` as a PNG file, for the desktop entry. The pixels are stored
+/// uncompressed. Each output pixel takes the nearest pixel of the
+/// 32px picture, so the pixel art stays sharp.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn png_scaled(size: u32) -> Vec<u8> {
+    let pixels = rgba();
+    let nearest = |at: u32| ((2 * at + 1) * SIZE / (2 * size)) as usize;
+    let mut raw = Vec::with_capacity((size as usize * 4 + 1) * size as usize);
+    for y in 0..size {
         raw.push(0); // no filter
-        raw.extend_from_slice(line);
+        let line = &pixels[nearest(y) * SIZE as usize * 4..][..SIZE as usize * 4];
+        for x in 0..size {
+            raw.extend_from_slice(&line[nearest(x) * 4..][..4]);
+        }
     }
-    // zlib: header, one stored block (the raw data is far below the 64 KiB block limit), checksum.
-    let mut zlib = vec![0x78, 0x01, 0x01];
-    zlib.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-    zlib.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
-    zlib.extend_from_slice(&raw);
+    // zlib: header, stored blocks of at most 64 KiB, checksum.
+    let mut zlib = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(u16::MAX as usize).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        zlib.push(u8::from(i + 1 == blocks.len()));
+        zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
     zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
 
     let mut header = Vec::new();
-    header.extend_from_slice(&SIZE.to_be_bytes());
-    header.extend_from_slice(&SIZE.to_be_bytes());
+    header.extend_from_slice(&size.to_be_bytes());
+    header.extend_from_slice(&size.to_be_bytes());
     header.extend_from_slice(&[8, 6, 0, 0, 0]); // 8 bits, RGBA, no interlace
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     chunk(&mut png, b"IHDR", &header);
@@ -97,6 +117,15 @@ mod tests {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(&png[16..24], &[0, 0, 0, 32, 0, 0, 0, 32]);
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+    }
+
+    #[test]
+    fn a_scaled_icon_is_the_same_picture_bigger() {
+        let big = png_scaled(64);
+        assert_eq!(&big[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&big[12..16], b"IHDR");
+        assert_eq!(&big[16..24], &[0, 0, 0, 64, 0, 0, 0, 64]);
+        assert_eq!(png_scaled(32), png());
     }
 
     #[test]
