@@ -28,6 +28,9 @@ pub struct Report {
     pub playing: bool,
     /// Real sound, not silence, has lately come out of that output.
     pub sounding: bool,
+    /// Play is on there, so what arrives will be played, whether or not an output is open for it
+    /// right now.
+    pub ready: bool,
     /// How much audio the far side is holding back, in ms.
     pub buffered_ms: u16,
 }
@@ -81,7 +84,7 @@ pub fn write_report(out: &mut Vec<u8>, epoch: u16, report: Report) {
     write_header(out, KIND_REPORT, epoch, 0);
     out.extend_from_slice(&report.received.to_le_bytes());
     out.push(report.loss_percent);
-    out.push(u8::from(report.playing) | u8::from(report.sounding) << 1);
+    out.push(u8::from(report.playing) | u8::from(report.sounding) << 1 | u8::from(report.ready) << 2);
     out.extend_from_slice(&report.buffered_ms.to_le_bytes());
     out.extend_from_slice(&[0, 0]);
 }
@@ -92,6 +95,7 @@ fn read_report(body: &[u8]) -> Option<Report> {
         loss_percent: body[4],
         playing: body[5] & 1 != 0,
         sounding: body[5] & 2 != 0,
+        ready: body[5] & 4 != 0,
         buffered_ms: u16::from_le_bytes([body[6], body[7]]),
     })
 }
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn a_report_and_a_quiet_marker_survive_the_round_trip() {
-        let report = Report { received: 90_000, loss_percent: 12, playing: true, sounding: true, buffered_ms: 30 };
+        let report = Report { received: 90_000, loss_percent: 12, playing: true, sounding: true, ready: true, buffered_ms: 30 };
         let mut out = Vec::new();
         write_report(&mut out, 3, report);
         assert_eq!(parse(&out).unwrap().body, Body::Report(report));
@@ -153,6 +157,13 @@ mod tests {
         let mut out = Vec::new();
         write_report(&mut out, 3, Report { playing: true, ..Default::default() });
         assert!(matches!(parse(&out).unwrap().body, Body::Report(Report { playing: true, sounding: false, .. })));
+    }
+
+    #[test]
+    fn being_ready_to_play_is_not_the_same_as_having_an_output_open() {
+        let mut out = Vec::new();
+        write_report(&mut out, 3, Report { ready: true, ..Default::default() });
+        assert!(matches!(parse(&out).unwrap().body, Body::Report(Report { playing: false, sounding: false, ready: true, .. })));
     }
 
     #[test]
