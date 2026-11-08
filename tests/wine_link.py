@@ -73,7 +73,7 @@ INPUT_PORT = 24850
 AUDIO_PORT = 24851
 CONTROL_PORT = 24852
 AUDIO_MAGIC = b"MKAU"
-AUDIO_VERSION = 2
+AUDIO_VERSION = 3
 API_PORT = 24880
 RELEASE_EXE = "mesh-kvm-windows-x86_64.exe"
 LOCAL = f"http://127.0.0.1:{API_PORT}"
@@ -1024,7 +1024,7 @@ def audio_checks():
     check("and none of it is played", audio["rx_peak"] == 0 and audio["rx_packets"] == 0, str(audio))
 
     # What v0.6 sends is plain MKAU, and that does raise the note.
-    plain = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3]) + struct.pack("<HI", 76, 0)
+    plain = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3, 0]) + struct.pack("<HI", 76, 0)
     for _ in range(5):
         ours.sendto(plain, (LAPTOP, AUDIO_PORT))
     seen = wait_for(lambda s: s["audio"]["rx_other_version"], 5)
@@ -1054,15 +1054,15 @@ def audio_checks():
         data, sender = packets[0]
         check("in the new format", data[4] == AUDIO_VERSION, str(data[:8]))
         # Tell it the sound is reaching a speaker here, and keep a stream coming the other way.
-        report = AUDIO_MAGIC + bytes([AUDIO_VERSION, 4]) + data[6:8] + bytes(4) + struct.pack("<IBBHH", 5, 3, 1, 20, 0)
-        quiet = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3]) + struct.pack("<HI", 77, 0)
+        report = AUDIO_MAGIC + bytes([AUDIO_VERSION, 4, 0]) + data[7:9] + bytes(4) + struct.pack("<IBBHH", 5, 3, 1, 20, 0)
+        quiet = AUDIO_MAGIC + bytes([AUDIO_VERSION, 3, 0]) + struct.pack("<HI", 77, 0)
         deadline = time.time() + 4
         answered = False
         while time.time() < deadline:
             ours.sendto(peer.from_sender.seal(report), sender)
             peer.to_exe(quiet)
             while got := peer.read():
-                answered = answered or got[0][:6] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4])
+                answered = answered or got[0][:7] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4, 0])
         audio = local()["audio"]
         check("an open output on the other device counts as connected", audio["tx_connected"] is True, str(audio))
         check("but not as playing, with nothing to hear", audio["tx_reaching"] is False, str(audio))

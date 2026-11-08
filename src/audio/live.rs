@@ -62,7 +62,8 @@ fn packet_path() {
 
     let listen = UdpSocket::bind(("127.0.0.1", port)).unwrap();
     let for_receiver = Arc::clone(&stream);
-    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, SocketAddr::from(([127, 0, 0, 1], 0)), &incoming, stop));
+    let for_mic = Arc::new(Mutex::new(RxStream::default()));
+    let receiver = std::thread::spawn(move || receive_loop(&listen, &for_receiver, &for_mic, SocketAddr::from(([127, 0, 0, 1], 0)), &incoming, stop));
     AUDIO_PLAYER_LIVE.store(true, Ordering::SeqCst);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let for_sender = Arc::clone(&out);

@@ -778,6 +778,26 @@ pub fn start_playback(stream: Arc<Mutex<RxStream>>) {
     }
 }
 
+/// How often a mic with nowhere to play is drained.
+const MIC_DRAIN_TICK: Duration = Duration::from_millis(20);
+
+/// Until there is a virtual microphone to play the peer's mic on, it is drained and dropped: it is
+/// never played on the speakers.
+pub fn start_mic_playback(stream: Arc<Mutex<RxStream>>) {
+    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-mic".to_string()).spawn(move || loop {
+        super::drain_mic(&stream, MIC_DRAIN_TICK, Instant::now());
+        std::thread::sleep(MIC_DRAIN_TICK);
+    });
+    if let Err(e) = spawned {
+        crate::settings::log_note(&format!("Couldn't start the mic drain: {e}"));
+    }
+}
+
+/// Whether the peer's mic has a virtual microphone to go to here.
+pub fn virtual_mic_ready() -> bool {
+    false
+}
+
 /// Plays the test chime here, on the output chosen for received audio.
 pub fn play_chime(pcm: &[f32]) {
     use std::io::Write;
