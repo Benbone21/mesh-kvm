@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pairing, entering the code</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#c6f135}a:hover{color:#c6f135}
+</style>
+</helmet>
+<div style="width: 1280px; height: 760px; box-sizing: border-box; position: relative; overflow: hidden; display: flex; flex-direction: column; background: #0f1113; color: #e6e8ea; font-family: Inter, sans-serif; font-size: 14px">
+  <div style="border-bottom: 1px solid #2a2f34; background: #171a1d">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 12px 20px">
+      <div style="width: 10px; height: 10px; background: #ffb86b"></div>
+      <div style="flex: 1; font-size: 15px"><span style="color: #9aa3ab">Not paired.</span> Everything stays on each device.</div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid #2a2f34">
+      <sc-for list="{{stats}}" as="s" hint-placeholder-count="5">
+        <div style="padding: 10px 20px 12px; border-right: 1px solid #2a2f34">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 1px; color: #9aa3ab">{{s.label}}</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 26px; font-weight: 500; color: {{s.fg}}">{{s.value}}</div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+  <div style="flex: 1; min-height: 0; display: flex">
+    <div style="width: 700px; box-sizing: border-box; background: #171a1d; border-right: 1px solid #2a2f34"></div>
+    <div style="flex: 1; min-width: 0"></div>
+  </div>
+  <div style="position: absolute; left: 410px; top: 190px; width: 460px; box-sizing: border-box; background: #1d2125; border: 1px solid #6b747c; padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 12px">
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 1px; color: #9aa3ab">PAIR WITH DEBIAN</div>
+    <label for="code" style="line-height: 1.4">Type the code Debian is showing.</label>
+    <input id="code" value="482 917" inputmode="numeric" maxlength="7" style="box-sizing: border-box; width: 100%; background: #0f1113; color: #e6e8ea; border: 1px solid #c6f135; padding: 14px 0; text-align: center; font-family: 'JetBrains Mono', monospace; font-size: 44px; font-weight: 500; line-height: 1; letter-spacing: 4px; outline: none">
+    <div style="font-size: 13px; color: #9aa3ab; line-height: 1.4">Use this device's own keyboard. The devices can't share one until they're paired.</div>
+    <div style="color: #ff8a7a; line-height: 1.4">A wrong code can't be used again. Show a new one on Debian and try once more.</div>
+    <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px">
+      <button type="button" style="font: inherit; min-height: 40px; min-width: 96px; background: transparent; color: #e6e8ea; border: 1px solid #6b747c">Cancel</button>
+      <button type="button" style="font: inherit; min-height: 40px; min-width: 96px; background: #c6f135; color: #0f1113; border: none; font-weight: 600">Pair</button>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":760}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const none = (label) => ({ label, value: '--', fg: '#9aa3ab' });
+    return {
+      stats: [none('ROUND TRIP'), none('LOST'), none('AUDIO LOST'), none('AUDIO BUFFER'), { label: 'LINK', value: 'Not paired', fg: '#ffb86b' }]
+    };
+  }
+}
+</script>
+</body>
+</html>

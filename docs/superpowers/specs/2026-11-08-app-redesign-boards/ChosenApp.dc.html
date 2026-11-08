@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chosen app design</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#c6f135}a:hover{color:#c6f135}
+</style>
+</helmet>
+<div style="width: 1280px; height: 1200px; box-sizing: border-box; display: flex; flex-direction: column; background: #0f1113; color: #e6e8ea; font-family: Inter, sans-serif; font-size: 14px">
+  <div style="border-bottom: 1px solid #2a2f34; background: #171a1d">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 12px 20px">
+      <div style="width: 10px; height: 10px; background: #c6f135"></div>
+      <div style="flex: 1; font-size: 15px"><span style="color: #9aa3ab">Control</span> <span style="font-weight: 600">Debian</span></div>
+      <button type="button" style="font: inherit; min-height: 36px; padding: 0 12px; background: #c6f135; color: #0f1113; border: none; font-weight: 600">Switch to Laptop</button>
+      <button type="button" style="font: inherit; min-height: 36px; padding: 0 12px; background: transparent; color: #ff8a7a; border: 1px solid #ff8a7a">Release all</button>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid #2a2f34">
+      <sc-for list="{{stats}}" as="s" hint-placeholder-count="5">
+        <div style="padding: 10px 20px 12px; border-right: 1px solid #2a2f34">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 1px; color: #9aa3ab">{{s.label}}</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 26px; font-weight: 500">{{s.value}}</div>
+          <svg width="210" height="36" viewBox="0 0 210 36" aria-hidden="true" style="display: block; margin-top: 4px"><path d="{{s.path}}" fill="none" stroke="#c6f135" stroke-width="1.5"></path></svg>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+  <div style="flex: 1; min-height: 0; display: flex">
+    <div style="width: 700px; box-sizing: border-box; background: #171a1d; border-right: 1px solid #2a2f34; padding: 12px 20px">
+      <div style="display: grid; grid-template-columns: minmax(0, 1fr) 130px 130px; font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; padding-bottom: 6px; border-bottom: 1px solid #6b747c">
+        <div style="color: #9aa3ab">SETTING</div><div>DEBIAN</div><div>LAPTOP</div>
+      </div>
+      <sc-for list="{{groups}}" as="g" hint-placeholder-count="7">
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 1px; color: #9aa3ab; padding-top: 10px">{{g.name}}</div>
+        <sc-for list="{{g.rows}}" as="r" hint-placeholder-count="3">
+          <div style="display: grid; grid-template-columns: minmax(0, 1fr) 130px 130px; align-items: center; min-height: 26px; border-bottom: 1px solid #23272b">
+            <div>{{r.label}}</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: {{r.a.fg}}">{{r.a.value}}</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: {{r.b.fg}}">{{r.b.value}}</div>
+          </div>
+        </sc-for>
+      </sc-for>
+    </div>
+    <div style="flex: 1; min-width: 0; position: relative">
+      <div style="position: absolute; left: 24px; top: 20px; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 1px; color: #9aa3ab">LAYOUT</div>
+      <div style="position: absolute; left: 40px; top: 240px; width: 280px; height: 158px; box-sizing: border-box; background: #1d2125; border: 1px solid #e6e8ea; padding: 10px"><div style="font-weight: 600">Debian</div><div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #9aa3ab">DP-1 2560×1440</div></div>
+      <div style="position: absolute; left: 320px; top: 280px; width: 180px; height: 112px; box-sizing: border-box; background: #1d2125; border: 1px solid #6b747c; padding: 10px"><div style="font-weight: 600">Laptop</div><div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #9aa3ab">1920×1080</div></div>
+      <div style="position: absolute; left: 318px; top: 280px; width: 4px; height: 112px; background: #c6f135"></div>
+      <div style="position: absolute; left: 24px; top: 44px; font-size: 13px; color: #9aa3ab">Drag a screen to move it. The bright edge is where the mouse crosses.</div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1200}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const on = { value: 'ON', fg: '#c6f135' };
+    const off = { value: 'OFF', fg: '#9aa3ab' };
+    const v = (value) => ({ value, fg: '#e6e8ea' });
+    return {
+      stats: [
+        { label: 'ROUND TRIP', value: '6 ms', path: 'M0 26 L30 25 L60 27 L90 24 L110 8 L130 24 L160 26 L190 25 L210 26' },
+        { label: 'LOST', value: '0.4%', path: 'M0 30 L40 30 L70 22 L90 30 L130 30 L150 26 L170 30 L210 30' },
+        { label: 'AUDIO LOST', value: '0%', path: 'M0 32 L210 32' },
+        { label: 'AUDIO BUFFER', value: '42 ms', path: 'M0 18 L40 17 L80 19 L120 18 L160 20 L210 18' },
+        { label: 'LINK', value: 'Secure', path: 'M0 12 L210 12' }
+      ],
+      groups: [
+        { name: 'INPUT', rows: [
+          { label: 'Share mouse', a: on, b: on },
+          { label: 'Share keyboard', a: on, b: off },
+          { label: 'Pointer speed on the other device', a: v('0.35×'), b: v('1.00×') }
+        ] },
+        { name: 'SCREENS', rows: [
+          { label: 'Resolution', a: v('2560×1440 ▾'), b: v('1920×1080 ▾') },
+          { label: 'Refresh rate', a: v('144 Hz ▾'), b: v('60 Hz ▾') }
+        ] },
+        { name: 'CLIPBOARD', rows: [
+          { label: 'Send clipboard', a: on, b: on },
+          { label: 'Receive clipboard', a: on, b: on }
+        ] },
+        { name: 'AUDIO', rows: [
+          { label: 'Output to send', a: v('Default ▾'), b: v('Speakers ▾') },
+          { label: 'Microphone or line-in', a: v('None ▾'), b: v('None ▾') },
+          { label: 'Play only on the other device', a: off, b: on },
+          { label: 'Send volume', a: v('100%'), b: v('100%') },
+          { label: 'Audio quality', a: v('128 kbit/s ▾'), b: v('128 kbit/s ▾') },
+          { label: 'Play audio from the other device', a: on, b: off },
+          { label: 'Play received audio on', a: v('Headset ▾'), b: v('Speakers ▾') },
+          { label: 'Playback volume', a: v('80%'), b: v('100%') }
+        ] },
+        { name: 'GAMES', rows: [
+          { label: 'Hold the mouse while a game runs', a: on, b: on },
+          { label: 'Lock the mouse here now', a: off, b: off }
+        ] },
+        { name: 'STARTUP', rows: [
+          { label: 'Start when this device boots', a: on, b: on }
+        ] },
+        { name: 'BOTH DEVICES', rows: [
+          { label: 'Main device', a: { value: 'MAIN', fg: '#c6f135' }, b: v('') },
+          { label: 'Address', a: v('192.168.8.210'), b: v('192.168.8.241') },
+          { label: 'Where Laptop sits', a: v('Right, lower ▾'), b: v('') },
+          { label: 'Push needed to cross', a: v('55'), b: v('') },
+          { label: 'Paired, fingerprint', a: v('4F2A-91C3'), b: v('Unpair') }
+        ] }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
