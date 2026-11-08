@@ -1,7 +1,7 @@
 //! The pairing window: choose, show a code, or type one. It draws what the service last said and
 //! says what the person asked for. Talking to the service is the caller's job.
 
-use super::theme::{DEEP, EDGE, AMBER, RED};
+use super::theme::legacy::{DEEP, EDGE, AMBER, RED};
 use super::widgets::small;
 use crate::secure::pairing::CODE_SECONDS;
 use eframe::egui::{self, vec2, Align2, Frame, Margin, RichText, Sense, Stroke, Ui};

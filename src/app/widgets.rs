@@ -1,6 +1,6 @@
 //! The small controls the window is built from.
 
-use super::theme::{self, line, AMBER, AMBER_GROOVE, DEEP, DIM, EDGE, GREEN, INK, RAISED, UNLIT};
+use super::theme::{self, line, legacy::{AMBER, AMBER_GROOVE, DEEP, DIM, EDGE, GREEN, INK, RAISED, UNLIT}};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, vec2, Align2, Color32, FontId, Galley, Painter, Pos2, Rect, Response,
     RichText, Sense, StrokeKind, TextFormat, TextStyle, Ui,
@@ -14,7 +14,7 @@ const SWITCH_TRAVEL_SECONDS: f32 = 0.16;
 const DISABLED_SWITCH: f32 = 0.55;
 
 pub fn small(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(theme::SMALL_SIZE).color(DIM)
+    RichText::new(text).size(theme::legacy::SMALL_SIZE).color(DIM)
 }
 
 fn body_font(ui: &Ui) -> FontId {
@@ -29,12 +29,12 @@ pub fn fitted(painter: &Painter, text: &str, font: FontId, colour: Color32, widt
 }
 
 pub fn wide_button(ui: &mut Ui, button: egui::Button) -> Response {
-    ui.add_sized([ui.available_width(), theme::BUTTON_HEIGHT], button)
+    ui.add_sized([ui.available_width(), theme::legacy::BUTTON_HEIGHT], button)
 }
 
 fn focus_ring(ui: &Ui, response: &Response, rect: Rect) {
     if response.has_focus() {
-        ui.painter().rect_stroke(rect.expand(2.0), theme::RADIUS, line(2.0, AMBER), StrokeKind::Outside);
+        ui.painter().rect_stroke(rect.expand(2.0), theme::legacy::RADIUS, line(2.0, AMBER), StrokeKind::Outside);
     }
 }
 
@@ -65,7 +65,7 @@ pub fn slide_switch(ui: &mut Ui, rect: Rect, side: f32, knob_text: Option<&str>,
     let response = ui.interact(rect, ui.id().with("slide switch"), sense).on_hover_text(hint);
     let shade = if enabled { 1.0 } else { DISABLED_SWITCH };
     let painter = ui.painter();
-    let radius = theme::RADIUS;
+    let radius = theme::legacy::RADIUS;
     let border = if enabled && response.hovered() { INK } else { EDGE };
     painter.rect_filled(rect, radius, DEEP);
     // A shadow along the top makes the track read as a recess.
@@ -87,7 +87,7 @@ pub fn slide_switch(ui: &mut Ui, rect: Rect, side: f32, knob_text: Option<&str>,
         grooves.rect_filled(groove, 0.0, AMBER_GROOVE.gamma_multiply(shade));
     }
     if let Some(text) = knob_text {
-        let galley = fitted(painter, text, FontId::proportional(theme::SMALL_SIZE + 1.0), DEEP, knob.width() - 18.0, 1);
+        let galley = fitted(painter, text, FontId::proportional(theme::legacy::SMALL_SIZE + 1.0), DEEP, knob.width() - 18.0, 1);
         let at = knob.center() - galley.size() / 2.0;
         // Painted twice, half a pixel apart, as the bundled font has no bold.
         painter.galley(at, galley.clone(), DEEP);
@@ -102,7 +102,7 @@ pub fn toggle_row(ui: &mut Ui, label: &str, on: bool) -> Response {
     let width = ui.available_width();
     let pill = vec2(PILL_SIZE[0], PILL_SIZE[1]);
     let galley = ui.painter().layout(label.to_string(), body_font(ui), INK, (width - pill.x - 12.0).max(1.0));
-    let height = (galley.size().y + 8.0).max(theme::ROW_HEIGHT);
+    let height = (galley.size().y + 8.0).max(theme::legacy::ROW_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
@@ -165,13 +165,13 @@ pub fn meter(ui: &mut Ui, percent: u32) {
 
 /// One half of a two-way choice.
 pub fn segment(ui: &mut Ui, width: f32, label: &str, selected: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, theme::BUTTON_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, theme::legacy::BUTTON_HEIGHT), Sense::click());
     let (fill, ink) = if selected { (AMBER, DEEP) } else { (RAISED, INK) };
     let painter = ui.painter();
-    painter.rect_filled(rect, theme::SMALL_RADIUS, fill);
+    painter.rect_filled(rect, theme::legacy::SMALL_RADIUS, fill);
     let border = if response.hovered() { INK } else if selected { AMBER } else { EDGE };
-    painter.rect_stroke(rect, theme::SMALL_RADIUS, line(1.0, border), StrokeKind::Inside);
-    let galley = fitted(painter, label, FontId::proportional(theme::SMALL_SIZE + 1.0), ink, width - 12.0, 1);
+    painter.rect_stroke(rect, theme::legacy::SMALL_RADIUS, line(1.0, border), StrokeKind::Inside);
+    let galley = fitted(painter, label, FontId::proportional(theme::legacy::SMALL_SIZE + 1.0), ink, width - 12.0, 1);
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
     focus_ring(ui, &response, rect);
     response
@@ -180,8 +180,8 @@ pub fn segment(ui: &mut Ui, width: f32, label: &str, selected: bool) -> Response
 /// Text at one end of `rect`, cut to fit, with a line under it if there is a second.
 pub fn paint_name_and_state(painter: &Painter, rect: Rect, title: &str, state: &str, side: Align2) {
     let width = rect.width();
-    let title = fitted(painter, title, FontId::proportional(theme::HEADING_SIZE), INK, width, 1);
-    let state = fitted(painter, state, FontId::proportional(theme::SMALL_SIZE), DIM, width, 1);
+    let title = fitted(painter, title, FontId::proportional(theme::legacy::HEADING_SIZE), INK, width, 1);
+    let state = fitted(painter, state, FontId::proportional(theme::legacy::SMALL_SIZE), DIM, width, 1);
     let total = title.size().y + state.size().y;
     let top = rect.center().y - total / 2.0;
     let x = |size: f32| if side == Align2::LEFT_CENTER { rect.left() } else { rect.right() - size };

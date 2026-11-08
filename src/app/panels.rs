@@ -2,7 +2,7 @@
 
 use super::canvas::{Canvas, MonitorKey};
 use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutDraft, Snapshot};
-use super::theme::{self, line, AMBER, DEEP, DIM, EDGE, INK};
+use super::theme::{self, line, legacy::{AMBER, DEEP, DIM, EDGE, INK}};
 use super::widgets::{meter, slider_row, small, toggle_row, wide_button};
 use crate::audio::BITRATES;
 use crate::platform::{DisplayInfo, DisplayMode};
@@ -59,9 +59,9 @@ pub struct Shared<'a> {
 
 /// The heading of a part of a device's section.
 fn subheading(ui: &mut Ui, text: &str) {
-    ui.add_space(theme::SECTION_GAP);
-    ui.label(RichText::new(text).size(theme::BODY_SIZE + 1.0).color(DIM));
-    ui.add_space(theme::HEADING_GAP - ui.spacing().item_spacing.y);
+    ui.add_space(theme::legacy::SECTION_GAP);
+    ui.label(RichText::new(text).size(theme::legacy::BODY_SIZE + 1.0).color(DIM));
+    ui.add_space(theme::legacy::HEADING_GAP - ui.spacing().item_spacing.y);
 }
 
 impl Panels {
@@ -69,7 +69,7 @@ impl Panels {
     pub fn device(&mut self, ui: &mut Ui, device: Device, shared: &mut Shared, requests: &mut Requests) {
         self.heading(ui, device, shared, requests);
         let Some(status) = shared.snapshot.device(device) else {
-            ui.add_space(theme::HEADING_GAP);
+            ui.add_space(theme::legacy::HEADING_GAP);
             let other = !shared.snapshot.is_here(device);
             let text = if other {
                 "Its controls show up here once it's connected."
@@ -100,14 +100,14 @@ impl Panels {
         };
         // The swatch ties these controls to the same device's screens on the map.
         let swatch = theme::screen_colour(device == Device::Debian);
-        let height = theme::TITLE_SIZE + 4.0;
+        let height = theme::legacy::TITLE_SIZE + 4.0;
         let row = ui.horizontal(|ui| {
             let (mark, _) = ui.allocate_exact_size(vec2(6.0, height), Sense::hover());
             ui.painter().rect_filled(mark, 2.0, swatch);
             let width = ui.available_width() - NAME_BOX_ROOM;
             // A long name gets smaller to fit, down to what can still be read.
-            let full = ui.painter().layout_no_wrap(shown.clone(), FontId::proportional(theme::TITLE_SIZE), INK).size().x;
-            let size = (theme::TITLE_SIZE * width / full.max(1.0)).clamp(theme::SMALL_SIZE, theme::TITLE_SIZE);
+            let full = ui.painter().layout_no_wrap(shown.clone(), FontId::proportional(theme::legacy::TITLE_SIZE), INK).size().x;
+            let size = (theme::legacy::TITLE_SIZE * width / full.max(1.0)).clamp(theme::legacy::SMALL_SIZE, theme::legacy::TITLE_SIZE);
             let field = egui::TextEdit::singleline(&mut shown)
                 .id(egui::Id::new(("device name", device)))
                 .font(FontId::proportional(size))
@@ -333,7 +333,7 @@ impl DevicePanel<'_, '_> {
         }
         if self.status.audio.play_only_on_other.is_some() {
             self.audio_sent(ui);
-            ui.add_space(theme::HEADING_GAP);
+            ui.add_space(theme::legacy::HEADING_GAP);
             self.audio_received(ui);
         } else {
             // Its status has none of this, and anything shown would be made up.
@@ -447,8 +447,8 @@ pub fn device_details(status: Option<&DeviceStatus>, here: bool) -> String {
 
 /// A plain line between the two devices when they are stacked.
 pub fn device_divider(ui: &mut Ui) {
-    ui.add_space(theme::SECTION_GAP);
+    ui.add_space(theme::legacy::SECTION_GAP);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, DEEP);
-    ui.add_space(theme::SECTION_GAP);
+    ui.add_space(theme::legacy::SECTION_GAP);
 }

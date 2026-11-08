@@ -7,7 +7,7 @@ use super::launch::ServiceStarter;
 use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, Light, ModeChange, ServiceStart, Snapshot};
 use super::pairing::{self, PairingInput, PairingRequest, PairingView};
 use super::panels::{self, Panels, Requests, Shared};
-use super::theme::{self, AMBER, DEEP, INK, PANEL, RAISED, RED};
+use super::theme::{self, legacy::{AMBER, DEEP, INK, PANEL, RAISED, RED}};
 use super::updates::{self, Banner, VersionWatch};
 use super::widgets::{paint_light, paint_name_and_state, segment, slide_switch, slider_row, small};
 use crate::webui::UNKNOWN_ADDRESS;
@@ -238,7 +238,7 @@ impl Window {
 
         egui::TopBottomPanel::top("header")
             .show_separator_line(false)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(theme::MARGIN, 10)))
+            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 10)))
             .show(ctx, |ui| self.header(ui, snapshot, &on));
         let updating = self.follow_update(ctx, snapshot);
         // A device dropping out is what an update looks like, and the line above says so.
@@ -279,7 +279,7 @@ impl Window {
             .show(ctx, |ui| self.controls(ui, snapshot, &on, body.columns, now));
         let settings = egui::TopBottomPanel::bottom("arrangement settings")
             .show_separator_line(false)
-            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::MARGIN, right: theme::MARGIN, top: 0, bottom: 12 }))
+            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::legacy::MARGIN, right: theme::legacy::MARGIN, top: 0, bottom: 12 }))
             .show(ctx, |ui| self.arrangement_settings(ui, snapshot, &on, now));
         // A panel takes the height it had last frame, so a reflow needs one more frame to settle.
         let settings_height = settings.response.rect.height();
@@ -288,7 +288,7 @@ impl Window {
             ctx.request_repaint();
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::MARGIN, right: theme::MARGIN, top: theme::MARGIN, bottom: 10 }))
+            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::legacy::MARGIN, right: theme::legacy::MARGIN, top: theme::legacy::MARGIN, bottom: 10 }))
             .show(ctx, |ui| self.canvas.show(ui, &mut self.layout, snapshot, now));
 
         let first_run = model::needs_peer(snapshot);
@@ -349,9 +349,9 @@ impl Window {
         };
         let mut pressed = None;
         // A gap below keeps it apart from a notice of the same colour.
-        let frame = Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::MARGIN, 8)).outer_margin(Margin { bottom: 2, ..Default::default() });
+        let frame = Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 8)).outer_margin(Margin { bottom: 2, ..Default::default() });
         egui::TopBottomPanel::top("update").show_separator_line(false).frame(frame).show(ctx, |ui| {
-            let text_size = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x;
+            let text_size = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x;
             let gap = ui.spacing().item_spacing.x;
             let button = banner.button.map_or(0.0, |b| text_size(ui, b.label()) + 2.0 * ui.spacing().button_padding.x + gap);
             let notes = banner.notes.as_ref().map_or(0.0, |_| text_size(ui, RELEASE_NOTES) + gap);
@@ -671,8 +671,8 @@ impl Window {
         let [left, right] = snapshot.in_order();
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_HEIGHT), Sense::hover());
         // The two buttons sit at the end, and the devices and their switch share the rest.
-        let buttons = ui.painter().layout_no_wrap("Release all input".into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x
-            + ui.painter().layout_no_wrap("Settings".into(), egui::FontId::proportional(theme::BODY_SIZE), INK).size().x
+        let buttons = ui.painter().layout_no_wrap("Release all input".into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x
+            + ui.painter().layout_no_wrap("Settings".into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x
             + 4.0 * ui.spacing().button_padding.x
             + ui.spacing().item_spacing.x;
         let room = Rect::from_min_max(bar.min, Pos2::new(bar.right() - buttons - BAY_GAP, bar.bottom()));
@@ -785,7 +785,7 @@ impl Window {
 
     fn licences_window(&mut self, ctx: &egui::Context) {
         // Wide enough for the licence's own line breaks, as long as the window allows it.
-        let width = LICENCES_WIDTH.min(ctx.screen_rect().width() - 2.0 * theme::MARGIN as f32);
+        let width = LICENCES_WIDTH.min(ctx.screen_rect().width() - 2.0 * theme::legacy::MARGIN as f32);
         egui::Window::new("Licences").open(&mut self.show_licences).collapsible(false).default_width(width).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() * 0.7).show(ui, |ui| {
                 ui.label(small(crate::licenses::TEXT));
@@ -795,7 +795,7 @@ impl Window {
 
     /// Where the devices sit and which leads, under the map they belong to.
     fn arrangement_settings(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
-        let gap = theme::MARGIN as f32;
+        let gap = theme::legacy::MARGIN as f32;
         let width = ui.available_width();
         let three = width >= THREE_SETTINGS_FROM;
         let column = if three { (width - 2.0 * gap) / 3.0 } else { (width - gap) / 2.0 };
@@ -903,9 +903,9 @@ impl Window {
         let panels = &mut self.panels;
         let [first, second] = snapshot.in_order();
         ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
-            Frame::new().inner_margin(Margin::same(theme::MARGIN)).show(ui, |ui| {
+            Frame::new().inner_margin(Margin::same(theme::legacy::MARGIN)).show(ui, |ui| {
                 if columns >= 2 {
-                    let gap = 2.0 * theme::MARGIN as f32;
+                    let gap = 2.0 * theme::legacy::MARGIN as f32;
                     let width = (ui.available_width() - gap) / 2.0;
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
@@ -952,7 +952,7 @@ impl Window {
 fn notice_strip(ctx: &egui::Context, id: &'static str, fill: Color32, contents: impl FnOnce(&mut Ui)) {
     egui::TopBottomPanel::top(id)
         .show_separator_line(false)
-        .frame(Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::MARGIN, 8)))
+        .frame(Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 8)))
         .show(ctx, contents);
 }
 

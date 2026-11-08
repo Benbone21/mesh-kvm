@@ -1,0 +1,19 @@
+Fonts bundled into mesh-kvm, both under the SIL Open Font License 1.1.
+
+Inter 4.1
+  Release:  https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+  Zip SHA-256: 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
+  extras/ttf/Inter-Regular.ttf   -> Inter-Regular.ttf
+    SHA-256: 40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82
+  extras/ttf/Inter-SemiBold.ttf  -> Inter-SemiBold.ttf
+    SHA-256: 78a843fade9d4612a5567302fb595b56976eb5fcebf4fea5a5912d638bafcde3
+  LICENSE.txt                    -> Inter-OFL.txt
+
+JetBrains Mono 2.304
+  Release:  https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip
+  Zip SHA-256: 6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf
+  fonts/ttf/JetBrainsMono-Regular.ttf -> JetBrainsMono-Regular.ttf
+    SHA-256: a0bf60ef0f83c5ed4d7a75d45838548b1f6873372dfac88f71804491898d138f
+  fonts/ttf/JetBrainsMono-Medium.ttf  -> JetBrainsMono-Medium.ttf
+    SHA-256: 31c92d01a8a08528b718a43addf0ad3df0af2ca4b7b3290a452f70f358e14d3d
+  OFL.txt                             -> JetBrainsMono-OFL.txt

@@ -3,7 +3,7 @@
 //! across the room. Decisions live in `model`; this file is painting and the pointer.
 
 use super::model::{self, Device, Display, LayoutConfig, LayoutDraft, MapView, Snapshot};
-use super::theme::{self, line, AMBER, BEZEL, DIM, GLASS, INK, MAT, ON_SCREEN, RED};
+use super::theme::{self, line, legacy::{AMBER, BEZEL, DIM, GLASS, INK, MAT, ON_SCREEN, RED}};
 use super::widgets::fitted;
 use eframe::egui::{
     self, epaint::Vertex, vec2, Color32, CornerRadius, CursorIcon, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape,
@@ -64,20 +64,20 @@ impl Canvas {
 
     pub fn show(&mut self, ui: &mut Ui, draft: &mut LayoutDraft, snapshot: &Snapshot, now: Instant) {
         let (mat, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-        ui.painter().rect_filled(mat, theme::RADIUS, MAT);
-        ui.painter().rect_stroke(mat, theme::RADIUS, line(1.0, theme::mix(MAT, Color32::BLACK, 0.35)), StrokeKind::Inside);
+        ui.painter().rect_filled(mat, theme::legacy::RADIUS, MAT);
+        ui.painter().rect_stroke(mat, theme::legacy::RADIUS, line(1.0, theme::mix(MAT, Color32::BLACK, 0.35)), StrokeKind::Inside);
         self.just_selected = false;
 
         let Some(state) = &draft.state else {
             let text = "Your screens show up here once mesh-kvm is running on this device.";
-            let galley = ui.painter().layout(text.into(), FontId::proportional(theme::BODY_SIZE), DIM, mat.width() - 48.0);
+            let galley = ui.painter().layout(text.into(), FontId::proportional(theme::legacy::BODY_SIZE), DIM, mat.width() - 48.0);
             ui.painter().galley(mat.center() - galley.size() / 2.0, galley, DIM);
             return;
         };
         let cfg = state.config.clone();
         let hint = "Drag any screen to move its whole device. The mouse crosses at the amber line.";
         let hint_width = mat.width() - 2.0 * (SIDE_ROOM + 4.0);
-        let hint = fitted(ui.painter(), hint, FontId::proportional(theme::SMALL_SIZE), DIM, hint_width, 2);
+        let hint = fitted(ui.painter(), hint, FontId::proportional(theme::legacy::SMALL_SIZE), DIM, hint_width, 2);
         let inner = Rect::from_min_max(
             mat.min + vec2(SIDE_ROOM, TAG_ROOM),
             mat.max - vec2(SIDE_ROOM, TAG_ROOM + hint.size().y + HINT_GAP),
@@ -100,7 +100,7 @@ impl Canvas {
             let held = self.drag.as_ref().is_some_and(|d| d.device == *device);
             let group_hovered = rects.iter().enumerate().any(|(i, _)| ui.ctx().read_response(monitor_id(*device, i)).is_some_and(|r| r.hovered()));
             if held || group_hovered {
-                painter.rect_stroke(boxed.expand(4.0), theme::RADIUS, line(1.5, if held { AMBER } else { INK }), StrokeKind::Outside);
+                painter.rect_stroke(boxed.expand(4.0), theme::legacy::RADIUS, line(1.5, if held { AMBER } else { INK }), StrokeKind::Outside);
             }
             for m in rects {
                 let key = (*device, m.name.clone());
@@ -238,7 +238,7 @@ fn paint_monitor(
     picked: bool,
 ) {
     let bezel = (rect.width().min(rect.height()) * 0.03).clamp(2.0, 7.0);
-    painter.rect_filled(rect.shrink(0.5), CornerRadius::same(theme::SMALL_RADIUS), BEZEL);
+    painter.rect_filled(rect.shrink(0.5), CornerRadius::same(theme::legacy::SMALL_RADIUS), BEZEL);
     let screen = rect.shrink(bezel);
     let lit = theme::screen_colour(device == Device::Debian);
     let (top, bottom, ink, soft) = match screens {
@@ -251,7 +251,7 @@ fn paint_monitor(
     };
     paint_glow(painter, screen, top, bottom);
     if picked {
-        painter.rect_stroke(rect.expand(1.0), theme::SMALL_RADIUS, line(2.5, AMBER), StrokeKind::Outside);
+        painter.rect_stroke(rect.expand(1.0), theme::legacy::SMALL_RADIUS, line(2.5, AMBER), StrokeKind::Outside);
     }
 
     let width = (screen.width() - 12.0).max(1.0);
@@ -294,7 +294,7 @@ fn paint_tags(painter: &Painter, groups: &[(Device, Rect)], snapshot: &Snapshot)
         let colour = theme::screen_colour(*device == Device::Debian);
         let suffix = if snapshot.is_here(*device) { " (this device)" } else { "" };
         let text = format!("{}{suffix}", snapshot.title(*device));
-        let galley = fitted(painter, &text, FontId::proportional(theme::BODY_SIZE), colour, rect.width().max(160.0), 1);
+        let galley = fitted(painter, &text, FontId::proportional(theme::legacy::BODY_SIZE), colour, rect.width().max(160.0), 1);
         let y = if below { rect.bottom() + 6.0 } else { rect.top() - galley.size().y - 6.0 };
         painter.galley(Pos2::new(rect.left(), y), galley, colour);
     }

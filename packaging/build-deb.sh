@@ -24,6 +24,8 @@ install -m 644 99-mesh-kvm-uinput.rules "$root/usr/lib/udev/rules.d/"
 install -m 755 packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm "$root/DEBIAN/"
 install -m 644 README.md "$root/usr/share/doc/mesh-kvm/"
 install -m 644 third_party/opus/COPYING "$root/usr/share/doc/mesh-kvm/opus-COPYING"
+install -m 644 third_party/fonts/Inter-OFL.txt "$root/usr/share/doc/mesh-kvm/Inter-OFL.txt"
+install -m 644 third_party/fonts/JetBrainsMono-OFL.txt "$root/usr/share/doc/mesh-kvm/JetBrainsMono-OFL.txt"
 
 # The program writes its own launchers and icon; only their paths differ here.
 home=$out/home
