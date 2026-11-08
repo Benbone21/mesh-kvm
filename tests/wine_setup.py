@@ -26,6 +26,10 @@ import sys
 import time
 import urllib.request
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from noise_peer import Keys
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_SETUP = REPO / "target/windows/mesh-kvm-setup.exe"
 PREFIX = pathlib.Path(os.environ.get("WINE_SETUP_PREFIX", "/tmp/claude-1000/mk/setupprefix"))
@@ -190,15 +194,17 @@ def test(setup):
         wait_until(settings.exists, 30)
         check("the service keeps its settings beside the exe", settings.exists())
         pairing = folder / "pairing.json"
-        paired = wait_until(pairing.exists, 30) and pairing.read_bytes()
-        check("a fresh install starts unpaired, with its own key", bool(paired) and json.loads(paired).get("peer") is None, str(paired))
+        fresh = local()
+        check("a fresh install starts unpaired", fresh.get("secure") == "unpaired", str(fresh.get("secure")))
         # As if it had been paired: the file must come through every install untouched.
-        paired = json.dumps({**json.loads(paired or b"{}"), "peer": {"public_key": "ab" * 32, "name": "Debian", "paired_at": 1}}).encode()
         wine.run(str(installed), "--quit", timeout=60)
         silent(10)
-        pairing.write_bytes(paired)
-        wine.start(str(installed), "--tray")
-        check("the pairing is read back", answers(90) is not None and local().get("paired") is True, str(local()))
+        wine.stop_all()
+        Keys.make().write_pairing(str(pairing), Keys.make().public, "Debian")
+        paired = pairing.read_bytes()
+        wine.run(setup_path, "/S")
+        st = answers(90)
+        check("installing again starts it paired", st is not None and st.get("secure") == "connecting", str(st and st.get("secure")))
         (folder / "autostart-disabled").unlink(missing_ok=True)
 
         # Again, over the running copy.
@@ -216,6 +222,7 @@ def test(setup):
         check("the pairing is kept", pairing.read_bytes() == paired)
         st = answers(90)
         check("and it's running again", st is not None, "see wine_setup.log")
+        check("and it's still paired", st is not None and st.get("secure") == "connecting", str(st and st.get("secure")))
 
         # --quit by itself: the window, the tray and the service.
         result = wine.run(str(installed), "--quit", timeout=60)
