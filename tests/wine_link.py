@@ -21,7 +21,9 @@ script's own key and release server:
     cargo build --release --features test-hooks --target x86_64-pc-windows-gnu
 
 A real install, swap, watcher and restore then run under Wine. Without it, that part is skipped and says
-so. It needs python3-cryptography, and takes about eight minutes.
+so. That includes an old service that's slow to let go of its ports, a new copy that answers and then
+dies for want of one, and another device that does the same. It needs python3-cryptography, and takes
+about fifteen minutes.
 """
 import contextlib
 import glob
@@ -416,6 +418,10 @@ def serve_layout(holder):
             self.wfile.write(body)
 
         def do_GET(self):
+            if holder.get("peer_gone"):
+                # Gone mid-request, as a service that dies does.
+                self.close_connection = True
+                return
             if self.path == "/api/local" and "peer_version" in holder:
                 update = {"state": "idle", "proving": holder.get("peer_proving", False)}
                 self.reply(json.dumps({"version": holder["peer_version"], "device_name": "Fake desk", "update": update}).encode())
@@ -423,6 +429,9 @@ def serve_layout(holder):
                 self.reply(json.dumps(holder["state"]).encode() if self.path == "/api/state" else b"{}")
 
         def do_POST(self):
+            if holder.get("peer_gone"):
+                self.close_connection = True
+                return
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             holder["asked_to_install"] = body
             self.reply(b'{"ok":true}')
@@ -1002,10 +1011,11 @@ def saved_peer_checks(exe):
     st = wait_for(lambda s: s["peer_ip"] == ANOTHER_PEER, 30)
     check("the service restarted itself on the new address", (st or {}).get("peer_ip") == ANOTHER_PEER, str(st))
     check("the new address is saved", json.load(open(settings_file())).get("peer_ip") == ANOTHER_PEER)
-    # The login script a real install writes is the same either way, and never holds the address.
-    scripts = glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/*/mesh-kvm-autostart.vbs")
-    check("the login script is there and doesn't pin an address",
-          bool(scripts) and "--peer" not in open(scripts[0]).read(), str(scripts))
+    # This copy isn't the installed one, so it writes no launchers and installs nothing.
+    programs = glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")
+    written = [p for p in glob.glob(f"{programs[0]}/**/mesh-kvm*", recursive=True)] if programs else []
+    check("a copy that isn't installed writes no launchers", programs and not written, str(written))
+    check("and doesn't install itself", not glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Local/mesh-kvm/mesh-kvm.exe"))
 
 
 def unpaired_checks(exe):
@@ -1134,6 +1144,45 @@ def log_in(env, log):
     subprocess.Popen(["wine", "wscript", "C:\\" + str(relative).replace("/", "\\")], env=env, stdout=log, stderr=subprocess.STDOUT)
 
 
+class PortHolder:
+    """Takes this device's input port as soon as it's free, as something that lingers would, and
+    keeps it for `hold` seconds. `taken_after` is how long it had to wait for it."""
+
+    def __init__(self, port, hold):
+        self.port, self.hold = port, hold
+        self.taken_after = None
+        self.started = time.time()
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while time.time() - self.started < 120:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.bind(("0.0.0.0", self.port))
+            except OSError:
+                sock.close()
+                time.sleep(0.05)
+                continue
+            self.taken_after = time.time() - self.started
+            time.sleep(self.hold)
+            sock.close()
+            return
+
+
+def looks_until(cond, timeout):
+    """Every /api/local answer until cond(state) holds, as (version, proving)."""
+    seen = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with contextlib.suppress(Exception):
+            st = local()
+            seen.append((st.get("version"), st["update"]["proving"]))
+            if cond(st):
+                break
+        time.sleep(0.1)
+    return seen
+
+
 def rejected_versions(folder):
     with contextlib.suppress(OSError):
         return json.loads((folder / "updates/check.json").read_text()).get("rejected", [])
@@ -1155,9 +1204,17 @@ def update_checks(hooks_exe, env, log, layout):
     installed.write_bytes(first)
     windows_path = "C:\\users\\" + folder.parent.parent.parent.name + "\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe"
     exe = Exe(windows_path, env, log)
+    # As mesh-kvm-setup.exe leaves it, so the update can be seen to keep it right.
+    uninstall_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\mesh-kvm"
+    subprocess.run(["wine", "reg", "add", uninstall_key, "/v", "DisplayVersion", "/d", "0.7.0", "/f"], env=env, stdout=log, stderr=subprocess.STDOUT)
+    listed_version = lambda: subprocess.run(["wine", "reg", "query", uninstall_key, "/v", "DisplayVersion"], env=env, capture_output=True, text=True).stdout.split()[-1:]
     try:
         exe.start("--peer", PEER, "--port", "24860")
         check("the installed copy answers on its version", answers_on("0.7.0", 90) is not None, "see wine_link.log")
+        scripts = lambda: glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/*/mesh-kvm-autostart.vbs")
+        wait_for(lambda s: scripts(), 20)
+        check("the installed copy writes the login script, which doesn't pin an address",
+              bool(scripts()) and "--peer" not in open(scripts()[0]).read(), str(scripts()))
         check("an update knows what's running", update_state()["current"] == "0.7.0", str(update_state()))
         check("nothing is offered yet", update_state()["ready"] is False, str(update_state()))
 
@@ -1213,6 +1270,10 @@ def update_checks(hooks_exe, env, log, layout):
             time.sleep(0.5)
         check("after 30 seconds of answering the marker goes", not marker.exists())
         check("the status stops saying it's proving", wait_for(lambda s: not s["update"]["proving"], 5)["update"]["proving"] is False)
+        deadline = time.time() + 5
+        while listed_version() != ["0.7.1"] and time.time() < deadline:
+            time.sleep(0.5)
+        check("Installed apps shows the new version", listed_version() == ["0.7.1"], str(listed_version()))
         time.sleep(35)
         st = local()
         check("the watcher leaves a healthy copy alone", st["version"] == "0.7.1" and installed.read_bytes() == second, st["version"])
@@ -1227,10 +1288,10 @@ def update_checks(hooks_exe, env, log, layout):
         wait_for(lambda s: False, 5)
         check("the swap happened", installed.read_bytes() == b"this is no exe")
         started = time.time()
-        st = wait_for(lambda s: s.get("version") == "0.7.1", 90)
+        st = wait_for(lambda s: s.get("version") == "0.7.1", 150)
         took = time.time() - started
         check("a new exe that won't start is replaced by the old one", st is not None and st.get("version") == "0.7.1", str(st and st.get("version")))
-        check("that took about a minute", 40 < took < 75, str(took))
+        check("that took about a minute and a half", 70 < took < 125, str(took))
         check("the old exe is back in place", installed.read_bytes() == second)
         check("there's nothing left waiting", not marker.exists() and not aside.exists())
         note = (st or {}).get("update", {}).get("note") or ""
@@ -1256,7 +1317,7 @@ def update_checks(hooks_exe, env, log, layout):
         check("the hanging version starts installing", reply.get("ok") is True, str(reply))
         wait_for(lambda s: False, 5)
         check("it's in place", installed.read_bytes() == hanging)
-        st = wait_for(lambda s: s.get("version") == "0.7.1", 90)
+        st = wait_for(lambda s: s.get("version") == "0.7.1", 150)
         check("a new exe that hangs is stopped and replaced too", st is not None and st.get("version") == "0.7.1", str(st and st.get("version")))
         check("the old exe is back in place again", installed.read_bytes() == second)
         check("the note names the version", "0.7.3" in ((st or {}).get("update", {}).get("note") or ""), str(st and st["update"]))
@@ -1316,7 +1377,7 @@ def update_checks(hooks_exe, env, log, layout):
         check("the hanging version is in place at the reboot", installed.read_bytes() == fifth and marker.exists())
         exe.stop()
         log_in(env, log)
-        st = wait_for(lambda s: s.get("version") == "0.7.4", 90)
+        st = wait_for(lambda s: s.get("version") == "0.7.4", 150)
         check("after the reboot the old version comes back by itself", st is not None and st.get("version") == "0.7.4", str(st and st.get("version")))
         check("the file is back too", installed.read_bytes() == fourth and not marker.exists())
         check("that version is turned down", "0.7.5" in rejected_versions(folder), str(rejected_versions(folder)))
@@ -1337,6 +1398,81 @@ def update_checks(hooks_exe, env, log, layout):
         check("the note says it was cut short", "interrupted" in (st or {}).get("update", {}).get("note", ""), str(st and st["update"]))
         check("that version isn't held against it", "0.7.6" not in rejected_versions(folder), str(rejected_versions(folder)))
         check("the half-finished copy is cleared away", not (folder / "mesh-kvm.exe.new").exists())
+        exe.stop()
+
+        # An old service that takes its time to end, holding its ports, and the input port still
+        # taken for a while after it has gone, as with something that inherited it.
+        lingering = as_version(base, "0.7.7", "LINGER")
+        installed.write_bytes(lingering)
+        aside.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+        exe.start("--peer", PEER, "--port", "24860")
+        check("an old service that will linger answers", answers_on("0.7.7", 90) is not None, "see wine_link.log")
+        eighth = as_version(base, "0.7.8")
+        release.publish("0.7.8", eighth)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.8" and s["update"]["ready"], 30)
+        holder = PortHolder(24860, hold=8)
+        reply = action("install_update")
+        check("the update starts", reply.get("ok") is True, str(reply))
+        seen = looks_until(lambda s: s.get("version") == "0.7.8", 150)
+        check("the old service kept its port for a while after the swap", (holder.taken_after or 0) > 5, str(holder.taken_after))
+        check("the new version still ends up running", seen and seen[-1][0] == "0.7.8", str(seen[-3:]))
+        check("it says it's proving from its first answer", ("0.7.8", False) not in seen, str(sorted(set(seen))))
+        deadline = time.time() + 90
+        while marker.exists() and time.time() < deadline:
+            time.sleep(0.5)
+        check("it proves itself once it has its ports", not marker.exists() and installed.read_bytes() == eighth)
+        check("and isn't held against it", "0.7.8" not in rejected_versions(folder), str(rejected_versions(folder)))
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("0.0.0.0", 24860))
+            has_port = False
+        except OSError:
+            has_port = True
+        probe.close()
+        check("and holds its input port", has_port)
+
+        # A new copy that can't get its input port for longer than it waits, like the laptop's
+        # 0.7.1: it answers, then dies. It must never look as if it had proved itself.
+        # 0.7.9 was turned down at the start, so this one is 0.7.20.
+        ninth = as_version(base, "0.7.20")
+        release.publish("0.7.20", ninth)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.20" and s["update"]["ready"], 30)
+        holder = PortHolder(24860, hold=40)
+        action("install_update")
+        seen = looks_until(lambda s: s.get("version") == "0.7.8" and s["update"]["state"] == "failed", 200)
+        check("the new copy answered before it died", ("0.7.20", True) in seen, str(sorted(set(seen))))
+        check("and never said it had proved itself", ("0.7.20", False) not in seen, str(sorted(set(seen))))
+        check("the old version is put back and runs", seen and seen[-1] == ("0.7.8", False), str(seen[-3:]))
+        check("the old exe is back in place", installed.read_bytes() == eighth and not marker.exists())
+        check("that version is turned down", "0.7.20" in rejected_versions(folder), str(rejected_versions(folder)))
+        logged = (folder / "mesh-kvm.log").read_text(errors="replace")
+        bind_failures = [line for line in logged.splitlines() if "Failed to bind UDP" in line]
+        check("the log says why", bool(bind_failures), logged[-500:])
+        check("with the time it happened", all(line[:2] == "20" and line[4] == "-" and line[13] == ":" for line in bind_failures), str(bind_failures))
+
+        # The other device comes back on the new version, answers, then dies: this one stays put.
+        layout.pop("asked_to_install", None)
+        layout["peer_version"] = "0.7.8"
+        layout["peer_proving"] = False
+        tenth = as_version(base, "0.7.21")
+        release.publish("0.7.21", tenth)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.21" and s["update"]["ready"], 30)
+        reply = action("update_both")
+        check("updating both starts again", reply.get("ok") is True, str(reply))
+        wait_for(lambda s: layout.get("asked_to_install"), 10)
+        layout["peer_version"] = "0.7.21"
+        time.sleep(3)
+        layout["peer_gone"] = True
+        time.sleep(25)
+        st = local()
+        check("a peer that answered on the new version and died isn't followed", st["version"] == "0.7.8" and installed.read_bytes() == eighth, st["version"])
+        check("this device is still waiting for it", st["update"]["state"] in ("updating_peer", "waiting_for_peer"), str(st["update"]))
+        check("nothing was swapped here", not marker.exists())
+        layout.pop("peer_gone", None)
     finally:
         exe.stop()
 

@@ -290,7 +290,7 @@ pub fn start_audio_listener(port: u16, peer: SocketAddr) -> Result<(), String> {
         .name("mesh-kvm-audio-rx".to_string())
         .spawn(move || {
             let bind_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
-            let socket = match UdpSocket::bind(bind_addr) {
+            let socket = match crate::app::launch::bind_patiently(|| UdpSocket::bind(bind_addr)) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("[Audio-RX] Failed to bind UDP {}: {}", bind_addr, e);

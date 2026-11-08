@@ -129,6 +129,8 @@ struct Window {
     /// The version the device that's behind was last told to look for.
     nudged_for: Option<String>,
     version_watch: VersionWatch,
+    /// A Windows copy run from somewhere other than where mesh-kvm is installed.
+    not_installed: bool,
 }
 
 impl eframe::App for Window {
@@ -168,6 +170,7 @@ impl Window {
             update_under_way: None,
             nudged_for: None,
             version_watch: VersionWatch::default(),
+            not_installed: cfg!(target_os = "windows") && !super::install::runs_from_installed(),
         }
     }
 
@@ -301,7 +304,7 @@ impl Window {
             }
         }
         let carried = self.update_under_way.clone().filter(|_| snapshot.local.is_none());
-        let banner = updates::update_banner(snapshot).or(carried);
+        let banner = updates::with_install_hint(updates::update_banner(snapshot).or(carried), self.not_installed);
         self.update_under_way = banner.clone().filter(|b| b.busy);
         if let Some(banner) = &banner {
             self.update_strip(ctx, snapshot, banner);

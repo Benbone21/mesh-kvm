@@ -1,5 +1,6 @@
 //! One window and one tray per login. The first of each holds a loopback port; a second one finds
-//! the port taken, and (for the window) asks the first to come forward.
+//! the port taken, and (for the window) asks the first to come forward. Quitting mesh-kvm asks both
+//! to close through the same ports.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,6 +13,7 @@ pub const WINDOW_PORT: u16 = 24881;
 pub const TRAY_PORT: u16 = 24882;
 
 const SHOW: &[u8] = b"show\n";
+const QUIT: &[u8] = b"quit\n";
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long a new copy waits for the old one it's replacing to let go of the port.
 const HANDOVER: Duration = Duration::from_secs(5);
@@ -56,23 +58,49 @@ fn classify(bound: std::io::Result<TcpListener>) -> Instance {
     }
 }
 
-/// Asks the process holding `port` to bring its window forward.
-pub fn signal_show(port: u16) {
-    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let _ = stream.write_all(SHOW);
+/// What one process can ask the one holding a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Word {
+    /// Bring the window forward.
+    Show,
+    /// Close, as mesh-kvm is quitting on this device.
+    Quit,
+}
+
+impl Word {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Show => SHOW,
+            Self::Quit => QUIT,
+        }
     }
 }
 
-/// Runs `on_show` each time another process calls `signal_show` for this listener.
-pub fn listen(listener: TcpListener, on_show: impl Fn() + Send + 'static) {
+/// Asks the process holding `port` to bring its window forward.
+pub fn signal_show(port: u16) {
+    signal(port, Word::Show);
+}
+
+/// Says `word` to the process holding `port`, if there is one.
+pub fn signal(port: u16, word: Word) {
+    if let Ok(mut stream) = TcpStream::connect_timeout(&(std::net::Ipv4Addr::LOCALHOST, port).into(), IO_TIMEOUT) {
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        let _ = stream.write_all(word.bytes());
+    }
+}
+
+/// Runs `on_word` each time another process calls `signal` for this listener.
+pub fn listen(listener: TcpListener, on_word: impl Fn(Word) + Send + 'static) {
     let spawned = std::thread::Builder::new().name("mesh-kvm-single".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-            let mut word = [0u8; SHOW.len()];
-            if stream.read_exact(&mut word).is_ok() && word == SHOW {
-                on_show();
+            let mut said = [0u8; 5];
+            if stream.read_exact(&mut said).is_err() {
+                continue;
+            }
+            if let Some(word) = [Word::Show, Word::Quit].into_iter().find(|w| w.bytes() == said) {
+                on_word(word);
             }
         }
     });
@@ -87,13 +115,19 @@ pub fn keep_for_window(listener: TcpListener) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(listener);
 }
 
-/// Call once the window's egui context exists: from then on, a second `--app` raises this window.
+/// Call once the window's egui context exists: from then on, a second `--app` raises this window,
+/// and quitting mesh-kvm closes it.
 pub fn serve_focus(ctx: eframe::egui::Context) {
     let listener = WINDOW_LISTENER
         .get()
         .and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(listener) = listener {
-        listen(listener, move || {
+        listen(listener, move |word| {
+            if word == Word::Quit {
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+                ctx.request_repaint();
+                return;
+            }
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Focus);
             // Wayland refuses a plain focus request. This one goes through xdg-activation.
@@ -161,11 +195,28 @@ mod tests {
         let port = free_port();
         let Instance::First(listener) = claim(port) else { panic!("port should be free") };
         let (tx, rx) = mpsc::channel();
-        listen(listener, move || {
-            let _ = tx.send(());
+        listen(listener, move |word| {
+            let _ = tx.send(word);
         });
         signal_show(port);
-        assert!(rx.recv_timeout(Duration::from_secs(3)).is_ok());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(Word::Show));
+    }
+
+    #[test]
+    fn quitting_reaches_the_listener_as_its_own_word() {
+        let port = free_port();
+        let Instance::First(listener) = claim(port) else { panic!("port should be free") };
+        let (tx, rx) = mpsc::channel();
+        listen(listener, move |word| {
+            let _ = tx.send(word);
+        });
+        signal(port, Word::Quit);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(Word::Quit));
+    }
+
+    #[test]
+    fn saying_something_to_nobody_does_no_harm() {
+        signal(free_port(), Word::Quit);
     }
 
     #[test]
@@ -173,8 +224,8 @@ mod tests {
         let port = free_port();
         let Instance::First(listener) = claim(port) else { panic!("port should be free") };
         let (tx, rx) = mpsc::channel();
-        listen(listener, move || {
-            let _ = tx.send(());
+        listen(listener, move |word| {
+            let _ = tx.send(word);
         });
         TcpStream::connect(("127.0.0.1", port)).unwrap().write_all(b"GET /\r\n").unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(700)).is_err());

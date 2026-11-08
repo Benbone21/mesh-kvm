@@ -811,7 +811,7 @@ pub fn start_clipboard_sync(peer_ip: String, port: u16) -> Result<(), String> {
         .name("mesh-kvm-clip-rx".to_string())
         .spawn(move || {
             let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-            let listener = match TcpListener::bind(bind_addr) {
+            let listener = match crate::app::launch::bind_patiently(|| TcpListener::bind(bind_addr)) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("[Clipboard] Failed to bind TCP {}: {}", bind_addr, e);

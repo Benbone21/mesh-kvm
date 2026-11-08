@@ -764,6 +764,13 @@ unsafe extern "system" fn session_window_proc(
     }
 }
 
+/// Lets go of every key and button this device is holding down or keeping from Windows, before
+/// the service ends.
+pub fn let_go() {
+    WindowsBackend.set_blocking(false, false);
+    WindowsBackend.release_held();
+}
+
 /// Lets go of everything, then replaces this process with a fresh service, which reads the saved
 /// address. Ending the process also removes the hooks.
 fn restart_service() -> ! {
@@ -849,7 +856,8 @@ pub fn run_windows_node(
     SEQ_COUNTER.store(init_seq, Ordering::SeqCst);
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", listen_port).parse().unwrap();
-    let socket = UdpSocket::bind(bind_addr)
+    // A service that replaces another may find the old one still letting go of this port.
+    let socket = crate::app::launch::bind_patiently(|| UdpSocket::bind(bind_addr))
         .map_err(|e| format!("Failed to bind UDP {}: {}", bind_addr, e))?;
     let rx_socket = socket
         .try_clone()
@@ -873,6 +881,7 @@ pub fn run_windows_node(
     // Ensure auto-boot on Windows login is installed. By now this process holds the API port, so
     // a process that loses the race to another service doesn't rewrite the launchers.
     crate::platform::windows::ensure_autorun_installed();
+    crate::update::note_service_up();
 
     println!("[Windows] Native display resolution: {}x{}, peer: {}", width, height, peer_addr);
     println!(

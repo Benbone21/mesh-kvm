@@ -345,6 +345,29 @@ impl Devices for Updater {
 
 static UPDATER: OnceLock<Arc<Updater>> = OnceLock::new();
 
+/// Set once the service holds every port it needs and runs, and never again once it's failing.
+/// Until then a new copy hasn't shown it works, however well its API answers.
+static SERVICE_UP: AtomicBool = AtomicBool::new(false);
+static SERVICE_FAILING: AtomicBool = AtomicBool::new(false);
+
+/// The service has everything it needs and is running.
+pub fn note_service_up() {
+    if !SERVICE_FAILING.load(Ordering::SeqCst) {
+        SERVICE_UP.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The service is stopping because something went wrong, which may take a while.
+pub fn note_service_failing() {
+    SERVICE_FAILING.store(true, Ordering::SeqCst);
+    SERVICE_UP.store(false, Ordering::SeqCst);
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn service_is_up() -> bool {
+    SERVICE_UP.load(Ordering::SeqCst)
+}
+
 /// Starts checking for updates.
 pub fn start(trial_running: Box<dyn Fn() -> bool + Send + Sync>) {
     let updater = Arc::new(Updater::new(
@@ -369,11 +392,23 @@ pub fn start(trial_running: Box<dyn Fn() -> bool + Send + Sync>) {
     }
 }
 
-/// `update` in `/api/local`. Before `start`, only the version is known.
+/// `update` in `/api/local`. Before `start`, only the version is known, and whether a swap is
+/// waiting on this version, so a new copy never says it has proved itself when it hasn't.
 pub fn status_json() -> Value {
     match UPDATER.get() {
         Some(updater) => updater.json(),
-        None => Status::default().json(running_version(), false),
+        None => Status { proving: proving_before_start(), ..Default::default() }.json(running_version(), false),
+    }
+}
+
+fn proving_before_start() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::swapped_to_this_version()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
 }
 

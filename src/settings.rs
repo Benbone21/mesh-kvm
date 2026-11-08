@@ -149,7 +149,54 @@ fn append_line(dir: &Path, line: &str) {
     if let Ok(mut file) =
         std::fs::OpenOptions::new().create(true).append(true).open(dir.join("mesh-kvm.log"))
     {
-        let _ = writeln!(file, "{}", line);
+        let _ = writeln!(file, "{} {}", local_time_text(local_time()), line);
+    }
+}
+
+/// A moment on this device's clock, as the log shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalTime {
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+}
+
+/// Such as `2026-11-07 19:01:26`.
+fn local_time_text(t: LocalTime) -> String {
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
+}
+
+#[cfg(unix)]
+fn local_time() -> LocalTime {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        libc::localtime_r(&now, &mut tm);
+    }
+    LocalTime {
+        year: (tm.tm_year + 1900).max(0) as u32,
+        month: (tm.tm_mon + 1).max(0) as u32,
+        day: tm.tm_mday.max(0) as u32,
+        hour: tm.tm_hour.max(0) as u32,
+        minute: tm.tm_min.max(0) as u32,
+        second: tm.tm_sec.max(0) as u32,
+    }
+}
+
+#[cfg(windows)]
+fn local_time() -> LocalTime {
+    let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    LocalTime {
+        year: t.wYear.into(),
+        month: t.wMonth.into(),
+        day: t.wDay.into(),
+        hour: t.wHour.into(),
+        minute: t.wMinute.into(),
+        second: t.wSecond.into(),
     }
 }
 
@@ -694,7 +741,29 @@ mod tests {
         append_fatal(&dir, "still no OpenGL");
         let log = std::fs::read_to_string(dir.join("mesh-kvm.log")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(log, "Fatal error: no OpenGL\nFatal error: still no OpenGL\n");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(lines[0].ends_with(" Fatal error: no OpenGL"), "{log}");
+        assert!(lines[1].ends_with(" Fatal error: still no OpenGL"), "{log}");
+    }
+
+    #[test]
+    fn every_log_line_starts_with_the_local_time() {
+        let dir = std::env::temp_dir().join(format!("mesh-kvm-stamp-{}", std::process::id()));
+        append_line(&dir, "Note: hello");
+        let log = std::fs::read_to_string(dir.join("mesh-kvm.log")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (stamp, rest) = log.split_at(19);
+        assert_eq!(rest, " Note: hello\n");
+        let shape: String = stamp.chars().map(|c| if c.is_ascii_digit() { '9' } else { c }).collect();
+        assert_eq!(shape, "9999-99-99 99:99:99", "{stamp}");
+        assert!(stamp.starts_with("20"), "{stamp}");
+    }
+
+    #[test]
+    fn a_time_in_the_log_is_padded_to_a_fixed_width() {
+        let t = LocalTime { year: 2026, month: 11, day: 7, hour: 9, minute: 1, second: 6 };
+        assert_eq!(local_time_text(t), "2026-11-07 09:01:06");
     }
 
     #[test]

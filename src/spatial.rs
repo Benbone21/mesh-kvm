@@ -969,6 +969,9 @@ pub fn studio_handler(
                 if act == "set_device_name" {
                     return Some(set_device_name(&state, &val));
                 }
+                if act == crate::quit::ACTION {
+                    return Some(crate::quit::answer(req.from_app_here));
+                }
                 if act == "set_audio_device" {
                     return Some(crate::settings::set_audio_device(&val, req.from_app_here));
                 }

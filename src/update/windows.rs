@@ -6,24 +6,21 @@ use super::swap::{self, Marker, OnStart, Paths, WatchHost};
 use super::store::Store;
 use super::trust::{check_file, running_version, Version};
 use super::{Installer, Updater};
-use crate::app::install::{aside_path, installed_exe};
-use crate::app::launch::{args_for_watcher, args_from_watcher, restart_service, RESTARTING_ENV};
+use crate::app::install::{aside_path, installed_exe, runs_from_installed};
+use crate::app::launch::{args_for_watcher, args_from_watcher, restart_service, spawn_exe, RESTARTING_ENV};
+use crate::platform::detach::{self, Child};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How long the watcher gives the old service to end by itself before it ends it.
+const OLD_SERVICE_ENDS_WITHIN: Duration = Duration::from_secs(20);
 
 pub struct Swap;
 
 fn paths() -> Option<Paths> {
     Some(Paths { installed: installed_exe()?, folder: crate::settings::config_dir() })
-}
-
-/// True when this exe is the installed one, however the two are spelt.
-fn runs_from_installed() -> bool {
-    let (Ok(exe), Some(installed)) = (std::env::current_exe(), installed_exe()) else { return false };
-    matches!((exe.canonicalize(), installed.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 impl Installer for Swap {
@@ -48,18 +45,17 @@ impl Installer for Swap {
             paths.leave_note(&format!("The update couldn't be installed, so this copy keeps running. {why}"));
             return Err(restart_service());
         }
+        #[cfg(feature = "test-hooks")]
+        super::trust::linger_if_told();
         std::process::exit(0);
     }
 }
 
-/// Runs from the old exe, as the new one may not run at all.
+/// Runs from the old exe, as the new one may not run at all. It's told this service's process id,
+/// so it can wait for this one to be gone before it starts the new one.
 fn start_watcher(paths: &Paths) -> Result<(), String> {
-    Command::new(aside_path(&paths.installed))
-        .args(args_for_watcher(std::env::args().skip(1).collect()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let args = args_for_watcher(std::env::args().skip(1).collect(), std::process::id());
+    detach::spawn(&aside_path(&paths.installed), &args, &[])
         .map(drop)
         .map_err(|e| format!("Couldn't start the update's watcher: {e}"))
 }
@@ -69,8 +65,13 @@ pub fn swap_pending() -> bool {
     paths().is_some_and(|paths| paths.swap_pending())
 }
 
+/// True when this is a new copy that a swap is waiting on, before the updater has even started.
+pub fn swapped_to_this_version() -> bool {
+    paths().and_then(|paths| paths.read_marker()).is_some_and(|marker| marker.to == running_version().to_string())
+}
+
 /// What a service does with what the last update left: shows its note, and if this is the new
-/// copy, proves that it works.
+/// copy, proves that it works. `proving` is set here, before the API answers anything.
 pub fn after_start(updater: &Arc<Updater>) {
     let Some(paths) = paths() else { return };
     paths.clear_failed();
@@ -82,7 +83,8 @@ pub fn after_start(updater: &Arc<Updater>) {
     if swap::on_start(&paths, updater.running) == OnStart::ProveHealthy {
         updater.status().proving = true;
         let started = Instant::now();
-        let answers = || matches!(crate::webui::http_call("127.0.0.1", "GET", "/api/local", ""), Ok((200, _)));
+        // Answering isn't enough: a service that has every port and is still running is.
+        let answers = || super::service_is_up() && matches!(crate::webui::http_call("127.0.0.1", "GET", "/api/local", ""), Ok((200, _)));
         let updater = updater.clone();
         let spawned = std::thread::Builder::new().name("mesh-kvm-update-health".into()).spawn(move || {
             swap::prove_healthy(&paths, started, &answers, &std::thread::sleep);
@@ -96,36 +98,46 @@ struct RealHost {
     exe: PathBuf,
     /// What the service was started with, so that it comes back the same.
     args: Vec<String>,
+    /// The service that started this watcher, if one did.
+    old_pid: Option<u32>,
     started: Instant,
     new_service: Option<Child>,
 }
 
 impl RealHost {
+    /// Started as a replacement, so it waits for ports that are still being let go.
     fn start(&self) -> Option<Child> {
-        Command::new(&self.exe)
-            .args(&self.args)
-            .env(RESTARTING_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()
+        let started = detach::spawn(&self.exe, &self.args, &[(RESTARTING_ENV, "1")]);
+        if let Err(e) = &started {
+            super::log(&format!("The update's watcher couldn't start {}: {e}", self.exe.display()));
+        }
+        started.ok()
     }
 }
 
 impl WatchHost for RealHost {
+    fn wait_for_old_service(&mut self) {
+        if let Some(pid) = self.old_pid {
+            if detach::wait_for_exit(pid, OLD_SERVICE_ENDS_WITHIN) {
+                super::log(&format!("The old service hadn't ended {} seconds after the update, so it was stopped.", OLD_SERVICE_ENDS_WITHIN.as_secs()));
+            }
+        }
+    }
+
     fn start_new_service(&mut self) {
+        super::log(&format!("The update's watcher is starting {}.", self.exe.display()));
         self.new_service = self.start();
     }
 
     fn stop_new_service(&mut self) {
         if let Some(child) = &mut self.new_service {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.kill();
+            child.wait(Duration::from_secs(10));
         }
     }
 
     fn start_restored_service(&mut self) {
+        super::log("The update's watcher put the old version back, and is starting it.");
         let _ = self.start();
     }
 
@@ -147,10 +159,11 @@ impl WatchHost for RealHost {
 /// `--update-watch`.
 pub fn run_watcher() {
     let Some(paths) = paths() else { return };
-    let (args, tray) = args_from_watcher(std::env::args().skip(1).collect());
-    let mut host = RealHost { exe: paths.installed.clone(), args, started: Instant::now(), new_service: None };
+    let told = args_from_watcher(std::env::args().skip(1).collect());
+    let mut host = RealHost { exe: paths.installed.clone(), args: told.service, old_pid: told.old_pid, started: Instant::now(), new_service: None };
     swap::watch(&paths, &mut host);
-    if tray {
-        let _ = Command::new(&paths.installed).arg("--tray").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    super::log(&format!("The update's watcher is done, after {} seconds.", host.started.elapsed().as_secs()));
+    if told.tray {
+        let _ = spawn_exe(paths.installed.clone(), &["--tray"], &[]);
     }
 }
