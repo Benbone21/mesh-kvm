@@ -103,6 +103,14 @@ impl Sparklines {
         }
     }
 
+    /// How long until a line that is still growing takes its next point, so the window is drawn
+    /// then and the lines move as the board shows. None while no line is shown or every one is
+    /// frozen, so a window with nothing to show stays idle.
+    pub fn next_wake(&self, now: Instant) -> Option<Duration> {
+        let growing = self.lines.iter().filter(|line| !line.frozen && !line.points.is_empty());
+        growing.filter_map(|line| line.taken).map(|taken| (taken + EVERY).saturating_duration_since(now)).min()
+    }
+
     pub fn get(&self, stat: Stat) -> &Sparkline {
         &self.lines[STATS.iter().position(|s| *s == stat).expect("every stat has a line")]
     }
@@ -157,6 +165,27 @@ mod tests {
         assert_eq!(path.last().unwrap()[0], 210.0);
         assert!(path.iter().all(|p| (0.0..=36.0).contains(&p[1])));
         assert!(path.last().unwrap()[1] < path[0][1], "the high point is drawn higher");
+    }
+
+    #[test]
+    fn a_growing_line_wakes_the_window_for_its_next_point() {
+        let mut lines = Sparklines::default();
+        let t = Instant::now();
+        assert_eq!(lines.next_wake(t), None, "nothing shown yet");
+        lines.sample(&link(secure(linked(), "encrypted"), 6, 0.4), t);
+        assert_eq!(lines.next_wake(t + Duration::from_millis(300)), Some(Duration::from_millis(700)));
+        assert_eq!(lines.next_wake(t + Duration::from_secs(3)), Some(Duration::ZERO));
+        lines.sample(&unpaired(), t + Duration::from_secs(1));
+        assert_eq!(lines.next_wake(t + Duration::from_secs(1)), None, "unpaired clears every line");
+    }
+
+    #[test]
+    fn frozen_lines_leave_the_window_idle() {
+        let mut lines = Sparklines::default();
+        let t = Instant::now();
+        lines.sample(&link(secure(linked(), "encrypted"), 6, 0.4), t);
+        lines.sample(&Snapshot::default(), t + Duration::from_secs(1));
+        assert_eq!(lines.next_wake(t + Duration::from_secs(1)), None);
     }
 
     #[test]

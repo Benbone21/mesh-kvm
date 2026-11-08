@@ -7,7 +7,7 @@ use super::view::fit_name;
 use super::widgets::{fitted, focus_ring};
 use eframe::egui::{
     self, vec2, CursorIcon, EventFilter, FontFamily, FontId, Key, Modifiers, Painter, Pos2, Rect, ScrollArea, Sense, Shape,
-    StrokeKind, Ui, UiBuilder,
+    StrokeKind, Ui, UiBuilder, WidgetInfo, WidgetType,
 };
 use std::time::Instant;
 
@@ -108,7 +108,16 @@ impl Canvas {
         let groups: Vec<(Device, Vec<Display>)> = Device::BOTH.into_iter().map(|d| (d, cfg.rects(d))).collect();
 
         // The tiles' hit areas come first, so the borders below know who is hovered or focused.
-        self.pointer(ui, cfg, &groups, &to_rect, inner, view, content, draft, now);
+        // A screen reader hears each tile as its caption and its device.
+        let spoken: Vec<Vec<String>> = groups
+            .iter()
+            .map(|(device, rects)| {
+                let title = snapshot.title(*device);
+                let caption = |m: &Display| model::tile_caption(m, model::display_for(snapshot.displays(*device), m));
+                rects.iter().map(|m| format!("Screen {}, {title}", caption(m))).collect()
+            })
+            .collect();
+        self.pointer(ui, cfg, &groups, &spoken, &to_rect, inner, view, content, draft, now);
 
         let painter = ui.painter().clone();
         let mut borders = Vec::new();
@@ -155,6 +164,7 @@ impl Canvas {
         ui: &mut Ui,
         cfg: &LayoutConfig,
         groups: &[(Device, Vec<Display>)],
+        spoken: &[Vec<String>],
         to_rect: &impl Fn(&Display) -> Rect,
         inner: Rect,
         view: MapView,
@@ -163,9 +173,10 @@ impl Canvas {
         now: Instant,
     ) {
         let in_map = |p: Pos2| (p.x - inner.min.x, p.y - inner.min.y);
-        for (device, rects) in groups {
+        for ((device, rects), spoken) in groups.iter().zip(spoken) {
             for (index, m) in rects.iter().enumerate() {
                 let response = ui.interact(to_rect(m), monitor_id(*device, index), Sense::click_and_drag());
+                response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &spoken[index]));
                 let response = response.on_hover_cursor(if self.drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::Grab });
                 if response.clicked() {
                     response.request_focus();

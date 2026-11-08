@@ -131,10 +131,8 @@ impl Table {
             let left = rect.left() + frame.label_width + DEVICE_COLUMN * column as f32;
             let cell_rect = Rect::from_min_size(Pos2::new(left, rect.top()), vec2(DEVICE_COLUMN, height - 1.0));
             let id = cell_id(&row.label, column);
-            let spoken = match cell.kind {
-                CellKind::Toggle(_) => format!("{}, {}", row.label, frame.names[column]),
-                _ => String::new(),
-            };
+            // Every cell is named for a screen reader as its setting and its device.
+            let spoken = format!("{}, {}", row.label, frame.names[column]);
             lit |= self.cell(ui, cell, cell_rect, id, (devices[column], &spoken), frame);
         }
         if lit {
@@ -188,6 +186,7 @@ impl Table {
             }
             CellKind::Action(kind) if clickable => {
                 let response = clickable_text(ui, cell, rect, id, colour);
+                name_for_reader(&response, WidgetType::Button, spoken, &cell.value);
                 if response.clicked() {
                     frame.requests.push(TableRequest::Action(device, *kind));
                 }
@@ -195,7 +194,7 @@ impl Table {
             }
             CellKind::Number { setting, value, range, step } if changeable => {
                 // A number stays draggable while it saves, as dragging sets it again each frame.
-                if let Some(value) = number(ui, cell, rect, id, colour, *value, range.clone(), *step) {
+                if let Some(value) = number(ui, cell, rect, id, colour, *value, range.clone(), *step, spoken) {
                     frame.requests.push(match setting {
                         Setting::Device(control) => TableRequest::Set(device, *control, value),
                         other => TableRequest::Number(*other, value),
@@ -222,15 +221,17 @@ impl Table {
                             }
                         }
                     });
+                name_for_reader(&combo.response, WidgetType::ComboBox, spoken, &cell.value);
                 with_hover_text(combo.response, cell, cut);
                 if let Some(value) = chosen {
                     frame.requests.push(TableRequest::Pick(device, pick.clone(), value));
                 }
                 false
             }
-            CellKind::Name if clickable => self.name(ui, cell, rect, id, device, frame.now, &mut frame.requests),
+            CellKind::Name if clickable => self.name(ui, cell, rect, id, (device, spoken), frame.now, &mut frame.requests),
             CellKind::Level(percent) => {
                 let response = ui.interact(rect, id, Sense::hover());
+                name_for_reader(&response, WidgetType::ProgressIndicator, spoken, &cell.value);
                 let bar = Rect::from_min_size(
                     Pos2::new(rect.left(), rect.center().y - LEVEL_HEIGHT / 2.0),
                     vec2(room, LEVEL_HEIGHT),
@@ -246,6 +247,8 @@ impl Table {
                 let response = ui.interact(rect, id, Sense::hover());
                 if matches!(cell.kind, CellKind::Toggle(_)) {
                     response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, false, cell.is_on(), spoken));
+                } else {
+                    name_for_reader(&response, WidgetType::Other, spoken, &cell.value);
                 }
                 let cut = paint_value(ui, cell, rect, colour);
                 with_hover_text(response, cell, cut);
@@ -256,7 +259,7 @@ impl Table {
 
     /// The device's name, which opens for typing when clicked. True while the pointer is on it.
     #[allow(clippy::too_many_arguments)]
-    fn name(&mut self, ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, device: Device, now: Instant, requests: &mut Vec<TableRequest>) -> bool {
+    fn name(&mut self, ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, (device, spoken): (Device, &str), now: Instant, requests: &mut Vec<TableRequest>) -> bool {
         let polled = &cell.value;
         let edit = self.names.entry(device).or_default();
         let settled = edit.sent_at.is_none_or(|at| now.saturating_duration_since(at) >= NAME_HOLD);
@@ -268,6 +271,7 @@ impl Table {
         if opened {
             let shown_cell = Cell { value: shown.clone(), ..cell.clone() };
             let response = clickable_text(ui, &shown_cell, rect, id, tone(cell.tone)).on_hover_cursor(CursorIcon::Text);
+            name_for_reader(&response, WidgetType::TextEdit, spoken, &shown);
             if !response.clicked() {
                 return response.hovered();
             }
@@ -285,6 +289,7 @@ impl Table {
             .margin(Margin::ZERO);
         let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
         let response = child.add(field);
+        name_for_reader(&response, WidgetType::TextEdit, spoken, &text);
         if opened {
             response.request_focus();
         }
@@ -359,6 +364,17 @@ fn clickable_text(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32)
     let cut = paint_value(ui, cell, rect, colour);
     focus_ring(ui, &response);
     with_hover_text(response, cell, cut)
+}
+
+/// Gives a screen reader the cell as `spoken`, its setting and device, with `value` as what it holds.
+fn name_for_reader(response: &Response, typ: WidgetType, spoken: &str, value: &str) {
+    let enabled = response.enabled();
+    response.widget_info(|| WidgetInfo {
+        enabled,
+        label: Some(spoken.to_string()),
+        current_text_value: Some(value.to_string()),
+        ..WidgetInfo::new(typ)
+    });
 }
 
 /// Paints the cell's value cut to the column. The whole value comes back when it had to be cut.
@@ -440,7 +456,7 @@ fn flat_widgets(ui: &mut Ui) {
 
 /// A number to drag or type, shown as the cell's text is. The new value, when it moved.
 #[allow(clippy::too_many_arguments)]
-fn number(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32, value: f64, range: RangeInclusive<f64>, step: f64) -> Option<f64> {
+fn number(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32, value: f64, range: RangeInclusive<f64>, step: f64, spoken: &str) -> Option<f64> {
     let (decimals, suffix) = number_style(&cell.value);
     // The cell's own place, under the number, as the other cells have.
     ui.interact(rect, id, Sense::hover());
@@ -465,6 +481,7 @@ fn number(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32, value: 
         .custom_formatter(move |v, _| format!("{v:.decimals$}{suffix}"))
         .custom_parser(move |text| text.trim().trim_end_matches(unit.as_str()).trim().parse().ok());
     let response = child.add(drag);
+    name_for_reader(&response, WidgetType::DragValue, spoken, &cell.value);
     let changed = response.changed() && edited != value;
     with_hover_text(response, cell, None);
     changed.then_some(edited)

@@ -162,6 +162,8 @@ struct Window {
     /// A Windows copy run from somewhere other than where mesh-kvm is installed.
     not_installed: bool,
     sparklines: Sparklines,
+    /// How the stats were split into rows last frame.
+    stat_rows: [usize; 2],
     /// The system asks for no animation. Read once, at the start.
     reduced: bool,
     /// The status square's colour when it last changed, the one it changed to, and when.
@@ -213,6 +215,7 @@ impl Window {
             version_watch: VersionWatch::default(),
             not_installed: cfg!(target_os = "windows") && !super::install::runs_from_installed(),
             sparklines: Sparklines::default(),
+            stat_rows: [0, 0],
             reduced: motion::reduced_motion(),
             square: (Color32::TRANSPARENT, Color32::TRANSPARENT, Instant::now()),
             dialog_opened: None,
@@ -282,6 +285,12 @@ impl Window {
             panel.show(ctx, |ui| requests.extend(top::notice_line(ui, notice)));
         }
         let rows = view::frame_layout(ctx.screen_rect().width(), ctx.screen_rect().height()).stat_rows;
+        // Cells that move to a new row aren't drawn whole in the pass that first places them, and
+        // the window may stay idle after it, so that pass is done again.
+        if rows != self.stat_rows {
+            self.stat_rows = rows;
+            ctx.request_discard("the stats moved to a new row");
+        }
         egui::TopBottomPanel::top("stats")
             .frame(Frame::new().fill(SURFACE))
             .show(ctx, |ui| top::stats_row(ui, snapshot, &self.sparklines, rows));
@@ -314,7 +323,12 @@ impl Window {
 
         self.canvas.end_lost_drag(ctx, &mut self.layout, now);
         self.send_changes(now);
-        let wake = [self.edits.next_wake(now), self.layout.next_wake(now), self.client.next_row_error_change()];
+        let wake = [
+            self.edits.next_wake(now),
+            self.layout.next_wake(now),
+            self.client.next_row_error_change(),
+            self.sparklines.next_wake(now),
+        ];
         let wake = wake.into_iter().flatten().min();
         if let Some(wake) = wake {
             ctx.request_repaint_after(wake);
@@ -1308,8 +1322,41 @@ mod tests {
                 last = Some(frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
             }
             let repaint = last.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
-            assert_eq!(repaint, Duration::MAX, "still repainting");
+            // Growing sparklines wake the window once a second, and nothing else may.
+            if window.sparklines.next_wake(now).is_some() {
+                assert!(repaint <= crate::app::sparkline::EVERY, "{repaint:?}");
+            } else {
+                assert_eq!(repaint, Duration::MAX, "still repainting");
+            }
         }
+        // Unpaired or with no service, no line is shown, and nothing is drawn until something changes.
+        // (`unpaired()` asks for the address, and its box's cursor blinks, so the pairing state is used.)
+        for snapshot in [secure(linked(), "unpaired"), Snapshot::default()] {
+            let (ctx, mut window) = (context(), window());
+            let now = Instant::now();
+            let mut last = None;
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(10));
+                last = Some(frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+            }
+            let repaint = last.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            assert_eq!(repaint, Duration::MAX, "{:?}", snapshot.local.as_ref().map(|l| l.secure.clone()));
+        }
+    }
+
+    #[test]
+    fn a_linked_window_wakes_about_once_a_second_for_its_sparklines() {
+        let (ctx, mut window, snapshot) = (context(), window(), link(secure(linked(), "encrypted"), 6, 0.4));
+        let now = Instant::now();
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(10));
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        }
+        let delay = |output: egui::FullOutput| output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        let first = delay(frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+        assert!(first > Duration::from_millis(900) && first <= Duration::from_secs(1), "{first:?}");
+        let later = delay(frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now + Duration::from_millis(400)));
+        assert!(later > Duration::from_millis(500) && later <= Duration::from_millis(600), "{later:?}");
     }
 
     #[test]
@@ -1606,6 +1653,53 @@ mod tests {
         let nodes = spoken_frame(&context(), &mut self::window(), &off, Instant::now());
         let keyboard = nodes.iter().find(|(l, ..)| l == "Share keyboard, debian-host").unwrap_or_else(|| panic!("{nodes:?}"));
         assert_eq!(keyboard.1, Some(Toggled::False));
+    }
+
+    /// Each node's role, name and value, from a frame tall enough to hold the whole table.
+    fn reader_nodes(snapshot: &Snapshot) -> Vec<(egui::accesskit::Role, String, Option<String>)> {
+        let (ctx, mut window) = (context(), window());
+        ctx.enable_accesskit();
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(frame(&ctx, &mut window, snapshot, [1280.0, 2400.0], vec![], Instant::now()));
+        }
+        let update = output.unwrap().platform_output.accesskit_update.expect("accesskit is on");
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(|l| (node.role(), l.to_string(), node.value().map(str::to_string))))
+            .collect()
+    }
+
+    #[test]
+    fn a_screen_reader_hears_every_kind_of_cell_and_each_screen_by_name() {
+        use egui::accesskit::Role;
+        let nodes = reader_nodes(&linked());
+        let find = |role: Role, name: &str| {
+            nodes.iter().find(|(r, l, _)| *r == role && l == name).unwrap_or_else(|| panic!("{role:?} {name}\n{nodes:#?}"))
+        };
+        let speed = find(Role::SpinButton, "Pointer speed on the other device, debian-host");
+        assert!(speed.2.as_deref().is_some_and(|v| v.ends_with('\u{d7}')), "{speed:?}");
+        let size = find(Role::ComboBox, "App size, debian-host");
+        assert_eq!(size.2.as_deref(), Some("100% \u{25be}"));
+        let licences = find(Role::Button, "Licences, debian-host");
+        assert_eq!(licences.2.as_deref(), Some("Show"));
+        let tile = nodes
+            .iter()
+            .find(|(r, l, _)| *r == Role::Button && l.starts_with("Screen ") && l.ends_with(", debian-host"))
+            .unwrap_or_else(|| panic!("{nodes:#?}"));
+        assert!(tile.1.contains('\u{d7}'), "names the screen by its caption: {tile:?}");
+    }
+
+    #[test]
+    fn the_stats_are_whole_in_the_first_frame_after_they_wrap_to_two_rows() {
+        // The window may not be drawn again until something changes, so the first frame has to be right.
+        let (ctx, mut window, s) = (context(), window(), link(secure(linked(), "encrypted"), 6, 0.4));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, MIN_WINDOW_SIZE, vec![], Instant::now()));
+        for label in ["ROUND TRIP", "LOST", "AUDIO LOST", "AUDIO BUFFER", "LINK", "Secure"] {
+            assert!(text.contains(label), "{label}\n{text}");
+        }
     }
 
     #[test]
