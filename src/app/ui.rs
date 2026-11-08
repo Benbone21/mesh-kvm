@@ -640,7 +640,7 @@ impl Window {
         let mut requests = Vec::new();
         if frame.stacked {
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
-                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     settings.show(ui, |ui| {
                         ui.set_width(ui.available_width());
@@ -653,9 +653,10 @@ impl Window {
             });
         } else if frame.body_scrolls {
             // Too short for the table to scroll beside a squashed canvas, so both scroll together.
+            // The canvas keeps the visible height, so its screens stay in view at the top.
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
                 let visible = ui.available_height();
-                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let size = vec2(frame.settings_width, 0.0);
@@ -667,8 +668,7 @@ impl Window {
                         });
                         let column = column.response.rect;
                         ui.painter().vline(column.right() - 0.5, column.y_range(), line(1.0, LINE));
-                        let height = column.height().max(visible);
-                        ui.allocate_ui(vec2(ui.available_width(), height), |ui| {
+                        ui.allocate_ui(vec2(ui.available_width(), visible), |ui| {
                             Frame::new().inner_margin(CANVAS_MARGIN).show(ui, |ui| canvas.show(ui, layout, snapshot, now));
                         });
                     });
@@ -681,7 +681,7 @@ impl Window {
                 .show_separator_line(true)
                 .frame(settings)
                 .show(ctx, |ui| {
-                    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| requests = draw_table(ui));
+                    ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| requests = draw_table(ui));
                 });
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(BG).inner_margin(CANVAS_MARGIN))
@@ -750,7 +750,13 @@ impl Window {
                     self.client.local_action(device, json!({ "action": "set_device_name", "name": name }));
                 }
                 TableRequest::Action(device, action) => self.apply_action(ctx, snapshot, device, action),
-                TableRequest::Hover(monitor) => self.canvas.hovered_in_controls = monitor,
+                // The canvas was drawn before this came, so it draws again to light the monitor.
+                TableRequest::Hover(monitor) => {
+                    if self.canvas.hovered_in_controls != monitor {
+                        self.canvas.hovered_in_controls = monitor;
+                        ctx.request_repaint();
+                    }
+                }
             }
         }
     }
@@ -1470,6 +1476,19 @@ mod tests {
     }
 
     #[test]
+    fn a_short_window_keeps_every_screen_in_view() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let size = [1280.0, 599.0];
+        settled(&ctx, &mut window, &snapshot, size);
+        let screen = ctx.screen_rect();
+        for (device, index) in [(Device::Debian, 0), (Device::Debian, 1), (Device::Windows, 0)] {
+            let rect = ctx.read_response(monitor_id(device, index)).unwrap().rect;
+            assert!(screen.contains_rect(rect), "{device:?} {index} {rect:?} outside {screen:?}");
+            assert!(rect.left() >= SETTINGS_WIDTH, "{device:?} {index} {rect:?}");
+        }
+    }
+
+    #[test]
     fn the_settings_column_is_700_wide_and_the_layout_takes_the_rest() {
         let (ctx, mut window, snapshot) = (context(), window(), linked());
         settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
@@ -1511,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saving_cell_ignores_another_click() {
+    fn the_window_asks_for_no_second_main_change_while_one_is_saving() {
         let (ctx, mut window, snapshot) = (context(), window(), linked());
         let now = Instant::now();
         // A main device change that hasn't been answered yet.

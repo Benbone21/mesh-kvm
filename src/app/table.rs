@@ -378,11 +378,18 @@ fn cut_to(ui: &Ui, text: &str, kind: Type, width: f32) -> Option<String> {
         return None;
     }
     let chars: Vec<char> = text.chars().collect();
-    (0..chars.len())
-        .rev()
-        .map(|keep| format!("{}\u{2026}", chars[..keep].iter().collect::<String>().trim_end()))
-        .find(|cut| text_width(ui, cut, kind) <= width)
-        .or_else(|| Some("\u{2026}".into()))
+    let cut = |keep: usize| format!("{}\u{2026}", chars[..keep].iter().collect::<String>().trim_end());
+    // The most characters that still fit, found by halving: keeping more is never narrower.
+    let (mut fits, mut too_many) = (0, chars.len());
+    while too_many - fits > 1 {
+        let middle = (fits + too_many) / 2;
+        if text_width(ui, &cut(middle), kind) <= width {
+            fits = middle;
+        } else {
+            too_many = middle;
+        }
+    }
+    Some(cut(fits))
 }
 
 /// Gives the response what there is to say on hover: why it can't change, what it is, and the
@@ -421,11 +428,14 @@ fn flat_widgets(ui: &mut Ui) {
 #[allow(clippy::too_many_arguments)]
 fn number(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32, value: f64, range: RangeInclusive<f64>, step: f64) -> Option<f64> {
     let (decimals, suffix) = number_style(&cell.value);
+    // The cell's own place, under the number, as the other cells have.
+    ui.interact(rect, id, Sense::hover());
     let mut edited = value;
     let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)).id_salt(id));
     flat_widgets(&mut child);
     child.spacing_mut().button_padding = vec2(SPACE_1, 0.0);
-    child.spacing_mut().interact_size.x = 0.0;
+    // The whole cell takes the drag, with the figure at its left.
+    child.spacing_mut().interact_size = rect.size();
     child.style_mut().override_font_id = Some(Type::Value.font());
     child.visuals_mut().override_text_color = Some(colour);
     let unit = suffix.clone();
@@ -508,6 +518,35 @@ mod tests {
         assert_eq!(click([toggle, Cell::blank()], 0), []);
         let locked = Cell { read_only: Some("Only Laptop can.".into()), ..cell("ON", CellKind::Toggle(Setting::Device(Control::Autostart))) };
         assert_eq!(click([locked, Cell::blank()], 0), []);
+    }
+
+    #[test]
+    fn a_number_can_be_dragged_from_anywhere_in_its_cell() {
+        let speed = CellKind::Number { setting: Setting::Device(Control::PointerSpeed), value: 1.0, range: 0.05..=2.0, step: 0.05 };
+        let row = Row { label: "Row".into(), cells: [cell("1.00\u{d7}", speed), Cell::blank()], error: None };
+        let groups = [GroupRows { group: Group::Input, rows: vec![row], notes: Vec::new() }];
+        let columns = [(Device::Debian, "Debian".to_string()), (Device::Windows, "Laptop".to_string())];
+        let (ctx, mut table) = (egui::Context::default(), Table::default());
+        crate::app::theme::apply(&ctx);
+        let mut requests = Vec::new();
+        let mut run = |events: Vec<Event>| {
+            let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(700.0, 400.0))), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    requests.extend(table.show(ui, &groups, columns.clone(), 400.0, None, false, Instant::now()));
+                });
+            });
+        };
+        run(vec![]);
+        // Near the right edge of the cell, well past the figure.
+        let cell = ctx.read_response(cell_id("Row", 0)).unwrap().rect;
+        let at = Pos2::new(cell.right() - 12.0, cell.center().y);
+        let press = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        run(vec![Event::PointerMoved(at)]);
+        run(vec![press(at, true)]);
+        run(vec![Event::PointerMoved(at + vec2(20.0, 0.0))]);
+        run(vec![Event::PointerMoved(at + vec2(40.0, 0.0)), press(at + vec2(40.0, 0.0), false)]);
+        assert!(requests.iter().any(|r| matches!(r, TableRequest::Set(Device::Debian, Control::PointerSpeed, v) if *v > 1.0)), "{requests:?}");
     }
 
     #[test]

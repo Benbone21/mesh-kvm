@@ -221,8 +221,8 @@ pub fn notices(snapshot: &Snapshot, start: &ServiceStart, last_error: Option<Str
     let said_above = snapshot.local.as_ref().is_none_or(|local| is_unpaired(local, snapshot));
     // A device dropping out is what an update looks like, and the update line says so.
     if !updating {
-        let reason = if matches!(start, ServiceStart::Failed(_)) { model::start_notice(start, snapshot) } else { None };
-        let text = reason.or_else(|| if said_above { None } else { model::status_message(snapshot) });
+        // With no service the body says why, so it isn't said here too.
+        let text = if said_above { None } else { model::status_message(snapshot) };
         if let Some(text) = text {
             let tone = if model::notice_is_serious(snapshot, start) { Tone::Danger } else { Tone::Warn };
             all.push(Notice { text, tone, dismiss: false });
@@ -436,8 +436,8 @@ mod tests {
         assert!(notices(&none, &ServiceStart::Done, None, false).is_empty());
         let n = notices(&linked(), &ServiceStart::Done, Some("Laptop didn't accept that change.".into()), false);
         assert_eq!((n.last().unwrap().tone, n.last().unwrap().dismiss), (Tone::Danger, true));
-        let failed = notices(&none, &ServiceStart::Failed("Couldn't start it.".into()), None, false);
-        assert_eq!(failed, vec![Notice { text: "Couldn't start it.".into(), tone: Tone::Danger, dismiss: false }]);
+        // The body gives the reason for a failed start.
+        assert!(notices(&none, &ServiceStart::Failed("Couldn't start it.".into()), None, false).is_empty());
         // A device dropping out is what an update looks like, so an update in progress hides the link notices.
         let mut alone = linked();
         alone.peer = None;
