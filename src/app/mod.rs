@@ -6,6 +6,7 @@ pub mod model;
 mod pairing;
 pub mod single;
 mod canvas;
+mod dialog;
 #[cfg(test)]
 mod fixtures;
 mod rows;

@@ -1,15 +1,11 @@
 //! The small controls the window is built from.
 
-use super::theme::{self, line, legacy::DIM, Type, ACCENT, DANGER, LINE_STRONG, ON_ACCENT, SPACE_3, STATUS_SQUARE, TEXT};
+use super::theme::{self, line, Type, ACCENT, DANGER, LINE_STRONG, ON_ACCENT, SPACE_3, STATUS_SQUARE, TEXT};
 use eframe::egui::{
-    text::LayoutJob, text::TextWrapping, vec2, Color32, CursorIcon, FontFamily, FontId, Galley, Painter, Response, RichText,
+    text::LayoutJob, text::TextWrapping, vec2, Color32, CursorIcon, FontFamily, FontId, Galley, Painter, Response,
     Sense, StrokeKind, TextFormat, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use std::sync::Arc;
-
-pub fn small(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(theme::legacy::SMALL_SIZE).color(DIM)
-}
 
 /// Text cut to fit `width`, on at most `rows` rows, ending in an ellipsis if it had to be cut.
 pub fn fitted(painter: &Painter, text: &str, font: FontId, colour: Color32, width: f32, rows: usize) -> Arc<Galley> {

@@ -4,6 +4,7 @@
 
 use super::canvas::Canvas;
 use super::client::{Client, PairingReply};
+use super::dialog;
 use super::launch::ServiceStarter;
 use super::model::{self, Control, ControlsEnabled, Device, Edits, LayoutDraft, ModeChange, Picks, ServiceStart, Snapshot};
 use super::pairing::{self, PairingInput, PairingRequest, PairingView};
@@ -11,17 +12,16 @@ use super::rows::{self, ActionKind, ChoiceValue, GroupRows, Pick, RowsInput, Set
 use super::sparkline::Sparklines;
 use super::table::{Table, TableRequest};
 use super::theme::{
-    self, legacy::{AMBER, DEEP, RED}, line, Type, BG, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SURFACE, TEXT,
-    TEXT_DIM,
+    self, legacy::DEEP, line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+    SURFACE, TEXT, TEXT_DIM,
 };
 use super::top::{self, TopRequest};
 use super::updates::{self, Banner, VersionWatch};
 use super::view;
-use super::widgets::{small, status_square};
+use super::widgets::{status_square, ButtonKind};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
-    self, vec2, Align, Align2, Frame, Key, Layout, Margin, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
-    ViewportCommand,
+    self, vec2, Align, Frame, Key, Layout, Margin, Modifiers, Rect, ScrollArea, Sense, Ui, ViewportCommand,
 };
 use serde_json::json;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -34,8 +34,6 @@ const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
 const CANVAS_MARGIN: Margin = Margin::same(SPACE_5 as i8);
 /// How often to look at how starting the service is going.
 const START_CHECK: Duration = Duration::from_millis(250);
-const PEER_PROMPT_WIDTH: f32 = 380.0;
-const MODE_PROMPT_WIDTH: f32 = 420.0;
 const MODE_PROMPT_SECONDS: f32 = crate::displays::REVERT_AFTER.as_secs() as f32;
 
 /// The app size a person can choose, on top of what the window's size does by itself.
@@ -103,7 +101,8 @@ struct PeerPrompt {
     error: Option<String>,
 }
 
-const LICENCES_WIDTH: f32 = 600.0;
+/// How much of the window's height the licence text may take before it scrolls.
+const LICENCES_HEIGHT: f32 = 0.7;
 
 /// How long the pairing window says it worked before it goes.
 const PAIRED_SHOWN: Duration = Duration::from_secs(2);
@@ -119,6 +118,9 @@ struct PairingWindow {
     paired_at: Option<Instant>,
     unpairing: Option<Receiver<PairingReply>>,
     unpair_error: Option<String>,
+    /// The last status, and when it was first seen, so a code's time left keeps counting down
+    /// between polls.
+    polled: Option<(pairing::PairingStatus, Instant)>,
 }
 
 struct Window {
@@ -127,6 +129,8 @@ struct Window {
     peer_prompt: PeerPrompt,
     pairing: PairingWindow,
     show_licences: bool,
+    /// The dialog that asks before unpairing is up.
+    unpair_confirm: bool,
     edits: Edits,
     /// The audio devices just picked, shown ahead of the poll.
     picks: Picks,
@@ -176,6 +180,7 @@ impl Window {
             peer_prompt: PeerPrompt::default(),
             pairing: PairingWindow::default(),
             show_licences: false,
+            unpair_confirm: false,
             edits: Edits::default(),
             picks: Picks::default(),
             layout: LayoutDraft::default(),
@@ -272,6 +277,7 @@ impl Window {
             self.mode_prompt(ctx, snapshot, device, change);
         }
         self.pairing_window(ctx, snapshot, now);
+        self.unpair_window(ctx, snapshot);
         // The table shows the fingerprint whenever the service encrypts.
         let encrypts = snapshot.local.as_ref().is_some_and(|l| !l.secure.is_empty());
         self.client.want_pairing(self.pairing.open || encrypts);
@@ -324,9 +330,9 @@ impl Window {
     }
 
     /// Asks whether to keep a new mode. Only the device with the screen can keep it, as only
-    /// someone there can see it worked. The other device's window can still send it back. The
-    /// service undoes the change by itself if nobody answers, so closing this window can't leave
-    /// a blank screen.
+    /// someone there can see it worked. The other device's window can still send it back, and Esc
+    /// does too. The service undoes the change by itself if nobody answers, so closing this window
+    /// can't leave a blank screen.
     fn mode_prompt(&mut self, ctx: &egui::Context, snapshot: &Snapshot, device: Device, change: &ModeChange) {
         let (mut keep, mut undo) = (false, false);
         let waiting = change.is_waiting();
@@ -336,42 +342,35 @@ impl Window {
         let screen = format!("{} on {}", change.name, snapshot.name(device));
         let here = snapshot.is_here(device);
         let elsewhere = format!("It can only be kept from {}.", snapshot.name(device));
-        let frame = Frame::popup(&ctx.style()).inner_margin(Margin::same(18));
-        egui::Window::new("Keep these screen settings?")
-            .id(egui::Id::new("mode prompt"))
-            .collapsible(false)
-            .resizable(false)
-            .frame(frame)
-            .min_width(MODE_PROMPT_WIDTH)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| match change.stage.as_str() {
+        let shown = dialog::show(ctx, egui::Id::new("mode prompt"), "Keep these screen settings?", 1.0, |ui| {
+            match change.stage.as_str() {
                 "applying" => {
-                    ui.label(format!("Changing {screen} to {target}."));
+                    dialog::text(ui, &format!("Changing {screen} to {target}."), Type::Body, TEXT);
                 }
                 "going_back" => {
-                    ui.label(format!("Putting {screen} back to {going_back}."));
+                    dialog::text(ui, &format!("Putting {screen} back to {going_back}."), Type::Body, TEXT);
                 }
                 _ => {
-                    ui.label(format!("{screen} is now {target}."));
-                    ui.label(small(format!("It goes back to {going_back} in {seconds} seconds unless you keep it.")));
+                    dialog::text(ui, &format!("{screen} is now {target}."), Type::Body, TEXT);
+                    let when = format!("It goes back to {going_back} in {seconds} seconds unless you keep it.");
+                    dialog::text(ui, &when, Type::Caption, TEXT_DIM);
                     let share = change.ms_left as f32 / 1000.0 / MODE_PROMPT_SECONDS;
-                    let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
-                    ui.painter().rect_filled(bar, 2.0, DEEP);
-                    let left = Rect::from_min_size(bar.min, vec2(bar.width() * share.clamp(0.0, 1.0), bar.height()));
-                    ui.painter().rect_filled(left, 2.0, AMBER);
-                    ui.add_space(4.0);
+                    countdown(ui, share);
                     if !here {
-                        ui.label(small(elsewhere));
+                        dialog::text(ui, &elsewhere, Type::Caption, TEXT_DIM);
                     }
-                    ui.horizontal(|ui| {
+                    dialog::buttons(ui, |ui| {
+                        let back = dialog::button(ui, "Go back now", ButtonKind::Secondary, true);
+                        dialog::focus_on_open(ui, &back);
+                        undo = back.clicked();
                         if here {
-                            let text = RichText::new("Keep this").color(DEEP);
-                            keep = ui.add(egui::Button::new(text).fill(AMBER).stroke(Stroke::NONE)).clicked();
+                            keep = dialog::button(ui, "Keep this", ButtonKind::Primary, true).clicked();
                         }
-                        undo = ui.button("Go back now").clicked();
                     });
                 }
-            });
+            }
+        });
+        undo |= shown.escaped;
         if waiting && (keep || undo) {
             self.client.local_action(device, model::mode_answer(change, keep));
         }
@@ -408,40 +407,41 @@ impl Window {
         let this_address = snapshot.local.as_ref().map_or("", |l| l.ip.as_str());
         let saving = self.peer_prompt.saving.is_some();
         let (mut connect, mut cancel) = (false, false);
-        egui::Window::new("Connect to your other device")
-            .collapsible(false)
-            .resizable(false)
-            .default_width(PEER_PROMPT_WIDTH)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label("Enter the address of the other device. mesh-kvm shows it on that device, next to its name.");
-                if !this_address.is_empty() && this_address != UNKNOWN_ADDRESS {
-                    ui.label(small(format!("This device's address is {this_address}.")));
+        let prompt = &mut self.peer_prompt;
+        let shown = dialog::show(ctx, egui::Id::new("peer prompt"), "Connect to your other device", 1.0, |ui| {
+            let ask = "Enter the address of the other device. mesh-kvm shows it on that device, next to its name.";
+            let label = dialog::text(ui, ask, Type::Body, TEXT);
+            if !this_address.is_empty() && this_address != UNKNOWN_ADDRESS {
+                dialog::text(ui, &format!("This device's address is {this_address}."), Type::Caption, TEXT_DIM);
+            }
+            let edit = egui::TextEdit::singleline(&mut prompt.address)
+                .hint_text("192.168.1.20")
+                .font(Type::Value.font())
+                .margin(Margin::symmetric(SPACE_3 as i8, SPACE_2 as i8))
+                .desired_width(f32::INFINITY);
+            let field = ui.add_enabled(!saving, edit).labelled_by(label.id);
+            if !prompt.focused {
+                prompt.focused = true;
+                field.request_focus();
+            }
+            let pressed_enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if let Some(error) = &prompt.error {
+                dialog::text(ui, error, Type::Body, DANGER);
+            }
+            if saving {
+                dialog::text(ui, "Saving the address.", Type::Caption, TEXT_DIM);
+            }
+            dialog::buttons(ui, |ui| {
+                if !first_run {
+                    cancel = dialog::button(ui, "Cancel", ButtonKind::Secondary, !saving).clicked();
                 }
-                let edit = egui::TextEdit::singleline(&mut self.peer_prompt.address)
-                    .hint_text("192.168.1.20")
-                    .desired_width(ui.available_width());
-                let field = ui.add_enabled(!saving, edit);
-                if !self.peer_prompt.focused {
-                    self.peer_prompt.focused = true;
-                    field.request_focus();
-                }
-                let pressed_enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if let Some(error) = &self.peer_prompt.error {
-                    ui.label(RichText::new(error).color(RED));
-                }
-                ui.horizontal(|ui| {
-                    let ready = !saving && !self.peer_prompt.address.trim().is_empty();
-                    let clicked = ui.add_enabled(ready, egui::Button::new("Connect")).clicked();
-                    connect = clicked || (ready && pressed_enter);
-                    if !first_run {
-                        cancel = ui.add_enabled(!saving, egui::Button::new("Cancel")).clicked();
-                    }
-                    if saving {
-                        ui.label(small("Saving the address."));
-                    }
-                });
+                let ready = !saving && !prompt.address.trim().is_empty();
+                let clicked = dialog::button(ui, "Connect", ButtonKind::Primary, ready).clicked();
+                connect = clicked || (ready && pressed_enter);
             });
+        });
+        // A first run can't go on without an address, so its box stays.
+        cancel |= shown.escaped && !first_run && !saving;
         if connect {
             self.save_peer(ctx);
         }
@@ -482,6 +482,7 @@ impl Window {
             match reply {
                 Ok(PairingReply::Refused(why)) => {
                     self.pairing.input.refusal = Some(why);
+                    self.pairing.input.refocus = true;
                     self.pairing.pending = None;
                 }
                 // The status says how it went, and a service that is restarting says nothing.
@@ -495,7 +496,11 @@ impl Window {
                     self.pairing.unpair_error = Some(why);
                     self.pairing.unpairing = None;
                 }
-                Ok(_) | Err(TryRecvError::Disconnected) => self.pairing.unpairing = None,
+                // Done, so the question is answered.
+                Ok(_) | Err(TryRecvError::Disconnected) => {
+                    self.pairing.unpairing = None;
+                    self.unpair_confirm = false;
+                }
                 Err(TryRecvError::Empty) => {}
             }
         }
@@ -542,12 +547,16 @@ impl Window {
             }
         }
         let other = snapshot.name(snapshot.in_order()[1]);
-        let here = snapshot.name(snapshot.in_order()[0]);
         let address = snapshot.local.as_ref().map(|l| l.peer_ip.as_str()).filter(|a| !a.is_empty() && *a != UNKNOWN_ADDRESS);
         let state = snapshot.pairing.as_ref().map(|p| p.state.as_str());
         let working = self.pairing.pending.is_some() || state == Some("entering");
-        let view = PairingView { status: snapshot.pairing.as_ref(), other: &other, this_device: &here, other_address: address, working };
-        let request = pairing::window(ctx, &view, &mut self.pairing.input);
+        let status = snapshot.pairing.as_ref();
+        if status != self.pairing.polled.as_ref().map(|(s, _)| s) {
+            self.pairing.polled = status.map(|s| (s.clone(), now));
+        }
+        let left_since_poll = self.pairing.polled.as_ref().map_or(Duration::ZERO, |(_, at)| now.saturating_duration_since(*at));
+        let view = PairingView { status, other: &other, other_address: address, working, left_since_poll };
+        let request = pairing::window(ctx, &view, &mut self.pairing.input, 1.0);
         self.apply_pairing(ctx, snapshot, request);
         // The countdown on a code moves each second.
         if state == Some("showing") {
@@ -610,13 +619,56 @@ impl Window {
     }
 
     fn licences_window(&mut self, ctx: &egui::Context) {
-        // Wide enough for the licence's own line breaks, as long as the window allows it.
-        let width = LICENCES_WIDTH.min(ctx.screen_rect().width() - 2.0 * theme::legacy::MARGIN as f32);
-        egui::Window::new("Licences").open(&mut self.show_licences).collapsible(false).default_width(width).show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height(ctx.screen_rect().height() * 0.7).show(ui, |ui| {
-                ui.label(small(crate::licenses::TEXT));
+        if !self.show_licences {
+            return;
+        }
+        let height = ctx.screen_rect().height() * LICENCES_HEIGHT;
+        let shown = dialog::show(ctx, egui::Id::new("licences"), "Licences", 1.0, |ui| {
+            ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+                dialog::text(ui, crate::licenses::TEXT, Type::Caption, TEXT_DIM);
+            });
+            let mut close = false;
+            dialog::buttons(ui, |ui| {
+                let button = dialog::button(ui, "Close", ButtonKind::Secondary, true);
+                dialog::focus_on_open(ui, &button);
+                close = button.clicked();
+            });
+            close
+        });
+        if shown.inner || shown.escaped {
+            self.show_licences = false;
+        }
+    }
+
+    /// Asks before unpairing, as pairing again needs both devices and a code.
+    fn unpair_window(&mut self, ctx: &egui::Context, snapshot: &Snapshot) {
+        if !self.unpair_confirm {
+            return;
+        }
+        let other = snapshot.name(snapshot.in_order()[1]);
+        let unpairing = self.pairing.unpairing.is_some();
+        let (mut unpair, mut cancel) = (false, false);
+        let error = self.pairing.unpair_error.as_deref();
+        let shown = dialog::show(ctx, egui::Id::new("unpair confirm"), "Unpair", 1.0, |ui| {
+            let ask = format!("Unpair {other}? The two devices stop sharing until you pair again.");
+            dialog::text(ui, &ask, Type::Body, TEXT);
+            if let Some(error) = error {
+                dialog::text(ui, error, Type::Body, DANGER);
+            }
+            dialog::buttons(ui, |ui| {
+                let button = dialog::button(ui, "Cancel", ButtonKind::Secondary, true);
+                dialog::focus_on_open(ui, &button);
+                cancel = button.clicked();
+                let label = if unpairing { "Unpairing\u{2026}" } else { "Unpair" };
+                unpair = dialog::button(ui, label, ButtonKind::Danger, !unpairing).clicked();
             });
         });
+        if unpair {
+            self.unpair(ctx);
+        }
+        if cancel || shown.escaped {
+            self.unpair_confirm = false;
+        }
     }
 
     /// The settings table and the layout canvas, side by side or one above the other, or why
@@ -803,7 +855,7 @@ impl Window {
             ActionKind::MakeMain => {}
             ActionKind::ChangeAddress => self.peer_prompt.open = true,
             ActionKind::Pair => self.open_pairing(snapshot),
-            ActionKind::Unpair => self.unpair(ctx),
+            ActionKind::Unpair => self.unpair_confirm = true,
             ActionKind::ResetSizes => {
                 self.client.master_action("reset_native_resolutions");
                 self.layout.let_poll_through();
@@ -821,6 +873,14 @@ impl Window {
         self.pairing.unpair_error = None;
         self.pairing.unpairing = Some(self.send_pairing(ctx, json!({ "action": "unpair" })));
     }
+}
+
+/// A dialog's time left: a `COUNTDOWN_HEIGHT` bar, `accent` for the `share` still to go.
+fn countdown(ui: &mut Ui, share: f32) {
+    let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), COUNTDOWN_HEIGHT), Sense::hover());
+    ui.painter().rect_filled(bar, 0.0, BG);
+    let left = Rect::from_min_size(bar.min, vec2(bar.width() * share.clamp(0.0, 1.0), bar.height()));
+    ui.painter().rect_filled(left, 0.0, ACCENT);
 }
 
 #[cfg(test)]
@@ -1451,7 +1511,7 @@ mod tests {
         window.open_pairing(&snapshot);
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
-        assert!(text.contains("Show a code here") && text.contains("Enter a code here"), "{text}");
+        assert!(text.contains("Show a code") && text.contains("Enter a code"), "{text}");
         assert!(window.client.wants_pairing());
 
         // The service restarts after pairing, so the window may only ever see the result.
@@ -1506,6 +1566,104 @@ mod tests {
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
         assert!(text.contains("Set the other device's address first"), "{text}");
+    }
+
+    /// Clicks the text `label` drawn inside the dialog `id`.
+    fn click_in_dialog(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, id: &str, label: &str, now: Instant) {
+        let output = settled(ctx, window, snapshot, WINDOW_SIZE);
+        let dialog = ctx.memory(|m| m.area_rect(egui::Id::new(id))).expect("the dialog is up");
+        let at = texts(&output).into_iter().find(|(t, r)| t == label && dialog.contains_rect(*r)).expect(label).1.center();
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+    }
+
+    #[test]
+    fn unpair_asks_first() {
+        let (ctx, mut window) = (context(), window());
+        let snapshot = secure(linked(), "encrypted");
+        let now = Instant::now();
+        let other = snapshot.in_order()[1];
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        window.apply_table(&ctx, &snapshot, vec![TableRequest::Action(other, ActionKind::Unpair)], now);
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        let ask = format!("Unpair {}? The two devices stop sharing until you pair again.", snapshot.name(other));
+        assert!(text.contains(&ask) && text.contains("\nCancel\n") && text.contains("\nUNPAIR\n"), "{text}");
+        assert!(window.pairing.unpairing.is_none(), "nothing is sent yet");
+        click_in_dialog(&ctx, &mut window, &snapshot, "unpair confirm", "Cancel", now);
+        assert!(!window.unpair_confirm, "Cancel closes it");
+        assert!(window.pairing.unpairing.is_none(), "and sends nothing");
+
+        window.apply_table(&ctx, &snapshot, vec![TableRequest::Action(other, ActionKind::Unpair)], now);
+        click_in_dialog(&ctx, &mut window, &snapshot, "unpair confirm", "Unpair", now);
+        assert!(window.pairing.unpairing.is_some(), "Unpair sends it, off the UI thread");
+        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+        assert!(text.contains("Unpairing\u{2026}") || !window.unpair_confirm, "{text}");
+        // Nothing listens, which is what a service restarting to unpair looks like, so it closes.
+        for _ in 0..400 {
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+            if window.pairing.unpairing.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!window.unpair_confirm);
+    }
+
+    #[test]
+    fn a_refused_unpair_says_why_in_its_dialog() {
+        let (ctx, mut window) = (context(), window());
+        let snapshot = secure(linked(), "encrypted");
+        window.unpair_confirm = true;
+        window.pairing.unpair_error = Some("The pairing file can't be read. Pair again to replace it.".into());
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        let in_dialog = text.split("\nUNPAIR\n").nth(1).unwrap_or_default();
+        assert!(in_dialog.contains("The pairing file can't be read."), "{text}");
+    }
+
+    #[test]
+    fn every_dialog_has_its_title_and_esc_closes_those_that_can_close() {
+        let esc = Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        window.show_licences = true;
+        assert!(drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE)).contains("\nLICENCES\n"));
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![esc.clone()], Instant::now());
+        assert!(!window.show_licences);
+        window.peer_prompt.open = true;
+        assert!(drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE)).contains("\nCONNECT TO YOUR OTHER DEVICE\n"));
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![esc.clone()], Instant::now());
+        assert!(!window.peer_prompt.open);
+        // A first run can't go on without the address.
+        let first = unpaired();
+        settled(&ctx, &mut window, &first, WINDOW_SIZE);
+        frame(&ctx, &mut window, &first, WINDOW_SIZE, vec![esc], Instant::now());
+        assert!(drawn_text(&settled(&ctx, &mut window, &first, WINDOW_SIZE)).contains("\nCONNECT TO YOUR OTHER DEVICE\n"));
+        let mut changing = linked();
+        changing.local.as_mut().unwrap().display_change.change = Some(waiting_change());
+        let (ctx, mut window) = (context(), self::window());
+        assert!(drawn_text(&settled(&ctx, &mut window, &changing, WINDOW_SIZE)).contains("\nKEEP THESE SCREEN SETTINGS?\n"));
+    }
+
+    #[test]
+    fn every_dialog_fits_the_smallest_window() {
+        let size = MIN_WINDOW_SIZE;
+        let screen = Rect::from_min_size(Pos2::ZERO, size.into());
+        let mut changing = linked();
+        changing.local.as_mut().unwrap().display_change.change = Some(waiting_change());
+        let cases: [(&str, Snapshot, fn(&mut Window)); 4] = [
+            ("licences", linked(), |w| w.show_licences = true),
+            ("peer prompt", unpaired(), |_| {}),
+            ("mode prompt", changing, |_| {}),
+            ("unpair confirm", secure(linked(), "encrypted"), |w| w.unpair_confirm = true),
+        ];
+        for (id, snapshot, open) in cases {
+            let (ctx, mut window) = (context(), window());
+            open(&mut window);
+            settled(&ctx, &mut window, &snapshot, size);
+            let area = ctx.memory(|m| m.area_rect(egui::Id::new(id))).expect(id);
+            assert!(screen.contains_rect(area), "{id} {area:?}");
+            assert_eq!(area.width(), theme::DIALOG_WIDTH, "{id}");
+        }
     }
 
     /// Every text shape drawn, with where it was drawn.
