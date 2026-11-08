@@ -1,9 +1,9 @@
 //! The settings table as plain values: each row's label and what each device's cell says and
 //! does. No egui types in here, only `Tone`.
 
-use super::ui::UI_SCALES;
 use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutState, Picks, Placement, Snapshot};
 use super::theme::Tone;
+use super::ui::UI_SCALES;
 use super::view::fit_name;
 use crate::audio::BITRATES;
 use crate::platform::{DisplayInfo, DisplayMode};
@@ -17,6 +17,7 @@ pub const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 pub const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 const WAIT_FOR_SCREEN: &str = "Wait for the screen change to finish.";
 const NAME_TIP: &str = "Type here to rename this device. Leave it empty to use its network name.";
+const MAIN_TIP: &str = "It takes the keyboard and mouse when the devices link up.";
 const MAIN_NEEDS_LINK: &str = "The main device can be chosen while the devices are linked and on the same version.";
 const ADDRESS_PINNED: &str = "How mesh-kvm starts on this device sets the address, so it can't be changed here.";
 const NO_LAYOUT: &str = "The layout shows up once mesh-kvm is running on this device.";
@@ -187,6 +188,8 @@ pub struct RowsInput<'a> {
     pub main_changing: bool,
     pub main_error: Option<&'a str>,
     pub unpairing: bool,
+    /// Why the last unpair was refused.
+    pub unpair_error: Option<&'a str>,
     pub now: Instant,
 }
 
@@ -476,9 +479,11 @@ impl Rows<'_, '_> {
     fn main_row(&self) -> Row {
         let main = self.input.snapshot.main_device();
         let row = self.row("Main device", |device, _| {
+            let tip = Some(MAIN_TIP.to_string());
             if main == Some(device) {
-                return Cell::new("MAIN".into(), Tone::Accent, CellKind::Plain);
+                return Cell { tooltip: tip, ..Cell::new("MAIN".into(), Tone::Accent, CellKind::Plain) };
             }
+            let action = |value, tone, kind| Cell { tooltip: tip.clone(), ..action(value, tone, kind) };
             let cell = action("Make main", Tone::Dim, ActionKind::MakeMain);
             if !self.input.on.main_device {
                 cell.read_only(MAIN_NEEDS_LINK)
@@ -564,7 +569,8 @@ impl Rows<'_, '_> {
                 } else {
                     action("Unpair", Tone::Text, ActionKind::Unpair)
                 };
-                return Some(Row { label: "Paired, fingerprint".into(), cells: [print, unpair], error: None });
+                let error = self.input.unpair_error.map(str::to_string);
+                return Some(Row { label: "Paired, fingerprint".into(), cells: [print, unpair], error });
             }
             _ => [action("Pair", Tone::Accent, ActionKind::Pair), Cell::blank()],
         };
@@ -609,7 +615,7 @@ impl Rows<'_, '_> {
         };
         let licences = Row {
             label: "Licences".into(),
-            cells: [self.this_device_only(|_| true, || action("Show", Tone::Text, ActionKind::ShowLicences)), Cell::blank()],
+            cells: [action("Show", Tone::Text, ActionKind::ShowLicences), Cell::blank()],
             error: None,
         };
         let mut notes = Vec::new();
@@ -696,6 +702,7 @@ mod tests {
             main_changing: false,
             main_error: None,
             unpairing: false,
+            unpair_error: None,
             now: Instant::now(),
         }
     }
@@ -1155,6 +1162,31 @@ mod tests {
         assert_eq!(licences.cells[0].value, "Show");
         let texts: Vec<String> = notes(&g, Group::Updates).into_iter().map(|n| n.text).collect();
         assert_eq!(texts, ["debian-host: mesh-kvm hasn't been able to check for updates for 3 days."]);
+    }
+
+    #[test]
+    fn licences_open_without_a_service() {
+        let g = groups(&input(&Snapshot::default()));
+        let licences = row(&g, "Licences");
+        assert!(matches!(licences.cells[0].kind, CellKind::Action(ActionKind::ShowLicences)));
+        assert_eq!(licences.cells[0].value, "Show");
+    }
+
+    #[test]
+    fn a_refused_unpair_sits_under_the_pairing_row() {
+        let s = secure(linked(), "encrypted");
+        let mut i = input(&s);
+        assert_eq!(row(&groups(&i), "Paired, fingerprint").error, None);
+        i.unpair_error = Some("The other device didn't answer.");
+        assert_eq!(row(&groups(&i), "Paired, fingerprint").error.as_deref(), Some("The other device didn't answer."));
+    }
+
+    #[test]
+    fn the_main_device_cells_explain_what_main_means() {
+        let g = groups(&input(&linked()));
+        for cell in &row(&g, "Main device").cells {
+            assert_eq!(cell.tooltip.as_deref(), Some("It takes the keyboard and mouse when the devices link up."));
+        }
     }
 
     #[test]
