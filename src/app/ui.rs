@@ -4,15 +4,18 @@
 use super::canvas::Canvas;
 use super::client::{Client, PairingReply};
 use super::launch::ServiceStarter;
-use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, Light, ModeChange, ServiceStart, Snapshot};
+use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, ModeChange, ServiceStart, Snapshot};
 use super::pairing::{self, PairingInput, PairingRequest, PairingView};
 use super::panels::{self, Panels, Requests, Shared};
-use super::theme::{self, legacy::{AMBER, DEEP, INK, PANEL, RAISED, RED}};
+use super::sparkline::Sparklines;
+use super::theme::{self, legacy::{AMBER, DEEP, PANEL, RED}, Type, SPACE_2, SPACE_3, SPACE_5, SURFACE, TEXT};
+use super::top::{self, TopRequest};
 use super::updates::{self, Banner, VersionWatch};
-use super::widgets::{paint_light, paint_name_and_state, segment, slide_switch, slider_row, small};
+use super::view;
+use super::widgets::{segment, slider_row, small};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
-    self, vec2, Align2, Color32, Frame, Key, Margin, Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
+    self, vec2, Align2, Frame, Key, Margin, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
     ViewportCommand,
 };
 use std::ops::RangeInclusive;
@@ -22,11 +25,6 @@ use std::time::{Duration, Instant};
 
 const WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
-const SWITCH_SIZE: [f32; 2] = [176.0, 44.0];
-const HEADER_HEIGHT: f32 = 46.0;
-const BAY_GAP: f32 = 16.0;
-/// Below this width a device's place in the header says it has control in fewer words.
-const ROOM_FOR_FULL_STATE: f32 = 190.0;
 /// Below this width the arrangement's settings take two rows.
 const THREE_SETTINGS_FROM: f32 = 620.0;
 
@@ -103,7 +101,6 @@ struct PeerPrompt {
 }
 
 const LICENCES_WIDTH: f32 = 600.0;
-const RELEASE_NOTES: &str = "Release notes";
 
 /// How long the pairing window says it worked before it goes.
 const PAIRED_SHOWN: Duration = Duration::from_secs(2);
@@ -151,6 +148,7 @@ struct Window {
     version_watch: VersionWatch,
     /// A Windows copy run from somewhere other than where mesh-kvm is installed.
     not_installed: bool,
+    sparklines: Sparklines,
 }
 
 impl eframe::App for Window {
@@ -193,6 +191,7 @@ impl Window {
             nudged_for: None,
             version_watch: VersionWatch::default(),
             not_installed: cfg!(target_os = "windows") && !super::install::runs_from_installed(),
+            sparklines: Sparklines::default(),
         }
     }
 
@@ -236,38 +235,39 @@ impl Window {
         let start = self.starter.state();
         self.layout.follow(snapshot.layout.clone(), self.canvas.is_dragging(), now);
 
-        egui::TopBottomPanel::top("header")
-            .show_separator_line(false)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 10)))
-            .show(ctx, |ui| self.header(ui, snapshot, &on));
-        let updating = self.follow_update(ctx, snapshot);
-        // A device dropping out is what an update looks like, and the line above says so.
-        let notice = if updating { None } else { model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)) };
-        if let Some(message) = notice {
-            let fill = if model::notice_is_serious(snapshot, &start) { RED } else { AMBER };
-            notice_strip(ctx, "notice", fill, |ui| {
-                ui.label(RichText::new(message).color(DEEP));
+        self.sparklines.sample(snapshot, now);
+        let line = view::status_line(snapshot, &start, &on);
+        let mut requests = Vec::new();
+        let bar = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
+        egui::TopBottomPanel::top("status bar").frame(bar).show(ctx, |ui| {
+            // The Settings menu stays at the end until the settings table takes its place.
+            let menu = ui.fonts(|f| f.layout_no_wrap("Settings".into(), Type::Body.font(), TEXT)).size().x
+                + 2.0 * ui.spacing().button_padding.x
+                + ui.spacing().item_spacing.x;
+            ui.horizontal(|ui| {
+                let room = (ui.available_width() - menu).max(0.0);
+                let switch_name = line.switch_to.map(|d| snapshot.title(d));
+                let status = ui.allocate_ui(vec2(room, 0.0), |ui| top::status_bar(ui, &line, theme::tone(line.square), switch_name.as_deref()));
+                requests.extend(status.inner);
+                ui.menu_button("Settings", |ui| self.settings_menu(ui, snapshot));
             });
+        });
+        let banner = self.follow_update(ctx, snapshot);
+        let updating = self.update_under_way.is_some();
+        let strip = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_2 as i8));
+        if let Some(banner) = &banner {
+            egui::TopBottomPanel::top("update").frame(strip).show(ctx, |ui| requests.extend(top::update_line(ui, banner)));
         }
-        for (index, note) in Device::BOTH.into_iter().filter_map(|d| snapshot.device(d)?.display_change.note.as_ref()).enumerate() {
-            notice_strip(ctx, if index == 0 { "first screen note" } else { "second screen note" }, AMBER, |ui| {
-                ui.label(RichText::new(note).color(DEEP));
-            });
+        for (index, notice) in view::notices(snapshot, &start, self.client.last_error(), updating).iter().enumerate() {
+            let panel = egui::TopBottomPanel::top(egui::Id::new("notice").with(index)).frame(strip);
+            panel.show(ctx, |ui| requests.extend(top::notice_line(ui, notice)));
         }
-        if let Some(message) = self.client.last_error() {
-            let client = self.client.clone();
-            notice_strip(ctx, "last error", RED, |ui| {
-                let text_width = (ui.available_width() - 92.0).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.allocate_ui(vec2(text_width, 0.0), |ui| {
-                        ui.set_width(text_width);
-                        ui.label(RichText::new(message).color(DEEP));
-                    });
-                    if ui.add(egui::Button::new(RichText::new("Dismiss").color(INK)).fill(DEEP)).clicked() {
-                        client.dismiss_error();
-                    }
-                });
-            });
+        let rows = view::frame_layout(ctx.screen_rect().width(), ctx.screen_rect().height()).stat_rows;
+        egui::TopBottomPanel::top("stats")
+            .frame(Frame::new().fill(SURFACE))
+            .show(ctx, |ui| top::stats_row(ui, snapshot, &self.sparklines, rows));
+        for request in requests {
+            self.apply_top(snapshot, request);
         }
 
         let body = model::body_layout(ctx.screen_rect().width());
@@ -300,7 +300,7 @@ impl Window {
             self.mode_prompt(ctx, snapshot, device, change);
         }
         self.pairing_window(ctx, snapshot, now);
-        // The menu is drawn inside the header, so only now is it known whether it was open.
+        // The menu is drawn inside the status bar, so only now is it known whether it was open.
         self.client.want_pairing(self.pairing.open || self.pairing_in_menu);
 
         self.canvas.end_lost_drag(ctx, &mut self.layout, now);
@@ -314,9 +314,9 @@ impl Window {
         }
     }
 
-    /// The update line, and what goes with it. A service that has just updated means this window
-    /// is the old version, so it starts again from the new exe. True while an update is under way.
-    fn follow_update(&mut self, ctx: &egui::Context, snapshot: &Snapshot) -> bool {
+    /// What the update line says, and what goes with it. A service that has just updated means
+    /// this window is the old version, so it starts again from the new exe.
+    fn follow_update(&mut self, ctx: &egui::Context, snapshot: &Snapshot) -> Option<Banner> {
         let own = crate::update::trust::running_version().to_string();
         if self.version_watch.moved_on(&own, snapshot.local.as_ref().map(|l| l.version.as_str())) {
             match super::launch::relaunch("--app") {
@@ -333,54 +333,19 @@ impl Window {
         let carried = self.update_under_way.clone().filter(|_| snapshot.local.is_none());
         let banner = updates::with_install_hint(updates::update_banner(snapshot).or(carried), self.not_installed);
         self.update_under_way = banner.clone().filter(|b| b.busy);
-        if let Some(banner) = &banner {
-            self.update_strip(ctx, snapshot, banner);
-        }
-        self.update_under_way.is_some()
+        banner
     }
 
-    /// One line at the top: what's happening, with the button and the release notes at its end.
-    fn update_strip(&self, ctx: &egui::Context, snapshot: &Snapshot, banner: &Banner) {
-        let quiet = banner.button.is_none() && !banner.busy && !banner.failed;
-        let (fill, ink) = match (banner.failed, quiet) {
-            (true, _) => (RED, DEEP),
-            (_, true) => (RAISED, INK),
-            _ => (AMBER, DEEP),
-        };
-        let mut pressed = None;
-        // A gap below keeps it apart from a notice of the same colour.
-        let frame = Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 8)).outer_margin(Margin { bottom: 2, ..Default::default() });
-        egui::TopBottomPanel::top("update").show_separator_line(false).frame(frame).show(ctx, |ui| {
-            let text_size = |ui: &Ui, text: &str| ui.painter().layout_no_wrap(text.into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x;
-            let gap = ui.spacing().item_spacing.x;
-            let button = banner.button.map_or(0.0, |b| text_size(ui, b.label()) + 2.0 * ui.spacing().button_padding.x + gap);
-            let notes = banner.notes.as_ref().map_or(0.0, |_| text_size(ui, RELEASE_NOTES) + gap);
-            let text_width = (ui.available_width() - button - notes).max(0.0);
-            ui.horizontal(|ui| {
-                ui.allocate_ui(vec2(text_width, 0.0), |ui| {
-                    ui.set_width(text_width);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new(&banner.text).color(ink));
-                        if let Some(detail) = &banner.detail {
-                            ui.label(small(detail).color(ink));
-                        }
-                    });
-                });
-                if let Some(button) = banner.button {
-                    let label = RichText::new(button.label()).color(INK);
-                    if ui.add(egui::Button::new(label).fill(DEEP)).clicked() {
-                        pressed = Some(button);
-                    }
+    fn apply_top(&mut self, snapshot: &Snapshot, request: TopRequest) {
+        match request {
+            TopRequest::Switch => self.client.master_action("toggle_focus"),
+            TopRequest::ReleaseAll => self.client.release_all_input(),
+            TopRequest::Update(button) => {
+                if let Some(here) = snapshot.this_device() {
+                    self.client.local_action(here, button.action());
                 }
-                if let Some(version) = &banner.notes {
-                    ui.visuals_mut().hyperlink_color = ink;
-                    ui.hyperlink_to(RELEASE_NOTES, updates::notes_url(version));
-                }
-            });
-        });
-        if let (Some(button), Some(here)) = (pressed, snapshot.this_device()) {
-            self.client.local_action(here, button.action());
+            }
+            TopRequest::DismissError => self.client.dismiss_error(),
         }
     }
 
@@ -667,46 +632,6 @@ impl Window {
         self.main_change = Some(change);
     }
 
-    fn header(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
-        let [left, right] = snapshot.in_order();
-        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), HEADER_HEIGHT), Sense::hover());
-        // The two buttons sit at the end, and the devices and their switch share the rest.
-        let buttons = ui.painter().layout_no_wrap("Release all input".into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x
-            + ui.painter().layout_no_wrap("Settings".into(), egui::FontId::proportional(theme::legacy::BODY_SIZE), INK).size().x
-            + 4.0 * ui.spacing().button_padding.x
-            + ui.spacing().item_spacing.x;
-        let room = Rect::from_min_max(bar.min, Pos2::new(bar.right() - buttons - BAY_GAP, bar.bottom()));
-        let switch_rect = Rect::from_center_size(room.center(), SWITCH_SIZE.into());
-        let left_bay = Rect::from_min_max(room.min, Pos2::new(switch_rect.left() - BAY_GAP, room.bottom()));
-        let right_bay = Rect::from_min_max(Pos2::new(switch_rect.right() + BAY_GAP, room.top()), room.max);
-        for (device, bay, side) in [(left, left_bay, Align2::LEFT_CENTER), (right, right_bay, Align2::RIGHT_CENTER)] {
-            device_bay(ui, bay, device, snapshot, side);
-        }
-        let active = snapshot.active();
-        let side = active.map_or(0.5, |d| if d == left { 0.0 } else { 1.0 });
-        let knob = active.map(|d| snapshot.title(d));
-        let hint = match (on.switch, active) {
-            (true, Some(device)) => format!("Switch keyboard and mouse to {}", snapshot.name(device.other())),
-            _ => "The switch works while the devices are linked and agree on a main device.".to_string(),
-        };
-        if slide_switch(ui, switch_rect, side, knob.as_deref(), on.switch, hint).clicked() {
-            self.client.master_action("toggle_focus");
-        }
-        let buttons = Rect::from_min_max(Pos2::new(bar.right() - buttons, bar.top()), bar.max);
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(buttons), |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("Settings", |ui| self.settings_menu(ui, snapshot));
-                ui.add_enabled_ui(on.release, |ui| {
-                    let text = RichText::new("Release all input").color(DEEP);
-                    let button = egui::Button::new(text).fill(RED).stroke(Stroke::NONE);
-                    if ui.add(button).on_hover_text("Gives each device back its own keyboard and mouse.").clicked() {
-                        self.client.release_all_input();
-                    }
-                });
-            });
-        });
-    }
-
     fn settings_menu(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
         ui.set_min_width(260.0);
         ui.label("App size");
@@ -949,25 +874,6 @@ impl Window {
     }
 }
 
-fn notice_strip(ctx: &egui::Context, id: &'static str, fill: Color32, contents: impl FnOnce(&mut Ui)) {
-    egui::TopBottomPanel::top(id)
-        .show_separator_line(false)
-        .frame(Frame::new().fill(fill).inner_margin(Margin::symmetric(theme::legacy::MARGIN, 8)))
-        .show(ctx, contents);
-}
-
-/// A device's name and state in the header, against one side of `rect`.
-fn device_bay(ui: &Ui, rect: Rect, device: Device, snapshot: &Snapshot, side: Align2) {
-    let (light, state) = model::device_badge(snapshot, device);
-    let state = if rect.width() < ROOM_FOR_FULL_STATE && light == Light::Active { "Has control" } else { state };
-    let painter = ui.painter().with_clip_rect(rect);
-    let on_left = side == Align2::LEFT_CENTER;
-    let light_x = if on_left { rect.left() + 8.0 } else { rect.right() - 8.0 };
-    paint_light(&painter, Pos2::new(light_x, rect.center().y), light);
-    let text = if on_left { rect.with_min_x(rect.left() + 26.0) } else { rect.with_max_x(rect.right() - 26.0) };
-    paint_name_and_state(&painter, text, &snapshot.title(device), state, side);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,7 +881,7 @@ mod tests {
     use crate::app::fixtures::*;
     use crate::app::model::Control;
     use crate::app::panels::device_details;
-    use eframe::egui::{Event, PointerButton, RawInput};
+    use eframe::egui::{Event, PointerButton, Pos2, RawInput};
 
     fn window() -> Window {
         // Nothing listens here, so whatever the tests send goes nowhere.
@@ -1098,6 +1004,66 @@ mod tests {
     }
 
     #[test]
+    fn the_top_shows_the_status_line_and_every_stat_label() {
+        let (ctx, mut window, s) = (context(), window(), secure(linked(), "encrypted"));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()));
+        // The fixture's devices report hostnames, which is what the window names them by.
+        for line in ["Control", "debian-host", "Switch to windows-host", "Release all", "ROUND TRIP", "LOST", "AUDIO LOST", "AUDIO BUFFER", "LINK", "Secure"] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+    }
+
+    #[test]
+    fn unpaired_shows_dashes_and_no_switch() {
+        let (ctx, mut window, s) = (context(), window(), unpaired());
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()));
+        for line in ["Not paired.", "Everything stays on each device.", "\nNot paired\n"] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        assert_eq!(text.lines().filter(|l| *l == "--").count(), 4, "{text}");
+        assert!(!text.contains("Switch to"), "{text}");
+    }
+
+    #[test]
+    fn the_top_fits_every_width_without_cutting_a_figure() {
+        let mut old = secure(linked(), "unpaired");
+        old.local.as_mut().unwrap().old_peer = true;
+        let mut snapshots = states();
+        snapshots.extend([unpaired(), old, link_down(secure(linked(), "encrypted"))]);
+        for size in [MIN_WINDOW_SIZE, [899.0, 760.0], [900.0, 760.0], WINDOW_SIZE] {
+            for snapshot in &snapshots {
+                let (ctx, mut window) = (context(), window());
+                frame(&ctx, &mut window, snapshot, size, vec![], Instant::now());
+                let output = frame(&ctx, &mut window, snapshot, size, vec![], Instant::now());
+                let figures: Vec<String> = view::STATS.iter().map(|s| view::stat_value(*s, snapshot).text).collect();
+                for clipped in &output.shapes {
+                    let egui::Shape::Text(shape) = &clipped.shape else { continue };
+                    let text = shape.galley.text();
+                    let ours = figures.iter().any(|f| f == text) || view::STATS.iter().any(|s| s.label() == text) || text == "Release all";
+                    if ours {
+                        assert!(!shape.galley.elided, "{text} cut at {size:?}");
+                        assert!(shape.visual_bounding_rect().right() <= size[0], "{text} past the edge at {size:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_device_name_is_cut_in_the_status_bar() {
+        let (ctx, mut window, mut s) = (context(), window(), secure(linked(), "encrypted"));
+        let long = "A desktop with a very long name";
+        s.local.as_mut().unwrap().device_name = long.into();
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()));
+        // The device panels still show the whole name until the settings table replaces them.
+        let shown = format!("Control {}", view::fit_name(long).0);
+        assert!(text.lines().any(|l| l == shown), "{text}");
+    }
+
+    #[test]
     fn the_update_line_fits_the_smallest_window_with_its_button_and_link() {
         for snapshot in update_states() {
             let (ctx, mut window) = (context(), window());
@@ -1108,7 +1074,7 @@ mod tests {
             if let Some(button) = banner.button {
                 assert!(text.contains(button.label()), "{text}");
             }
-            assert_eq!(text.contains(RELEASE_NOTES), banner.notes.is_some(), "{text}");
+            assert_eq!(text.contains(top::RELEASE_NOTES), banner.notes.is_some(), "{text}");
             let strip = ctx.screen_rect().width();
             let widest = output.shapes.iter().filter_map(|c| match &c.shape {
                 egui::Shape::Text(shape) if banner.text.starts_with(shape.galley.text().get(..4).unwrap_or("?")) => Some(shape.visual_bounding_rect().right()),

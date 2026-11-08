@@ -1,17 +1,15 @@
 //! The small controls the window is built from.
 
-use super::theme::{self, line, legacy::{AMBER, AMBER_GROOVE, DEEP, DIM, EDGE, GREEN, INK, RAISED, UNLIT}};
+use super::theme::{self, line, legacy::{AMBER, DEEP, DIM, EDGE, GREEN, INK, RAISED}, Type, ACCENT, DANGER, LINE_STRONG, ON_ACCENT, SPACE_3, STATUS_SQUARE, TEXT};
 use eframe::egui::{
-    self, text::LayoutJob, text::TextWrapping, vec2, Align2, Color32, FontId, Galley, Painter, Pos2, Rect, Response,
-    RichText, Sense, StrokeKind, TextFormat, TextStyle, Ui,
+    self, text::LayoutJob, text::TextWrapping, vec2, Color32, CursorIcon, FontFamily, FontId, Galley, Painter, Pos2, Rect,
+    Response, RichText, Sense, StrokeKind, TextFormat, TextStyle, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 const PILL_SIZE: [f32; 2] = [40.0, 22.0];
 const METER_HEIGHT: f32 = 6.0;
-const SWITCH_TRAVEL_SECONDS: f32 = 0.16;
-const DISABLED_SWITCH: f32 = 0.55;
 
 pub fn small(text: impl Into<String>) -> RichText {
     RichText::new(text).size(theme::legacy::SMALL_SIZE).color(DIM)
@@ -32,69 +30,94 @@ pub fn wide_button(ui: &mut Ui, button: egui::Button) -> Response {
     ui.add_sized([ui.available_width(), theme::legacy::BUTTON_HEIGHT], button)
 }
 
-fn focus_ring(ui: &Ui, response: &Response, rect: Rect) {
+/// The old controls' ring, until they go.
+fn legacy_focus_ring(ui: &Ui, response: &Response, rect: Rect) {
     if response.has_focus() {
         ui.painter().rect_stroke(rect.expand(2.0), theme::legacy::RADIUS, line(2.0, AMBER), StrokeKind::Outside);
     }
 }
 
-/// What a device's status light shows.
-pub use super::model::Light;
-
-pub fn paint_light(painter: &Painter, center: Pos2, light: Light) {
-    const RADIUS: f32 = 6.0;
-    let colour = match light {
-        Light::Off => {
-            painter.circle(center, RADIUS, UNLIT, line(2.0, EDGE));
-            return;
-        }
-        Light::Connected => GREEN,
-        Light::Active => AMBER,
-    };
-    for (spread, alpha) in [(6.0, 0.05), (4.0, 0.08), (2.5, 0.14), (1.2, 0.2)] {
-        painter.circle_filled(center, RADIUS + spread, colour.gamma_multiply(alpha));
+/// A 2px `accent` outline 2px out from a control that has the keyboard.
+pub fn focus_ring(ui: &Ui, response: &Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(response.rect.expand(2.0), 0.0, line(2.0, ACCENT), StrokeKind::Outside);
     }
-    painter.circle_filled(center, RADIUS, colour);
 }
 
-/// The one physical object on the panel: a slide switch that shows who owns the keyboard. `side`
-/// is where the knob sits, from 0 at the left to 1 at the right, and 0.5 when nobody is known to
-/// have control.
-pub fn slide_switch(ui: &mut Ui, rect: Rect, side: f32, knob_text: Option<&str>, enabled: bool, hint: String) -> Response {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let response = ui.interact(rect, ui.id().with("slide switch"), sense).on_hover_text(hint);
-    let shade = if enabled { 1.0 } else { DISABLED_SWITCH };
-    let painter = ui.painter();
-    let radius = theme::legacy::RADIUS;
-    let border = if enabled && response.hovered() { INK } else { EDGE };
-    painter.rect_filled(rect, radius, DEEP);
-    // A shadow along the top makes the track read as a recess.
-    for (depth, alpha) in [(2.0, 0.4), (4.0, 0.25), (7.0, 0.12)] {
-        let shadow = Rect::from_min_size(rect.min, vec2(rect.width(), depth)).shrink2(vec2(2.0, 0.0));
-        painter.rect_filled(shadow, 0.0, Color32::BLACK.gamma_multiply(alpha));
-    }
-    painter.rect_stroke(rect, radius, line(2.0, border.gamma_multiply(shade)), StrokeKind::Inside);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// Filled `accent`, for the one thing a view most wants done.
+    Primary,
+    /// Outlined in `line-strong`.
+    Secondary,
+    /// Outlined in `danger`.
+    Danger,
+}
 
-    let inset = 5.0;
-    let knob_size = vec2((rect.width() - 2.0 * inset) * 0.58, rect.height() - 2.0 * inset);
-    let travel = rect.width() - 2.0 * inset - knob_size.x;
-    let position = ui.ctx().animate_value_with_time(response.id.with("knob"), side, SWITCH_TRAVEL_SECONDS);
-    let knob = Rect::from_min_size(rect.min + vec2(inset + travel * position, inset), knob_size);
-    painter.rect_filled(knob, 3.0, AMBER.gamma_multiply(shade));
-    let grooves = painter.with_clip_rect(knob.shrink(1.0));
-    for edge in [knob.left() + 4.0, knob.right() - 7.0] {
-        let groove = Rect::from_min_size(Pos2::new(edge, knob.top()), vec2(2.0, knob.height()));
-        grooves.rect_filled(groove, 0.0, AMBER_GROOVE.gamma_multiply(shade));
+impl ButtonKind {
+    /// A primary button's label is semibold.
+    fn font(self) -> FontId {
+        match self {
+            ButtonKind::Primary => FontId::new(Type::Body.font().size, FontFamily::Name(theme::INTER_SEMIBOLD.into())),
+            _ => Type::Body.font(),
+        }
     }
-    if let Some(text) = knob_text {
-        let galley = fitted(painter, text, FontId::proportional(theme::legacy::SMALL_SIZE + 1.0), DEEP, knob.width() - 18.0, 1);
-        let at = knob.center() - galley.size() / 2.0;
-        // Painted twice, half a pixel apart, as the bundled font has no bold.
-        painter.galley(at, galley.clone(), DEEP);
-        painter.galley(at + vec2(0.5, 0.0), galley, DEEP);
+}
+
+/// How wide `flat_button` makes a button with `label`, when its least width is less.
+pub fn flat_button_width(ui: &Ui, label: &str, kind: ButtonKind) -> f32 {
+    ui.fonts(|f| f.layout_no_wrap(label.to_owned(), kind.font(), TEXT)).size().x + 2.0 * SPACE_3
+}
+
+/// A square button with its label centred, at least `min_size`. A disabled one is drawn at 40%
+/// and takes no clicks or keyboard.
+pub fn flat_button(ui: &mut Ui, label: &str, kind: ButtonKind, min_size: Vec2, enabled: bool) -> Response {
+    let ink = match kind {
+        ButtonKind::Primary => ON_ACCENT,
+        ButtonKind::Secondary => TEXT,
+        ButtonKind::Danger => DANGER,
+    };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), kind.font(), ink);
+    let size = min_size.max(galley.size() + vec2(2.0 * SPACE_3, 0.0));
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, mut response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    if enabled {
+        response = response.on_hover_cursor(CursorIcon::PointingHand);
     }
-    focus_ring(ui, &response, rect);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let (hovered, pressed) = (enabled && response.hovered(), enabled && response.is_pointer_button_down_on());
+    let (fill, border) = match kind {
+        ButtonKind::Primary => {
+            let fill = if pressed { theme::pressed(ACCENT) } else if hovered { theme::hovered(ACCENT) } else { ACCENT };
+            (fill, None)
+        }
+        ButtonKind::Secondary => {
+            let fill = if pressed { LINE_STRONG.gamma_multiply(0.15) } else { Color32::TRANSPARENT };
+            (fill, Some(if hovered { TEXT } else { LINE_STRONG }))
+        }
+        ButtonKind::Danger => {
+            let fill = if pressed { DANGER.gamma_multiply(0.15) } else if hovered { DANGER.gamma_multiply(0.1) } else { Color32::TRANSPARENT };
+            (fill, Some(DANGER))
+        }
+    };
+    let shade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, shade(fill));
+    if let Some(border) = border {
+        painter.rect_stroke(rect, 0.0, line(1.0, shade(border)), StrokeKind::Inside);
+    }
+    painter.galley(rect.center() - galley.size() / 2.0, galley, shade(ink));
+    focus_ring(ui, &response);
     response
+}
+
+/// The square at the start of the status bar, and of the update and notice lines.
+pub fn status_square(ui: &mut Ui, colour: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(STATUS_SQUARE), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, colour);
 }
 
 /// A label with an on and off switch. The whole row can be clicked.
@@ -121,7 +144,7 @@ pub fn toggle_row(ui: &mut Ui, label: &str, on: bool) -> Response {
     let travel = pill.x - pill.y;
     let center = Pos2::new(track.left() + corner + travel * t, track.center().y);
     painter.circle_filled(center, corner - 4.0, theme::mix(DIM, DEEP, t));
-    focus_ring(ui, &response, track);
+    legacy_focus_ring(ui, &response, track);
     response
 }
 
@@ -173,19 +196,6 @@ pub fn segment(ui: &mut Ui, width: f32, label: &str, selected: bool) -> Response
     painter.rect_stroke(rect, theme::legacy::SMALL_RADIUS, line(1.0, border), StrokeKind::Inside);
     let galley = fitted(painter, label, FontId::proportional(theme::legacy::SMALL_SIZE + 1.0), ink, width - 12.0, 1);
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
-    focus_ring(ui, &response, rect);
+    legacy_focus_ring(ui, &response, rect);
     response
-}
-
-/// Text at one end of `rect`, cut to fit, with a line under it if there is a second.
-pub fn paint_name_and_state(painter: &Painter, rect: Rect, title: &str, state: &str, side: Align2) {
-    let width = rect.width();
-    let title = fitted(painter, title, FontId::proportional(theme::legacy::HEADING_SIZE), INK, width, 1);
-    let state = fitted(painter, state, FontId::proportional(theme::legacy::SMALL_SIZE), DIM, width, 1);
-    let total = title.size().y + state.size().y;
-    let top = rect.center().y - total / 2.0;
-    let x = |size: f32| if side == Align2::LEFT_CENTER { rect.left() } else { rect.right() - size };
-    let state_at = Pos2::new(x(state.size().x), top + title.size().y);
-    painter.galley(Pos2::new(x(title.size().x), top), title, INK);
-    painter.galley(state_at, state, DIM);
 }

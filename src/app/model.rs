@@ -706,30 +706,6 @@ pub fn enabled(snapshot: &Snapshot) -> ControlsEnabled {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Light {
-    Off,
-    Connected,
-    Active,
-}
-
-/// The status light and wording for a device in the top bar.
-pub fn device_badge(snapshot: &Snapshot, device: Device) -> (Light, &'static str) {
-    if snapshot.device(device).is_none() {
-        return (Light::Off, "Not connected");
-    }
-    let has_control = snapshot.active() == Some(device)
-        && (snapshot.linked() || snapshot.this_device() == Some(device));
-    if has_control {
-        (Light::Active, "Has keyboard and mouse")
-    } else if snapshot.linked() || snapshot.this_device() == Some(device) {
-        (Light::Connected, "Connected")
-    } else {
-        // Its service may still answer the app, but no input can reach it.
-        (Light::Off, "Link down")
-    }
-}
-
 /// True when this device's service is waiting to be told the other device's address.
 pub fn needs_peer(snapshot: &Snapshot) -> bool {
     snapshot.local.as_ref().is_some_and(|d| d.paired == Some(false))
@@ -2131,31 +2107,6 @@ mod tests {
         let alone = Snapshot { local: Some(device("debian", 0)), ..Default::default() };
         assert_eq!(alone.main_device(), Some(Device::Debian));
         assert_eq!(Snapshot::default().main_device(), None);
-    }
-
-    #[test]
-    fn badges_follow_the_active_device() {
-        let snap = pair(0, 0);
-        assert_eq!(device_badge(&snap, Device::Debian), (Light::Active, "Has keyboard and mouse"));
-        assert_eq!(device_badge(&snap, Device::Windows), (Light::Connected, "Connected"));
-        assert_eq!(device_badge(&Snapshot::default(), Device::Debian), (Light::Off, "Not connected"));
-    }
-
-    #[test]
-    fn a_device_the_link_cannot_reach_is_not_shown_as_connected() {
-        // Its service still answers the app, but no input can get to it.
-        let snap = link_snapshot(false, LinkStatus::default(), true);
-        assert_eq!(device_badge(&snap, Device::Windows), (Light::Off, "Link down"));
-        assert_eq!(device_badge(&snap, Device::Debian), (Light::Active, "Has keyboard and mouse"));
-    }
-
-    #[test]
-    fn an_unlinked_peer_never_claims_the_keyboard() {
-        let mut snap = pair(0, 0);
-        let layout = snap.layout.as_mut().unwrap();
-        layout.telemetry.peer_online = false;
-        layout.telemetry.active_node = "Windows".into();
-        assert_eq!(device_badge(&snap, Device::Windows).0, Light::Off);
     }
 
     #[test]

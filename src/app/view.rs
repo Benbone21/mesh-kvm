@@ -17,9 +17,15 @@ pub struct StatusLine {
     pub show_release: bool,
 }
 
-/// This device has no session with the other one yet, or was never told its address.
+/// This device has no session with the other one yet, or was never told its address. An old
+/// peer can't pair at all, which says more than that it hasn't, as `model::status_message` has it.
 fn is_unpaired(local: &DeviceStatus, snapshot: &Snapshot) -> bool {
-    model::needs_peer(snapshot) || local.secure == "unpaired"
+    model::needs_peer(snapshot) || (local.secure == "unpaired" && !is_old_peer(local))
+}
+
+/// The devices have nothing to measure between them until they pair.
+pub fn not_paired(snapshot: &Snapshot) -> bool {
+    snapshot.local.as_ref().is_some_and(|local| is_unpaired(local, snapshot))
 }
 
 /// The other device is running a version that can't encrypt, and nothing from it is used.
@@ -134,7 +140,9 @@ pub fn percent(value: f32) -> String {
 pub fn stat_value(stat: Stat, snapshot: &Snapshot) -> StatValue {
     let unknown = || StatValue { text: "--".into(), tone: Tone::Dim, sample: None, spoken: format!("{}, not known", stat.spoken()) };
     let Some(local) = &snapshot.local else { return unknown() };
-    if is_unpaired(local, snapshot) {
+    let unpaired = is_unpaired(local, snapshot);
+    // LINK says so in words, and has nothing to plot.
+    if unpaired && stat != Stat::Link {
         return unknown();
     }
     let link = local.link.as_ref().filter(|l| l.measured && local.peer_online);
@@ -162,7 +170,7 @@ pub fn stat_value(stat: Stat, snapshot: &Snapshot) -> StatValue {
         }),
         Stat::Link => {
             let (word, tone) = link_word(snapshot);
-            let sample = (!is_old_peer(local)).then(|| if snapshot.linked() { 1.0 } else { 0.0 });
+            let sample = (!unpaired && !is_old_peer(local)).then(|| if snapshot.linked() { 1.0 } else { 0.0 });
             StatValue { text: word.into(), tone, sample, spoken: format!("{}, {word}", stat.spoken()) }
         }
     }
@@ -238,6 +246,8 @@ pub struct FrameLayout {
     pub body_scrolls: bool,
 }
 
+// The stacked body (Task 7) uses this.
+#[allow(dead_code)]
 pub const STACKED_CANVAS_HEIGHT: f32 = 320.0;
 
 pub fn frame_layout(width: f32, height: f32) -> FrameLayout {
@@ -252,6 +262,8 @@ pub fn frame_layout(width: f32, height: f32) -> FrameLayout {
 }
 
 /// What a settings row's label has left after the margins and the two device columns.
+// The settings table (Task 7) uses this.
+#[allow(dead_code)]
 pub fn label_width(settings_width: f32) -> f32 {
     settings_width - 2.0 * SPACE_5 - 2.0 * DEVICE_COLUMN
 }
@@ -338,7 +350,8 @@ mod tests {
             assert_eq!((v.text.as_str(), v.tone, v.sample), ("--", Tone::Dim, None));
         }
         assert_eq!(link_word(&unpaired()), ("Not paired", Tone::Warn));
-        assert_eq!(stat_value(Stat::Link, &unpaired()).sample, None);
+        let word = stat_value(Stat::Link, &unpaired());
+        assert_eq!((word.text.as_str(), word.tone, word.sample), ("Not paired", Tone::Warn, None));
         // Nothing from before the link went down is shown, and nothing before audio arrives.
         let down = link_down(link(secure(linked(), "encrypted"), 6, 0.4));
         assert_eq!(stat_value(Stat::RoundTrip, &down).text, "--");
@@ -380,6 +393,19 @@ mod tests {
         let mut one_way = secure(linked(), "encrypted");
         one_way.local.as_mut().unwrap().link = Some(LinkStatus { one_way: true, ..Default::default() });
         assert_eq!(link_word(&one_way), ("One way", Tone::Warn));
+    }
+
+    #[test]
+    fn an_old_peer_says_it_needs_an_update_rather_than_pairing() {
+        // An old peer leaves this device unpaired, as it can't encrypt.
+        let mut old = secure(linked(), "unpaired");
+        old.local.as_mut().unwrap().old_peer = true;
+        assert_eq!(link_word(&old), ("Needs update", Tone::Warn));
+        let line = status_line(&old, &ServiceStart::Done, &model::enabled(&old));
+        assert_eq!((line.lead.as_str(), line.rest.as_str()), ("Not linked.", "windows-host needs an update before it can pair."));
+        let said = notices(&old, &ServiceStart::Done, None, false);
+        assert!(said[0].text.contains("older mesh-kvm that can't encrypt"), "{said:?}");
+        assert!(!not_paired(&old) && not_paired(&unpaired()));
     }
 
     #[test]

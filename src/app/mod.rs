@@ -9,9 +9,9 @@ mod canvas;
 #[cfg(test)]
 mod fixtures;
 mod panels;
+mod sparkline;
 mod theme;
-// Nothing draws from the view model until the window is rebuilt on it.
-#[allow(dead_code)]
+mod top;
 mod view;
 pub mod tray;
 pub mod ui;
