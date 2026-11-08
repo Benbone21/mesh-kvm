@@ -2,6 +2,7 @@
 
 use super::canvas::{Canvas, MonitorKey};
 use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutDraft, Picks, Snapshot};
+use super::rows::{CANT_CHANGE, MAX_POINTER_SPEED, MIN_POINTER_SPEED, VOLUME_RANGE};
 use super::theme::{self, line, legacy::{AMBER, DEEP, DIM, EDGE, INK}};
 use super::widgets::{meter, slider_row, small, toggle_row, wide_button};
 use crate::audio::BITRATES;
@@ -14,13 +15,9 @@ use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
-pub const MIN_POINTER_SPEED: f64 = 0.05;
-pub const MAX_POINTER_SPEED: f64 = 2.0;
-const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 /// How long a new name stays on show before the polled one takes over.
 const NAME_HOLD: Duration = Duration::from_secs(3);
 const NAME_BOX_ROOM: f32 = 2.0;
-const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 
 /// A device's name while it is being changed.
 #[derive(Default)]
