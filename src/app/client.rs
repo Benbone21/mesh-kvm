@@ -1,10 +1,11 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
-use super::model::{older_message, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
+use super::model::{older_message, Control, release_route, Device, Release, DeviceStatus, LayoutState, Snapshot};
 use crate::platform::DisplayInfo;
 use super::pairing::PairingStatus;
 use crate::webui::{http_call_port, http_call_port_waiting, UI_PORT};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -34,12 +35,18 @@ struct Job {
     title: String,
     path: String,
     body: String,
+    /// The setting row this change is for, so a problem is kept with that row.
+    row: Option<(Device, Control)>,
 }
 
 struct Shared {
     snapshot: Mutex<Snapshot>,
     /// Why the last change didn't go through, worded for the person to read.
     last_error: Mutex<Option<(String, Instant)>>,
+    /// Why a setting's last change didn't go through, kept for its row.
+    row_errors: Mutex<HashMap<(Device, Control), (String, Instant)>>,
+    /// Rows whose change was refused, until the window takes them to show the polled value again.
+    refused: Mutex<Vec<(Device, Control)>>,
     error_hold: Duration,
     stop: AtomicBool,
     /// The window wants to see `/api/pairing`, which holds a code and so isn't asked for otherwise.
@@ -106,6 +113,8 @@ impl Client {
         let shared = Arc::new(Shared {
             snapshot: Mutex::default(),
             last_error: Mutex::default(),
+            row_errors: Mutex::default(),
+            refused: Mutex::default(),
             error_hold,
             stop: AtomicBool::new(false),
             pairing_wanted: AtomicBool::new(false),
@@ -151,8 +160,23 @@ impl Client {
             .spawn(move || {
                 for job in queue {
                     let reply = http_call_port(LOCALHOST, port, "POST", &job.path, &job.body);
+                    let problem = send_problem(&job.title, reply);
+                    if let Some(row) = job.row {
+                        let mut errors = lock(&sender.row_errors);
+                        match problem {
+                            Some(message) => {
+                                errors.insert(row, (message, Instant::now()));
+                                lock(&sender.refused).push(row);
+                            }
+                            None if errors.get(&row).is_some_and(|(_, at)| at.elapsed() >= sender.error_hold) => {
+                                errors.remove(&row);
+                            }
+                            None => {}
+                        }
+                        continue;
+                    }
                     let mut error = lock(&sender.last_error);
-                    match send_problem(&job.title, reply) {
+                    match problem {
                         Some(message) => *error = Some((message, Instant::now())),
                         // A change that works clears an old error, but not one the person
                         // has had no time to read.
@@ -204,6 +228,16 @@ impl Client {
         lock(&self.shared.last_error).as_ref().map(|(m, _)| m.clone())
     }
 
+    /// Why the last change to one setting didn't go through, for that setting's row.
+    pub fn row_error(&self, key: (Device, Control)) -> Option<String> {
+        lock(&self.shared.row_errors).get(&key).map(|(m, _)| m.clone())
+    }
+
+    /// The settings whose change was refused since the last call, each listed once per refusal.
+    pub fn take_refused(&self) -> Vec<(Device, Control)> {
+        std::mem::take(&mut *lock(&self.shared.refused))
+    }
+
     pub fn dismiss_error(&self) {
         *lock(&self.shared.last_error) = None;
     }
@@ -215,25 +249,36 @@ impl Client {
         Some(if here == device.node() { path.to_string() } else { format!("/api/peer{path}") })
     }
 
-    fn send(&self, device: Device, path: &str, body: serde_json::Value) {
+    fn send(&self, device: Device, path: &str, body: serde_json::Value, row: Option<(Device, Control)>) {
         match self.route(device, path) {
             Some(path) => {
                 let title = self.snapshot().title(device);
-                let _ = self.jobs.send(Job { title, path, body: body.to_string() });
+                let _ = self.jobs.send(Job { title, path, body: body.to_string(), row });
             }
-            None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
+            None => match row {
+                Some(row) => {
+                    lock(&self.shared.row_errors).insert(row, (NOT_RUNNING.into(), Instant::now()));
+                    lock(&self.shared.refused).push(row);
+                }
+                None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
+            },
         }
     }
 
     /// Sends an action such as `{"action": "set_autostart", "enabled": true}` to one device.
     pub fn local_action(&self, device: Device, action: serde_json::Value) {
-        self.send(device, "/api/local/action", action);
+        self.send(device, "/api/local/action", action, None);
+    }
+
+    /// Sends one setting's new value to `device`. A problem is kept for that setting's row.
+    pub fn send_control(&self, device: Device, control: Control, value: f64) {
+        self.send(device, "/api/local/action", control.action(value), Some((device, control)));
     }
 
     /// This device, which is where layout-wide actions and layout edits go.
     fn send_here(&self, path: &str, body: serde_json::Value) {
         match self.snapshot().this_device() {
-            Some(device) => self.send(device, path, body),
+            Some(device) => self.send(device, path, body, None),
             None => *lock(&self.shared.last_error) = Some((NOT_RUNNING.into(), Instant::now())),
         }
     }
@@ -737,6 +782,43 @@ mod tests {
         );
         let err = client.set_main_device(Device::Debian).unwrap_err();
         assert_eq!(err, "windows-box is running an older mesh-kvm. Update it, or sign out and back in.");
+    }
+
+    #[test]
+    fn a_refused_control_is_kept_for_its_row_and_not_the_window() {
+        let (port, log) = pair("debian", 200, |_| r#"{"ok":false}"#.into());
+        let (client, _rx) = start(port);
+        ready(&client);
+        let key = (Device::Debian, Control::Autostart);
+        client.send_control(key.0, key.1, 1.0);
+        wait_for("the request", || log.lock().unwrap().iter().any(|(m, _, _)| m == "POST"));
+        wait_for("the row error", || client.row_error(key).is_some());
+        assert!(client.row_error(key).unwrap().contains("didn't accept that change"));
+        assert_eq!(client.last_error(), None);
+        assert_eq!(client.take_refused(), [key]);
+        assert!(client.take_refused().is_empty());
+    }
+
+    #[test]
+    fn a_control_that_works_clears_its_rows_error_after_the_hold() {
+        let refuse = Arc::new(AtomicBool::new(true));
+        let answer = refuse.clone();
+        let (port, _) = stub(move |method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, local_json("debian")),
+            ("GET", "/api/peer/api/local") => (200, local_json("windows")),
+            ("GET", "/api/state") => (200, STATE.into()),
+            ("POST", _) if answer.load(Ordering::SeqCst) => (200, r#"{"ok":false}"#.into()),
+            ("POST", _) => (200, r#"{"ok":true}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        let client = start_holding(port, Duration::from_millis(0));
+        ready(&client);
+        let key = (Device::Debian, Control::Autostart);
+        client.send_control(key.0, key.1, 1.0);
+        wait_for("the row error", || client.row_error(key).is_some());
+        refuse.store(false, Ordering::SeqCst);
+        client.send_control(key.0, key.1, 1.0);
+        wait_for("the row error to clear", || client.row_error(key).is_none());
     }
 
     #[test]

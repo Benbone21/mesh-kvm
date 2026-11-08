@@ -582,8 +582,11 @@ impl Window {
     }
 
     fn send_changes(&mut self, now: Instant) {
+        for key in self.client.take_refused() {
+            self.edits.forget(key);
+        }
         for ((device, control), value) in self.edits.take_due(now) {
-            self.client.local_action(device, control.action(value));
+            self.client.send_control(device, control, value);
         }
         if let Some(edit) = self.layout.take_due(now) {
             self.client.save_layout(edit);
@@ -1367,7 +1370,9 @@ mod tests {
         window.edits.set((Device::Debian, Control::Autostart), 1.0, now);
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
         // With no service the send fails at once, which shows that it was tried.
-        assert!(window.client.last_error().is_some());
+        // A control's problem is kept for its row, not the window.
+        let key = (Device::Debian, Control::Autostart);
+        assert!(window.client.row_error(key).is_some());
         assert_eq!(window.edits.take_due(now), vec![]);
         // The error strip draws, and the window keeps working.
         frame(&ctx, &mut window, &snapshot, MIN_WINDOW_SIZE, vec![], now);

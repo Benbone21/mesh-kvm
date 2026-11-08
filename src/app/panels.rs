@@ -1,7 +1,7 @@
 //! The controls beside the arrangement: one column of sections for each device.
 
 use super::canvas::{Canvas, MonitorKey};
-use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutDraft, Snapshot};
+use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutDraft, Picks, Snapshot};
 use super::theme::{self, line, legacy::{AMBER, DEEP, DIM, EDGE, INK}};
 use super::widgets::{meter, slider_row, small, toggle_row, wide_button};
 use crate::audio::BITRATES;
@@ -21,7 +21,6 @@ const VOLUME_RANGE: RangeInclusive<f64> = 0.0..=150.0;
 const NAME_HOLD: Duration = Duration::from_secs(3);
 const NAME_BOX_ROOM: f32 = 2.0;
 /// How long a picked device stays on show before the polled choice takes over.
-const PICK_HOLD: Duration = Duration::from_secs(1);
 
 const CANT_CHANGE: &str = "Its resolution and refresh rate can't be changed from here right now.";
 
@@ -37,7 +36,7 @@ struct NameEdit {
 #[derive(Default)]
 pub struct Panels {
     names: HashMap<Device, NameEdit>,
-    picks: HashMap<(Device, DeviceRole), (String, Instant)>,
+    picks: Picks,
 }
 
 /// What the person asked for in one device's section, for the window to send.
@@ -150,7 +149,7 @@ struct DevicePanel<'a, 'b> {
     status: &'a DeviceStatus,
     shared: &'a mut Shared<'b>,
     requests: &'a mut Requests,
-    picks: &'a mut HashMap<(Device, DeviceRole), (String, Instant)>,
+    picks: &'a mut Picks,
 }
 
 impl DevicePanel<'_, '_> {
@@ -386,8 +385,7 @@ impl DevicePanel<'_, '_> {
     /// A dropdown of real devices. A new pick shows at once, ahead of the next status.
     fn device_picker(&mut self, ui: &mut Ui, role: DeviceRole, label: &str, devices: &[AudioDevice], polled: &str) {
         let key = (self.device, role);
-        let held = self.picks.get(&key).filter(|(_, at)| self.shared.now.duration_since(*at) < PICK_HOLD);
-        let current = held.map_or(polled.to_string(), |(id, _)| id.clone());
+        let current = self.picks.shown(key, polled, self.shared.now);
         ui.label(label);
         let mut chosen = None;
         let shown = model::device_label(&current, devices);
@@ -409,7 +407,7 @@ impl DevicePanel<'_, '_> {
             .on_hover_text(shown.as_str());
         if let Some(id) = chosen {
             self.requests.actions.push((self.device, json!({ "action": "set_audio_device", "role": role.name(), "id": id })));
-            self.picks.insert(key, (id, self.shared.now));
+            self.picks.set(key, id, self.shared.now);
         }
     }
 

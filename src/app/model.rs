@@ -862,6 +862,16 @@ impl Edits {
         }
     }
 
+    /// Whether `key` has a value the person set that the poll hasn't shown yet.
+    pub fn is_saving(&self, key: (Device, Control), polled: f64, now: Instant) -> bool {
+        self.entries.get(&key).is_some_and(|e| (e.unsent || now < e.held_until) && e.value != polled)
+    }
+
+    /// Drops an edit, for a change the service refused, so the control shows the polled value again.
+    pub fn forget(&mut self, key: (Device, Control)) {
+        self.entries.remove(&key);
+    }
+
     /// The edits ready to send. A value edited again within the gap waits, and only its latest
     /// value goes.
     pub fn take_due(&mut self, now: Instant) -> Vec<((Device, Control), f64)> {
@@ -884,6 +894,28 @@ impl Edits {
             .map(|e| if e.unsent { e.next_send().unwrap_or(now) } else { e.held_until })
             .min()
             .map(|at| at.saturating_duration_since(now))
+    }
+}
+
+/// How long a new dropdown pick shows before the polled value takes over.
+const PICK_HOLD: Duration = Duration::from_secs(1);
+
+/// The audio devices the person just picked, shown ahead of the next status.
+#[derive(Default)]
+pub struct Picks {
+    picked: HashMap<(Device, DeviceRole), (String, Instant)>,
+}
+
+impl Picks {
+    pub fn set(&mut self, key: (Device, DeviceRole), id: String, now: Instant) {
+        self.picked.insert(key, (id, now));
+    }
+
+    pub fn shown(&self, key: (Device, DeviceRole), polled: &str, now: Instant) -> String {
+        match self.picked.get(&key) {
+            Some((id, at)) if now.saturating_duration_since(*at) < PICK_HOLD => id.clone(),
+            _ => polled.to_string(),
+        }
     }
 }
 
@@ -1431,6 +1463,36 @@ mod tests {
 
     fn has(ps: &[Placement], label: &str) -> bool {
         ps.iter().any(|p| p.label == label)
+    }
+
+    #[test]
+    fn a_value_is_saving_until_the_poll_shows_it() {
+        let (mut edits, t, key) = (Edits::default(), Instant::now(), (Device::Windows, Control::KeyboardSharing));
+        edits.set(key, 1.0, t);
+        assert!(edits.is_saving(key, 0.0, t));
+        assert!(!edits.is_saving(key, 1.0, t));
+        edits.take_due(t);
+        let later = t + HOLD + Duration::from_millis(1);
+        assert!(!edits.is_saving(key, 0.0, later));
+        assert_eq!(edits.shown(key, 0.0, later), 0.0, "an answer that never came snaps back once the hold is over");
+    }
+
+    #[test]
+    fn forgetting_an_edit_snaps_back_at_once() {
+        let (mut edits, t, key) = (Edits::default(), Instant::now(), (Device::Debian, Control::Autostart));
+        edits.set(key, 1.0, t);
+        edits.forget(key);
+        assert_eq!(edits.shown(key, 0.0, t), 0.0);
+        assert!(edits.take_due(t).is_empty());
+    }
+
+    #[test]
+    fn a_new_pick_shows_for_a_second_then_the_poll_wins() {
+        let (mut picks, t, key) = (Picks::default(), Instant::now(), (Device::Debian, DeviceRole::Output));
+        assert_eq!(picks.shown(key, "polled", t), "polled");
+        picks.set(key, "picked".into(), t);
+        assert_eq!(picks.shown(key, "polled", t + Duration::from_millis(900)), "picked");
+        assert_eq!(picks.shown(key, "polled", t + PICK_HOLD), "polled");
     }
 
     #[test]
