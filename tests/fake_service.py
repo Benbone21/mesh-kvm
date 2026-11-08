@@ -11,6 +11,11 @@ the mode change countdown the way the real service does. Run it where that port 
 sending, failure, echo, missing, old, laptop, nomute or wrong. POST {"state": ...} to /fake/audio to change it while running,
 and GET /fake/requests for the audio actions the app has sent. --link picks how the link looks: good,
 poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/link to change that too.
+--update picks where an update has got to: none, both, offline, peer-downloading, here-downloading, updating-peer,
+waiting-peer, installing, view-only, peer-failed, apt-failed, restored, no-polkit or stale. POST {"state": ...} to
+/fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
+--version says what version the service is, which POST {"version": ...} to /fake/version changes, as
+an update would, so the app can be seen starting again.
 """
 
 import argparse
@@ -65,6 +70,8 @@ class World:
         self.note = {"Debian": None, "Windows": None}
         self.settings = {"Debian": default_settings(), "Windows": default_settings()}
         self.requests = []
+        self.update = update_states()["none"]
+        self.version = "0.3.0"
 
     def rects(self, node):
         if not self.screens[node]:
@@ -92,11 +99,12 @@ class World:
         status = {
             "node": node.lower(), "device_name": self.names[node], "hostname": "bread" if node == "Debian" else "THINKPAD",
             "ip": "192.168.8.210" if node == "Debian" else "192.168.8.241", "peer_ip": "192.168.8.241", "paired": True,
-            "version": "0.3.0", "os": "", "label": "", "peer_online": self.online, "active_node": self.active, "panic_mode": False,
+            "version": self.version, "os": "", "label": "", "peer_online": self.online, "active_node": self.active, "panic_mode": False,
             "game_lock": False, "game_reason": "", "displays": self.rects(node), "cursor": [2600, 700], "autostart": True,
             "peer_pinned": False, "main_device": 0, "main_conflict": False,
             "display_change": {"change": None, "note": self.note[node]},
             "link": self.link,
+            "update": self.update[0 if node == "Debian" else 1],
         }
         status.update(self.settings[node])
         if change:
@@ -197,6 +205,33 @@ def set_audio_state(world, name):
         world.settings["Windows"]["audio"] = audio_idle() | WINDOWS_DEVICES | windows
 
 
+def update_status(state="idle", available="0.7.1", ready=False, note=None, progress=None, **more):
+    return {"current": "0.7.0", "available": available, "ready": ready, "state": state, "note": note, "progress": progress} | more
+
+
+def update_states():
+    """Each device's `update` in each state. `None` for the second means it can't be reached."""
+    idle = update_status(available=None)
+    ready = update_status("ready", ready=True)
+    going = update_status("updating_peer", ready=True)
+    return {
+        "none": (idle, idle),
+        "both": (ready, ready),
+        "offline": (ready, None),
+        "peer-downloading": (ready, update_status("downloading", progress=45)),
+        "here-downloading": (update_status("downloading", progress=12), ready),
+        "updating-peer": (going, update_status("installing", ready=True)),
+        "waiting-peer": (update_status("waiting_for_peer", ready=True), None),
+        "installing": (update_status("installing", ready=True), update_status("idle", available=None)),
+        "view-only": (update_status("view_only"), ready),
+        "peer-failed": (update_status("failed", ready=True, note="ThinkPad didn't come back on version 0.7.1 within 5 minutes, so this device stayed as it is."), ready),
+        "apt-failed": (update_status("failed", ready=True, note="The update failed, and the old version keeps running. E: Sub-process /usr/bin/dpkg returned an error code (1) To go back by hand, run: sudo apt-get install --reinstall --allow-downgrades /var/cache/mesh-kvm/kept/mesh-kvm_0.7.0_amd64.deb"), ready),
+        "restored": (update_status("failed", ready=True, note="Version 0.7.1 didn't start properly, so version 0.7.0 was put back."), None),
+        "no-polkit": (update_status("ready", ready=True, preflight="needs_password", by_hand="sudo apt-get install /home/bread/.config/mesh-kvm/updates/0.7.1/mesh-kvm_0.7.1_amd64.deb"), ready),
+        "stale": (update_status(available=None, note="mesh-kvm hasn't been able to check for updates for 3 days."), idle),
+    }
+
+
 def serve(world):
     class Handler(BaseHTTPRequestHandler):
         def reply(self, body):
@@ -214,7 +249,9 @@ def serve(world):
             with world.lock:
                 expire(world)
                 path = self.path.removeprefix("/api/peer")
-                if path == "/api/local":
+                if self.path.startswith("/api/peer") and world.update[1] is None:
+                    self.send_error(502)
+                elif path == "/api/local":
                     self.reply(world.local(self.node()))
                 elif path == "/fake/requests":
                     self.reply(world.requests)
@@ -236,8 +273,12 @@ def serve(world):
                     set_audio_state(world, body["state"])
                 elif self.path == "/fake/link":
                     set_link_state(world, body["state"])
+                elif self.path == "/fake/update":
+                    world.update = update_states()[body["state"]]
+                elif self.path == "/fake/version":
+                    world.version = body["version"]
                 elif self.path.endswith("/api/local/action"):
-                    if "audio" in body.get("action", "") or "play_only" in body.get("action", ""):
+                    if any(word in body.get("action", "") for word in ("audio", "play_only", "update")):
                         world.requests.append({"device": self.node()} | body)
                     act(world, self.node(), body)
                 self.reply({"ok": True})
@@ -308,8 +349,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-modes", action="store_true", help="this device's desktop isn't answering about modes")
     parser.add_argument("--audio", default="idle", choices=list(audio_states()))
     parser.add_argument("--link", default="good", choices=list(link_states()))
+    parser.add_argument("--update", default="none", choices=list(update_states()))
+    parser.add_argument("--version", default="0.3.0")
     options = parser.parse_args()
     world = World(options.monitors, options.name_style == "long", options.no_modes)
     set_audio_state(world, options.audio)
     set_link_state(world, options.link)
+    world.update = update_states()[options.update]
+    world.version = options.version
     serve(world)

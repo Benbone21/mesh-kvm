@@ -28,13 +28,29 @@ const VBS_HEAD: &str = "Set WshShell = CreateObject(\"WScript.Shell\")\r\n";
 /// The script in the Startup folder: starts the service and the tray at login, both windowless.
 /// The service reads the saved address, so that a change in the app is never undone at login.
 /// `peer` is for an address that can't be saved yet.
+///
+/// If an update hasn't proved itself, as with a reboot right after the swap, the installed exe may
+/// be missing or broken. The old exe then does the starting, as a watcher that can put things back.
+/// It runs as a copy, as `Run` goes through the shell, which won't start a file called `.old`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn windows_vbs(exe: &str, peer: Option<&str>) -> String {
     let service = match peer {
         Some(peer) => format!("--role windows --peer {peer}"),
         None => "--role windows".to_string(),
     };
-    format!("{VBS_HEAD}{}{}", vbs_run(exe, &service), vbs_run(exe, "--tray"))
+    let folder = exe.rsplit_once('\\').map_or("", |(folder, _)| folder);
+    let marker = crate::update::swap::MARKER_NAME;
+    let aside = format!("{exe}.old");
+    let copy = format!("{folder}\\{}", crate::update::swap::RECOVERY_EXE);
+    let watcher = vbs_run(&copy, &format!("{} --tray {service}", crate::update::swap::WATCH_FLAG));
+    format!(
+        "{VBS_HEAD}Set Fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+         If Fso.FileExists(\"{folder}\\{marker}\") And Fso.FileExists(\"{aside}\") Then\r\n\
+         Fso.CopyFile \"{aside}\", \"{copy}\", True\r\n\
+         {watcher}WScript.Quit\r\nEnd If\r\n{}{}",
+        vbs_run(exe, &service),
+        vbs_run(exe, "--tray")
+    )
 }
 
 /// The address in a login script an older version wrote, if it holds a usable one.
@@ -244,9 +260,29 @@ pub fn spawn_self(arg: &str) -> std::io::Result<()> {
     spawn_with(&[arg], &[])
 }
 
+/// Set on a window or tray started by the one it replaces, which still holds the port.
+pub const RELAUNCHED_ENV: &str = "MESH_KVM_RELAUNCHED";
+
+/// A running exe that an update moved aside still goes by the name it has now.
+fn without_old_suffix(path: PathBuf) -> PathBuf {
+    let text = path.to_str();
+    match text.and_then(|p| p.strip_suffix(".old").or_else(|| p.strip_suffix(".failed"))) {
+        Some(clean) => PathBuf::from(clean),
+        None => path,
+    }
+}
+
+/// Starts the new version of a window or tray, which waits for this old one to end.
+pub fn relaunch(arg: &str) -> std::io::Result<()> {
+    spawn_exe(without_old_suffix(running_exe()?), &[arg], &[(RELAUNCHED_ENV, "1")])
+}
+
 /// Starts this exe again with `args` and does not wait for it. It outlives this process.
 fn spawn_with(args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
-    let exe = running_exe()?;
+    spawn_exe(running_exe()?, args, envs)
+}
+
+fn spawn_exe(exe: PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     let mut command = Command::new(exe);
     command.args(args).envs(envs.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
@@ -422,6 +458,22 @@ fn restart_args(args: Vec<String>) -> Vec<String> {
         return vec!["--role".to_string(), crate::platform::ROLE.to_string()];
     }
     args
+}
+
+/// What a watcher is started with: everything the service it replaces was.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn args_for_watcher(args: Vec<String>) -> Vec<String> {
+    let mut all = vec![crate::update::swap::WATCH_FLAG.to_string()];
+    all.extend(restart_args(args));
+    all
+}
+
+/// What a watcher should start the service with, and whether to start the tray too.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn args_from_watcher(args: Vec<String>) -> (Vec<String>, bool) {
+    let tray = args.iter().any(|a| a == "--tray");
+    let args = args.into_iter().filter(|a| a != "--tray" && a != crate::update::swap::WATCH_FLAG).collect();
+    (restart_args(args), tray)
 }
 
 /// Replaces this service with a new one, which reads the settings again. Only returns on failure.
@@ -639,7 +691,8 @@ mod tests {
     #[test]
     fn login_script_starts_service_and_tray() {
         let vbs = windows_vbs(EXE, None);
-        let runs: Vec<&str> = vbs.lines().filter(|l| l.contains("WshShell.Run")).collect();
+        let normal = vbs.split_once("End If").unwrap().1;
+        let runs: Vec<&str> = normal.lines().filter(|l| l.contains("WshShell.Run")).collect();
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().any(|l| l.contains("--role windows")));
         assert!(!vbs.contains("--peer"), "the saved address is used, so that an app change isn't undone");
@@ -655,8 +708,8 @@ mod tests {
         let want_tray = "WshShell.Run \"\"\"C:\\Users\\Mary Jane\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe\"\" --tray\", 0, False";
         let lines: Vec<&str> = vbs.lines().collect();
         assert_eq!(lines[0], "Set WshShell = CreateObject(\"WScript.Shell\")");
-        assert_eq!(lines[1], want_service);
-        assert_eq!(lines[2], want_tray);
+        assert_eq!(lines[lines.len() - 2], want_service);
+        assert_eq!(lines[lines.len() - 1], want_tray);
     }
 
     #[test]
@@ -782,6 +835,50 @@ mod tests {
             PathBuf::from("/opt/mesh-kvm")
         );
         assert_eq!(without_deleted_suffix(PathBuf::from("/opt/mesh-kvm")), PathBuf::from("/opt/mesh-kvm"));
+    }
+
+    #[test]
+    fn a_copy_moved_aside_as_failed_also_starts_from_the_installed_name() {
+        assert_eq!(without_old_suffix(PathBuf::from(r"C:\a\mesh-kvm.exe.failed")), PathBuf::from(r"C:\a\mesh-kvm.exe"));
+    }
+
+    #[test]
+    fn a_login_during_an_unproven_update_goes_through_the_old_exe() {
+        let vbs = windows_vbs(EXE, None);
+        assert!(vbs.contains(r#"Fso.FileExists("C:\Users\me\AppData\Local\mesh-kvm\update-pending.json")"#), "{vbs}");
+        assert!(vbs.contains(&format!(r#"Fso.FileExists("{EXE}.old")"#)), "{vbs}");
+        let copy = r"C:\Users\me\AppData\Local\mesh-kvm\mesh-kvm-recover.exe";
+        assert!(vbs.contains(&format!(r#"Fso.CopyFile "{EXE}.old", "{copy}", True"#)), "{vbs}");
+        let watcher = format!("WshShell.Run \"\"\"{copy}\"\" --update-watch --tray --role windows\", 0, False");
+        assert!(vbs.contains(&watcher), "{vbs}");
+        assert!(vbs.split_once("End If").unwrap().0.lines().filter(|l| l.contains("WshShell.Run")).all(|l| l.contains(".exe\"\"")), "the shell only runs an exe");
+        let (recovery, normal) = vbs.split_once("End If").unwrap();
+        assert!(recovery.contains("WScript.Quit"), "the normal start doesn't run as well");
+        assert!(normal.contains("--role windows") && normal.contains("--tray"), "{vbs}");
+    }
+
+    #[test]
+    fn a_login_during_an_update_keeps_a_pinned_address() {
+        let vbs = windows_vbs(EXE, Some("192.168.8.210"));
+        assert!(vbs.contains("--update-watch --tray --role windows --peer 192.168.8.210"), "{vbs}");
+        assert_eq!(peer_in_login_script(&vbs).as_deref(), Some("192.168.8.210"));
+    }
+
+    #[test]
+    fn the_watcher_is_given_the_service_arguments_and_starts_the_service_with_them() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(args_for_watcher(args(&["--role", "windows", "--port", "9"])), args(&["--update-watch", "--role", "windows", "--port", "9"]));
+        assert_eq!(args_for_watcher(vec![]), args(&["--update-watch", "--role", crate::platform::ROLE]));
+        let (service, tray) = args_from_watcher(args(&["--update-watch", "--tray", "--role", "windows", "--port", "9"]));
+        assert_eq!((service, tray), (args(&["--role", "windows", "--port", "9"]), true));
+        let (service, tray) = args_from_watcher(args(&["--update-watch"]));
+        assert_eq!((service, tray), (args(&["--role", crate::platform::ROLE]), false));
+    }
+
+    #[test]
+    fn a_new_copy_starts_from_the_installed_name_and_not_the_one_moved_aside() {
+        assert_eq!(without_old_suffix(PathBuf::from(r"C:\a\mesh-kvm.exe.old")), PathBuf::from(r"C:\a\mesh-kvm.exe"));
+        assert_eq!(without_old_suffix(PathBuf::from("/usr/bin/mesh-kvm")), PathBuf::from("/usr/bin/mesh-kvm"));
     }
 
     #[test]

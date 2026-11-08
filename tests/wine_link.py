@@ -24,10 +24,21 @@ nothing to drive.
 
 To also drive the laptop's own keyboard and mouse, set WINE_LINK_DISPLAY to a throwaway X display that
 xdotool can type on. Without it, that step is skipped and says so.
+
+To also run the self-update, set MESH_KVM_HOOKS_EXE to a build with the test hooks, as that takes this
+script's own key and release server:
+
+    cargo build --release --features test-hooks --target x86_64-pc-windows-gnu
+
+A real install, swap, watcher and restore then run under Wine. Without it, that part is skipped and says
+so. It needs python3-cryptography, and takes about eight minutes.
 """
 import contextlib
 import errno
 import glob
+import hashlib
+import http.client
+import http.server
 import json
 import os
 import pathlib
@@ -62,6 +73,7 @@ CONTROL_PORT = 24852
 AUDIO_MAGIC = b"MKAU"
 AUDIO_VERSION = 2
 API_PORT = 24880
+RELEASE_EXE = "mesh-kvm-windows-x86_64.exe"
 LOCAL = f"http://127.0.0.1:{API_PORT}"
 DESKTOP_NAME = "wine-link-desktop"
 
@@ -495,14 +507,22 @@ def pairing_file():
 
 
 def answer_api(tcp, holder):
-    """Answers the exe on one connection: `holder["state"]` is what this device says at /api/state."""
+    """Answers the exe on one connection: `holder["state"]` is what this device says at /api/state,
+    `holder["peer_version"]` its version, and `holder["asked_to_install"]` what it was asked."""
     try:
         stream = Stream(tcp, ME, EXE_KEYS.public, None)
         wire = ApiWire(stream)
         while stream.purpose == API:
             request = wire.read()
-            _, path = request.text(), request.text()
-            text = json.dumps(holder["state"]) if path == "/api/state" else "{}"
+            method, path, body = request.text(), request.text(), request.text()
+            if method == "POST" and path == "/api/local/action":
+                holder["asked_to_install"] = json.loads(body or "{}")
+                text = '{"ok":true}'
+            elif path == "/api/local" and "peer_version" in holder:
+                update = {"state": "idle", "proving": holder.get("peer_proving", False)}
+                text = json.dumps({"version": holder["peer_version"], "device_name": "Fake desk", "update": update})
+            else:
+                text = json.dumps(holder["state"]) if path == "/api/state" else "{}"
             wire.write(struct.pack("<H", 200) + bincode_text(text))
     except (OSError, EOFError, Refused):
         pass
@@ -535,6 +555,46 @@ def serve_layout(holder):
 
     threading.Thread(target=accept, daemon=True).start()
     return stop
+
+
+class ReleaseServer:
+    """Pretends to be GitHub, with this script's key, on a local port."""
+
+    def __init__(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        self.key = Ed25519PrivateKey.generate()
+        raw = self.key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self.public = raw.hex()
+        self.tag = None
+        self.files = {}
+        release = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.endswith("/releases/latest"):
+                    body = json.dumps({"tag_name": release.tag}).encode() if release.tag else None
+                else:
+                    body = release.files.get(self.path.rsplit("/", 1)[-1])
+                self.send_response(200 if body is not None else 404)
+                self.send_header("Content-Length", str(len(body or b"")))
+                self.end_headers()
+                self.wfile.write(body or b"")
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.address = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def publish(self, version, exe, signed_exe=None):
+        """A signed release. `signed_exe` is what the signature vouches for, if not `exe`."""
+        vouched = signed_exe or exe
+        files = {RELEASE_EXE: {"size": len(vouched), "sha256": hashlib.sha256(vouched).hexdigest()}}
+        manifest = json.dumps({"version": version, "files": files}).encode()
+        self.files = {"release.json": manifest, "release.json.sig": self.key.sign(manifest), RELEASE_EXE: exe}
+        self.tag = f"v{version}"
 
 
 def link_checks(peer, inbox):
@@ -1416,6 +1476,251 @@ def damaged_file_checks(exe):
         check("and the file is left as it was", f.read() == damaged)
 
 
+def as_version(program, version, extra=""):
+    """The same program, claiming to be `version`, as the test hooks read it off the end."""
+    return program + f"MESH-KVM-TEST-VERSION={version} {extra}\n".encode()
+
+
+def action(name, **fields):
+    return call("/api/local/action", {"action": name, **fields})
+
+
+def update_state():
+    return local()["update"]
+
+
+def answers_on(version, timeout):
+    return wait_for(lambda s: s.get("version") == version, timeout)
+
+
+def service_command_lines():
+    """What each service in this prefix was started with."""
+    lines = []
+    for pid in glob.glob("/proc/[0-9]*"):
+        with contextlib.suppress(OSError):
+            environ = pathlib.Path(pid, "environ").read_bytes()
+            command = pathlib.Path(pid, "cmdline").read_bytes().split(b"\0")
+            if f"WINEPREFIX={PREFIX}".encode() in environ and b"--role" in command and b"--update-watch" not in command:
+                lines.append(command)
+    return lines
+
+
+def log_in(env, log):
+    """What Windows does at login, with the script the program wrote there."""
+    scripts = glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/[Ss]tart[Uu]p/mesh-kvm-autostart.vbs")
+    check("the login script is there", len(scripts) == 1, str(scripts))
+    relative = pathlib.Path(scripts[0]).relative_to(f"{PREFIX}/drive_c")
+    subprocess.Popen(["wine", "wscript", "C:\\" + str(relative).replace("/", "\\")], env=env, stdout=log, stderr=subprocess.STDOUT)
+
+
+def rejected_versions(folder):
+    with contextlib.suppress(OSError):
+        return json.loads((folder / "updates/check.json").read_text()).get("rejected", [])
+    return []
+
+
+def update_checks(hooks_exe, env, log, layout):
+    # z. The whole self-update: install, watcher and restore, with nothing pretend but the release.
+    release = ReleaseServer()
+    env = env | {"MESH_KVM_TEST_RELEASE_SERVER": release.address, "MESH_KVM_TEST_RELEASE_KEY": release.public}
+    folder = pathlib.Path(glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Local")[0]) / "mesh-kvm"
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir()
+    installed = folder / "mesh-kvm.exe"
+    aside = folder / "mesh-kvm.exe.old"
+    marker = folder / "update-pending.json"
+    base = pathlib.Path(hooks_exe).read_bytes()
+    first, second = as_version(base, "0.7.0"), as_version(base, "0.7.1")
+    EXE_KEYS.write_pairing(str(folder / "pairing.json"), ME.public, "Debian")
+    installed.write_bytes(first)
+    windows_path = "C:\\users\\" + folder.parent.parent.parent.name + "\\AppData\\Local\\mesh-kvm\\mesh-kvm.exe"
+    exe = Exe(windows_path, env, log)
+    try:
+        exe.start("--peer", PEER, "--port", "24860")
+        check("the installed copy answers on its version", answers_on("0.7.0", 90) is not None, "see wine_link.log")
+        check("an update knows what's running", update_state()["current"] == "0.7.0", str(update_state()))
+        check("nothing is offered yet", update_state()["ready"] is False, str(update_state()))
+
+        # A real download, through the real checks.
+        release.publish("0.7.9", b"not what was signed", signed_exe=b"what was signed")
+        action("check_update")
+        st = wait_for(lambda s: s["update"]["note"], 30)
+        check("a file that doesn't match is turned down and said so", "doesn't match" in (st["update"]["note"] or ""), str(st["update"]))
+        check("nothing was offered", st["update"]["ready"] is False, str(st["update"]))
+        check("the bad file is gone", not (folder / "updates/0.7.9").exists())
+
+        release.publish("0.7.1", second)
+        action("check_update")
+        st = wait_for(lambda s: s["update"]["ready"], 60)
+        check("a good release ends up ready", st["update"]["ready"] and st["update"]["state"] == "ready", str(st["update"]))
+        check("it's the version published", st["update"]["available"] == "0.7.1", str(st["update"]))
+
+        refused = post_from(STRANGER, "/api/local/action", {"action": "install_update"})
+        check("a stranger can't start an update", refused is None, str(refused))
+        reply = call("/api/local/action", {"action": "install_update"}, {"Origin": "http://evil.example"})
+        check("a web page can't start an update", reply.get("ok") is False, str(reply))
+        check("nothing has happened yet", not aside.exists() and local()["version"] == "0.7.0")
+
+        # Updating both from here: the other device goes first, and this one waits for it.
+        layout["peer_version"] = "0.7.0"
+        reply = action("update_both")
+        check("updating both starts", reply.get("ok") is True, str(reply))
+        st = wait_for(lambda s: layout.get("asked_to_install"), 10)
+        check("the other device is asked to install first", bool(layout.get("asked_to_install")), str(st["update"]))
+        check("what it's asked names no file or version", layout.get("asked_to_install") == {"action": "install_update"}, str(layout.get("asked_to_install")))
+        time.sleep(3)
+        check("this device waits for the other one", local()["version"] == "0.7.0" and not aside.exists(), str(update_state()))
+        check("the banner step is the other device's", update_state()["state"] == "updating_peer", str(update_state()))
+        layout["peer_version"] = "0.7.1"
+        layout["peer_proving"] = True
+        time.sleep(5)
+        check("a peer still proving itself isn't followed yet", local()["version"] == "0.7.0" and not aside.exists(), str(update_state()))
+        layout["peer_proving"] = False
+        st = answers_on("0.7.1", 60)
+        check("the new version answers from the installed place", st is not None and st["version"] == "0.7.1", str(st and st.get("version")))
+        check("the old exe stays beside it", aside.exists() and aside.read_bytes() == first)
+        check("the installed file is the new one", installed.read_bytes() == second)
+        check("a marker waits for it to prove itself", marker.exists())
+        check("the status says it's proving", st["update"]["proving"] is True, str(st["update"]))
+        reply = action("install_update")
+        check("nothing new installs meanwhile", reply.get("ok") is False, str(reply))
+        lines = service_command_lines()
+        check("the new service keeps its arguments", any(b"--port" in line and b"24860" in line for line in lines), str(lines))
+        time.sleep(20)
+        check("it isn't healthy too early", marker.exists())
+        deadline = time.time() + 30
+        while marker.exists() and time.time() < deadline:
+            time.sleep(0.5)
+        check("after 30 seconds of answering the marker goes", not marker.exists())
+        check("the status stops saying it's proving", wait_for(lambda s: not s["update"]["proving"], 5)["update"]["proving"] is False)
+        time.sleep(35)
+        st = local()
+        check("the watcher leaves a healthy copy alone", st["version"] == "0.7.1" and installed.read_bytes() == second, st["version"])
+        check("nothing is on offer any more", st["update"]["ready"] is False and st["update"]["state"] == "idle", str(st["update"]))
+
+        # A new exe that won't start at all, asked for by the other device.
+        release.publish("0.7.2", b"this is no exe")
+        action("check_update")
+        wait_for(lambda s: s["update"]["ready"], 30)
+        status = post_from(PEER, "/api/local/action", {"action": "install_update", "file": "C:\\evil.exe", "version": "9.9.9"})
+        check("the other device can start an update, and can't name anything", status == 200, str(status))
+        wait_for(lambda s: False, 5)
+        check("the swap happened", installed.read_bytes() == b"this is no exe")
+        started = time.time()
+        st = wait_for(lambda s: s.get("version") == "0.7.1", 90)
+        took = time.time() - started
+        check("a new exe that won't start is replaced by the old one", st is not None and st.get("version") == "0.7.1", str(st and st.get("version")))
+        check("that took about a minute", 40 < took < 75, str(took))
+        check("the old exe is back in place", installed.read_bytes() == second)
+        check("there's nothing left waiting", not marker.exists() and not aside.exists())
+        note = (st or {}).get("update", {}).get("note") or ""
+        check("a note says what happened", "0.7.2" in note and "0.7.1" in note, note)
+        check("the banner shows it as failed", st["update"]["state"] == "failed", str(st["update"]))
+        check("the note says it won't be offered again", "won't be offered again" in note, note)
+        check("the version is turned down", "0.7.2" in rejected_versions(folder), str(rejected_versions(folder)))
+        check("nothing is on offer after a rollback", st["update"]["ready"] is False, str(st["update"]))
+        reply = action("install_update")
+        check("installing it again is refused", reply.get("ok") is False, str(reply))
+        status = post_from(PEER, "/api/local/action", {"action": "install_update"})
+        check("the other device gets no further", local()["version"] == "0.7.1" and installed.read_bytes() == second, str(status))
+        action("check_update")
+        time.sleep(3)
+        check("a later look doesn't bring it back", update_state()["ready"] is False, str(update_state()))
+
+        # A new exe that starts and never gets as far as answering.
+        hanging = as_version(base, "0.7.3", "HANG")
+        release.publish("0.7.3", hanging)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.3" and s["update"]["ready"], 30)
+        reply = action("install_update")
+        check("the hanging version starts installing", reply.get("ok") is True, str(reply))
+        wait_for(lambda s: False, 5)
+        check("it's in place", installed.read_bytes() == hanging)
+        st = wait_for(lambda s: s.get("version") == "0.7.1", 90)
+        check("a new exe that hangs is stopped and replaced too", st is not None and st.get("version") == "0.7.1", str(st and st.get("version")))
+        check("the old exe is back in place again", installed.read_bytes() == second)
+        check("the note names the version", "0.7.3" in ((st or {}).get("update", {}).get("note") or ""), str(st and st["update"]))
+
+        # A swap that can't happen leaves this version running, and never an older one.
+        fourth = as_version(base, "0.7.4")
+        release.publish("0.7.4", fourth)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.4" and s["update"]["ready"], 30)
+        aside.write_bytes(first)
+        marker.mkdir()
+        action("install_update")
+        time.sleep(3)
+        st = wait_for(lambda s: "couldn't be installed" in (s["update"]["note"] or ""), 30)
+        check("a marker that can't be written stops the update and says so", st is not None and "couldn't be installed" in (st["update"]["note"] or ""), str(st and st["update"]))
+        check("that leaves this version in place, with no downgrade", installed.read_bytes() == second and local()["version"] == "0.7.1")
+        check("the older exe beside it is untouched", aside.read_bytes() == first)
+        marker.rmdir()
+        aside.unlink()
+        aside.mkdir()
+        (aside / "held").write_text("in use")
+        action("install_update")
+        time.sleep(3)
+        st = wait_for(lambda s: "move the running copy aside" in (s["update"]["note"] or ""), 30)
+        check("an old exe that can't be replaced stops the update and says so", st is not None, str(st and st["update"]))
+        check("that leaves this version in place too", installed.read_bytes() == second and local()["version"] == "0.7.1")
+        check("nothing is left waiting", not marker.exists() and not (folder / "mesh-kvm.exe.new").exists())
+        shutil.rmtree(aside)
+
+        # A reboot while a good new version is proving itself: the login script sees it through.
+        action("install_update")
+        st = wait_for(lambda s: s.get("version") == "0.7.4", 60)
+        check("the swap goes through once it can", st is not None and st.get("version") == "0.7.4", str(st and st.get("version")))
+        check("it's proving when the power goes", marker.exists())
+        exe.stop()
+        check("after the reboot the marker is still there", marker.exists() and aside.exists())
+        log_in(env, log)
+        st = wait_for(lambda s: s.get("version") == "0.7.4", 60)
+        check("the login script starts the new version", st is not None and st.get("version") == "0.7.4", str(st and st.get("version")))
+        deadline = time.time() + 60
+        while marker.exists() and time.time() < deadline:
+            time.sleep(0.5)
+        check("it proves itself after the reboot", not marker.exists())
+        time.sleep(35)
+        check("the watcher from the login script leaves it alone", local()["version"] == "0.7.4" and installed.read_bytes() == fourth)
+        exe.stop()
+
+        # A reboot while a new version that hangs has the installed place.
+        fifth = as_version(base, "0.7.5", "HANG")
+        release.publish("0.7.5", fifth)
+        log_in(env, log)
+        answers_on("0.7.4", 60)
+        action("check_update")
+        wait_for(lambda s: s["update"]["available"] == "0.7.5" and s["update"]["ready"], 30)
+        action("install_update")
+        wait_for(lambda s: False, 4)
+        check("the hanging version is in place at the reboot", installed.read_bytes() == fifth and marker.exists())
+        exe.stop()
+        log_in(env, log)
+        st = wait_for(lambda s: s.get("version") == "0.7.4", 90)
+        check("after the reboot the old version comes back by itself", st is not None and st.get("version") == "0.7.4", str(st and st.get("version")))
+        check("the file is back too", installed.read_bytes() == fourth and not marker.exists())
+        check("that version is turned down", "0.7.5" in rejected_versions(folder), str(rejected_versions(folder)))
+        exe.stop()
+
+        # A crash between the two renames: no installed exe at all.
+        sixth = as_version(base, "0.7.6")
+        aside.write_bytes(fourth)
+        installed.unlink()
+        (folder / "mesh-kvm.exe.new").write_bytes(sixth)
+        marker.write_text(json.dumps({"from": "0.7.4", "to": "0.7.6"}))
+        log_in(env, log)
+        started = time.time()
+        st = wait_for(lambda s: s.get("version") == "0.7.4", 60)
+        check("with no installed exe at all, login brings the old one back", st is not None and st.get("version") == "0.7.4", str(st and st.get("version")))
+        check("and doesn't wait a minute for it", time.time() - started < 40, str(time.time() - started))
+        check("the exe is in its place", installed.read_bytes() == fourth and not marker.exists())
+        check("the note says it was cut short", "interrupted" in (st or {}).get("update", {}).get("note", ""), str(st and st["update"]))
+        check("that version isn't held against it", "0.7.6" not in rejected_versions(folder), str(rejected_versions(folder)))
+        check("the half-finished copy is cleared away", not (folder / "mesh-kvm.exe.new").exists())
+    finally:
+        exe.stop()
+
+
 def test(exe_path, linux_path):
     if not os.path.exists(exe_path):
         sys.exit(f"exe not found: {exe_path}")
@@ -1490,6 +1795,13 @@ def test(exe_path, linux_path):
         pairing_checks(exe, linux)
         linux.stop()
         damaged_file_checks(exe)
+        exe.stop()
+        hooks_exe = os.environ.get("MESH_KVM_HOOKS_EXE")
+        if hooks_exe:
+            serve_layout(layout)
+            update_checks(hooks_exe, env, log, layout)
+        else:
+            print("SKIP: the self-update, as MESH_KVM_HOOKS_EXE isn't set", flush=True)
     finally:
         linux.stop()
         exe.stop()

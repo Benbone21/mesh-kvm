@@ -14,6 +14,7 @@ mod router;
 mod secure;
 mod settings;
 mod spatial;
+mod update;
 mod webui;
 
 use clap::Parser;
@@ -106,6 +107,11 @@ struct Cli {
     #[arg(long, hide = true)]
     read_clipboard: bool,
 
+    /// See a new exe through its first minute, and put the old one back if it fails
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    update_watch: bool,
+
     /// Write the menu and login launchers for this exe (Linux), then exit
     #[cfg(target_os = "linux")]
     #[arg(long)]
@@ -191,7 +197,7 @@ fn show_box(text: &str, icon: windows_sys::Win32::UI::WindowsAndMessaging::MESSA
 
 /// Runs the app window, or raises the one that is already open. Returns when the window closes.
 fn run_app_window() {
-    match app::single::claim(app::single::WINDOW_PORT) {
+    match app::single::claim_after_handover(app::single::WINDOW_PORT) {
         app::single::Instance::AlreadyRunning => {
             app::single::signal_show(app::single::WINDOW_PORT);
             return;
@@ -228,6 +234,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     if cli.read_clipboard {
         clipboard::print_snapshot();
+        return;
+    }
+
+    #[cfg(target_os = "windows")]
+    if cli.update_watch {
+        update::windows::run_watcher();
         return;
     }
 
@@ -461,6 +473,8 @@ fn pair_through(call: Call, request: &str, showing: bool, say: &mut dyn FnMut(&s
 
 /// Runs the service until it is told to stop.
 fn run_service(cli: Cli) {
+    #[cfg(feature = "test-hooks")]
+    update::trust::hang_if_told();
     wait_for_old_service();
 
     // First of all, so that a second service stops here and touches nothing.
@@ -490,7 +504,7 @@ fn run_service(cli: Cli) {
     let pinned = chosen.as_ref().is_some_and(|c| c.2);
     println!(
         "=== mesh-kvm v{} | Role: {} | Peer: {} ===",
-        env!("CARGO_PKG_VERSION"),
+        update::trust::running_version(),
         cli.role,
         if peer_text.is_empty() { "none yet" } else { &peer_text },
     );
@@ -499,6 +513,8 @@ fn run_service(cli: Cli) {
     let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
     let state = std::sync::Arc::new(std::sync::RwLock::new(state));
     let displays = spatial::start_displays(state.clone(), platform.clone());
+    let trial = displays.clone();
+    update::start(Box::new(move || trial.trial_running()));
     let pairing = std::sync::Arc::new(pairing_service(secure, pinned));
     let handler = spatial::studio_handler(state.clone(), platform.clone(), displays, pairing);
     if let Err(e) = webui::start(listener, peer_ip.clone(), handler.clone()) {

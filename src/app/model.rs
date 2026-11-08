@@ -340,6 +340,8 @@ pub struct DeviceStatus {
     pub secure: String,
     /// The other device is running a version that can't encrypt.
     pub old_peer: bool,
+    /// Missing from a service that can't update itself.
+    pub update: Option<super::updates::UpdateStatus>,
 }
 
 /// `link` in `/api/local`: how the link looks from one device.

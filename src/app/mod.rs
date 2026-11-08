@@ -10,4 +10,5 @@ mod panels;
 mod theme;
 pub mod tray;
 pub mod ui;
+pub mod updates;
 mod widgets;

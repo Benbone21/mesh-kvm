@@ -82,6 +82,9 @@ const MAX_FRAME: usize = 4 * 1024 * 1024;
 const CONNECT_WAIT: Duration = Duration::from_millis(350);
 const ANSWER_WAIT: Duration = Duration::from_millis(1200);
 const WRITE_WAIT: Duration = Duration::from_millis(600);
+/// For a request that matters enough to wait out a slow link, like installing an update.
+const PATIENT_CONNECT_WAIT: Duration = Duration::from_secs(3);
+const PATIENT_ANSWER_WAIT: Duration = Duration::from_secs(10);
 /// The connection is replaced after this, so its keys rotate too.
 const HOUR: Duration = Duration::from_secs(3600);
 /// How long the serving side waits for a request. The caller replaces its connection every hour,
@@ -165,6 +168,21 @@ impl Link {
     /// One request, with one in flight at a time. A failure drops the connection and gives the error:
     /// the call isn't tried again, as a change must not be sent twice, and the next one reconnects.
     fn call(&self, pairing: Option<&Pairing>, target: Option<SocketAddr>, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+        self.call_within(pairing, target, method, path, body, CONNECT_WAIT, ANSWER_WAIT)
+    }
+
+    /// `call` with its own waits for connecting and for the answer.
+    #[allow(clippy::too_many_arguments)]
+    fn call_within(
+        &self,
+        pairing: Option<&Pairing>,
+        target: Option<SocketAddr>,
+        method: &str,
+        path: &str,
+        body: &str,
+        connect: Duration,
+        answer: Duration,
+    ) -> Result<(u16, String), String> {
         let request = ApiRequest { method: method.into(), path: path.into(), body: body.into() };
         let size = bincode::serialized_size(&request).map_err(|e| e.to_string())?;
         if size > MAX_FRAME as u64 {
@@ -176,11 +194,11 @@ impl Link {
         }
         if slot.is_none() {
             let target = target.ok_or("no peer")?;
-            let stream = open_with(pairing, target, Purpose::Api, CONNECT_WAIT)?;
+            let stream = open_with(pairing, target, Purpose::Api, connect)?;
             *slot = Some(ApiConnection { stream, opened: Instant::now() });
         }
         let Some(connection) = slot.as_mut() else { return Err("no connection".into()) };
-        let result = exchange(&mut connection.stream, &request);
+        let result = exchange(&mut connection.stream, &request, answer);
         if result.is_err() {
             *slot = None;
         }
@@ -188,11 +206,11 @@ impl Link {
     }
 }
 
-fn exchange(stream: &mut SecureStream, request: &ApiRequest) -> Result<(u16, String), String> {
+fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> Result<(u16, String), String> {
     stream.set_write_wait(Some(WRITE_WAIT)).map_err(|e| e.to_string())?;
     write_msg(stream, request).map_err(|e| format!("peer unreachable: {e}"))?;
     // One limit for the whole answer, so a trickle can't hold the link.
-    stream.set_read_deadline(Some(Instant::now() + ANSWER_WAIT));
+    stream.set_read_deadline(Some(Instant::now() + wait));
     let answer = read_msg::<ApiAnswer>(stream).map_err(|e| format!("peer didn't answer: {e}"));
     stream.set_read_deadline(None);
     let answer = answer?;
@@ -210,6 +228,12 @@ pub fn set_target(target: SocketAddr) {
 /// A request to the other device's API. Fails when this device isn't paired.
 pub fn peer_call(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     PEER_LINK.call(super::services().pairing.as_deref(), TARGET.get().copied(), method, path, body)
+}
+
+/// `peer_call` for a request that matters enough to wait out a slow link.
+pub fn peer_call_patiently(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+    let pairing = super::services().pairing.as_deref();
+    PEER_LINK.call_within(pairing, TARGET.get().copied(), method, path, body, PATIENT_CONNECT_WAIT, PATIENT_ANSWER_WAIT)
 }
 
 #[cfg(test)]
