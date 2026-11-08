@@ -206,6 +206,8 @@ pub enum Type {
     Caption,
     Label,
     Head,
+    /// The time left and who is being waited for, under a pairing code's countdown.
+    Countdown,
     Value,
     Stat,
     CodeShow,
@@ -224,6 +226,7 @@ impl Type {
             Type::Caption => inter(13.0),
             Type::Label => mono(11.0),
             Type::Head => mono_medium(12.0),
+            Type::Countdown => mono(12.0),
             Type::Value => mono(13.0),
             Type::Stat => mono_medium(26.0),
             Type::CodeShow => mono_medium(54.0),
@@ -380,6 +383,7 @@ mod tests {
         assert_eq!(Type::Caption.font().size, 13.0);
         assert_eq!((Type::Label.font().size, Type::Label.letter_spacing()), (11.0, 1.0));
         assert_eq!(Type::Head.font().family, FontFamily::Name(MONO_MEDIUM.into()));
+        assert_eq!(Type::Countdown.font(), FontId::new(12.0, FontFamily::Monospace));
         assert_eq!(Type::Stat.font().size, 26.0);
         assert_eq!((Type::CodeShow.font().size, Type::CodeShow.letter_spacing()), (54.0, 4.0));
         assert_eq!((Type::CodeEnter.font().size, Type::CodeEnter.letter_spacing()), (44.0, 4.0));

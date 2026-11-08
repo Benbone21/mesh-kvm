@@ -1,18 +1,20 @@
 //! The one look every dialog has: a raised box a quarter of the way down, over the dimmed app.
 
 use super::theme::{
-    line, Type, BG, DIALOG_BUTTON_HEIGHT, DIALOG_BUTTON_MIN_WIDTH, DIALOG_WIDTH, LINE_STRONG, RAISED, SPACE_1, SPACE_2,
-    SPACE_3, SPACE_4, TEXT_DIM,
+    line, Type, BG, DIALOG_BUTTON_HEIGHT, DIALOG_BUTTON_MIN_WIDTH, DIALOG_WIDTH, LINE_STRONG, RAISED, SPACE_1, SPACE_3, SPACE_4, TEXT_DIM,
 };
 use super::widgets::{flat_button, ButtonKind};
 use eframe::egui::{
     self, pos2, vec2, Align, Area, Color32, Frame, Id, Layout, Margin, Modal, Order, Pos2, Rect, Response, Sense, Ui,
     UiBuilder, UiKind, Vec2,
 };
+use std::hash::Hash;
 
 /// The padding inside a dialog: 18 at the top, 20 at the sides and bottom.
 const PADDING: Margin = Margin { left: 20, right: 20, top: 18, bottom: 20 };
 const BORDER: f32 = 1.0;
+/// The space between a dialog's buttons, as the spec's component table has it.
+const BUTTON_GAP: f32 = SPACE_3;
 /// How much of the app shows through the backdrop.
 const BACKDROP: f32 = 0.6;
 
@@ -84,18 +86,18 @@ pub fn button(ui: &mut Ui, label: &str, kind: ButtonKind, enabled: bool) -> Resp
     flat_button(ui, label, kind, vec2(DIALOG_BUTTON_MIN_WIDTH, DIALOG_BUTTON_HEIGHT), enabled)
 }
 
-/// A row of buttons against the right edge, 8 apart, in the order `add` adds them, which is also
+/// A row of buttons against the right edge, 12 apart, in the order `add` adds them, which is also
 /// the order the keyboard reaches them in. The row's width is only known once it is drawn, so it
-/// is placed by last frame's width and drawn again when that changes.
-pub fn buttons(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    let id = ui.id().with("dialog buttons");
+/// is placed by last frame's width, kept under `id_salt`, and drawn again when that changes.
+pub fn buttons(ui: &mut Ui, id_salt: impl Hash, add: impl FnOnce(&mut Ui)) {
+    let id = ui.id().with(("dialog buttons", id_salt));
     let width = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
     ui.add_space(SPACE_1);
     let full = ui.available_rect_before_wrap();
     let left = (full.right() - width).max(full.left());
     let rect = Rect::from_min_max(pos2(left, full.top()), pos2(full.right(), full.top() + DIALOG_BUTTON_HEIGHT));
     let row = ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)), |ui| {
-        ui.spacing_mut().item_spacing.x = SPACE_2;
+        ui.spacing_mut().item_spacing.x = BUTTON_GAP;
         add(ui);
     });
     let drawn = row.response.rect.width();
@@ -117,15 +119,15 @@ mod tests {
         assert_eq!(origin(vec2(760.0, 560.0), 500.0), pos2(150.0, 44.0));
     }
 
-    fn run(ctx: &egui::Context, events: Vec<Event>) -> (bool, Option<Rect>, Vec<(String, Rect)>) {
+    fn run(ctx: &egui::Context, events: Vec<Event>) -> (bool, Option<Rect>, Vec<(String, Rect)>, Vec<Rect>) {
         let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 760.0))), events, ..Default::default() };
-        let mut escaped = false;
+        let (mut escaped, mut pressable) = (false, Vec::new());
         let output = ctx.run(raw, |ctx| {
             escaped = show(ctx, Id::new("test dialog"), "Test", 1.0, |ui| {
                 text(ui, "A sentence.", Type::Body, theme::TEXT);
-                buttons(ui, |ui| {
-                    button(ui, "Cancel", ButtonKind::Secondary, true);
-                    button(ui, "Go", ButtonKind::Primary, true);
+                buttons(ui, "test", |ui| {
+                    pressable.push(button(ui, "Cancel", ButtonKind::Secondary, true).rect);
+                    pressable.push(button(ui, "Go", ButtonKind::Primary, true).rect);
                 });
             })
             .escaped;
@@ -136,18 +138,18 @@ mod tests {
                 texts.push((shape.galley.text().to_string(), shape.visual_bounding_rect()));
             }
         }
-        (escaped, ctx.memory(|m| m.area_rect(Id::new("test dialog"))), texts)
+        (escaped, ctx.memory(|m| m.area_rect(Id::new("test dialog"))), texts, pressable)
     }
 
     #[test]
     fn a_dialog_is_460_wide_with_its_title_and_its_buttons_on_the_right_in_order() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
-        let mut last = (false, None, Vec::new());
+        let mut last = (false, None, Vec::new(), Vec::new());
         for _ in 0..3 {
             last = run(&ctx, vec![]);
         }
-        let (escaped, area, texts) = last;
+        let (escaped, area, texts, pressable) = last;
         let area = area.unwrap();
         assert!(!escaped);
         assert_eq!(area.width(), DIALOG_WIDTH);
@@ -155,6 +157,10 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "TEST"), "{texts:?}");
         let at = |label: &str| texts.iter().find(|(t, _)| t == label).unwrap().1;
         assert!(at("Cancel").right() < at("Go").left());
+        let [cancel, go] = pressable[..] else { panic!("{pressable:?}") };
+        assert_eq!(go.left() - cancel.right(), 12.0, "the gap between buttons");
+        assert_eq!(go.right(), area.right() - 21.0, "against the padding on the right");
+        assert_eq!((go.width(), go.height()), (DIALOG_BUTTON_MIN_WIDTH, DIALOG_BUTTON_HEIGHT));
         // The last button ends at the padding on the right, and is at least 96 wide.
         let edge = area.right() - 21.0;
         assert!(at("Go").right() < edge && at("Go").left() > edge - DIALOG_BUTTON_MIN_WIDTH, "{area:?} {:?}", at("Go"));

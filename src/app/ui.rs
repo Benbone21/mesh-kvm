@@ -359,7 +359,7 @@ impl Window {
                     if !here {
                         dialog::text(ui, &elsewhere, Type::Caption, TEXT_DIM);
                     }
-                    dialog::buttons(ui, |ui| {
+                    dialog::buttons(ui, "mode", |ui| {
                         let back = dialog::button(ui, "Go back now", ButtonKind::Secondary, true);
                         dialog::focus_on_open(ui, &back);
                         undo = back.clicked();
@@ -431,7 +431,7 @@ impl Window {
             if saving {
                 dialog::text(ui, "Saving the address.", Type::Caption, TEXT_DIM);
             }
-            dialog::buttons(ui, |ui| {
+            dialog::buttons(ui, "peer", |ui| {
                 if !first_run {
                     cancel = dialog::button(ui, "Cancel", ButtonKind::Secondary, !saving).clicked();
                 }
@@ -479,6 +479,9 @@ impl Window {
 
     fn collect_pairing(&mut self) {
         if let Some(reply) = self.pairing.pending.as_ref().map(Receiver::try_recv) {
+            if reply.is_ok() {
+                self.pairing.input.answered();
+            }
             match reply {
                 Ok(PairingReply::Refused(why)) => {
                     self.pairing.input.refusal = Some(why);
@@ -628,7 +631,7 @@ impl Window {
                 dialog::text(ui, crate::licenses::TEXT, Type::Caption, TEXT_DIM);
             });
             let mut close = false;
-            dialog::buttons(ui, |ui| {
+            dialog::buttons(ui, "licences", |ui| {
                 let button = dialog::button(ui, "Close", ButtonKind::Secondary, true);
                 dialog::focus_on_open(ui, &button);
                 close = button.clicked();
@@ -655,7 +658,7 @@ impl Window {
             if let Some(error) = error {
                 dialog::text(ui, error, Type::Body, DANGER);
             }
-            dialog::buttons(ui, |ui| {
+            dialog::buttons(ui, "unpair", |ui| {
                 let button = dialog::button(ui, "Cancel", ButtonKind::Secondary, true);
                 dialog::focus_on_open(ui, &button);
                 cancel = button.clicked();
@@ -1597,8 +1600,6 @@ mod tests {
         window.apply_table(&ctx, &snapshot, vec![TableRequest::Action(other, ActionKind::Unpair)], now);
         click_in_dialog(&ctx, &mut window, &snapshot, "unpair confirm", "Unpair", now);
         assert!(window.pairing.unpairing.is_some(), "Unpair sends it, off the UI thread");
-        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
-        assert!(text.contains("Unpairing\u{2026}") || !window.unpair_confirm, "{text}");
         // Nothing listens, which is what a service restarting to unpair looks like, so it closes.
         for _ in 0..400 {
             frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
@@ -1608,6 +1609,75 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!window.unpair_confirm);
+    }
+
+    #[test]
+    fn an_unpair_under_way_says_so_in_its_dialog() {
+        let (ctx, mut window) = (context(), window());
+        let snapshot = secure(linked(), "encrypted");
+        window.unpair_confirm = true;
+        // An unpair that hasn't been answered, as one that is telling the other device would be.
+        let (_answer, waiting) = mpsc::channel();
+        window.pairing.unpairing = Some(waiting);
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        let in_dialog = text.split("\nUNPAIR\n").nth(1).unwrap_or_default();
+        assert!(in_dialog.contains("\nUnpairing\u{2026}\n"), "{text}");
+        assert!(window.unpair_confirm, "it stays up until it is answered");
+    }
+
+    #[test]
+    fn a_second_wrong_code_after_an_answer_clears_the_box_and_gives_it_the_keyboard() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        snapshot.pairing = Some(serde_json::from_str(r#"{"state":"failed","error":"The code was wrong. Show a new code and try again."}"#).unwrap());
+        window.pairing.input.entering = true;
+        window.pairing.input.code = "111 111".into();
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        assert_eq!(window.pairing.input.code, "");
+        // Another code goes, and the poll still has the last failure.
+        window.pairing.input.code = "482 917".into();
+        let (answer, waiting) = mpsc::channel();
+        window.pairing.pending = Some(waiting);
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        assert!(!text.contains("can't be used again"), "{text}");
+        answer.send(PairingReply::Done).unwrap();
+        // It failed the same way before any poll saw it being tried.
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        assert!(window.pairing.pending.is_none());
+        assert!(text.contains("can't be used again"), "{text}");
+        assert_eq!(window.pairing.input.code, "");
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("pairing code"))));
+    }
+
+    #[test]
+    fn esc_on_the_mode_prompt_goes_back() {
+        let local = r#"{"node":"debian","hostname":"debian-host","ip":"192.168.8.2","peer_online":true}"#;
+        let (port, log) = logging_service(local, r#"{"ok":true}"#);
+        let client = Client::start_on(port, Box::new(|| {}));
+        let (ctx, mut window) = (context(), Window::new(client, ServiceStarter::default()));
+        for _ in 0..400 {
+            if window.client.snapshot().local.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut snapshot = linked();
+        snapshot.local.as_mut().unwrap().display_change.change = Some(waiting_change());
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        assert!(!log.lock().unwrap().iter().any(|b| b.contains("display_mode")), "nothing sent before Esc");
+        let esc = Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![esc], Instant::now());
+        let want = model::mode_answer(&waiting_change(), false).to_string();
+        let mut sent = false;
+        for _ in 0..400 {
+            sent = log.lock().unwrap().iter().any(|b| b.ends_with(&want));
+            if sent {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(sent, "{want} in {:?}", log.lock().unwrap());
     }
 
     #[test]
@@ -1790,10 +1860,19 @@ mod tests {
     /// A service on a port of its own, answering this device's status as `local`, with no
     /// other device, and refusing every action.
     fn refusing_service(local: &'static str) -> u16 {
+        logging_service(local, r#"{"ok":false}"#).0
+    }
+
+    /// As `refusing_service`, answering every action with `answer`, and keeping the path and body
+    /// of each request it is sent.
+    fn logging_service(local: &'static str, answer: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = log.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
+                let kept = kept.clone();
                 std::thread::spawn(move || {
                     let mut data = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1815,16 +1894,18 @@ mod tests {
                     }
                     let text = String::from_utf8_lossy(&data);
                     let path = text.split_whitespace().nth(1).unwrap_or_default();
+                    let sent = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    kept.lock().unwrap().push(format!("{path} {sent}"));
                     let (status, body) = match path {
                         "/api/local" => (200, local),
-                        "/api/local/action" => (200, r#"{"ok":false}"#),
+                        "/api/local/action" => (200, answer),
                         _ => (404, "{}"),
                     };
                     let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 });
             }
         });
-        port
+        (port, log)
     }
 
     #[test]

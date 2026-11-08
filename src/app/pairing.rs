@@ -6,7 +6,7 @@ use super::theme::{line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, TEXT, TEXT_
 use super::widgets::ButtonKind;
 use crate::secure::pairing::CODE_SECONDS;
 use eframe::egui::{
-    self, text::CCursor, text::CCursorRange, vec2, Align, Event, FontId, Frame, Galley, Id, Layout, Margin, Rect, Sense,
+    self, text::CCursor, text::CCursorRange, vec2, Align, Event, Frame, Galley, Id, Layout, Margin, Rect, Sense,
     Ui, WidgetInfo, WidgetType,
 };
 use serde::Deserialize;
@@ -65,6 +65,8 @@ pub struct PairingInput {
     focused: bool,
     /// The failure on show has cleared the code box already.
     failure_seen: bool,
+    /// The screen drawn last frame, so the keyboard can be given out again when it changes.
+    shown: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +78,12 @@ pub enum PairingRequest {
 }
 
 impl PairingInput {
+    /// The service answered what was sent, so a failure seen after this is a new one, even with
+    /// the same words as the last.
+    pub fn answered(&mut self) {
+        self.failure_seen = false;
+    }
+
     pub fn ready(&self) -> bool {
         code_digits(&self.code).len() == CODE_DIGITS
     }
@@ -118,6 +126,8 @@ fn screen<'a>(view: &PairingView<'a>, input: &PairingInput) -> Screen<'a> {
     match (state, view.status.and_then(|s| s.code.as_deref())) {
         ("paired", _) => Screen::Paired,
         _ if view.status.is_some_and(|s| s.peer_name.is_some()) => Screen::Paired,
+        // A code is being tried again, so what went wrong last time no longer applies.
+        ("failed", _) if input.entering && view.working => Screen::Entering { failure: None },
         ("failed", _) if input.entering => {
             let failure = if error.starts_with(WRONG_CODE) { wrong_code_text(view.other) } else { error.to_string() };
             Screen::Entering { failure: Some(failure) }
@@ -130,6 +140,19 @@ fn screen<'a>(view: &PairingView<'a>, input: &PairingInput) -> Screen<'a> {
         ("entering", _) => Screen::Entering { failure: None },
         _ if input.entering => Screen::Entering { failure: None },
         _ => Screen::Choice,
+    }
+}
+
+impl Screen<'_> {
+    /// Which screen this is, whatever it shows.
+    fn kind(&self) -> u8 {
+        match self {
+            Screen::Choice => 0,
+            Screen::Showing { .. } => 1,
+            Screen::Entering { .. } => 2,
+            Screen::Failed(_) => 3,
+            Screen::Paired => 4,
+        }
     }
 }
 
@@ -150,18 +173,24 @@ pub fn window(ctx: &egui::Context, view: &PairingView, input: &mut PairingInput,
         Screen::Entering { failure: Some(_) } => {}
         _ => input.failure_seen = false,
     }
+    // A new screen gets the keyboard as a new dialog would: the code box, or else Cancel.
+    let moved = input.shown != Some(screen.kind());
+    input.shown = Some(screen.kind());
+    if moved && matches!(screen, Screen::Entering { .. }) {
+        input.refocus = true;
+    }
     let title = format!("Pair with {}", view.other);
     let shown = dialog::show(ctx, Id::new("pairing window"), &title, opacity, |ui| match screen {
-        Screen::Choice => choice(ui, view, input),
-        Screen::Showing { code, left } => showing(ui, view, code, left),
+        Screen::Choice => choice(ui, view, input, moved),
+        Screen::Showing { code, left } => showing(ui, view, code, left, moved),
         Screen::Entering { failure } => entering(ui, view, input, failure.as_deref()),
         Screen::Failed(error) => {
             dialog::text(ui, error, Type::Body, DANGER);
             working_line(ui, view);
             refusal_line(ui, input);
             let mut request = None;
-            dialog::buttons(ui, |ui| {
-                request = cancel(ui, true);
+            dialog::buttons(ui, "failed", |ui| {
+                request = cancel(ui, true, moved);
                 if dialog::button(ui, "Show a new code", ButtonKind::Primary, !view.working).clicked() {
                     request = Some(PairingRequest::Show);
                 }
@@ -181,10 +210,13 @@ pub fn window(ctx: &egui::Context, view: &PairingView, input: &mut PairingInput,
     shown.inner
 }
 
-/// The Cancel button, which has the keyboard when the dialog opens with nothing to type in.
-fn cancel(ui: &mut Ui, nothing_to_type: bool) -> Option<PairingRequest> {
+/// The Cancel button, which has the keyboard when the dialog opens, or `moved` to this screen,
+/// with nothing to type in.
+fn cancel(ui: &mut Ui, nothing_to_type: bool, moved: bool) -> Option<PairingRequest> {
     let button = dialog::button(ui, "Cancel", ButtonKind::Secondary, true);
-    if nothing_to_type {
+    if nothing_to_type && moved {
+        button.request_focus();
+    } else if nothing_to_type {
         dialog::focus_on_open(ui, &button);
     }
     button.clicked().then_some(PairingRequest::Cancel)
@@ -202,7 +234,7 @@ fn refusal_line(ui: &mut Ui, input: &PairingInput) {
     }
 }
 
-fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput) -> Option<PairingRequest> {
+fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, moved: bool) -> Option<PairingRequest> {
     let mut request = None;
     let sentence = "Pairing lets these two devices trust each other. You only do this once, and it needs mesh-kvm open on both.";
     dialog::text(ui, sentence, Type::Body, TEXT);
@@ -211,8 +243,8 @@ fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput) -> Option<P
     }
     working_line(ui, view);
     refusal_line(ui, input);
-    dialog::buttons(ui, |ui| {
-        request = cancel(ui, true);
+    dialog::buttons(ui, "choice", |ui| {
+        request = cancel(ui, true, moved);
         if dialog::button(ui, "Enter a code", ButtonKind::Secondary, !view.working).clicked() {
             input.entering = true;
         }
@@ -223,7 +255,7 @@ fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput) -> Option<P
     request
 }
 
-fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32) -> Option<PairingRequest> {
+fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32, moved: bool) -> Option<PairingRequest> {
     let sentence = format!("Open mesh-kvm on {}, choose Enter a code, and type:", view.other);
     dialog::text(ui, &sentence, Type::Body, TEXT);
     let shown = code_shown(code);
@@ -240,17 +272,16 @@ fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32) -> Option<Pai
     ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * share, bar.height())), 0.0, ACCENT);
     ui.add_space(gap);
     ui.spacing_mut().item_spacing.y = gap;
-    let row = FontId::monospace(12.0);
     let left = format!("{} LEFT, ONE TRY", clock(left.ceil() as u64));
     let waiting = format!("WAITING FOR {}", view.other.to_uppercase());
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(left).font(row.clone()).color(TEXT_DIM));
+        ui.label(Type::Countdown.job(&left, TEXT_DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(egui::RichText::new(waiting).font(row).color(TEXT_DIM));
+            ui.label(Type::Countdown.job(&waiting, TEXT_DIM));
         });
     });
     let mut request = None;
-    dialog::buttons(ui, |ui| request = cancel(ui, true));
+    dialog::buttons(ui, "showing", |ui| request = cancel(ui, true, moved));
     request
 }
 
@@ -304,8 +335,8 @@ fn entering(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, failure: 
         dialog::text(ui, failure, Type::Body, DANGER);
     }
     refusal_line(ui, input);
-    dialog::buttons(ui, |ui| {
-        request = cancel(ui, false);
+    dialog::buttons(ui, "entering", |ui| {
+        request = cancel(ui, false, false);
         let ready = input.ready() && !view.working;
         let label = if view.working { "Pairing\u{2026}" } else { "Pair" };
         let pair = dialog::button(ui, label, ButtonKind::Primary, ready);
@@ -489,6 +520,46 @@ mod tests {
         input.code = "1".into();
         draw(&view(Some(&failed)), &mut input);
         assert_eq!(input.code, "1");
+    }
+
+    #[test]
+    fn a_second_wrong_code_in_a_row_clears_the_box_and_gives_it_the_keyboard_again() {
+        let ctx = context();
+        let failed = status(r#"{"state":"failed","error":"The code was wrong. Show a new code and try again."}"#);
+        let mut input = PairingInput { entering: true, code: "111 111".into(), ..Default::default() };
+        settle(&ctx, &view(Some(&failed)), &mut input, [1280.0, 760.0]);
+        assert_eq!(input.code, "");
+        // The next code goes, and the old failure is still the last status polled.
+        input.code = "482 917".into();
+        let mut sending = view(Some(&failed));
+        sending.working = true;
+        let drawn = settle(&ctx, &sending, &mut input, [1280.0, 760.0]);
+        assert!(!drawn.text.contains("can't be used again"), "{}", drawn.text);
+        assert!(drawn.text.contains("Pairing\u{2026}"), "{}", drawn.text);
+        assert_eq!(input.code, "482 917", "kept while it is being tried");
+        // It is answered, and fails the same way before a poll ever sees it being tried.
+        input.answered();
+        let drawn = settle(&ctx, &view(Some(&failed)), &mut input, [1280.0, 760.0]);
+        assert!(drawn.text.contains("can't be used again"), "{}", drawn.text);
+        assert_eq!(input.code, "");
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("pairing code"))));
+    }
+
+    #[test]
+    fn a_new_screen_gets_the_keyboard() {
+        let enter = || Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let ctx = context();
+        let mut input = PairingInput::default();
+        settle(&ctx, &view(None), &mut input, [1280.0, 760.0]);
+        // Choice to showing: Cancel has it.
+        let showing = status(r#"{"state":"showing","code":"482917","seconds_left":94}"#);
+        settle(&ctx, &view(Some(&showing)), &mut input, [1280.0, 760.0]);
+        assert_eq!(one(&ctx, &view(Some(&showing)), &mut input, [1280.0, 760.0], vec![enter()]).request, Some(PairingRequest::Cancel));
+        // Choice to entering: the code box has it.
+        let mut input = PairingInput::default();
+        assert_eq!(click(&ctx, &view(None), &mut input, "Enter a code"), None);
+        settle(&ctx, &view(None), &mut input, [1280.0, 760.0]);
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("pairing code"))));
     }
 
     #[test]
