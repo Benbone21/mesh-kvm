@@ -369,13 +369,13 @@ pub struct LinkStatus {
 }
 
 /// From this much on, the link line stands out.
-const POOR_LOSS_PERCENT: f32 = 5.0;
-const POOR_ROUND_TRIP_MS: u32 = 150;
+pub(super) const POOR_LOSS_PERCENT: f32 = 5.0;
+pub(super) const POOR_ROUND_TRIP_MS: u32 = 150;
 
 impl LinkStatus {
     /// The worst loss either way, from the link's own packets and from audio, which sends far more
     /// of them and also counts what came too late to play.
-    fn loss(&self) -> Option<f32> {
+    pub fn loss(&self) -> Option<f32> {
         [self.loss_in, self.loss_out, self.audio_loss_in, self.audio_loss_out].into_iter().flatten().reduce(f32::max)
     }
 }
