@@ -27,15 +27,15 @@ A `mesh-kvm.exe` run from anywhere else, such as Downloads, doesn't install itse
 
 On Debian, install the `.deb`, or run `mesh-kvm --install-launchers` once. That adds mesh-kvm to your applications menu and starts the tray icon when you log in.
 
-The first time the app opens on a device, it asks for the other device's address. Enter it on both devices. The app shows each device's own address in the box and next to the device's name. The address is saved, and you can change it later under Settings in the window. Use an IPv4 address such as `192.168.1.20`.
+The first time the app opens on a device, it asks for the other device's address. Enter it on both devices. The app shows each device's own address in the box and next to the device's name. The address is saved, and you can change it later in the Address row of the window's table. Use an IPv4 address such as `192.168.1.20`.
 
 ## Pairing
 
 The devices share nothing until they're paired. You do this once. It needs mesh-kvm open on both, and the other device's address set on the device that enters the code.
 
-1. Open Settings in the app and choose Pair, then Show a code here. The code is good for 2 minutes and one try.
-2. On the other device, choose Pair, then Enter a code here, and type the code. Use that device's own keyboard, as the devices can't share one until they're paired.
-3. Both devices show the same fingerprint under Settings, such as `4F2A-91C3`, and the link comes up.
+1. In the app, find Pair under BOTH DEVICES in the table and choose Show a code. The code is good for 2 minutes and one try.
+2. On the other device, choose Pair under BOTH DEVICES, then Enter a code, and type the code. Use that device's own keyboard, as the devices can't share one until they're paired.
+3. Both devices show the same fingerprint in the table, such as `4F2A-91C3`, and the link comes up.
 
 A wrong code can't be tried again: show a new one. TCP port 24853 is open only while a code is showing. If the device showing the code has the other device's address saved, it accepts only that address. With no address saved it accepts any address for that 2-minute, one-try window, so someone else on the network could take the try, with one guess in a million per code. If the wrong address is saved, the device entering the code says so, and the code stays good.
 
@@ -43,7 +43,7 @@ Only the device showing the code needs its firewall to let 24853 in, for that lo
 
 Without a window, `mesh-kvm --pair-show` and `mesh-kvm --pair <code>` do the same through the running service.
 
-Unpair is in the same Settings menu. It removes the other device here, and tells that device if it can be reached. If it can't, its handshakes are refused until you pair again. The keys are in `pairing.json`, in `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows, and unpairing keeps this device's own key. If that file can't be read, the device stays unpaired and the app says why.
+Unpair is in the same BOTH DEVICES group, and asks you to confirm first. It removes the other device here, and tells that device if it can be reached. If it can't, its handshakes are refused until you pair again. The keys are in `pairing.json`, in `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows, and unpairing keeps this device's own key. If that file can't be read, the device stays unpaired and the app says why.
 
 ### What is and isn't protected
 
@@ -66,25 +66,33 @@ Opening the app or the tray starts the background service if it isn't running, s
 
 Opening mesh-kvm from the Start menu or the applications menu shows the app window. It works the same from either device. You can also run `mesh-kvm --app`.
 
-Most of the window is your desk: every monitor of both devices, to scale. The screens of the device that has the keyboard and mouse are lit. Beside it are the controls for each device, under Screens, Input, Clipboard, Audio and Startup. They sit side by side in a wide window and one above the other in a narrow one, and they scroll if they don't all fit.
+The window is a flat dark readout. From the top down:
 
-Everything sizes from the window, and a big window enlarges the text and controls a little. To change that, use App size under Settings, or Ctrl with plus, minus or 0. A larger app size raises the smallest size the window can go to, so nothing runs out of room.
+- The status bar shows whether the devices are linked and which one has the keyboard and mouse, with Switch and Release all beside it.
+- Under it, the update line appears when an update is ready or being installed. See [Updating](#updating).
+- Five live figures follow, each with the last minute of history drawn beside it. These include ROUND TRIP and LOST.
+- Below is one table with every setting for both devices side by side, this device first. It is grouped INPUT, SCREENS, CLIPBOARD, AUDIO, GAMES, STARTUP, BOTH DEVICES and UPDATES.
+- The layout, your desk with every monitor of both devices to scale, sits beside the table, or under it in a narrow window. The screens of the device that has the keyboard and mouse are lit.
+
+The window scrolls if it doesn't all fit. Everything sizes from the window, and a big window enlarges the text and controls a little. To change that, use App size under BOTH DEVICES, or Ctrl with plus, minus or 0. A larger app size raises the smallest size the window can go to, so nothing runs out of room. Motion is cut back if the system asks for reduced motion.
 
 The window remembers its size and app size. It remembers its position on Windows and on X11. On Wayland the desktop chooses where windows open, so the position isn't kept. These are saved in `~/.local/share/mesh-kvm` on Debian and `%APPDATA%\mesh-kvm\data` on Windows.
 
-Devices go by their own names. Click a device's name in the window and type to rename it, from either device. Leave it empty to go back to its network name.
+Devices go by their own names. Click a device's name at the top of its column and type to rename it, from either device. Leave it empty to go back to its network name.
 
 The tray icon sits in the notification area. Its menu has Open, Switch device, Release all input, and Quit mesh-kvm.
 
-Closing the window does not stop sharing. The service keeps running and the tray stays. Quit mesh-kvm in the tray stops all of mesh-kvm on that device: the window, the tray and the service. Anything Play only on the other device muted comes back first. On Debian under systemd, the `mesh-kvm` unit is stopped, so it doesn't start again by itself. The other device then shows this one as offline. To start again, open mesh-kvm from the Start menu or the applications menu, or sign in again with starting at sign-in on. `mesh-kvm --quit` does the same as the tray's Quit.
+The window has its own taskbar button. Closing it with X closes only the window: sharing, the service and the tray keep running. Opening mesh-kvm again brings back the same window instead of making a second one, and if the tray isn't running, opening the window starts it.
+
+Quit mesh-kvm in the tray stops all of mesh-kvm on that device: the window, the tray and the service. Anything Play only on the other device muted comes back first. On Debian under systemd, the `mesh-kvm` unit is stopped, so it doesn't start again by itself. The other device then shows this one as offline. To start again, open mesh-kvm from the Start menu or the applications menu, or sign in again with starting at sign-in on. `mesh-kvm --quit` does the same as the tray's Quit.
 
 ## Toggles
 
-Each device has its own switches in the app window.
+Each device has its own switches in the table. They read ON or OFF. If a device refuses a change, the switch goes back and a line under its row says why.
 
 - Share mouse and Share keyboard turn sharing of each one on or off.
 - Send clipboard and Receive clipboard choose which way the clipboard travels: text, images and files. Copied files move as soon as you copy them, up to 2 GB per copy, and the last two copies stay in a `received` folder beside the settings. If an app takes more than 2 seconds to hand over what it copied, a note says so, the copy goes when the app finishes, and a copy from anywhere else still works meanwhile.
-- Start mesh-kvm when this device boots controls starting at login or boot. With it off, the tray still appears at login on Debian, but the service waits until you open the app.
+- Start when this device boots controls starting at login or boot. With it off, the tray still appears at login on Debian, but the service waits until you open the app.
 
 Changes take effect straight away and are kept when mesh-kvm restarts.
 
@@ -93,7 +101,7 @@ Changes take effect straight away and are kept when mesh-kvm restarts.
 Each device has its own audio controls, and sound can go both ways at once.
 
 - Microphone or line-in to send, and Output to send, choose what this device sends. Each lists your real devices by name, or None. Choosing anything starts sending, and if you choose both they are sent mixed, turned down just enough that the sum doesn't clip. A microphone can only be chosen on the device it belongs to, though the other device can turn it off.
-- Play received audio on chooses where sound from the other device plays. Play audio turns it off.
+- Play received audio on chooses where sound from the other device plays. Play audio from the other device turns it off.
 - Play only on the other device mutes the output you chose to send, so you hear that sound on one device only. It is on by default. On Windows it also mutes the default output if that's a different one, and changes what's sent: see below.
 - Audio quality chooses the bitrate of what this device sends: 64, 96, 128 or 256 kbit/s, or Uncompressed at about 1.6 Mbit/s. Each packet adds about 32 kbit/s on the network on top of that. On poor Wi-Fi, use a lower one: smaller packets get through more often.
 - The lines under each part say how the audio is doing: how much is lost on the way, how much couldn't be repaired, and how much is held back to smooth out the network. A note appears if a capture can't be opened, delivers nothing, or a microphone gives only silence.
@@ -123,7 +131,7 @@ A microphone that can hear the speakers will still pick them up. Headphones avoi
 
 Audio travels on UDP port 24851 as Opus in 10 ms packets, or plain PCM in 5 ms packets when Uncompressed is chosen. A jitter buffer on the receiving side holds as little as the network allows: one packet on a clean link, more when packets arrive unevenly, and it shrinks back once things calm down. A missing packet is rebuilt or made up by the decoder rather than left as a gap. Both devices need the same packet format, so update them together. If they differ, audio stays silent and the app says so.
 
-Opus is built from the copy in `third_party/opus`, so building needs only a C compiler, on both targets. Its licence is under Licences in the Settings menu, and `mesh-kvm --licenses` shows it too. `tests/audio_measure.py` measures quality, delay and bandwidth at each bitrate with `tc netem` adding loss and jitter. `tests/audio_devices.py` runs two whole devices beside private sound servers, and checks echo, muting, devices coming and going, and mixing. Neither can reach your real audio.
+Opus is built from the copy in `third_party/opus`, so building needs only a C compiler, on both targets. Its licence is under Licences in the UPDATES group, and `mesh-kvm --licenses` shows it too. The same list covers the bundled Inter and JetBrains Mono fonts, under the SIL Open Font License. `tests/audio_measure.py` measures quality, delay and bandwidth at each bitrate with `tc netem` adding loss and jitter. `tests/audio_devices.py` runs two whole devices beside private sound servers, and checks echo, muting, devices coming and going, and mixing. Neither can reach your real audio.
 
 ## Bad Wi-Fi
 
@@ -139,13 +147,13 @@ mesh-kvm is built for a network that loses packets, delays them, and now and the
 - If the other device can be heard but can't hear this one, even from the moment the link came up, as with a firewall on it, this device keeps its keyboard and mouse. It takes them back after 2.5 seconds if they had crossed, refuses to cross, and says so. Control returns in the same way once the other device can hear.
 - Text you copy while the other device can't be reached goes when the link is back. Only the newest copy waits, and for at most 10 minutes. Anything copied since on either device takes its place, and if both devices have text waiting, both end up with the later one. Images and files don't wait: a note under Clipboard says what stayed behind, and to copy it again.
 
-The Input section shows how the link looks from each device: the worst loss in either direction, counting what audio loses as well as the link's own packets, and the time for a packet to get there and back. Hover over it for each direction. It stands out from 5% loss or 150 ms. A figure only shows once it's known. While the link is down it gives no figures, and the other device shows as Link down. If the other device can't hear this one, it says that instead.
+The ROUND TRIP and LOST figures at the top show how the link looks: the time for a packet to get there and back, and the worst loss in either direction, counting what audio loses as well as the link's own packets. Hover over one for each direction. A figure stands out from 5% loss or 150 ms. It shows `--` until it's known. While the link is down it gives no figures, and the other device shows as Link down. If the other device can't hear this one, it says that instead.
 
 ## Arranging screens
 
 Every monitor on both devices appears in the app, including ones to the left of or above a device's main screen, with its name, resolution and refresh rate.
 
-Drag any screen to arrange the devices. The whole device moves together: mesh-kvm arranges how the two devices meet, and each device's own monitors stay where its operating system has them. To change those, use that device's display settings. A dragged device snaps to the edge of the other device's nearest screen, never lands on top of one, and lines up with a screen's start, middle or end when it comes close. The amber line shows where the mouse crosses.
+Drag any screen in the layout to arrange the devices. The whole device moves together: mesh-kvm arranges how the two devices meet, and each device's own monitors stay where its operating system has them. To change those, use that device's display settings. A dragged device snaps to the edge of the other device's nearest screen, never lands on top of one, and lines up with a screen's start, middle or end when it comes close. The bright edge shows where the mouse crosses. With a screen selected, the arrow keys move it by 10 pixels, and Shift with an arrow by 1.
 
 An arrangement you change on either device is saved there and passed to the other one. If the other device is away, your change is kept and reaches it when it comes back. Changes to different things on the two devices are both kept, such as moving a device on one and changing the push needed to cross on the other. If both devices changed the same thing, the newer change wins, and on a tie the second device's does.
 
@@ -153,7 +161,7 @@ The layout is saved as `layout.json` beside the settings: `~/.config/mesh-kvm` o
 
 ## Resolution and refresh rate
 
-Each screen has a resolution and a refresh rate menu, which list what that monitor offers. Click a screen on the map to find its menus. Changing one applies on the device the monitor belongs to, from either device's app.
+Each screen has a resolution and a refresh rate menu, in the SCREENS rows of the table, which list what that monitor offers. Changing one applies on the device the monitor belongs to, from either device's app.
 
 The app then asks whether to keep the change. Keep this only appears on the device with that screen, since that's where you can see it worked. The other device's app can only send it back. If nobody answers within 15 seconds, the screen goes back by itself. The service does that, so it still happens if the app closes or the screen goes blank, and the devices return to where they sat in the arrangement.
 
@@ -171,7 +179,7 @@ When an update is ready, a line at the top of the app says so, with a link to th
 - Update this device shows when the other device is offline or can't update, with a note that the two won't work together until both match.
 - If the other device hasn't finished downloading, the line shows how far along it is, and the button waits. The device that's behind is told to look as soon as the other has found the update.
 - A copy that isn't the installed one, such as one run from `target/release`, only says that a version is available. On Windows it also says to use `mesh-kvm-setup.exe` to install.
-- Settings shows the version running, has Check now, and says if a download was turned down or no check has worked for 3 days. A failed check is otherwise quiet.
+- UPDATES in the table shows the version running, has Check now, and says if a download was turned down or no check has worked for 3 days. A failed check is otherwise quiet.
 - An update clicked during a screen change waits for the change to end.
 
 Anything is installed only if it's signed by the release key built into the app, newer than what's running, the version it came as, and exactly the file that was signed. HTTPS isn't what's trusted, so a compromised GitHub account alone can't push an update. A download that doesn't match what was signed is deleted and fetched again from nothing, once. If it still doesn't match, or the signature is wrong, that version isn't tried again. A copy that isn't the installed one never turns a version down for the installed copy.
@@ -247,7 +255,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 
 ## Tests
 
-`cargo test` runs the unit tests. `tests/netem_link.py` puts two devices on a bad network with `tc netem`, with a pretend person typing and clicking on one and a tone playing to the other. It covers loss, delay, reordering, 2-second dropouts in both directions, using the local device during one, one-way links, an outage past 15 seconds, a flapping link, Release all input on either device, and a restart. It checks that keys arrive in order, Ctrl+C stays Ctrl+C, no key sticks, audio keeps playing and control returns only when it should. Its top comment says how to run it. Input there is the real router, link and sockets with the keyboard and mouse left out, and audio has private sound servers, so it can't reach your real desktop or audio. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, held keys and late packets, dropouts, the audio bus, layout sync, and saving and changing the address:
+`cargo test` runs the unit tests. `tests/netem_link.py` puts two devices on a bad network with `tc netem`, with a pretend person typing and clicking on one and a tone playing to the other. It covers loss, delay, reordering, 2-second dropouts in both directions, using the local device during one, one-way links, an outage past 15 seconds, a flapping link, Release all input on either device, and a restart. It checks that keys arrive in order, Ctrl+C stays Ctrl+C, no key sticks, audio keeps playing and control returns only when it should. Its top comment says how to run it. Input there is the real router, link and sockets with the keyboard and mouse left out, and audio has private sound servers, so it can't reach your real desktop or audio. `tests/fake_service.py` pretends to be the service for two devices, with 3 or 6 monitors, so the app window can be looked at and resized with nothing real behind it. Its top comment says how to run it. `tests/fake_service.py --secure` shows the pairing states. `tests/wine_link.py` runs the Windows build under Wine and plays the other device, sending hand-made packets and reading the ones that come back. It checks the link, the active-device logic, input and edges in both directions, held keys and late packets, dropouts, the audio bus, layout sync, and saving and changing the address:
 
 ```
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
