@@ -16,6 +16,7 @@ When one device sends its microphone, the other should see it as a microphone in
 - A PipeWire null sink shows up as an output with the description given, and its monitor carries what's played into it.
 - A remap source on a null sink's monitor shows up as a microphone and records what's played into that sink.
 - A null sink created with `media.class=Audio/Source/Virtual` shows as a microphone. `pw-play --target` did not link to it, so it recorded silence.
+- **Chosen for the build:** `module-pipe-source` fed through a FIFO shows only a microphone, with no extra output. It records what's written, and gives silence when nothing is.
 
 ## Design
 

@@ -212,6 +212,7 @@ fn an_older_peer_is_noted_not_played() {
     - After a failed load, it waits `RETRY_AFTER = 5 s` before trying again.
   - **Startup cleanup:** `pub fn clear_leftovers(run)` unloads every module in `pactl list short modules` whose line contains `mesh-kvm-peer-`.
   - **Status:** `pub fn present() -> Option<String>` gives the clean name while both modules are loaded. The status JSON reads it, and `virtual_mic_ready` is `present().is_some()`.
+  - **Errors:** `pub fn last_error() -> Option<String>` gives the first line of `pactl`'s stderr from the latest failed load, and is cleared on success.
 - **Feeding the mic.** `start_mic_playback` runs a thread that does three things while `present()` is some:
   1. Opens `fifo_path()` with `O_WRONLY | O_NONBLOCK`.
   2. Every 10 ms by the clock, fills 480 frames from the mic `RxStream`.
@@ -324,7 +325,7 @@ fn no_cable_means_no_virtual_mic() {
 
 **Interfaces:**
 - Consumes:
-  - From Task 4, `virtual_linux::present()`.
+  - From Task 4, `virtual_linux::present()` and `virtual_linux::last_error()`.
   - From Task 5, `wasapi::cable_found()`.
   - From Task 2, `peer_mic_ready`.
   - From Task 3, `AUDIO_RX_MIC_LIVE`.
@@ -335,7 +336,7 @@ fn no_cable_means_no_virtual_mic() {
     - `"rx_mic_live": bool`.
   - **Model:** `AudioStatus` gains `virtual_kind: VirtualKind { Linux, Cable, NoCable }` and `virtual_present: bool`, each defaulting to absent for older peers, plus `tx_mic_ready: bool`.
   - **New row:** "Virtual devices", placed after "Play received audio on". Each device's cell text comes from the copy in Global Constraints. `<peer>` is the *other* column's device name, the same name the table header shows.
-    - **Debian:** `Linux` with `present` true gives the in-sound-settings text; otherwise "Appears when linked".
+    - **Debian:** `Linux` with `present` true gives the in-sound-settings text; with `error` set, `"Couldn't add the devices: <error>"`; otherwise "Appears when linked".
     - **Windows:** `Cable` gives the pick text, with the rename hint as the tooltip. `NoCable` gives the install text, with the link opened by the cell's action.
   - **Mic note:** on the sending device, when its input is not off and the other device's `virtual_present` is false, the "Microphone or line-in" cell carries the note `"<peer> has no virtual mic. Install VB-Cable there."`, but only when the peer's `virtual_kind` is `NoCable`.
   - **Accessibility:** every new cell has an accessible name made of the row label and the cell text, as the other cells do.
