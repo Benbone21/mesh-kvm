@@ -5,6 +5,7 @@ use super::model::{Control, Device};
 use super::motion;
 use super::rows::{ActionKind, Cell, CellKind, ChoiceValue, GroupRows, Note, Pick, Row, Setting, DROPDOWN};
 use super::theme::{
+    self,
     line, tone, Type, ACCENT, BG, DANGER, DEVICE_COLUMN, LINE_FAINT, LINE_STRONG, RAISED, ROW_MIN_HEIGHT, SPACE_1, SPACE_2,
     TEXT, TEXT_DIM,
 };
@@ -165,7 +166,7 @@ impl Table {
         }
         let mut colour = tone(cell.tone);
         if cell.saving {
-            colour = colour.gamma_multiply(SAVING_OPACITY);
+            colour = theme::faded(colour, SAVING_OPACITY);
         }
         let room = DEVICE_COLUMN - CELL_GAP;
         // A read-only cell and one waiting on the service only say what they are.
@@ -444,9 +445,11 @@ fn number(ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, colour: Color32, value: 
     // The cell's own place, under the number, as the other cells have.
     ui.interact(rect, id, Sense::hover());
     let mut edited = value;
-    let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)).id_salt(id));
+    // The figure starts where the other cells' values do, as on the board.
+    let layout = Layout::left_to_right(Align::Center).with_main_align(Align::Min);
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(layout).id_salt(id));
     flat_widgets(&mut child);
-    child.spacing_mut().button_padding = vec2(SPACE_1, 0.0);
+    child.spacing_mut().button_padding = vec2(0.0, 0.0);
     // The whole cell takes the drag, with the figure at its left.
     child.spacing_mut().interact_size = rect.size();
     child.style_mut().override_font_id = Some(Type::Value.font());
@@ -560,6 +563,35 @@ mod tests {
         run(vec![Event::PointerMoved(at + vec2(20.0, 0.0))]);
         run(vec![Event::PointerMoved(at + vec2(40.0, 0.0)), press(at + vec2(40.0, 0.0), false)]);
         assert!(requests.iter().any(|r| matches!(r, TableRequest::Set(Device::Debian, Control::PointerSpeed, v) if *v > 1.0)), "{requests:?}");
+    }
+
+    #[test]
+    fn a_number_starts_where_the_other_cells_values_do() {
+        let speed = CellKind::Number { setting: Setting::Device(Control::PointerSpeed), value: 1.0, range: 0.05..=2.0, step: 0.05 };
+        let on = CellKind::Toggle(Setting::Device(Control::MouseSharing));
+        let row = Row { label: "Row".into(), cells: [cell("1.00\u{d7}", speed), cell("ON", on)], error: None };
+        let groups = [GroupRows { group: Group::Input, rows: vec![row], notes: Vec::new() }];
+        let columns = [(Device::Debian, "Debian".to_string()), (Device::Windows, "Laptop".to_string())];
+        let (ctx, mut table) = (egui::Context::default(), Table::default());
+        crate::app::theme::apply(&ctx);
+        let mut output = None;
+        for _ in 0..2 {
+            let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(700.0, 400.0))), ..Default::default() };
+            output = Some(ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    table.show(ui, &groups, columns.clone(), 400.0, None, false, Instant::now());
+                });
+            }));
+        }
+        let output = output.unwrap();
+        let left_of = |text: &str| {
+            output.shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos.x),
+                _ => None,
+            })
+        };
+        let inset = |column: usize, text: &str| left_of(text).unwrap() - ctx.read_response(cell_id("Row", column)).unwrap().rect.left();
+        assert_eq!(inset(0, "1.00\u{d7}"), inset(1, "ON"));
     }
 
     #[test]

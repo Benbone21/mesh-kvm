@@ -17,8 +17,8 @@ const CODE_DIGITS: usize = 6;
 /// Six digits and the space between the two groups.
 const CODE_CHARS: usize = CODE_DIGITS + 1;
 /// The padding above and below the code, shown or typed.
-const CODE_SHOW_PADDING: i8 = 18;
-const CODE_ENTER_PADDING: i8 = 14;
+const CODE_SHOW_PADDING: f32 = 18.0;
+const CODE_ENTER_PADDING: f32 = 14.0;
 /// How the service words a code that didn't match. Other failures are shown as it words them.
 const WRONG_CODE: &str = "The code was wrong.";
 
@@ -259,11 +259,20 @@ fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, moved: bool
     request
 }
 
+/// The space above and below a code. The boards set a code with a line height of 1, and egui's
+/// row is taller, so the space is cut by the difference and the box comes out as tall as drawn.
+fn code_margin(ui: &Ui, kind: Type, padding: f32) -> Margin {
+    let font = kind.font();
+    let row = ui.fonts(|f| f.row_height(&font));
+    let both = (2.0 * padding - (row - font.size)).round().max(0.0) as i8;
+    Margin { left: 0, right: 0, top: both / 2, bottom: both - both / 2 }
+}
+
 fn showing(ui: &mut Ui, view: &PairingView, code: &str, seconds: u64, moved: bool) -> Option<PairingRequest> {
     let sentence = format!("Open mesh-kvm on {}, choose Enter a code, and type:", view.other);
     dialog::text(ui, &sentence, Type::Body, TEXT);
     let shown = code_shown(code);
-    let display = Frame::new().fill(BG).inner_margin(Margin::symmetric(0, CODE_SHOW_PADDING)).show(ui, |ui| {
+    let display = Frame::new().fill(BG).inner_margin(code_margin(ui, Type::CodeShow, CODE_SHOW_PADDING)).show(ui, |ui| {
         ui.vertical_centered(|ui| ui.label(Type::CodeShow.job(&shown, ACCENT)));
     });
     display.response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, spoken_code(code)));
@@ -324,6 +333,7 @@ fn entering(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, failure: 
     let edit = egui::TextEdit::singleline(&mut input.code)
         .id(id)
         .frame(false)
+        .margin(Margin::ZERO)
         .char_limit(CODE_CHARS)
         .horizontal_align(Align::Center)
         .desired_width(f32::INFINITY)
@@ -331,7 +341,7 @@ fn entering(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, failure: 
     let boxed = Frame::new()
         .fill(BG)
         .stroke(line(1.0, ACCENT))
-        .inner_margin(Margin::symmetric(0, CODE_ENTER_PADDING))
+        .inner_margin(code_margin(ui, Type::CodeEnter, CODE_ENTER_PADDING))
         .show(ui, |ui| ui.add_enabled(!view.working, edit));
     let field = boxed.inner.labelled_by(label.id);
     if !input.focused || input.refocus {
@@ -379,6 +389,8 @@ mod tests {
     }
 
     struct Drawn {
+        /// The code boxes: filled `BG` and wider than any button.
+        boxes: Vec<egui::epaint::RectShape>,
         text: String,
         texts: Vec<(String, Rect)>,
         request: Option<PairingRequest>,
@@ -389,15 +401,20 @@ mod tests {
         let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size.into())), events, ..Default::default() };
         let mut request = None;
         let output = ctx.run(raw, |ctx| request = window(ctx, view, input, 1.0));
-        let (mut text, mut texts) = (String::new(), Vec::new());
+        let (mut text, mut texts, mut boxes) = (String::new(), Vec::new(), Vec::new());
         for clipped in &output.shapes {
+            if let egui::Shape::Rect(r) = &clipped.shape {
+                if r.fill == theme::BG && r.rect.width() > 300.0 && r.rect.height() > COUNTDOWN_HEIGHT {
+                    boxes.push(r.clone());
+                }
+            }
             if let egui::Shape::Text(shape) = &clipped.shape {
                 text.push_str(shape.galley.text());
                 text.push('\n');
                 texts.push((shape.galley.text().to_string(), shape.visual_bounding_rect()));
             }
         }
-        Drawn { text, texts, request, area: ctx.memory(|m| m.area_rect(egui::Id::new("pairing window"))) }
+        Drawn { boxes, text, texts, request, area: ctx.memory(|m| m.area_rect(egui::Id::new("pairing window"))) }
     }
 
     fn context() -> egui::Context {
@@ -490,6 +507,17 @@ mod tests {
         let mut later = view(Some(&showing));
         later.left_since_poll = Duration::from_millis(4500);
         assert!(draw(&later, &mut PairingInput::default()).text.contains("1:30 LEFT, ONE TRY"));
+    }
+
+    #[test]
+    fn the_code_boxes_are_as_tall_as_on_the_boards() {
+        // The boards set the codes with a line height of 1: 54 + 2 × 18, and 44 + 2 × 14 inside a 1px border.
+        let showing = status(r#"{"state":"showing","code":"482917","seconds_left":94}"#);
+        let shown = draw(&view(Some(&showing)), &mut PairingInput::default()).boxes;
+        assert_eq!(shown.iter().map(|b| b.rect.height()).collect::<Vec<_>>(), [90.0], "{shown:?}");
+        let typed = draw(&view(None), &mut PairingInput { entering: true, code: "482 917".into(), ..Default::default() }).boxes;
+        assert_eq!(typed.len(), 1, "{typed:?}");
+        assert_eq!(typed[0].rect.height() + 2.0 * typed[0].stroke.width * f32::from(matches!(typed[0].stroke_kind, egui::StrokeKind::Outside)), 74.0, "{typed:?}");
     }
 
     #[test]

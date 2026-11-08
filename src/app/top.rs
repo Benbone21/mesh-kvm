@@ -6,7 +6,7 @@ use super::motion;
 use super::sparkline::{Sparkline, Sparklines};
 use super::theme::{
     line, tone, Type, ACCENT, DANGER, LINE, SPACE_1, SPACE_2, SPACE_3, SPACE_5, SPARKLINE_SIZE, SPARKLINE_STROKE,
-    STATUS_BUTTON_HEIGHT, SURFACE, TEXT, TEXT_DIM,
+    STATUS_BUTTON_HEIGHT, STATUS_SQUARE, SURFACE, TEXT, TEXT_DIM,
 };
 use super::updates::{notes_url, Banner, UpdateButton};
 use super::view::{fit_name, stat_value, Notice, Stat, StatusLine, STATS};
@@ -97,14 +97,13 @@ pub fn update_line(ui: &mut Ui, banner: &Banner) -> Option<TopRequest> {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         ui.set_min_height(STATUS_BUTTON_HEIGHT);
-        if banner.failed {
-            status_square(ui, DANGER);
-        }
+        // The square goes level with the first line of the words, once they are placed.
+        let square = banner.failed.then(|| ui.allocate_exact_size(vec2(STATUS_SQUARE, 0.0), Sense::hover()).0);
         let room = (ui.available_width() - button - notes).max(0.0);
         let natural = |text: &str, kind: Type| ui.fonts(|f| f.layout_job(kind.job(text, TEXT))).size().x;
         let wanted = banner.detail.as_deref().map_or(0.0, |d| natural(d, Type::Caption)).max(natural(&banner.text, Type::Body));
         let width = wanted.min(room).ceil();
-        ui.allocate_ui(vec2(width, 0.0), |ui| {
+        let words = ui.allocate_ui(vec2(width, 0.0), |ui| {
             ui.set_width(width);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
@@ -114,6 +113,11 @@ pub fn update_line(ui: &mut Ui, banner: &Banner) -> Option<TopRequest> {
                 }
             });
         });
+        if let Some(slot) = square {
+            let first_line = ui.fonts(|f| f.layout_job(Type::Body.job("A", TEXT))).size().y;
+            let centre = Pos2::new(slot.center().x, words.response.rect.top() + first_line / 2.0);
+            ui.painter().rect_filled(Rect::from_center_size(centre, Vec2::splat(STATUS_SQUARE)), 0.0, DANGER);
+        }
         if let Some(version) = &banner.notes {
             ui.hyperlink_to(RichText::new(RELEASE_NOTES).font(Type::Body.font()), notes_url(version));
         }
@@ -133,13 +137,19 @@ pub fn notice_line(ui: &mut Ui, notice: &Notice) -> Option<TopRequest> {
     let mut request = None;
     let gap = SPACE_3;
     let dismiss = if notice.dismiss { flat_button_width(ui, DISMISS, ButtonKind::Secondary) + gap } else { 0.0 };
-    ui.horizontal(|ui| {
+    // The square sits level with the first line of the words, however many lines they take, and
+    // that line sits level with Dismiss.
+    let first_line = ui.fonts(|f| f.layout_job(Type::Body.job("A", TEXT))).size().y;
+    let lift = if notice.dismiss { ((STATUS_BUTTON_HEIGHT - first_line) / 2.0).max(0.0) } else { 0.0 };
+    ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        ui.set_min_height(if notice.dismiss { STATUS_BUTTON_HEIGHT } else { 0.0 });
-        status_square(ui, tone(notice.tone));
+        let slot = vec2(STATUS_SQUARE, first_line + 2.0 * lift);
+        let (slot, _) = ui.allocate_exact_size(slot, Sense::hover());
+        ui.painter().rect_filled(Rect::from_center_size(slot.center(), Vec2::splat(STATUS_SQUARE)), 0.0, tone(notice.tone));
         let room = (ui.available_width() - dismiss).max(0.0);
         ui.allocate_ui(vec2(room, 0.0), |ui| {
             ui.set_width(room);
+            ui.add_space(lift);
             let said = ui.label(Type::Body.job(&notice.text, TEXT));
             motion::live(ui.ctx(), said.id);
         });

@@ -16,6 +16,12 @@ waiting-peer, installing, view-only, peer-failed, apt-failed, restored, no-polki
 /fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
 --version says what version the service is, which POST {"version": ...} to /fake/version changes, as
 an update would, so the app can be seen starting again.
+--secure picks how the link's encryption stands, for both devices: encrypted, connecting, unpaired or old-peer (an
+other device too old to pair). Leave it out for a service that doesn't encrypt. POST {"state": ...} to /fake/secure to
+change it while running.
+GET /api/pairing answers from a small pairing state machine: pair_show shows the code 482917 counting down from 120,
+pair_enter with 482917 pairs with the fingerprint 4F2A-91C3, any other code fails as a wrong code, pair_cancel goes
+back to idle, and unpair leaves both devices unpaired.
 """
 
 import argparse
@@ -26,6 +32,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 24880
 REVERT_AFTER = 15
+PAIRING_CODE = "482917"
+CODE_LASTS = 120
+FINGERPRINT = "4F2A-91C3"
 
 
 def modes(sizes_and_rates):
@@ -72,6 +81,10 @@ class World:
         self.requests = []
         self.update = update_states()["none"]
         self.version = "0.3.0"
+        self.secure = None
+        self.old_peer = False
+        self.pairing = {"state": "idle"}
+        self.code_until = None
 
     def rects(self, node):
         if not self.screens[node]:
@@ -106,11 +119,51 @@ class World:
             "link": self.link,
             "update": self.update[0 if node == "Debian" else 1],
         }
+        if self.secure is not None:
+            status.update({"secure": self.secure, "old_peer": self.old_peer})
         status.update(self.settings[node])
         if change:
             left = max(0, int((change["until"] - time.time()) * 1000))
             status["display_change"]["change"] = {k: change[k] for k in ("id", "output", "name", "from", "to")} | {"stage": "waiting", "ms_left": left}
         return status
+
+
+def pairing_status(world):
+    """What `/api/pairing` says, with the code's time counted down and run out."""
+    status = dict(world.pairing)
+    if status["state"] == "showing":
+        left = world.code_until - time.time()
+        if left <= 0:
+            world.pairing = {"state": "failed", "error": "The code ran out. Show a new one."}
+            return pairing_status(world)
+        status["seconds_left"] = int(left) + (left % 1 > 0)
+    if world.secure not in (None, "unpaired"):
+        status |= {"peer_name": world.names["Windows"], "fingerprint": FINGERPRINT}
+    return status
+
+
+def pair(world, body):
+    """The pairing actions, as the real service's state machine takes them."""
+    action = body.get("action")
+    if action == "pair_show":
+        world.pairing = {"state": "showing", "code": PAIRING_CODE}
+        world.code_until = time.time() + CODE_LASTS
+    elif action == "pair_enter" and body.get("code") == PAIRING_CODE:
+        world.secure, world.old_peer = "encrypted", False
+        world.pairing = {"state": "paired"}
+    elif action == "pair_enter":
+        world.pairing = {"state": "failed", "error": "The code was wrong. Show a new code and try again."}
+    elif action == "pair_cancel":
+        world.pairing = {"state": "idle"}
+    elif action == "unpair":
+        world.secure = "unpaired"
+        world.pairing = {"state": "idle"}
+
+
+def set_secure_state(world, name):
+    world.secure, world.old_peer = {"encrypted": ("encrypted", False), "connecting": ("connecting", False),
+                                    "unpaired": ("unpaired", False), "old-peer": ("unpaired", True)}[name]
+    world.pairing = {"state": "idle"}
 
 
 def link_states():
@@ -257,6 +310,8 @@ def serve(world):
                     self.reply(world.requests)
                 elif path == "/api/state":
                     self.reply(world.state())
+                elif self.path == "/api/pairing":
+                    self.reply(pairing_status(world))
                 elif path == "/api/displays":
                     self.reply({"displays": world.screens[self.node()]})
                 else:
@@ -275,6 +330,8 @@ def serve(world):
                     set_link_state(world, body["state"])
                 elif self.path == "/fake/update":
                     world.update = update_states()[body["state"]]
+                elif self.path == "/fake/secure":
+                    set_secure_state(world, body["state"])
                 elif self.path == "/fake/version":
                     world.version = body["version"]
                 elif self.path.endswith("/api/local/action"):
@@ -307,7 +364,9 @@ def set_mode(world, node, output, mode):
 
 def act(world, node, body):
     action = body.get("action")
-    if action == "set_device_name":
+    if action in ("pair_show", "pair_enter", "pair_cancel", "unpair"):
+        pair(world, body)
+    elif action == "set_device_name":
         world.names[node] = body["name"] or world.names[node]
     elif action == "set_display_mode":
         s = next(s for s in world.screens[node] if s["id"] == body["output"])
@@ -351,10 +410,13 @@ if __name__ == "__main__":
     parser.add_argument("--link", default="good", choices=list(link_states()))
     parser.add_argument("--update", default="none", choices=list(update_states()))
     parser.add_argument("--version", default="0.3.0")
+    parser.add_argument("--secure", choices=["encrypted", "connecting", "unpaired", "old-peer"])
     options = parser.parse_args()
     world = World(options.monitors, options.name_style == "long", options.no_modes)
     set_audio_state(world, options.audio)
     set_link_state(world, options.link)
     world.update = update_states()[options.update]
     world.version = options.version
+    if options.secure:
+        set_secure_state(world, options.secure)
     serve(world)

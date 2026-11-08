@@ -72,15 +72,15 @@ pub fn flat_button(ui: &mut Ui, label: &str, kind: ButtonKind, min_size: Vec2, e
             (fill, None)
         }
         ButtonKind::Secondary => {
-            let fill = if pressed { LINE_STRONG.gamma_multiply(0.15) } else { Color32::TRANSPARENT };
+            let fill = if pressed { theme::faded(LINE_STRONG, 0.15) } else { Color32::TRANSPARENT };
             (fill, Some(if hovered { TEXT } else { LINE_STRONG }))
         }
         ButtonKind::Danger => {
-            let fill = if pressed { DANGER.gamma_multiply(0.15) } else if hovered { DANGER.gamma_multiply(0.1) } else { Color32::TRANSPARENT };
+            let fill = if pressed { theme::faded(DANGER, 0.15) } else if hovered { theme::faded(DANGER, 0.1) } else { Color32::TRANSPARENT };
             (fill, Some(DANGER))
         }
     };
-    let shade = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
+    let shade = |c: Color32| if enabled { c } else { theme::faded(c, 0.4) };
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, shade(fill));
     if let Some(border) = border {

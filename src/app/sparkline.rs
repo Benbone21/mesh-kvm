@@ -104,7 +104,7 @@ impl Sparklines {
     }
 
     pub fn get(&self, stat: Stat) -> &Sparkline {
-        &self.lines[STATS.iter().position(|s| *s == stat).unwrap_or(0)]
+        &self.lines[STATS.iter().position(|s| *s == stat).expect("every stat has a line")]
     }
 }
 

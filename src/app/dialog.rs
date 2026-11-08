@@ -1,6 +1,7 @@
 //! The one look every dialog has: a raised box a quarter of the way down, over the dimmed app.
 
 use super::theme::{
+    self,
     line, Type, BG, DIALOG_BUTTON_HEIGHT, DIALOG_BUTTON_MIN_WIDTH, DIALOG_WIDTH, LINE_STRONG, RAISED, SPACE_1, SPACE_3, SPACE_4, TEXT_DIM,
 };
 use super::widgets::{flat_button, ButtonKind};
@@ -48,7 +49,7 @@ pub fn show<R>(ctx: &egui::Context, id: Id, title: &str, opacity: f32, body: imp
     let shown = Modal::new(id)
         .area(area)
         .frame(frame)
-        .backdrop_color(BG.gamma_multiply(BACKDROP * opacity))
+        .backdrop_color(theme::faded(BG, BACKDROP * opacity))
         .show(ctx, |ui| {
             ui.multiply_opacity(opacity);
             ui.set_width(DIALOG_WIDTH - PADDING.sum().x - 2.0 * BORDER);

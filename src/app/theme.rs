@@ -1,8 +1,5 @@
 //! The look of the window: colour tokens, sizes, fonts, and the egui style built from them.
 
-// Later tasks use the tokens this one adds.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -69,52 +66,9 @@ pub const SPARKLINE_STROKE: f32 = 1.5;
 pub const INTER_SEMIBOLD: &str = "Inter SemiBold";
 pub const MONO_MEDIUM: &str = "JetBrains Mono Medium";
 
-/// The old palette and sizes, until the last of the window moves to the tokens above.
-pub mod legacy {
-    use super::Color32;
-
-    pub const DEEP: Color32 = Color32::from_rgb(0x15, 0x24, 0x2a);
-    pub const PANEL: Color32 = Color32::from_rgb(0x20, 0x35, 0x3c);
-    pub const RAISED: Color32 = Color32::from_rgb(0x2b, 0x46, 0x4e);
-    pub const EDGE: Color32 = Color32::from_rgb(0x41, 0x63, 0x6c);
-    pub const INK: Color32 = Color32::from_rgb(0xee, 0xe9, 0xda);
-    pub const DIM: Color32 = Color32::from_rgb(0xa5, 0xbc, 0xbc);
-    pub const AMBER: Color32 = Color32::from_rgb(0xff, 0xb2, 0x2e);
-    pub const GREEN: Color32 = Color32::from_rgb(0x63, 0xe0, 0x8e);
-    pub const RED: Color32 = Color32::from_rgb(0xff, 0x7a, 0x66);
-    /// The grooves in the slide switch's knob.
-    pub const AMBER_GROOVE: Color32 = Color32::from_rgb(0xe7, 0x9b, 0x1c);
-    /// A status light that is off.
-    pub const UNLIT: Color32 = Color32::from_rgb(0x0e, 0x18, 0x1c);
-
-    /// The felt mat the monitors stand on, which is the largest thing in the window.
-    pub const MAT: Color32 = Color32::from_rgb(0x1b, 0x3d, 0x3a);
-    /// The casing around a screen.
-    pub const BEZEL: Color32 = Color32::from_rgb(0x0b, 0x12, 0x15);
-    /// A screen with nothing to show: its device isn't connected.
-    pub const GLASS: Color32 = Color32::from_rgb(0x16, 0x20, 0x24);
-    /// Dark text on a lit screen.
-    pub const ON_SCREEN: Color32 = Color32::from_rgb(0x10, 0x20, 0x24);
-    /// What each device's screens look like lit. Amber is kept for what can be acted on and for the
-    /// place the devices meet, so neither device is amber.
-    pub const SCREEN_FIRST: Color32 = Color32::from_rgb(0xb9, 0xea, 0xdd);
-    pub const SCREEN_SECOND: Color32 = Color32::from_rgb(0xc8, 0xd2, 0xff);
-
-    pub const RADIUS: u8 = 6;
-    pub const SMALL_RADIUS: u8 = 4;
-    /// The space around the window's parts.
-    pub const MARGIN: i8 = 16;
-    pub const ROW_HEIGHT: f32 = 30.0;
-    pub const BUTTON_HEIGHT: f32 = 34.0;
-    /// The type scale, each step about a quarter up from the last.
-    pub const SMALL_SIZE: f32 = 13.0;
-    pub const BODY_SIZE: f32 = 15.0;
-    pub const HEADING_SIZE: f32 = 18.0;
-    pub const TITLE_SIZE: f32 = 22.0;
-    /// The space above a section, and below its heading.
-    pub const SECTION_GAP: f32 = 20.0;
-    pub const HEADING_GAP: f32 = 6.0;
-}
+/// What each device's screens are tinted with on the canvas, muted into `RAISED` by `tile_fill`.
+pub const SCREEN_FIRST: Color32 = Color32::from_rgb(0xb9, 0xea, 0xdd);
+pub const SCREEN_SECOND: Color32 = Color32::from_rgb(0xc8, 0xd2, 0xff);
 
 pub fn line(width: f32, colour: Color32) -> Stroke {
     Stroke { width, color: colour }
@@ -129,13 +83,15 @@ pub fn mix(a: Color32, b: Color32, amount: f32) -> Color32 {
 /// The colour of `device`'s lit screens.
 pub fn screen_colour(first_device: bool) -> Color32 {
     if first_device {
-        legacy::SCREEN_FIRST
+        SCREEN_FIRST
     } else {
-        legacy::SCREEN_SECOND
+        SCREEN_SECOND
     }
 }
 
-pub fn contrast(a: Color32, b: Color32) -> f32 {
+/// The WCAG contrast ratio between two colours, which the tests hold the tokens to.
+#[cfg(test)]
+fn contrast(a: Color32, b: Color32) -> f32 {
     let luminance = |c: Color32| {
         let lin = |x: u8| {
             let x = x as f32 / 255.0;
@@ -164,6 +120,11 @@ pub fn pressed(fill: Color32) -> Color32 {
 /// `base` with `amount` of `border` in it, for a faint fill in a border's colour.
 pub fn tint(base: Color32, border: Color32, amount: f32) -> Color32 {
     mix(base, border, amount)
+}
+
+/// `colour` at `opacity`, from 0 to 1, over whatever is behind it.
+pub fn faded(colour: Color32, opacity: f32) -> Color32 {
+    colour.gamma_multiply(opacity)
 }
 
 /// A screen tile's fill: `RAISED` with a muted tint of its device's colour.

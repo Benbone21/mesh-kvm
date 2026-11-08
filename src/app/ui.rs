@@ -13,7 +13,7 @@ use super::rows::{self, ActionKind, ChoiceValue, GroupRows, Pick, RowsInput, Set
 use super::sparkline::Sparklines;
 use super::table::{Table, TableRequest};
 use super::theme::{
-    self, legacy::DEEP, line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+    self, line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
     SURFACE, TEXT, TEXT_DIM,
 };
 use super::top::{self, TopRequest};
@@ -183,7 +183,7 @@ impl eframe::App for Window {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        DEEP.to_normalized_gamma_f32()
+        BG.to_normalized_gamma_f32()
     }
 }
 
@@ -2164,6 +2164,48 @@ mod tests {
             }
         }
         assert!(hover_text(&ctx, &mut window, &snapshot, "Name", 0).contains(name));
+    }
+
+    /// The square drawn in `panel`, and the middle of the first line of the words beside it.
+    fn square_and_first_line(ctx: &egui::Context, output: &egui::FullOutput, panel: egui::Id) -> (Rect, f32) {
+        let panel = egui::containers::panel::PanelState::load(ctx, panel).expect("the panel").rect;
+        let square = output
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.rect.width() == theme::STATUS_SQUARE && panel.contains_rect(r.rect) => Some(r.rect),
+                _ => None,
+            })
+            .expect("a square");
+        let words = output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if panel.contains(t.pos) && t.pos.x > square.right() => Some(t),
+                _ => None,
+            })
+            .min_by(|a, b| a.pos.x.total_cmp(&b.pos.x))
+            .expect("words beside it");
+        (square, words.pos.y + words.galley.rows[0].rect.center().y)
+    }
+
+    #[test]
+    fn a_notice_square_sits_level_with_the_words_beside_it() {
+        let (ctx, mut window) = (context(), window());
+        let output = settled(&ctx, &mut window, &link_down(linked()), WINDOW_SIZE);
+        let (square, first_line) = square_and_first_line(&ctx, &output, egui::Id::new("notice").with(0));
+        assert!((square.center().y - first_line).abs() <= 1.0, "square {square:?}, first line at {first_line}");
+    }
+
+    #[test]
+    fn a_failed_updates_square_sits_level_with_the_first_line_of_its_note() {
+        let failed = update_states().into_iter().find(|s| s.local.as_ref().unwrap().update.as_ref().unwrap().state == "failed").unwrap();
+        for size in [WINDOW_SIZE, MIN_WINDOW_SIZE] {
+            let (ctx, mut window) = (context(), window());
+            let output = settled(&ctx, &mut window, &failed, size);
+            let (square, first_line) = square_and_first_line(&ctx, &output, egui::Id::new("update"));
+            assert!((square.center().y - first_line).abs() <= 1.0, "{size:?}: square {square:?}, first line at {first_line}");
+        }
     }
 
     #[test]
