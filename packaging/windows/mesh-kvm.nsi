@@ -82,11 +82,18 @@ Page custom StartupPage StartupPageLeave
   Pop $1
   nsExec::Exec 'taskkill /F /IM mesh-kvm-recover.exe'
   Pop $1
+  ; An update's watcher runs from the old exe moved aside. Left running, it could start the old copy
+  ; again or hold that file.
+  nsExec::Exec 'taskkill /F /IM mesh-kvm.exe.old'
+  Pop $1
   Sleep 500
 !macroend
 
 Function .onInit
   SetShellVarContext current
+  ; Always here, even if /D= says otherwise: the updater and the login script expect it here, and
+  ; the uninstaller removes this folder.
+  StrCpy $INSTDIR "$LOCALAPPDATA\mesh-kvm"
   ; A reinstall keeps the choice made before.
   StrCpy $Autostart 1
   ${If} ${FileExists} "$INSTDIR\autostart-disabled"
@@ -145,6 +152,7 @@ Section "mesh-kvm"
 
   ; What an update left behind doesn't apply to a fresh install.
   Delete "$INSTDIR\mesh-kvm.exe.old"
+  Delete "$INSTDIR\mesh-kvm.exe.old.stale"
   Delete "$INSTDIR\mesh-kvm.exe.new"
   Delete "$INSTDIR\mesh-kvm.exe.failed"
   Delete "$INSTDIR\mesh-kvm-recover.exe"
@@ -200,6 +208,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\mesh-kvm.exe"
   Delete "$INSTDIR\mesh-kvm.exe.old"
+  Delete "$INSTDIR\mesh-kvm.exe.old.stale"
   Delete "$INSTDIR\mesh-kvm.exe.new"
   Delete "$INSTDIR\mesh-kvm.exe.failed"
   Delete "$INSTDIR\mesh-kvm-recover.exe"

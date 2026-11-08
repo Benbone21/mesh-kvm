@@ -469,10 +469,11 @@ def apt_failing(helper, signer):
 
 
 def shipped_build(shipped, signer):
-    """A build with no hooks has the placeholder key, and takes nothing from outside."""
+    """A build with no hooks has only the real release key, and takes nothing from outside."""
     place(signer)
     result = run(shipped, [NEW], helper_env(signer))
-    refused("a shipped build ignores a key from the environment", result, "no release key")
+    # The test key isn't the release key, so what it signed is turned away.
+    refused("a shipped build ignores a key from the environment", result, "signature is wrong")
     data = pathlib.Path(shipped).read_bytes()
     check("a shipped build has no trace of the hooks", b"MESH_KVM_TEST" not in data)
     for word in [b"eframe", b"egui", b"winit", b"clipboard"]:

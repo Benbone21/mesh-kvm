@@ -93,6 +93,8 @@ def refuses(name, result, says):
 
 
 def refusals(tree):
+    # The real key has been committed since 0.7.0, so the placeholder is put back to check it.
+    tree.set_key("PLACEHOLDER: run packaging/make-release-key.sh")
     refuses("the placeholder key is refused", tree.dry(), "placeholder")
     refuses("the placeholder is refused for a real run too", tree.run(tree.version, str(tree.notes)), "placeholder")
 
