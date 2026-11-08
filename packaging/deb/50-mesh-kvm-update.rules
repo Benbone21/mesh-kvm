@@ -1,8 +1,10 @@
 // The active local user can install a mesh-kvm update with no password. That's safe only because
 // this one program trusts nothing it's handed: see src/update/apply/main.rs.
+// The action belongs to /usr/lib/mesh-kvm/apply-update alone, through the policy's exec.path, so the
+// rule doesn't also ask for the program: pkcheck can't pass that detail, and the app's check before
+// an update would never get a yes.
 polkit.addRule(function(action, subject) {
     if (action.id == "io.github.benbone21.mesh-kvm.apply-update" &&
-        action.lookup("program") == "/usr/lib/mesh-kvm/apply-update" &&
         subject.local && subject.active) {
         return polkit.Result.YES;
     }
