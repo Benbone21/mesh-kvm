@@ -5,7 +5,7 @@
 //! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    devices, peer_listening, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    devices, peer_listening, peer_ready, peer_reporting, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
     AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS,
 };
 use crate::settings::write_atomically;
@@ -33,6 +33,14 @@ const SILENCE_HOLD: Duration = Duration::from_secs(30);
 const SETTLED_AFTER: Duration = Duration::from_secs(5);
 /// How long an unsettled mute waits out a silence. Nobody may be hearing anything, so not long.
 const UNSETTLED_HOLD: Duration = Duration::from_secs(3);
+/// With a capture proven under a mute, silence never ends a run. Sound going out that the far side
+/// doesn't hear for this long does: it can't play it, so it had better come out here.
+const UNHEARD_LIMIT: Duration = Duration::from_secs(5);
+/// With a capture proven under a mute, how long the far side's last word that Play is on still
+/// counts while its reports have stopped coming, as they do on bad Wi-Fi with the input link up.
+/// Real sound going out still has to be heard within `UNHEARD_LIMIT`, so this can't keep anyone
+/// from hearing it for longer than that.
+const REPORT_GAP_HOLD: Duration = Duration::from_secs(30);
 /// Sound vanishing on a mute this many times running stops the muting for a while. Muting only
 /// happens with a capture that a mute can't reach, so this is a safety net: what it mostly sees is
 /// short sounds. A capture that really was being silenced would come round every few seconds, so
@@ -375,12 +383,16 @@ impl Recent {
 /// Decides whether sound is reaching the other device, across the gaps in it. Starting takes real
 /// sound, confirmed from the far side. Carrying on is more forgiving, as silence on the output is
 /// normal: it's what's between tracks. But silence can also mean the mute itself stopped the sound,
-/// with nobody hearing anything. See the constants above for how the two are told apart.
+/// with nobody hearing anything. See the constants above for how the two are told apart. A capture
+/// proven to carry on under a mute can't be silenced by it, so there silence of any length keeps
+/// the run going: otherwise pressing play after a long pause would sound here until confirmed.
 #[derive(Default)]
 struct SoundHold {
     /// When this run of muting began.
     since: Option<Instant>,
     last_confirmed: Option<Instant>,
+    /// When sound began going out without the far side hearing it.
+    unheard_since: Option<Instant>,
     vanished: u32,
     last_vanished: Option<Instant>,
     barred_until: Option<Instant>,
@@ -410,12 +422,12 @@ impl SoundHold {
         }
     }
 
-    /// `requested`: the person wants it and the link is up. `confirmed`: real sound is going out
-    /// and the far side says it's coming out of an output. `connected`: the capture is running and
-    /// the far side has an output open, sound or no sound.
+    /// `requested`: the person wants it and the link is up. `sending`: real sound is going out.
+    /// `confirmed`: and the far side says it's coming out of an output. `connected`: the capture is
+    /// running and the far side can play, sound or no sound.
     /// `proven`: that this capture carries on under a mute has been measured, so sound stopping can
     /// only be sound stopping.
-    fn tick(&mut self, requested: bool, confirmed: bool, connected: bool, proven: bool, now: Instant) -> bool {
+    fn tick(&mut self, requested: bool, sending: bool, confirmed: bool, connected: bool, proven: bool, now: Instant) -> bool {
         if !requested {
             *self = Self::default();
             return false;
@@ -428,6 +440,7 @@ impl SoundHold {
             if confirmed {
                 self.since = Some(now);
                 self.last_confirmed = Some(now);
+                self.unheard_since = None;
             }
             return confirmed;
         };
@@ -439,6 +452,18 @@ impl SoundHold {
             return false;
         }
         let last = self.last_confirmed.unwrap_or(started);
+        if proven {
+            if confirmed || !sending {
+                self.unheard_since = None;
+                return true;
+            }
+            let unheard = *self.unheard_since.get_or_insert(now);
+            if now.duration_since(unheard) >= UNHEARD_LIMIT {
+                self.end_run(started, last, proven, now);
+                return false;
+            }
+            return true;
+        }
         let settled = last.duration_since(started) >= SETTLED_AFTER;
         let hold = if settled { SILENCE_HOLD } else { UNSETTLED_HOLD };
         if now.duration_since(last) >= hold {
@@ -468,6 +493,10 @@ struct Readings {
     peer_online: bool,
     /// The far side has an output open.
     peer_listening: bool,
+    /// The far side has Play on, so it would play what arrives, output open or not.
+    peer_ready: bool,
+    /// A report has come from the far side lately. Without one, none of the above is known.
+    peer_reporting: bool,
     /// The far side says real sound is coming out of that output.
     peer_hearing: bool,
     /// Sound from the far side is playing here, on the output that would be muted.
@@ -480,6 +509,8 @@ struct LiveSignals {
     tx: Recent,
     rx: Recent,
     hold: SoundHold,
+    /// When the far side last said Play is on.
+    ready_at: Option<Instant>,
 }
 
 impl LiveSignals {
@@ -500,6 +531,8 @@ impl LiveSignals {
                 sound_packets: AUDIO_TX_SOUND_PACKETS.load(Ordering::Relaxed),
                 peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
                 peer_listening: peer_listening(now, RECENT_AUDIO),
+                peer_ready: peer_ready(now, RECENT_AUDIO),
+                peer_reporting: peer_reporting(now, RECENT_AUDIO),
                 peer_hearing: reaching_peer(now, RECENT_AUDIO),
                 playing_here,
             },
@@ -513,14 +546,22 @@ impl LiveSignals {
         let sending_sound = self.tx.note(r.sound_packets != self.sound_packets, now);
         self.sound_packets = r.sound_packets;
         let confirmed = r.capture_running && sending_sound && r.peer_hearing;
-        let connected = r.capture_running && r.peer_listening;
+        // A proven capture's run outlasts any pause, and the far side may shut its output in one.
+        // Its reports can stop for a while on bad Wi-Fi too: until it says otherwise, Play stays on.
+        if r.peer_reporting {
+            self.ready_at = r.peer_ready.then_some(now);
+        }
+        let ready = r.peer_ready
+            || (!r.peer_reporting && self.ready_at.is_some_and(|at| now.duration_since(at) < REPORT_GAP_HOLD));
+        let can_play = r.peer_listening || (r.capture_proven_under_mute && ready);
+        let connected = r.capture_running && can_play;
         let requested = r.setting && r.output_chosen && r.peer_online && r.capture_survives_mute;
         MuteInputs {
             setting: r.setting,
             send_on: r.output_chosen,
             tx_active: r.capture_running,
             peer_online: r.peer_online,
-            reaching_peer: self.hold.tick(requested, confirmed, connected, r.capture_proven_under_mute, now),
+            reaching_peer: self.hold.tick(requested, sending_sound, confirmed, connected, r.capture_proven_under_mute, now),
             receiving_audio: self.rx.note(r.playing_here, now),
         }
     }
@@ -1106,6 +1147,8 @@ mod tests {
         sound_packets: 0,
         peer_online: true,
         peer_listening: true,
+        peer_ready: false,
+        peer_reporting: true,
         peer_hearing: false,
         playing_here: false,
     };
@@ -1254,8 +1297,9 @@ mod tests {
     }
 
     #[test]
-    fn short_sounds_close_together_never_bar_a_capture_proven_under_a_mute() {
-        // Windows exclusion: sound stopping is just sound stopping, however often it happens.
+    fn short_sounds_close_together_never_bar_a_capture_proven_under_a_mute_and_it_stays_muted_between_them() {
+        // Windows exclusion: sound stopping is just sound stopping, however often it happens, so the
+        // quiet between them doesn't end the run.
         let (mut outputs, flag) = (Outputs::default(), flag("proven"));
         let mut c = MuteController::new(&mut outputs, flag);
         let mut signals = LiveSignals::default();
@@ -1277,7 +1321,8 @@ mod tests {
             mutes += u32::from(muted && !was_muted);
             was_muted = muted;
         }
-        assert!(mutes >= 10, "it goes on muting for each one: {mutes}");
+        assert_eq!(mutes, 1, "muted at the first one, and held");
+        assert!(c.backend.is(SPEAKERS));
     }
 
     #[test]
@@ -1342,6 +1387,268 @@ mod tests {
         let fell_back = Readings { capture_survives_mute: false, ..sounding(11) };
         run(&mut c, &mut signals, fell_back, t + STEP * 10);
         assert!(!c.backend.is(SPEAKERS), "the capture is ordinary now, and a mute would silence it");
+    }
+
+    /// Sound on a capture proven under a mute, as the two ends report it.
+    fn proven_sounding(packets: u64) -> Readings {
+        Readings { capture_proven_under_mute: true, peer_ready: true, ..sounding(packets) }
+    }
+
+    /// Nothing playing on a capture proven under a mute. The far side still has Play on.
+    const PROVEN_QUIET: Readings =
+        Readings { capture_proven_under_mute: true, peer_ready: true, sound_packets: 10, ..QUIET_LINK };
+
+    /// Ten seconds of confirmed sound, which starts a run of muting.
+    fn proven_run_started(c: &mut MuteController<&mut Outputs>, signals: &mut LiveSignals, t: Instant) {
+        for second in 0..10 {
+            run(c, signals, proven_sounding(second + 1), t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_proven_capture_stays_muted_through_ten_minutes_of_silence_and_when_play_is_pressed_again() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-pause"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..610 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "unmuted {second} seconds in");
+        }
+        for second in 610..620 {
+            // The first moments of sound, before the far side has said it hears it.
+            let r = Readings { peer_hearing: second > 611, ..proven_sounding(u64::from(second)) };
+            run(&mut c, &mut signals, r, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "unmuted {second} seconds in");
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1, "muted once, and left: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_proven_capture_stays_muted_while_the_far_side_shuts_its_output_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-player-shut"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..100 {
+            let shut = Readings { peer_listening: false, ..PROVEN_QUIET };
+            run(&mut c, &mut signals, shut, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_when_the_other_device_goes_offline_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-offline"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..300 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        let offline = Readings { peer_online: false, peer_listening: false, peer_ready: false, ..PROVEN_QUIET };
+        run(&mut c, &mut signals, offline, t + STEP * 300);
+        assert!(!c.backend.is(SPEAKERS));
+        // Back online and quiet: nothing is muted until sound is confirmed again.
+        for second in 301..400 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+            assert!(!c.backend.is(SPEAKERS), "{second}");
+        }
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_when_the_other_device_can_no_longer_play() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-play-off"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..300 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+        }
+        let play_off = Readings { peer_listening: false, peer_ready: false, ..PROVEN_QUIET };
+        run(&mut c, &mut signals, play_off, t + STEP * 300);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    /// Reports have stopped coming, as on bad Wi-Fi, while the input link is still up.
+    const NO_REPORTS: Readings =
+        Readings { peer_listening: false, peer_ready: false, peer_reporting: false, peer_hearing: false, ..PROVEN_QUIET };
+
+    #[test]
+    fn a_proven_capture_stays_muted_when_reports_stop_for_a_while_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-report-gap"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..100 {
+            // Gaps of up to 20 seconds, then reports again.
+            let r = if second % 30 < 20 { NO_REPORTS } else { PROVEN_QUIET };
+            run(&mut c, &mut signals, r, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1, "muted once, and left: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_when_reports_stay_away() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-reports-gone"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        let gone_at = 10 + REPORT_GAP_HOLD.as_secs() as u32;
+        for second in 10..gone_at - 1 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        for second in gone_at - 1..gone_at + 2 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        assert!(!c.backend.is(SPEAKERS), "nothing has said Play is on for too long");
+    }
+
+    #[test]
+    fn a_proven_capture_without_reports_gives_the_output_back_once_sound_goes_unheard() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-reports-gone-sound"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..15 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        for second in 15..22 {
+            run(&mut c, &mut signals, Readings { sound_packets: u64::from(second), ..NO_REPORTS }, t + STEP * second);
+        }
+        assert!(!c.backend.is(SPEAKERS), "sound nobody reports hearing comes out here");
+    }
+
+    #[test]
+    fn a_report_saying_play_is_off_counts_at_once_even_after_a_gap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-gap-then-off"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..15 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        let play_off = Readings { peer_listening: false, peer_ready: false, ..PROVEN_QUIET };
+        run(&mut c, &mut signals, play_off, t + STEP * 15);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_capture_not_proven_is_not_held_through_a_report_gap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("unproven-report-gap"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, Readings { peer_ready: true, ..sounding(second + 1) }, t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        let gap = Readings { sound_packets: 10, peer_listening: false, peer_ready: false, peer_reporting: false, ..QUIET_LINK };
+        run(&mut c, &mut signals, gap, t + STEP * 10);
+        assert!(!c.backend.is(SPEAKERS), "as before");
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_when_its_sound_goes_unheard() {
+        // Play is on over there, but nothing is coming out: better it comes out here.
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-unheard"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..100 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+        }
+        let unheard = |second: u32| Readings { peer_hearing: false, ..proven_sounding(u64::from(second)) };
+        for second in 100..104 {
+            run(&mut c, &mut signals, unheard(second), t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        for second in 104..110 {
+            run(&mut c, &mut signals, unheard(second), t + STEP * second);
+        }
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_at_once_when_the_setting_is_turned_off_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-setting-off"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..200 {
+            run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+        }
+        run(&mut c, &mut signals, Readings { setting: false, ..PROVEN_QUIET }, t + STEP * 200);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_at_once_when_the_output_stops_being_sent_or_captured() {
+        for (name, stopped) in [
+            ("proven-not-sent", Readings { output_chosen: false, ..PROVEN_QUIET }),
+            ("proven-capture-stopped", Readings { capture_running: false, ..PROVEN_QUIET }),
+            ("proven-capture-ordinary", Readings { capture_survives_mute: false, capture_proven_under_mute: false, ..PROVEN_QUIET }),
+        ] {
+            let (mut outputs, flag) = (Outputs::default(), flag(name));
+            let mut c = MuteController::new(&mut outputs, flag);
+            let mut signals = LiveSignals::default();
+            let t = Instant::now();
+            proven_run_started(&mut c, &mut signals, t);
+            for second in 10..200 {
+                run(&mut c, &mut signals, PROVEN_QUIET, t + STEP * second);
+            }
+            run(&mut c, &mut signals, stopped, t + STEP * 200);
+            assert!(!c.backend.is(SPEAKERS), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_capture_not_proven_still_gives_the_output_back_after_thirty_seconds_of_silence() {
+        let (mut outputs, flag) = (Outputs::default(), flag("unproven-pause"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        // Last heard at nine seconds in. It even has Play on over there.
+        let quiet = Readings { sound_packets: 10, peer_ready: true, ..QUIET_LINK };
+        for second in 10..39 {
+            run(&mut c, &mut signals, quiet, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        run(&mut c, &mut signals, quiet, t + STEP * 39);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_capture_not_proven_still_lets_go_when_the_far_side_shuts_its_output_even_with_play_on() {
+        let (mut outputs, flag) = (Outputs::default(), flag("unproven-shut"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, sounding(second + 1), t + STEP * second as u32);
+        }
+        let shut = Readings { sound_packets: 10, peer_listening: false, peer_ready: true, ..QUIET_LINK };
+        run(&mut c, &mut signals, shut, t + STEP * 10);
+        assert!(!c.backend.is(SPEAKERS));
     }
 
     /// Two outputs to mute: what's chosen, and the one Windows is really playing on.
@@ -1440,10 +1747,10 @@ mod tests {
         let mut hold = SoundHold::default();
         let t = Instant::now();
         hold.barred_until = Some(t + LONGEST_BAR);
-        assert!(!hold.tick(true, true, true, false, t));
+        assert!(!hold.tick(true, true, true, true, false, t));
         assert!(hold.barred(t));
-        hold.tick(false, false, false, false, t);
-        assert!(hold.tick(true, true, true, false, t));
+        hold.tick(false, false, false, false, false, t);
+        assert!(hold.tick(true, true, true, true, false, t));
     }
 
     #[test]

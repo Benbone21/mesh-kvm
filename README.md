@@ -17,11 +17,13 @@ cargo build --release
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The outputs are `target/release/mesh-kvm` for Debian and `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` for Windows. `target/release/apply-update` is the Debian update helper. `packaging/build-deb.sh` makes the `.deb` from these, and uses `$CARGO_TARGET_DIR` if that's set.
+The outputs are `target/release/mesh-kvm` for Debian and `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` for Windows. `target/release/apply-update` is the Debian update helper. `packaging/build-deb.sh` makes the `.deb` from these, and `packaging/windows/build-setup.sh <version>` makes the Windows installer, `target/windows/mesh-kvm-setup.exe`, with `makensis` from the `nsis` package. Both use `$CARGO_TARGET_DIR` if that's set.
 
 ## Install
 
-On Windows, double-click `mesh-kvm.exe`. It copies itself to `%LOCALAPPDATA%\mesh-kvm`, adds a Start menu entry, and sets itself up to start at login.
+On Windows, run `mesh-kvm-setup.exe`. It installs mesh-kvm for you only, so it needs no admin rights, into `%LOCALAPPDATA%\mesh-kvm`, where the settings are kept too. It adds a Start menu entry, and asks whether to start mesh-kvm when you sign in, which is on unless you turned it off before. If mesh-kvm is running, it's stopped first. At the end it offers to open mesh-kvm. It appears in Installed apps in Windows' settings, with its version, and is removed from there. Removing it asks whether to delete your settings as well, and keeps them unless you say yes. `mesh-kvm-setup.exe /S` installs without asking, and `/AUTOSTART=off` turns starting at sign-in off.
+
+A `mesh-kvm.exe` run from anywhere else, such as Downloads, doesn't install itself. With mesh-kvm installed, it opens the installed one's window and closes. With nothing installed, it runs as it is, and the window says to use `mesh-kvm-setup.exe` to install.
 
 On Debian, install the `.deb`, or run `mesh-kvm --install-launchers` once. That adds mesh-kvm to your applications menu and starts the tray icon when you log in.
 
@@ -56,7 +58,7 @@ It doesn't cover:
 
 ## Starting and stopping
 
-Opening the app or the tray starts the background service if it isn't running, so there is nothing else to start. On Linux it uses the `mesh-kvm` systemd user service when there is one, and otherwise starts the service directly. If the service can't start, the app says so and names the log file.
+Opening the app or the tray starts the background service if it isn't running, so there is nothing else to start. On Linux it uses the `mesh-kvm` systemd user service when there is one, and otherwise starts the service directly. If the service can't start, the app says so and names the log file. Each line in the log starts with the time it was written.
 
 `--peer` and `--switch-edge` are optional. `--peer` sets the address for that run and saves it. While it is in use, the app can't change the address, because the flag would win again at the next start. `--switch-edge` says which side of this device the other one sits on, and only matters for a device with no layout yet.
 
@@ -72,9 +74,9 @@ The window remembers its size and app size. It remembers its position on Windows
 
 Devices go by their own names. Click a device's name in the window and type to rename it, from either device. Leave it empty to go back to its network name.
 
-The tray icon sits in the notification area. Its menu has Open, Switch device, Release all input, and Quit.
+The tray icon sits in the notification area. Its menu has Open, Switch device, Release all input, and Quit mesh-kvm.
 
-Closing the window does not stop sharing. The service keeps running and the tray stays. Choosing Quit in the tray removes only the tray icon; sharing carries on. To stop sharing completely, end the `mesh-kvm` process on that device.
+Closing the window does not stop sharing. The service keeps running and the tray stays. Quit mesh-kvm in the tray stops all of mesh-kvm on that device: the window, the tray and the service. Anything Play only on the other device muted comes back first. On Debian under systemd, the `mesh-kvm` unit is stopped, so it doesn't start again by itself. The other device then shows this one as offline. To start again, open mesh-kvm from the Start menu or the applications menu, or sign in again with starting at sign-in on. `mesh-kvm --quit` does the same as the tray's Quit.
 
 ## Toggles
 
@@ -100,7 +102,7 @@ Each device has its own audio controls, and sound can go both ways at once.
 
 On Windows, muting an output also silences an ordinary recording of it, and it follows the volume slider too. A test on the laptop showed that exactly. So with this on, mesh-kvm asks Windows for all sound except its own, which comes from before the mute and the volume slider. That has three effects: every app's sound on every output is sent, a small line under Output to send says so, and the level sent no longer changes with the laptop's volume. It also means the output chosen no longer decides what's sent, so the Windows default output is muted as well. If Windows won't do this, nothing is muted, sound plays on both devices, and a note says why. Debian doesn't need any of this.
 
-The output is muted only once the other device confirms that real sound is coming out of its output. A pause in the sound keeps it muted for up to 30 seconds, so it doesn't go on and off between tracks. It comes back when you stop sending, the link drops, the other device stops playing, or sound from the other device is playing on that same output. If sound stops right after muting, the output comes back within seconds. On Debian, if that happens twice in half a minute, it stays on for a while and a note says so. Sending a microphone doesn't mute anything. If you had muted the output yourself, it stays muted, and if you unmute it by hand, mesh-kvm leaves it alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
+The output is muted only once the other device confirms that real sound is coming out of its output. A pause in the sound keeps it muted for up to 30 seconds, so it doesn't go on and off between tracks. On Windows, where the capture is known to keep working under the mute, a pause of any length keeps it muted, so pressing play again doesn't sound on the laptop first. There it comes back if Play is turned off on the other device, if nothing has been heard from that device for 30 seconds, or if sound going out isn't heard there for 5 seconds. It comes back when you stop sending, the link drops, the other device stops playing, or sound from the other device is playing on that same output. If sound stops right after muting, the output comes back within seconds. On Debian, if that happens twice in half a minute, it stays on for a while and a note says so. Sending a microphone doesn't mute anything. If you had muted the output yourself, it stays muted, and if you unmute it by hand, mesh-kvm leaves it alone until sending next starts. If the output changes, say to a headset, the old one comes back and the new one is muted. If mesh-kvm stops unexpectedly, the tray unmutes after 5 seconds.
 
 ### Devices coming and going
 
@@ -168,13 +170,13 @@ When an update is ready, a line at the top of the app says so, with a link to th
 - Update both devices shows when both have it ready. The other device goes first, whichever one you click, and the line shows each step. Sharing drops for a few seconds on each. If the other device doesn't come back on the new version within 5 minutes, this one stays as it is and the line says which device failed.
 - Update this device shows when the other device is offline or can't update, with a note that the two won't work together until both match.
 - If the other device hasn't finished downloading, the line shows how far along it is, and the button waits. The device that's behind is told to look as soon as the other has found the update.
-- A copy that isn't the installed one, such as one run from `target/release`, only says that a version is available.
+- A copy that isn't the installed one, such as one run from `target/release`, only says that a version is available. On Windows it also says to use `mesh-kvm-setup.exe` to install.
 - Settings shows the version running, has Check now, and says if a download was turned down or no check has worked for 3 days. A failed check is otherwise quiet.
 - An update clicked during a screen change waits for the change to end.
 
 Anything is installed only if it's signed by the release key built into the app, newer than what's running, the version it came as, and exactly the file that was signed. HTTPS isn't what's trusted, so a compromised GitHub account alone can't push an update. A download that doesn't match what was signed is deleted and fetched again from nothing, once. If it still doesn't match, or the signature is wrong, that version isn't tried again. A copy that isn't the installed one never turns a version down for the installed copy.
 
-On Windows the new exe is copied beside the installed one and checked again, then takes the installed place with the old one kept as `mesh-kvm.exe.old`. No admin prompt is needed. If the new copy isn't answering and 30 seconds old within 60 seconds of the swap, a small watcher running from the old exe puts it back and starts it, the app says what happened, and that version isn't offered again. Until it has proved itself, `/api/local` says `proving`, and the other device doesn't follow it. If the laptop restarts in that minute, the login script starts the old exe as a watcher again, so the same thing happens at login, even if the crash left no installed exe at all.
+On Windows the new exe is copied beside the installed one and checked again, then takes the installed place with the old one kept as `mesh-kvm.exe.old`. No admin prompt is needed. A small watcher running from the old exe waits for the old service to end, for up to 20 seconds, and then ends it if it hasn't, as it holds the ports the new one needs. Only then does it start the new copy, which waits up to 20 more seconds for any port that's still taken. If the new copy doesn't have its ports, answer and reach 30 seconds old within 90 seconds of starting, the watcher puts the old one back and starts it, the app says what happened, and that version isn't offered again. Until it has proved itself, `/api/local` says `proving`, from its very first answer, and the other device doesn't follow it. The other device also waits until the new version has kept answering for 10 seconds, so a copy that answers and then dies isn't followed. A look or two lost on bad Wi-Fi doesn't start that wait over. If the laptop restarts before the new copy has proved itself, the login script starts the old exe as a watcher again, so the same thing happens at login, even if the crash left no installed exe at all. The watcher and everything else mesh-kvm starts on Windows get none of its open handles, so no port can stay held by one of them. After an update, Installed apps shows the new version.
 
 On Debian a small helper, `/usr/lib/mesh-kvm/apply-update`, runs as root through `pkexec`, with no password for the active local user. It takes only a version, copies the download into `/var/cache/mesh-kvm`, which only root can reach, repeats every check on those copies, and installs through `apt-get install -y`, so the Timeshift hook still runs. If apt fails, the old version keeps running, the line shows apt's message, and it gives the command that puts the last good package back. mesh-kvm asks polkit beforehand, with `pkcheck`, which installs nothing, and `/api/local` reports the answer as `preflight`. If polkit would refuse or want a password, or `pkexec` says no anyway, the line says so and gives the exact `sudo apt-get install` command, and the old version keeps running. mesh-kvm stops waiting for the helper after 30 minutes and says so, though apt may still finish. The last two installed packages stay in `/var/cache/mesh-kvm/kept` as the way back by hand, as Debian has no automatic rollback.
 
@@ -182,13 +184,13 @@ After an update, the window and tray start again by themselves if they were open
 
 ### Updating by hand
 
-Version 0.7.0 itself goes on by hand, on both devices, and so does anything older. The two devices should run the same version: if one still runs an older mesh-kvm, the app says which one and turns off the controls it can't use. Against a 0.5 device, input still works as it did, with no correcting of lost keys and no return of control, and the app says so. The clipboard doesn't reach that device until it's updated, and a note says that too.
+Version 0.7.0 itself goes on by hand, on both devices, and so does anything older. On the laptop, 0.7.2 goes on by hand too, with `mesh-kvm-setup.exe`: the update to 0.7.1 could leave the laptop with nothing running. The two devices should run the same version: if one still runs an older mesh-kvm, the app says which one and turns off the controls it can't use. Against a 0.5 device, input still works as it did, with no correcting of lost keys and no return of control, and the app says so. The clipboard doesn't reach that device until it's updated, and a note says that too.
 
 Your settings carry over. The first start finds the address in the `--peer` your launchers already use and saves it. On Debian, it imports `layout.json` along with its pointer speed, and leaves the old file where it is. It looks in the folder the service runs in, then `~/mesh-kvm`, then the folders above the program.
 
-1. On the laptop, double-click the new `mesh-kvm.exe`. This is the normal way to install. If mesh-kvm is already running, the new copy is installed over the old one (the old one is moved aside and deleted later), the launchers are rewritten so the tray starts at login, and the new version takes effect once every `mesh-kvm.exe` is ended in Task Manager (Details tab) and started again, or at the next login.
+1. On the laptop, run `mesh-kvm-setup.exe` from the release. It stops whatever mesh-kvm is running, installs over it in the same place, keeps your settings, and opens it at the end.
 2. On Debian, install the new `.deb` with `sudo apt-get install ./mesh-kvm_<version>_amd64.deb`, as that also brings the update helper, then restart mesh-kvm.
-3. Delete old downloads. Running any `mesh-kvm.exe`, old ones included, replaces the installed copy, so an old download double-clicked later puts the old version back.
+3. Delete old downloads of `mesh-kvm.exe`. One from before 0.7.2 still installs itself over the installed copy when it's double-clicked, which puts that old version back.
 4. Pair the two devices, as under [Pairing](#pairing).
 
 ### Updating to the encrypted release
@@ -209,7 +211,7 @@ Then, with the version in `Cargo.toml` already bumped and committed:
 packaging/release.sh <version> <notes-file>
 ```
 
-It refuses a placeholder key, a signing key that doesn't match the public one, uncommitted changes, a tag on another commit and a version that isn't newer than the latest release. It runs the tests, builds both targets and the `.deb`, and checks the programs as they'll ship: no test hooks, this key, this version. Then it writes and signs `release.json`, uploads a draft, pushes the tag and publishes a full release. If that fails partway, run it again: nothing sees a draft, and it carries on from a tag on the same commit. `--dry-run` stops before the tag and prints the rest, and never talks to GitHub, so `--latest <version>` stands in for the latest release there.
+It refuses a placeholder key, a signing key that doesn't match the public one, uncommitted changes, a tag on another commit and a version that isn't newer than the latest release. It runs the tests, builds both targets, the `.deb` and `mesh-kvm-setup.exe`, and checks the programs as they'll ship: no test hooks, this key, this version. Then it writes and signs `release.json`, which lists the installer as well, uploads a draft, pushes the tag and publishes a full release. A device only looks up its own file in `release.json`, so older versions read it as before. If that fails partway, run it again: nothing sees a draft, and it carries on from a tag on the same commit. `--dry-run` stops before the tag and prints the rest, and never talks to GitHub, so `--latest <version>` stands in for the latest release there.
 
 ## Hotkeys
 
@@ -233,7 +235,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 - The Windows lock screen and UAC prompts can't be controlled remotely. Use the laptop's own keyboard and trackpad for those.
 - Packet sizes and timing still show when someone is typing, and nothing stops a program on the same device calling the local API. See [What is and isn't protected](#what-is-and-isnt-protected).
 - Of updates, the other device can only ask for a download that has already passed its checks to be installed.
-- A Windows update that's cut short is put right by the login script, which only exists with Start mesh-kvm when this device boots on. With that off, if the laptop restarts in the minute after the swap and the new exe doesn't work, `mesh-kvm.exe.old` in `%LOCALAPPDATA%\mesh-kvm` is the way back by hand.
+- A Windows update that's cut short is put right by the login script, which only exists with Start mesh-kvm when this device boots on. With that off, if the laptop restarts in the minute and a half after the swap and the new exe doesn't work, running `mesh-kvm-setup.exe` again is the way back by hand.
 - Addresses are IPv4 only, and there is no automatic discovery.
 - There is no Mac build yet.
 
@@ -245,7 +247,7 @@ Ctrl+Alt+F11 still switches focus when mouse or keyboard sharing is off, so it i
 unshare -rn bash -c 'ip link set lo up && python3 -I tests/wine_link.py [path/to/mesh-kvm.exe]'
 ```
 
-The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`. Set `WINE_LINK_PREFIX` to put the Wine prefix somewhere other than `/tmp`. Set `MESH_KVM_HOOKS_EXE` to a build made with `--features test-hooks` to also run a real self-update under Wine against a pretend release server: the swap, the other-device-first order, proving, the watcher, the restore after a new exe that won't start or hangs, a swap that can't happen, and restarts in the middle, recovered through the real login script. It speaks to the exe through `tests/noise_peer.py`, a second Noise implementation in Python, and ends with the Linux build pairing with the exe for real.
+The exe path defaults to `target/x86_64-pc-windows-gnu/release/mesh-kvm.exe` in the repository and can also be set with `MESH_KVM_EXE`. Run it from the repository root; it needs `wine`, `ip` and Python 3.12 or later. Set `WINE_LINK_DISPLAY` to a throwaway X display to also press a real key and move the real mouse on the laptop, which needs `xdotool`. Set `WINE_LINK_PREFIX` to put the Wine prefix somewhere other than `/tmp`. Set `MESH_KVM_HOOKS_EXE` to a build made with `--features test-hooks` to also run a real self-update under Wine against a pretend release server: the swap, the other-device-first order, proving, the watcher, the restore after a new exe that won't start or hangs, a swap that can't happen, and restarts in the middle, recovered through the real login script. It also covers an old service that's slow to let go of its ports, a new copy that answers and then dies because its input port stays taken, and another device that does the same. It speaks to the exe through `tests/noise_peer.py`, a second Noise implementation in Python, and ends with the Linux build pairing with the exe for real. `tests/wine_setup.py` runs `mesh-kvm-setup.exe` under Wine: a silent install, a reinstall over a running copy, starting at sign-in off and on, a copy run from Downloads with and without an install, `--quit`, and a silent uninstall. Its top comment says how to run it.
 
 The updater's unit tests use their own key and a release server on a local port. Only a build with the `test-hooks` feature can be pointed at another server or key, and `packaging/release.sh` refuses to ship one. `tests/deb_helper.py` attacks the real `apply-update` as root in a throwaway namespace with a pretend `apt-get`, so it can't reach the real apt, polkit, `/usr` or `/etc`. `tests/release_dry_run.py` checks everything `packaging/release.sh` refuses, then does a whole `--dry-run` on a throwaway clone with a throwaway key. Their top comments say how to run them. `tests/fake_service.py --update` shows the update line in each state.
 

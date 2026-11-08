@@ -2,6 +2,7 @@
 
 use super::model::ServiceStart;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -72,45 +73,34 @@ const START_MENU_SCRIPT: &str = "mesh-kvm.vbs";
 const START_MENU_SHORTCUT: &str = "mesh-kvm.lnk";
 const LOGIN_SCRIPT: &str = "mesh-kvm-autostart.vbs";
 
-/// A PowerShell string literal: single-quoted, with single quotes doubled.
-fn ps_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
-}
-
-/// The PowerShell that creates the Start Menu shortcut: opens the app, with the exe's own icon.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn shortcut_script(lnk: &str, exe: &str) -> String {
-    let dir = Path::new(exe).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-    format!(
-        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut({}); \
-         $s.TargetPath={}; $s.Arguments='--app'; $s.WorkingDirectory={}; \
-         $s.IconLocation={}; $s.Save()",
-        ps_quote(lnk),
-        ps_quote(exe),
-        ps_quote(&dir),
-        ps_quote(&format!("{exe},0"))
-    )
-}
-
-/// Creates `lnk` with PowerShell, with no console window. True when the shortcut exists after.
+/// Creates `lnk`, which opens the app with the exe's own icon, through the shell's own shortcut
+/// object. True when the shortcut exists after.
 #[cfg(target_os = "windows")]
 pub fn make_shortcut(lnk: &Path, exe: &str) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let script = shortcut_script(&lnk.to_string_lossy(), exe);
-    let ran = Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    matches!(ran, Ok(status) if status.success()) && lnk.exists()
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let dir = Path::new(exe).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let made = unsafe {
+        // Already set up on this thread, one way or the other, is fine too.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        (|| -> windows::core::Result<()> {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            link.SetPath(&HSTRING::from(exe))?;
+            link.SetArguments(&HSTRING::from("--app"))?;
+            link.SetWorkingDirectory(&HSTRING::from(dir.as_str()))?;
+            link.SetIconLocation(&HSTRING::from(exe), 0)?;
+            link.SetDescription(&HSTRING::from("Share one mouse and keyboard between your computers"))?;
+            link.cast::<IPersistFile>()?.Save(&HSTRING::from(lnk.as_os_str()), true)
+        })()
+    };
+    made.is_ok() && lnk.exists()
 }
 
 /// Writes the Start Menu entry (a shortcut, or the script if the shortcut can't be made), removes
 /// the one older installs left, and (when `autostart` is on and the Startup folder exists) writes
-/// the login script. Returns the login script's path if it was written.
+/// the login script, or removes it when `autostart` is off. Returns the login script's path if it
+/// was written.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn install_windows_launchers(
     programs_dir: &Path,
@@ -120,9 +110,12 @@ pub fn install_windows_launchers(
     shortcut: &dyn Fn(&Path, &str) -> bool,
 ) -> Option<PathBuf> {
     let _ = std::fs::remove_file(programs_dir.join(OLD_START_MENU_SCRIPT));
-    // The login script goes first: PowerShell takes a moment, and the app reads this file to
+    // The login script goes first: the shortcut can take a moment, and the app reads this file to
     // show the start-at-boot switch.
     let startup = programs_dir.join("Startup");
+    if !autostart {
+        let _ = std::fs::remove_file(startup.join(LOGIN_SCRIPT));
+    }
     let login = (autostart && startup.exists())
         .then(|| startup.join(LOGIN_SCRIPT))
         .and_then(|login| std::fs::write(&login, windows_vbs(exe, peer)).ok().map(|_| login));
@@ -282,7 +275,15 @@ fn spawn_with(args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     spawn_exe(running_exe()?, args, envs)
 }
 
-fn spawn_exe(exe: PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
+/// On Windows the child gets none of this process's handles: see `platform::detach`.
+#[cfg(target_os = "windows")]
+pub fn spawn_exe(exe: PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    crate::platform::detach::spawn(&exe, &args, envs).map(drop)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn spawn_exe(exe: PathBuf, args: &[&str], envs: &[(&str, &str)]) -> std::io::Result<()> {
     let mut command = Command::new(exe);
     command.args(args).envs(envs.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(unix)]
@@ -460,20 +461,73 @@ fn restart_args(args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// What a watcher is started with: everything the service it replaces was.
+/// Names the service a watcher has to see end before it starts the new one.
+pub const OLD_PID_FLAG: &str = "--old-pid";
+
+/// What a watcher is started with: everything the service it replaces was, and that service's
+/// process id.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn args_for_watcher(args: Vec<String>) -> Vec<String> {
-    let mut all = vec![crate::update::swap::WATCH_FLAG.to_string()];
+pub fn args_for_watcher(args: Vec<String>, old_pid: u32) -> Vec<String> {
+    let mut all = vec![crate::update::swap::WATCH_FLAG.to_string(), OLD_PID_FLAG.to_string(), old_pid.to_string()];
     all.extend(restart_args(args));
     all
 }
 
-/// What a watcher should start the service with, and whether to start the tray too.
+/// What a watcher was told.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WatcherArgs {
+    /// What to start the service with.
+    pub service: Vec<String>,
+    /// Start the tray too, as at login.
+    pub tray: bool,
+    /// The old service, when it's the one that started this watcher. The login script has none.
+    pub old_pid: Option<u32>,
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub fn args_from_watcher(args: Vec<String>) -> (Vec<String>, bool) {
-    let tray = args.iter().any(|a| a == "--tray");
-    let args = args.into_iter().filter(|a| a != "--tray" && a != crate::update::swap::WATCH_FLAG).collect();
-    (restart_args(args), tray)
+pub fn args_from_watcher(args: Vec<String>) -> WatcherArgs {
+    let mut service = Vec::new();
+    let (mut tray, mut old_pid) = (false, None);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tray" => tray = true,
+            OLD_PID_FLAG => old_pid = args.next().and_then(|pid| pid.parse().ok()),
+            _ if arg == crate::update::swap::WATCH_FLAG => {}
+            _ => service.push(arg),
+        }
+    }
+    WatcherArgs { service: restart_args(service), tray, old_pid }
+}
+
+/// How long a service started by the one it replaces waits for that one's ports to come free.
+pub const PORTS_WAIT: Duration = Duration::from_secs(20);
+const PORTS_LOOK: Duration = Duration::from_millis(250);
+
+/// True for a service started by the one it replaces, or by the update's watcher.
+pub fn restarting() -> bool {
+    std::env::var_os(RESTARTING_ENV).is_some()
+}
+
+/// Binds with `bind`. A service that replaces another keeps trying while the port is still taken,
+/// for up to `PORTS_WAIT`, as the old one may take a while to end. Any other start fails at once,
+/// as a taken port then means another service is running.
+pub fn bind_patiently<T>(bind: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let patience = if restarting() { PORTS_WAIT } else { Duration::ZERO };
+    retry_while_taken(patience, bind, &std::thread::sleep)
+}
+
+fn retry_while_taken<T>(patience: Duration, mut bind: impl FnMut() -> std::io::Result<T>, wait: &dyn Fn(Duration)) -> std::io::Result<T> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match bind() {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && waited < patience => {
+                wait(PORTS_LOOK);
+                waited += PORTS_LOOK;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Replaces this service with a new one, which reads the settings again. Only returns on failure.
@@ -724,16 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_script_quotes_single_quotes_in_paths() {
-        let script = shortcut_script(r"C:\Users\O'Neil\Start Menu\mesh-kvm.lnk", r"C:\Users\O'Neil\mesh-kvm.exe");
-        assert!(script.contains(r"CreateShortcut('C:\Users\O''Neil\Start Menu\mesh-kvm.lnk')"));
-        assert!(script.contains(r"$s.TargetPath='C:\Users\O''Neil\mesh-kvm.exe'"));
-        assert!(script.contains("$s.Arguments='--app'"));
-        assert!(script.contains(r"$s.IconLocation='C:\Users\O''Neil\mesh-kvm.exe,0'"));
-        assert!(script.ends_with("$s.Save()"));
-    }
-
-    #[test]
     fn percent_signs_in_the_exe_path_are_doubled_in_a_desktop_entry() {
         let entry = linux_desktop_entry("/opt/100%/mesh-kvm", "--app");
         assert!(entry.contains("Exec=/opt/100%%/mesh-kvm --app\n"));
@@ -867,12 +911,69 @@ mod tests {
     #[test]
     fn the_watcher_is_given_the_service_arguments_and_starts_the_service_with_them() {
         let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-        assert_eq!(args_for_watcher(args(&["--role", "windows", "--port", "9"])), args(&["--update-watch", "--role", "windows", "--port", "9"]));
-        assert_eq!(args_for_watcher(vec![]), args(&["--update-watch", "--role", crate::platform::ROLE]));
-        let (service, tray) = args_from_watcher(args(&["--update-watch", "--tray", "--role", "windows", "--port", "9"]));
-        assert_eq!((service, tray), (args(&["--role", "windows", "--port", "9"]), true));
-        let (service, tray) = args_from_watcher(args(&["--update-watch"]));
-        assert_eq!((service, tray), (args(&["--role", crate::platform::ROLE]), false));
+        assert_eq!(args_for_watcher(args(&["--role", "windows", "--port", "9"]), 4242), args(&["--update-watch", "--old-pid", "4242", "--role", "windows", "--port", "9"]));
+        assert_eq!(args_for_watcher(vec![], 7), args(&["--update-watch", "--old-pid", "7", "--role", crate::platform::ROLE]));
+        let told = args_from_watcher(args(&["--update-watch", "--old-pid", "4242", "--role", "windows", "--port", "9"]));
+        assert_eq!(told, WatcherArgs { service: args(&["--role", "windows", "--port", "9"]), tray: false, old_pid: Some(4242) });
+        let told = args_from_watcher(args(&["--update-watch"]));
+        assert_eq!(told, WatcherArgs { service: args(&["--role", crate::platform::ROLE]), tray: false, old_pid: None });
+    }
+
+    #[test]
+    fn a_watcher_from_the_login_script_has_no_old_service_to_wait_for() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let told = args_from_watcher(args(&["--update-watch", "--tray", "--role", "windows", "--peer", "192.168.8.210"]));
+        assert_eq!(told, WatcherArgs { service: args(&["--role", "windows", "--peer", "192.168.8.210"]), tray: true, old_pid: None });
+    }
+
+    fn taken() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::AddrInUse)
+    }
+
+    #[test]
+    fn a_replacing_service_waits_for_its_ports_to_come_free() {
+        let tries = Cell::new(0);
+        let waited = Cell::new(Duration::ZERO);
+        let bound = retry_while_taken(
+            PORTS_WAIT,
+            || {
+                tries.set(tries.get() + 1);
+                if tries.get() < 20 { Err(taken()) } else { Ok("bound") }
+            },
+            &|time| waited.set(waited.get() + time),
+        );
+        assert_eq!(bound.unwrap(), "bound");
+        assert!(waited.get() < PORTS_WAIT, "{:?}", waited.get());
+    }
+
+    #[test]
+    fn a_replacing_service_gives_up_on_a_port_that_stays_taken() {
+        let waited = Cell::new(Duration::ZERO);
+        let bound: std::io::Result<()> = retry_while_taken(PORTS_WAIT, || Err(taken()), &|time| waited.set(waited.get() + time));
+        assert_eq!(bound.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(waited.get(), PORTS_WAIT);
+    }
+
+    #[test]
+    fn a_normal_start_finds_a_taken_port_at_once() {
+        let tries = Cell::new(0);
+        let bound: std::io::Result<()> = retry_while_taken(Duration::ZERO, || {
+            tries.set(tries.get() + 1);
+            Err(taken())
+        }, &|_| panic!("it waited"));
+        assert!(bound.is_err());
+        assert_eq!(tries.get(), 1);
+    }
+
+    #[test]
+    fn only_a_taken_port_is_tried_again() {
+        let tries = Cell::new(0);
+        let bound: std::io::Result<()> = retry_while_taken(PORTS_WAIT, || {
+            tries.set(tries.get() + 1);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }, &|_| {});
+        assert_eq!(bound.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(tries.get(), 1);
     }
 
     #[test]
@@ -929,6 +1030,17 @@ mod tests {
         let programs = programs(&dir);
         install_windows_launchers(&programs, EXE, None, false, &|_, _| false);
         assert!(programs.join("mesh-kvm.vbs").exists());
+        assert!(!programs.join("Startup/mesh-kvm-autostart.vbs").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn turning_autostart_off_removes_a_login_script_already_there() {
+        let dir = temp("win-off-again");
+        let programs = programs(&dir);
+        install_windows_launchers(&programs, EXE, None, true, &|_, _| true);
+        assert!(programs.join("Startup/mesh-kvm-autostart.vbs").exists());
+        install_windows_launchers(&programs, EXE, None, false, &|_, _| true);
         assert!(!programs.join("Startup/mesh-kvm-autostart.vbs").exists());
         let _ = std::fs::remove_dir_all(dir);
     }

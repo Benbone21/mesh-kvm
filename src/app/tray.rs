@@ -13,6 +13,10 @@ const REFRESH_EVERY_MS: u64 = 500;
 const POLL_EVERY: Duration = Duration::from_secs(2);
 /// How long a failed action shows in the tooltip.
 const NOTICE_FOR: Duration = Duration::from_secs(5);
+/// How long the tray has to close by itself once it's told to.
+const LEAVE_WITHIN: Duration = Duration::from_secs(3);
+/// The menu item that stops mesh-kvm on this device.
+const QUIT_LABEL: &str = "Quit mesh-kvm";
 
 /// What the tray's tooltip says, in plain words.
 fn tooltip(snapshot: &Snapshot) -> String {
@@ -98,13 +102,38 @@ fn perform(action: Action, client: &Client, shared: &SharedNotices) {
     }
 }
 
-/// Runs the tray until Quit. Quit ends only this process; the service keeps running.
+/// Set when this tray is to close: told so by `--quit` or the installer, or after its own Quit.
+static LEAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn leaving() -> bool {
+    LEAVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Quit mesh-kvm: stops the window, the service and this tray. The other device then only sees
+/// this one as offline. It starts again from the menu, or at sign-in if that's on.
+fn quit_everything() {
+    LEAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let quit = crate::quit::everything_here();
+    if quit == crate::quit::Quit::StillRunning {
+        crate::settings::log_note("Quit was chosen in the tray, but the service didn't stop.");
+    }
+}
+
+/// Runs the tray until Quit, which stops mesh-kvm on this device.
 pub fn run_tray() -> Result<(), String> {
-    let _held = match super::single::claim_after_handover(super::single::TRAY_PORT) {
+    let held = match super::single::claim_after_handover(super::single::TRAY_PORT) {
         super::single::Instance::First(listener) => listener,
         super::single::Instance::AlreadyRunning => return Ok(()),
         super::single::Instance::Failed(e) => return Err(e),
     };
+    super::single::listen(held, |word| {
+        if word == super::single::Word::Quit {
+            LEAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            // The loop notices within a moment. A tray still waiting for the taskbar doesn't.
+            std::thread::sleep(LEAVE_WITHIN);
+            std::process::exit(0);
+        }
+    });
     crate::mute::start_service_watch();
     platform::run(starter_for_login(crate::settings::autostart_disabled_marker().exists()))
 }
@@ -177,7 +206,7 @@ mod platform {
                 self.item("Release all input", Action::ReleaseAll),
                 MenuItem::Separator,
                 StandardItem {
-                    label: "Quit".into(),
+                    label: QUIT_LABEL.into(),
                     activate: Box::new(|this: &mut Self| this.quit.store(true, Ordering::SeqCst)),
                     ..Default::default()
                 }
@@ -203,7 +232,7 @@ mod platform {
             .spawn()
             .map_err(|e| format!("The tray icon couldn't start: {e}"))?;
         let mut watch = VersionWatch::default();
-        while !quit.load(Ordering::SeqCst) && !handle.is_closed() {
+        while !quit.load(Ordering::SeqCst) && !leaving() && !handle.is_closed() {
             std::thread::sleep(Duration::from_millis(REFRESH_EVERY_MS));
             follow_update(&client, &mut watch);
             let text = current_text(&client, &shared, &starter.state());
@@ -212,6 +241,9 @@ mod platform {
                     tray.text = text;
                 }
             });
+        }
+        if quit.load(Ordering::SeqCst) {
+            quit_everything();
         }
         Ok(())
     }
@@ -257,7 +289,7 @@ mod platform {
         let open = MenuItem::new("Open", true, None);
         let switch = MenuItem::new("Switch device", true, None);
         let release = MenuItem::new("Release all input", true, None);
-        let quit = MenuItem::new("Quit", true, None);
+        let quit = MenuItem::new(QUIT_LABEL, true, None);
         let menu = Menu::new();
         menu.append_items(&[&open, &switch, &release, &PredefinedMenuItem::separator(), &quit])
             .map_err(|e| format!("The tray menu couldn't be built: {e}"))?;
@@ -291,8 +323,13 @@ mod platform {
                 DispatchMessageW(&msg);
             }
             follow_update(&client, &mut watch);
+            if leaving() {
+                return Ok(());
+            }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == *quit.id() {
+                    drop(tray);
+                    quit_everything();
                     return Ok(());
                 }
                 if let Some((_, action)) = actions.iter().find(|(id, _)| *id == event.id) {

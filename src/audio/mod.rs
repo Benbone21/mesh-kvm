@@ -92,13 +92,14 @@ struct HeardBack {
     at: Option<Instant>,
     playing: bool,
     sounding: bool,
+    ready: bool,
 }
 
-static HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false, sounding: false });
+static HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false, sounding: false, ready: false });
 
 fn note_heard_back(report: packet::Report, now: Instant) {
     *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner) =
-        HeardBack { at: Some(now), playing: report.playing, sounding: report.sounding };
+        HeardBack { at: Some(now), playing: report.playing, sounding: report.sounding, ready: report.ready };
     AUDIO_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
 }
 
@@ -119,6 +120,17 @@ pub fn reaching_peer(now: Instant, within: Duration) -> bool {
 /// True while the other device has an output open for what's sent, sound or no sound.
 pub fn peer_listening(now: Instant, within: Duration) -> bool {
     heard_back(now, within).playing
+}
+
+/// True while the other device says it would play what's sent: Play is on there, even if its output
+/// is shut for now for want of sound.
+pub fn peer_ready(now: Instant, within: Duration) -> bool {
+    heard_back(now, within).ready
+}
+
+/// True while reports are coming from the other device at all.
+pub fn peer_reporting(now: Instant, within: Duration) -> bool {
+    heard_back(now, within).at.is_some()
 }
 
 /// What is being sent out, ready for the sender.
@@ -225,6 +237,7 @@ fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
     let sounded_at = *SOUNDED_AT.lock().unwrap_or_else(PoisonError::into_inner);
     let mut report = stream.report(playing);
     report.sounding = playing && seen_within(sounded_at, now, SOUNDING_FOR);
+    report.ready = !AUDIO_RX_MUTED.load(Ordering::Relaxed);
     AUDIO_RX_LIVE.store(alive, Ordering::Relaxed);
     AUDIO_RX_PACKETS.store(stream.counts().received, Ordering::Relaxed);
     AUDIO_RX_LOSS.store((stream.loss_percent() * 10.0) as u32, Ordering::Relaxed);
@@ -355,7 +368,7 @@ pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) 
         .name("mesh-kvm-audio-rx".to_string())
         .spawn(move || {
             let bind_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
-            let socket = match UdpSocket::bind(bind_addr) {
+            let socket = match crate::app::launch::bind_patiently(|| UdpSocket::bind(bind_addr)) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("[Audio-RX] Failed to bind UDP {}: {}", bind_addr, e);

@@ -453,6 +453,7 @@ impl RxStream {
             loss_percent: self.loss_percent.ceil().min(100.0) as u8,
             playing,
             sounding: false,
+            ready: false,
             buffered_ms: self.buffered_ms() as u16,
         }
     }

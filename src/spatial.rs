@@ -975,6 +975,9 @@ pub fn studio_handler(
                 if act == "set_device_name" {
                     return Some(set_device_name(&state, &val));
                 }
+                if act == crate::quit::ACTION {
+                    return Some(crate::quit::answer(req.from_app_here));
+                }
                 if act == "set_audio_device" {
                     return Some(crate::settings::set_audio_device(&val, req.from_app_here));
                 }
@@ -1718,6 +1721,16 @@ mod tests {
         assert!(handler(&from_peer).unwrap().contains("only be kept on the device"));
         let here = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Local);
         assert_eq!(handler(&here).unwrap(), crate::settings::OK_RESPONSE);
+    }
+
+    #[test]
+    fn the_other_device_cant_quit_this_one() {
+        let state = Arc::new(shared_at(0, NodeId::Debian, None));
+        let platform: Arc<dyn Platform> = Arc::new(NoScreens);
+        let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change(), test_pairing("quit"));
+        let body = serde_json::json!({ "action": crate::quit::ACTION }).to_string();
+        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
+        assert!(handler(&from_peer).unwrap().contains("can only be quit from this device"));
     }
 
     #[test]

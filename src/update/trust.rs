@@ -95,6 +95,14 @@ pub fn hang_if_told() {
     }
 }
 
+/// A test exe can be an old service that takes its time to end after a swap, holding its ports.
+#[cfg(feature = "test-hooks")]
+pub fn linger_if_told() {
+    if test_exe_tail().is_some_and(|tail| tail.contains("LINGER")) {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+    }
+}
+
 /// The key in `text`, or `None` for the placeholder or anything else that isn't a usable key.
 pub fn parse_key(text: &str) -> Option<VerifyingKey> {
     let text = text.trim();

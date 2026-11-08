@@ -1150,8 +1150,9 @@ pub fn run_debian_node(
     }
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", listen_port).parse().unwrap();
-    let socket = UdpSocket::bind(bind_addr)
+    let socket = crate::app::launch::bind_patiently(|| UdpSocket::bind(bind_addr))
         .map_err(|e| format!("Failed to bind UDP {}: {}", bind_addr, e))?;
+    crate::update::note_service_up();
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set UDP socket nonblocking: {}", e))?;

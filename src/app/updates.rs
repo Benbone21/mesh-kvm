@@ -139,6 +139,24 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
     Some(ready_banner(snapshot, version, &name))
 }
 
+/// The line on a Windows copy that isn't the installed one, such as one run from Downloads with
+/// nothing installed. It doesn't install itself or update, so it says how to install.
+const NOT_INSTALLED: &str = "This copy of mesh-kvm isn't installed, so it won't start at sign-in or update itself.";
+const HOW_TO_INSTALL: &str = "To install mesh-kvm, run mesh-kvm-setup.exe.";
+
+/// Adds how to install to the line, on a copy that isn't installed. An update under way, a failure
+/// or a button keeps the line to itself.
+pub fn with_install_hint(banner: Option<Banner>, not_installed: bool) -> Option<Banner> {
+    if !not_installed {
+        return banner;
+    }
+    match banner {
+        Some(banner) if banner.busy || banner.failed || banner.button.is_some() => Some(banner),
+        Some(banner) => Some(Banner { detail: Some(HOW_TO_INSTALL.to_string()), ..banner }),
+        None => Some(Banner { text: NOT_INSTALLED.to_string(), detail: Some(HOW_TO_INSTALL.to_string()), button: None, notes: None, failed: false, busy: false }),
+    }
+}
+
 fn failed_peer_has_arrived(snapshot: &Snapshot, local: &UpdateStatus) -> bool {
     let arrived = snapshot.peer.as_ref().is_some_and(|p| Some(p.version.as_str()) == local.available.as_deref());
     local.failed_on.as_deref() == Some("peer") && local.ready && arrived
@@ -233,6 +251,22 @@ mod tests {
 
     fn ready() -> UpdateStatus {
         status("ready", Some("0.7.1"), true)
+    }
+
+    #[test]
+    fn a_copy_that_is_not_installed_says_how_to_install() {
+        let banner = with_install_hint(None, true).unwrap();
+        assert!(banner.text.contains("isn't installed"), "{banner:?}");
+        assert!(banner.detail.unwrap().contains("mesh-kvm-setup.exe"));
+        assert_eq!(with_install_hint(None, false), None);
+    }
+
+    #[test]
+    fn a_copy_that_is_not_installed_still_says_what_version_is_out() {
+        let available = update_banner(&snapshot(status("view_only", Some("0.7.1"), false), Some(Some(ready()))));
+        let banner = with_install_hint(available, true).unwrap();
+        assert_eq!(banner.text, "Version 0.7.1 is available");
+        assert!(banner.detail.unwrap().contains("mesh-kvm-setup.exe"));
     }
 
     #[test]

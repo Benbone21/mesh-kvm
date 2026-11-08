@@ -10,6 +10,7 @@ mod licenses;
 mod mute;
 mod platform;
 mod protocol;
+mod quit;
 mod router;
 mod secure;
 mod settings;
@@ -94,9 +95,13 @@ struct Cli {
     #[arg(long, alias = "studio")]
     app: bool,
 
-    /// Show the tray icon for the service on this device, and exit when Quit is chosen
+    /// Show the tray icon for the service on this device. Its Quit stops mesh-kvm on this device
     #[arg(long)]
     tray: bool,
+
+    /// Stop mesh-kvm on this device: the window, the tray and the service, then exit
+    #[arg(long)]
+    quit: bool,
 
     /// Show the licences of what's built into this program, then exit
     #[arg(long, alias = "licences")]
@@ -112,10 +117,19 @@ struct Cli {
     #[arg(long, hide = true)]
     update_watch: bool,
 
-    /// Write the menu and login launchers for this exe (Linux), then exit
-    #[cfg(target_os = "linux")]
+    /// The service a watcher waits for before it starts the new one
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    old_pid: Option<u32>,
+
+    /// Write the menu and login launchers, then exit. On Windows, mesh-kvm-setup.exe runs this
     #[arg(long)]
     install_launchers: bool,
+
+    /// With --install-launchers on Windows: start mesh-kvm at sign-in, 'on' or 'off'
+    #[cfg(target_os = "windows")]
+    #[arg(long, value_parser = ["on", "off"])]
+    autostart: Option<String>,
 }
 
 fn parse_peer_socket_addr(peer: &str, default_port: u16) -> Result<(String, SocketAddr), String> {
@@ -153,25 +167,21 @@ fn is_bare_launch(arg_count: usize) -> bool {
 /// What a bare Windows launch does.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
-struct BarePlan {
-    /// Install this exe over the installed one now (a running service won't do it).
-    install_exe: bool,
-    /// This process turns into the service.
-    become_service: bool,
+enum BarePlan {
+    /// A copy run from somewhere else, such as Downloads, while mesh-kvm is installed: it opens the
+    /// installed copy's window and ends. It never installs itself over that copy.
+    OpenInstalled,
+    /// Opens the tray and the window, and this process becomes the service unless one is running.
+    /// A copy with nothing installed runs like this too, but installs nothing.
+    Run { become_service: bool },
 }
 
-/// A bare launch always opens the tray and window. With no service it becomes one (which installs
-/// itself); with a service already running it installs only if it is a different, newer download.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn bare_launch_plan(service_running: bool, exe_differs: bool) -> BarePlan {
-    BarePlan { install_exe: service_running && exe_differs, become_service: !service_running }
-}
-
-/// The address a running service says it uses.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn peer_in_status(body: &str) -> Option<String> {
-    let status: serde_json::Value = serde_json::from_str(body).ok()?;
-    settings::validate_peer(status.get("peer_ip")?.as_str()?).ok()
+fn bare_launch_plan(is_installed_copy: bool, installed_exists: bool, service_running: bool) -> BarePlan {
+    if !is_installed_copy && installed_exists {
+        return BarePlan::OpenInstalled;
+    }
+    BarePlan::Run { become_service: !service_running }
 }
 
 /// What to tell the person when the window can't open, such as when there is no OpenGL.
@@ -251,41 +261,31 @@ fn main() {
         return;
     }
 
+    if cli.quit {
+        let quit = quit::everything_here();
+        println!("{quit:?}");
+        std::process::exit(if quit == quit::Quit::StillRunning { 1 } else { 0 });
+    }
+
     // Double-clicking the Windows exe passes no arguments. It opens the tray and the window, and
     // becomes the service unless one is already running; the login launcher always passes arguments.
     #[cfg(target_os = "windows")]
     if is_bare_launch(std::env::args_os().len()) {
-        let running = webui::http_call("127.0.0.1", "GET", "/api/local", "").ok();
-        let service_running = running.is_some();
-        let running_peer = running.and_then(|(_, body)| peer_in_status(&body));
-        let installed = app::install::installed_exe();
-        let exe_differs = match (std::env::current_exe(), &installed) {
-            (Ok(current), Some(installed)) => app::install::needs_install(&current, installed),
-            _ => false,
-        };
-        let plan = bare_launch_plan(service_running, exe_differs);
-        if plan.install_exe {
-            if let (Ok(current), Some(installed)) = (std::env::current_exe(), &installed) {
-                // A newer download was double-clicked while an older copy runs: install it now.
-                match app::install::replace_exe(&current, installed) {
-                    Ok(()) => settings::log_note(&format!(
-                        "Installed the newer {} over the running copy; it takes effect once every mesh-kvm.exe is ended and started again.",
-                        current.display()
-                    )),
-                    Err(e) => settings::log_fatal(&e),
-                }
+        let service_running = webui::http_call("127.0.0.1", "GET", "/api/local", "").is_ok();
+        let installed = app::install::installed_exe().filter(|exe| exe.exists());
+        let plan = bare_launch_plan(app::install::runs_from_installed(), installed.is_some(), service_running);
+        if let (BarePlan::OpenInstalled, Some(installed)) = (&plan, installed) {
+            if let Err(e) = app::launch::spawn_exe(installed.clone(), &["--app"], &[]) {
+                settings::log_fatal(&format!("Couldn't open the installed mesh-kvm at {}: {e}", installed.display()));
             }
-            // The old service wrote the old launchers, which start no tray at login.
-            settings::load_and_apply();
-            let peer = settings::peer_ip().or(running_peer);
-            platform::windows::rewrite_launchers(peer.as_deref());
+            return;
         }
         for flag in ["--tray", "--app"] {
             if let Err(e) = app::launch::spawn_self(flag) {
                 settings::log_fatal(&format!("Couldn't start mesh-kvm {flag}: {e}"));
             }
         }
-        if !plan.become_service {
+        if plan == (BarePlan::Run { become_service: false }) {
             return;
         }
     }
@@ -302,10 +302,14 @@ fn main() {
         run_tray_icon();
         return;
     }
-    #[cfg(target_os = "linux")]
     if cli.install_launchers {
-        if let Err(e) = app::launch::install_linux_launchers() {
+        #[cfg(target_os = "linux")]
+        let installed = app::launch::install_linux_launchers();
+        #[cfg(target_os = "windows")]
+        let installed = platform::windows::install_for_setup(cli.autostart.as_deref().map(|a| a == "on"));
+        if let Err(e) = installed {
             eprintln!("Error: {}", e);
+            settings::log_fatal(&e);
             std::process::exit(1);
         }
         return;
@@ -316,6 +320,8 @@ fn main() {
 
 /// Stops and leaves a note where the app can point to.
 fn fail(message: &str) -> ! {
+    // A new copy that fails hasn't proved itself, however long stopping takes.
+    update::note_service_failing();
     eprintln!("Error: {}", message);
     settings::log_fatal(message);
     mute::shutdown();
@@ -477,8 +483,9 @@ fn run_service(cli: Cli) {
     update::trust::hang_if_told();
     wait_for_old_service();
 
-    // First of all, so that a second service stops here and touches nothing.
-    let listener = match webui::bind() {
+    // First of all, so that a second service stops here and touches nothing. One that replaces
+    // another waits for the port, as the old one may still be letting go of it.
+    let listener = match app::launch::bind_patiently(webui::bind) {
         Ok(listener) => listener,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             println!("mesh-kvm is already running on this device.");
@@ -524,6 +531,7 @@ fn run_service(cli: Cli) {
     let Some((_, peer_addr, _)) = chosen else {
         // Nothing to share with yet, so nothing is captured. The app asks for the address.
         println!("No other device is known yet. Waiting for its address from the app.");
+        update::note_service_up();
         while !settings::restart_requested() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -674,13 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn a_running_service_gives_its_peer() {
-        assert_eq!(super::peer_in_status(r#"{"peer_ip":"192.168.8.241"}"#).as_deref(), Some("192.168.8.241"));
-        assert_eq!(super::peer_in_status(r#"{"peer_ip":""}"#), None);
-        assert_eq!(super::peer_in_status("not json"), None);
-    }
-
-    #[test]
     fn bare_launch_has_no_arguments() {
         assert!(is_bare_launch(1));
     }
@@ -693,25 +694,30 @@ mod tests {
     }
 
     #[test]
-    fn bare_launch_plan_covers_every_case() {
+    fn a_copy_run_from_elsewhere_opens_the_installed_one_and_never_installs_itself() {
         use super::{bare_launch_plan, BarePlan};
-        assert_eq!(
-            bare_launch_plan(false, false),
-            BarePlan { install_exe: false, become_service: true }
-        );
-        assert_eq!(
-            bare_launch_plan(false, true),
-            BarePlan { install_exe: false, become_service: true },
-            "a starting service installs the exe itself"
-        );
-        assert_eq!(
-            bare_launch_plan(true, false),
-            BarePlan { install_exe: false, become_service: false }
-        );
-        assert_eq!(
-            bare_launch_plan(true, true),
-            BarePlan { install_exe: true, become_service: false }
-        );
+        assert_eq!(bare_launch_plan(false, true, false), BarePlan::OpenInstalled);
+        assert_eq!(bare_launch_plan(false, true, true), BarePlan::OpenInstalled);
+    }
+
+    #[test]
+    fn with_nothing_installed_a_copy_runs_by_itself() {
+        use super::{bare_launch_plan, BarePlan};
+        assert_eq!(bare_launch_plan(false, false, false), BarePlan::Run { become_service: true });
+        assert_eq!(bare_launch_plan(false, false, true), BarePlan::Run { become_service: false });
+    }
+
+    #[test]
+    fn the_installed_copy_opens_the_tray_and_window_and_starts_the_service_if_needed() {
+        use super::{bare_launch_plan, BarePlan};
+        assert_eq!(bare_launch_plan(true, true, false), BarePlan::Run { become_service: true });
+        assert_eq!(bare_launch_plan(true, true, true), BarePlan::Run { become_service: false });
+    }
+
+    #[test]
+    fn quit_is_a_flag_of_its_own() {
+        assert!(Cli::try_parse_from(["mesh-kvm", "--quit"]).unwrap().quit);
+        assert!(!Cli::try_parse_from(["mesh-kvm"]).unwrap().quit);
     }
 
     #[test]

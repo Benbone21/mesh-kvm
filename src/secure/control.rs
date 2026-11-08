@@ -30,7 +30,8 @@ impl Drop for Place {
 /// Listens on `port` for the paired device alone. Each connection gets its own thread, so a long
 /// transfer holds nothing up.
 pub fn start(port: u16, peer: IpAddr, pairing: Arc<Pairing>, incoming: Incoming) -> Result<(), String> {
-    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|e| format!("Couldn't open TCP {port}: {e}"))?;
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = crate::app::launch::bind_patiently(|| TcpListener::bind(bind_addr)).map_err(|e| format!("Couldn't open TCP {port}: {e}"))?;
     println!("[Control] Listening on TCP {port}");
     serve(listener, peer, pairing, incoming)
 }

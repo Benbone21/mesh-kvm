@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "mesh-kvm"
-version = "0.7.0"
+version = "0.7.2"
 edition = "2021"
 description = "Zero-latency P2P Mesh Input, Clipboard, and Audio daemon bridging Debian 13 and Windows 11"
 
@@ -72,6 +72,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
     "Win32_Graphics_Gdi",
 ] }
 

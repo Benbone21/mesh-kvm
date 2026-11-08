@@ -55,7 +55,7 @@ impl Installer for Deb {
 
     fn preflight(&self) -> Preflight {
         let mut command = Command::new(PKCHECK);
-        command.args(["--action-id", ACTION, "--process", &std::process::id().to_string(), "--detail", "program", HELPER]);
+        command.args(["--action-id", ACTION, "--process", &std::process::id().to_string()]);
         match run_limited(command, PREFLIGHT_LIMIT) {
             Ran::Finished(output) => read_pkcheck(output.status.code()),
             _ => Preflight::Unknown,

@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// Starts the watcher, in place of a service.
 pub const WATCH_FLAG: &str = "--update-watch";
-/// How long after the swap it has to get there.
-pub const RESTORE_AFTER: Duration = Duration::from_secs(60);
+/// How long after it's started it has to get there. That covers a wait of up to 20 seconds for
+/// the old service's ports, and the 30 seconds after that.
+pub const RESTORE_AFTER: Duration = Duration::from_secs(90);
 const LOOK_EVERY: Duration = Duration::from_millis(500);
 /// What the login script runs the old exe as.
 pub const RECOVERY_EXE: &str = "mesh-kvm-recover.exe";
@@ -82,17 +83,26 @@ impl Paths {
         let _ = fs::remove_file(self.note());
     }
 
+    /// Where an old exe still in use goes when a newer update needs its place.
+    fn stale(&self) -> PathBuf {
+        let mut name = self.installed.as_os_str().to_owned();
+        name.push(".old.stale");
+        PathBuf::from(name)
+    }
+
     pub fn staged(&self) -> PathBuf {
         let mut name = self.installed.as_os_str().to_owned();
         name.push(".new");
         PathBuf::from(name)
     }
 
-    /// A failed exe is left behind if it couldn't be stopped, and a copy if a swap was cut short.
-    /// Any later start clears them.
+    /// A failed exe is left behind if it couldn't be stopped, a copy if a swap was cut short, and
+    /// an old exe that was still running when a later update needed its place. Any later start
+    /// clears them.
     pub fn clear_failed(&self) {
         let _ = fs::remove_file(self.failed());
         let _ = fs::remove_file(self.staged());
+        let _ = fs::remove_file(self.stale());
         let _ = fs::remove_file(self.folder.join(RECOVERY_EXE));
     }
 }
@@ -130,7 +140,7 @@ pub fn swap_in(paths: &Paths, new_exe: &Path, marker: &Marker, check: &dyn Fn(&P
     check(&paths.staged()).inspect_err(|_| drop_staged())?;
     write_marker(paths, marker).inspect_err(|_| drop_staged())?;
     let aside = aside_path(&paths.installed);
-    if let Err(e) = fs::rename(&paths.installed, &aside) {
+    if let Err(e) = move_aside(paths, &aside) {
         drop_staged();
         paths.clear_marker();
         return Err(format!("Couldn't move the running copy aside: {e}"));
@@ -143,6 +153,30 @@ pub fn swap_in(paths: &Paths, new_exe: &Path, marker: &Marker, check: &dyn Fn(&P
     }
     paths.clear_note();
     Ok(())
+}
+
+/// How long the move aside keeps trying when it's refused for a moment.
+const ASIDE_TRIES: u32 = 10;
+const ASIDE_GAP: Duration = Duration::from_millis(500);
+
+/// Moves the installed exe aside. An old exe already there from the last update can still be in
+/// use, as the watcher from that update runs from it, and Windows won't replace a file that's
+/// running. It will rename one, so that one is moved out of the way first.
+fn move_aside(paths: &Paths, aside: &Path) -> std::io::Result<()> {
+    if aside.is_file() && fs::remove_file(aside).is_err() {
+        let _ = fs::remove_file(paths.stale());
+        let _ = fs::rename(aside, paths.stale());
+    }
+    let mut tries = 1;
+    loop {
+        match fs::rename(&paths.installed, aside) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && tries < ASIDE_TRIES => {
+                tries += 1;
+                std::thread::sleep(ASIDE_GAP);
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Swaps, and starts the watcher. The old exe only comes back if the swap really happened: after a
@@ -177,6 +211,9 @@ pub fn put_old_back(paths: &Paths) -> Result<(), String> {
 
 /// What the watcher does to the outside world.
 pub trait WatchHost {
+    /// Waits for the service that started the watcher to have ended, and ends it if it takes too
+    /// long, as it holds the ports a new service needs. At login there is none.
+    fn wait_for_old_service(&mut self);
     fn start_new_service(&mut self);
     /// Stops the new service, if it's still going.
     fn stop_new_service(&mut self);
@@ -191,6 +228,7 @@ pub trait WatchHost {
 /// Starts the new copy and sees it through. It ends with a service running, whatever it found:
 /// it also runs at login when a marker is there, as nothing else would then be watching.
 pub fn watch(paths: &Paths, host: &mut dyn WatchHost) {
+    host.wait_for_old_service();
     if !paths.swap_pending() {
         return host.start_new_service();
     }
@@ -199,13 +237,17 @@ pub fn watch(paths: &Paths, host: &mut dyn WatchHost) {
         return restore(paths, host, marker.as_ref(), false);
     }
     host.start_new_service();
-    while host.elapsed() < RESTORE_AFTER {
-        if !paths.swap_pending() {
+    let started = host.elapsed();
+    // Only this swap's marker counts. A later update's is for its own watcher, even if this one
+    // has been slow to see that its swap proved itself.
+    let still_ours = || paths.swap_pending() && paths.read_marker() == marker;
+    while host.elapsed().saturating_sub(started) < RESTORE_AFTER {
+        if !still_ours() {
             return;
         }
         host.wait(LOOK_EVERY);
     }
-    if paths.swap_pending() {
+    if still_ours() {
         host.stop_new_service();
         restore(paths, host, marker.as_ref(), true);
     }
@@ -294,9 +336,17 @@ mod tests {
         /// What the installed place held when the restored service was started.
         restored: Option<String>,
         rejected: Option<String>,
+        old_ends_after: Duration,
+        /// When another update swaps in after this one proved itself.
+        next_update_at: Option<Duration>,
     }
 
     impl WatchHost for FakeHost {
+        fn wait_for_old_service(&mut self) {
+            self.calls.push("wait for old");
+            // Ending the old one takes a while, and the new one's time starts after.
+            self.now.set(self.now.get() + self.old_ends_after);
+        }
         fn start_new_service(&mut self) {
             self.calls.push("start new");
         }
@@ -315,6 +365,9 @@ mod tests {
             if self.healthy_at.is_some_and(|at| self.now.get() >= at) {
                 self.paths.clear_marker();
             }
+            if self.next_update_at.is_some_and(|at| self.now.get() >= at) {
+                write_marker(&self.paths, &Marker { from: "0.7.1".into(), to: "0.7.2".into() }).unwrap();
+            }
         }
         fn elapsed(&self) -> Duration {
             self.now.get()
@@ -322,7 +375,7 @@ mod tests {
     }
 
     fn host(paths: &Paths, healthy_at: Option<Duration>) -> FakeHost {
-        FakeHost { paths: paths.clone(), now: Cell::new(Duration::ZERO), healthy_at, calls: Vec::new(), restored: None, rejected: None }
+        FakeHost { paths: paths.clone(), now: Cell::new(Duration::ZERO), healthy_at, calls: Vec::new(), restored: None, rejected: None, old_ends_after: Duration::ZERO, next_update_at: None }
     }
 
     #[test]
@@ -417,13 +470,25 @@ mod tests {
     }
 
     #[test]
+    fn an_old_exe_from_the_last_update_is_replaced_by_this_one() {
+        let paths = paths("second");
+        swapped(&paths);
+        paths.clear_marker();
+        let newer = paths.installed.with_file_name("newer.exe");
+        fs::write(&newer, "newer").unwrap();
+        swap_in(&paths, &newer, &marker(), &|_| Ok(())).unwrap();
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "newer");
+        assert_eq!(fs::read_to_string(aside_path(&paths.installed)).unwrap(), "new");
+    }
+
+    #[test]
     fn a_crash_between_the_renames_goes_straight_back_with_no_blame() {
         let paths = paths("crash");
         swapped(&paths);
         fs::rename(&paths.installed, paths.staged()).unwrap();
         let mut host = host(&paths, None);
         watch(&paths, &mut host);
-        assert_eq!(host.calls, vec!["start restored"], "no waiting for an exe that isn't there");
+        assert_eq!(host.calls, vec!["wait for old", "start restored"], "no waiting for an exe that isn't there");
         assert_eq!(host.restored.as_deref(), Some("old"));
         assert_eq!(host.rejected, None, "the new version did nothing wrong");
         assert!(paths.read_note().unwrap().contains("interrupted"));
@@ -433,7 +498,7 @@ mod tests {
     fn what_a_recovery_left_behind_is_cleared_at_a_later_start() {
         let paths = paths("leftovers");
         fs::create_dir_all(&paths.folder).unwrap();
-        for file in [paths.failed(), paths.staged(), paths.folder.join(RECOVERY_EXE)] {
+        for file in [paths.failed(), paths.staged(), paths.stale(), paths.folder.join(RECOVERY_EXE)] {
             fs::write(&file, "x").unwrap();
             paths.clear_failed();
             assert!(!file.exists(), "{}", file.display());
@@ -446,7 +511,7 @@ mod tests {
         fs::write(&paths.installed, "new").unwrap();
         let mut host = host(&paths, None);
         watch(&paths, &mut host);
-        assert_eq!(host.calls, vec!["start new"]);
+        assert_eq!(host.calls, vec!["wait for old", "start new"]);
     }
 
     #[test]
@@ -477,24 +542,60 @@ mod tests {
         swapped(&paths);
         let mut host = host(&paths, Some(Duration::from_secs(35)));
         watch(&paths, &mut host);
-        assert_eq!(host.calls, vec!["start new"]);
+        assert_eq!(host.calls, vec!["wait for old", "start new"]);
         assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "new");
         assert_eq!(paths.read_note(), None);
     }
 
     #[test]
-    fn a_new_copy_that_is_not_healthy_in_a_minute_is_replaced_by_the_old_one() {
+    fn a_new_copy_that_is_not_healthy_in_time_is_replaced_by_the_old_one() {
         let paths = paths("unhealthy");
         swapped(&paths);
         let mut host = host(&paths, None);
         watch(&paths, &mut host);
-        assert_eq!(host.calls, vec!["start new", "stop new", "start restored"]);
+        assert_eq!(host.calls, vec!["wait for old", "start new", "stop new", "start restored"]);
         assert_eq!(host.restored.as_deref(), Some("old"));
         assert_eq!(host.now.get(), RESTORE_AFTER);
         assert!(!aside_path(&paths.installed).exists());
         assert!(!paths.swap_pending());
         let note = paths.read_note().unwrap();
         assert!(note.contains("0.7.1") && note.contains("0.7.0"), "{note}");
+    }
+
+    #[test]
+    fn the_new_service_starts_only_once_the_old_one_has_ended() {
+        let paths = paths("old-first");
+        swapped(&paths);
+        let mut host = host(&paths, Some(Duration::from_secs(20 + 35)));
+        host.old_ends_after = Duration::from_secs(20);
+        watch(&paths, &mut host);
+        assert_eq!(host.calls, vec!["wait for old", "start new"], "the slow old one doesn't count against the new");
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "new");
+    }
+
+    #[test]
+    fn the_new_copy_gets_its_whole_time_after_a_slow_old_one() {
+        let paths = paths("old-slow");
+        swapped(&paths);
+        let mut host = host(&paths, None);
+        host.old_ends_after = Duration::from_secs(20);
+        watch(&paths, &mut host);
+        assert_eq!(host.now.get(), Duration::from_secs(20) + RESTORE_AFTER);
+    }
+
+    #[test]
+    fn a_slow_watcher_leaves_the_next_update_alone() {
+        let paths = paths("next");
+        swapped(&paths);
+        let mut host = host(&paths, Some(Duration::from_secs(30)));
+        // It never got to look while its own swap had no marker.
+        host.healthy_at = None;
+        host.next_update_at = Some(Duration::from_secs(30));
+        watch(&paths, &mut host);
+        assert_eq!(host.calls, vec!["wait for old", "start new"]);
+        assert_eq!(host.rejected, None);
+        assert_eq!(paths.read_marker().unwrap().to, "0.7.2", "the next update's marker is its own");
+        assert_eq!(fs::read_to_string(&paths.installed).unwrap(), "new");
     }
 
     #[test]

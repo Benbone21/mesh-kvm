@@ -312,22 +312,12 @@ pub fn old_login_script_peer() -> Option<String> {
     crate::app::launch::peer_in_login_script(&script)
 }
 
-/// Installs `mesh-kvm.exe` into `%LOCALAPPDATA%\mesh-kvm\mesh-kvm.exe` and creates a silent
-/// windowless Startup launcher (service and tray) in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mesh-kvm-autostart.vbs`
-/// so the Windows 11 laptop automatically starts `mesh-kvm` in the background on every boot/login.
+/// Writes the Start menu entry and the login script for the installed exe, and keeps its version
+/// in Windows' list of installed apps. Only the installed copy does this: a copy run from anywhere
+/// else, such as Downloads, leaves everything as it is.
 pub fn ensure_autorun_installed() {
-    // The shortcut comes from PowerShell, which takes a moment: keep it off the caller's thread.
+    // The shortcut can take a moment: keep it off the caller's thread.
     let _ = std::thread::Builder::new().name("mesh-kvm-install".into()).spawn(install_launchers);
-}
-
-/// Rewrites the Start Menu entry and the login script for the installed exe, without touching the
-/// exe. A double-click over an old running service uses this, so the next login starts the tray.
-/// That service may overwrite the settings file, which it reads none of the new fields from, so
-/// the login script carries `peer` until a current service has started once and saved it.
-pub fn rewrite_launchers(peer: Option<&str>) {
-    if let Some(installed_exe) = crate::app::install::installed_exe() {
-        write_launchers(&installed_exe, peer);
-    }
 }
 
 fn install_launchers() {
@@ -335,33 +325,66 @@ fn install_launchers() {
     let Some(installed_exe) = install::installed_exe() else {
         return;
     };
-
+    if !install::runs_from_installed() {
+        return;
+    }
     // While an update proves itself, the old exe is what would put things right.
     if !crate::update::windows::swap_pending() {
         install::clear_stale(&installed_exe);
     }
-    if let Ok(cur_exe) = std::env::current_exe() {
-        if install::needs_install(&cur_exe, &installed_exe) {
-            if let Err(e) = install::replace_exe(&cur_exe, &installed_exe) {
-                crate::settings::log_fatal(&e);
-            }
-        }
-    }
-
     write_launchers(&installed_exe, None);
+    note_installed_version();
+}
+
+/// `--install-launchers`, which `mesh-kvm-setup.exe` runs once it has put the exe in place:
+/// starting at sign-in on or off, the Start menu entry, and the login script to match.
+pub fn install_for_setup(autostart: Option<bool>) -> Result<(), String> {
+    let installed_exe = crate::app::install::installed_exe().ok_or("Couldn't find where mesh-kvm is installed.")?;
+    if !installed_exe.exists() {
+        return Err(format!("mesh-kvm isn't installed at {}.", installed_exe.display()));
+    }
+    let marker = crate::settings::autostart_disabled_marker();
+    match autostart {
+        Some(true) => {
+            let _ = fs::remove_file(&marker);
+        }
+        Some(false) => {
+            fs::create_dir_all(crate::settings::config_dir()).map_err(|e| format!("Couldn't save the setting: {e}"))?;
+            fs::write(&marker, "").map_err(|e| format!("Couldn't save the setting: {e}"))?;
+        }
+        None => {}
+    }
+    write_launchers(&installed_exe, None);
+    note_installed_version();
+    Ok(())
+}
+
+/// Where `mesh-kvm-setup.exe` lists mesh-kvm among the installed apps.
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\mesh-kvm";
+
+/// Keeps the version shown in Windows' installed apps right, after an update or a rollback. Only
+/// an install made by `mesh-kvm-setup.exe` has the entry, and nothing else is added.
+fn note_installed_version() {
+    use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ};
+    let mut key: HKEY = ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut key) } != ERROR_SUCCESS {
+        return;
+    }
+    let version = wide(&crate::update::trust::running_version().to_string());
+    unsafe {
+        RegSetValueExW(key, wide("DisplayVersion").as_ptr(), 0, REG_SZ, version.as_ptr().cast(), (version.len() * 2) as u32);
+        RegCloseKey(key);
+    }
 }
 
 fn write_launchers(installed_exe: &Path, peer: Option<&str>) {
     let Ok(appdata) = std::env::var("APPDATA") else {
         return;
     };
-    let exe_to_run = if installed_exe.exists() {
-        installed_exe.to_path_buf()
-    } else if let Ok(cur_exe) = std::env::current_exe() {
-        cur_exe
-    } else {
+    if !installed_exe.exists() {
         return;
-    };
+    }
+    let exe_to_run = installed_exe.to_path_buf();
 
     let programs_dir = PathBuf::from(&appdata)
         .join("Microsoft")
