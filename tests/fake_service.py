@@ -15,7 +15,8 @@ poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/
 waiting-peer, installing, view-only, peer-failed, apt-failed, restored, no-polkit or stale. POST {"state": ...} to
 /fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
 --version says what version the service is, which POST {"version": ...} to /fake/version changes, as
-an update would, so the app can be seen starting again.
+an update would, so the app can be seen starting again. POST {"device": "Windows", "stage": ...} to /fake/mode to
+hold a change to that device's first screen at applying or going_back, as a service waiting on a screen does.
 --secure picks how the link's encryption stands, for both devices: encrypted, connecting, unpaired or old-peer (an
 other device too old to pair). Leave it out for a service that doesn't encrypt. POST {"state": ...} to /fake/secure to
 change it while running.
@@ -124,7 +125,7 @@ class World:
         status.update(self.settings[node])
         if change:
             left = max(0, int((change["until"] - time.time()) * 1000))
-            status["display_change"]["change"] = {k: change[k] for k in ("id", "output", "name", "from", "to")} | {"stage": "waiting", "ms_left": left}
+            status["display_change"]["change"] = {k: change[k] for k in ("id", "output", "name", "from", "to")} | {"stage": change.get("stage", "waiting"), "ms_left": left}
         return status
 
 
@@ -334,6 +335,8 @@ def serve(world):
                     set_secure_state(world, body["state"])
                 elif self.path == "/fake/version":
                     world.version = body["version"]
+                elif self.path == "/fake/mode":
+                    hold_mode_change(world, body["device"], body["stage"])
                 elif self.path.endswith("/api/local/action"):
                     if any(word in body.get("action", "") for word in ("audio", "play_only", "update")):
                         world.requests.append({"device": self.node()} | body)
@@ -390,6 +393,14 @@ def act(world, node, body):
         world.settings[node]["audio"]["play_only_on_other"] = body["enabled"]
     elif action == "set_audio_rx_muted":
         world.settings[node]["audio"]["rx_muted"] = body["muted"]
+
+
+def hold_mode_change(world, node, stage):
+    """A change to `node`'s first screen at `stage`. Only a waiting one counts down."""
+    s = world.screens[node][0]
+    to = next(m for m in s["modes"] if m != s["current"])
+    world.change[node] = {"output": s["id"], "name": s["name"], "from": s["current"], "to": to, "stage": stage,
+                          "until": time.time() + (REVERT_AFTER if stage == "waiting" else 24 * 3600), "id": int(time.time() * 1000)}
 
 
 def expire(world):

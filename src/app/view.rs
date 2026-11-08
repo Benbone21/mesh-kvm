@@ -229,9 +229,23 @@ pub fn notices(snapshot: &Snapshot, start: &ServiceStart, last_error: Option<Str
         }
     }
     let notes = Device::BOTH.into_iter().filter_map(|d| snapshot.device(d)?.display_change.note.clone());
-    all.extend(notes.map(|text| Notice { text, tone: Tone::Warn, dismiss: false }));
+    all.extend(screen_change_under_way(snapshot).into_iter().chain(notes).map(|text| Notice { text, tone: Tone::Warn, dismiss: false }));
     all.extend(last_error.map(|text| Notice { text, tone: Tone::Danger, dismiss: true }));
     all
+}
+
+/// A screen change that is being made or undone, which has nothing to answer, so it is a notice
+/// rather than a dialog. The service can stay undoing one for as long as the screen is gone.
+fn screen_change_under_way(snapshot: &Snapshot) -> Option<String> {
+    let (device, change) = snapshot.mode_change()?;
+    let screen = format!("{} on {}", change.name, snapshot.name(device));
+    let from = change.from.as_ref().map_or_else(String::new, |m| m.label());
+    let to = change.to.as_ref().map_or_else(String::new, |m| m.label());
+    match change.stage.as_str() {
+        "applying" => Some(format!("Changing {screen} to {to}.")),
+        "going_back" => Some(format!("Putting {screen} back to {from}.")),
+        _ => None,
+    }
 }
 
 /// How the window divides its width and height.
@@ -426,6 +440,24 @@ mod tests {
         assert!(shown.ends_with('…'));
         assert_eq!(full.as_deref(), Some(long));
         assert_eq!(fit_name(&"x".repeat(24)).1, None);
+    }
+
+    #[test]
+    fn a_screen_change_is_a_notice_only_while_nothing_can_be_answered() {
+        let at = |stage: &str| {
+            let mut s = linked();
+            let mut change = waiting_change();
+            change.stage = stage.into();
+            s.peer.as_mut().unwrap().display_change.change = Some(change);
+            // Whatever the fixture already has to say comes first.
+            notices(&s, &ServiceStart::Done, None, false).split_off(notices(&linked(), &ServiceStart::Done, None, false).len())
+        };
+        let applying = at("applying");
+        assert_eq!(applying[0].text, "Changing Big on windows-host to 1920 × 1080 at 60 Hz.");
+        assert_eq!((applying[0].tone, applying[0].dismiss), (Tone::Warn, false));
+        assert_eq!(at("going_back")[0].text, "Putting Big on windows-host back to 2560 × 1440 at 144 Hz.");
+        // A change waiting for an answer is the dialog's.
+        assert!(at("waiting").is_empty());
     }
 
     #[test]

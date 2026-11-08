@@ -70,7 +70,7 @@ The window is a flat dark readout. From the top down:
 
 - The status bar shows whether the devices are linked and which one has the keyboard and mouse, with Switch and Release all beside it.
 - Under it, the update line appears when an update is ready or being installed. See [Updating](#updating).
-- Five live figures follow, each with the last minute of history drawn beside it. These include ROUND TRIP and LOST.
+- Five live figures follow, each with the last minute of history drawn beside it: ROUND TRIP, LOST, AUDIO LOST, AUDIO BUFFER and LINK.
 - Below is one table with every setting for both devices side by side, this device first. It is grouped INPUT, SCREENS, CLIPBOARD, AUDIO, GAMES, STARTUP, BOTH DEVICES and UPDATES.
 - The layout, your desk with every monitor of both devices to scale, sits beside the table, or under it in a narrow window. The screens of the device that has the keyboard and mouse are lit.
 
@@ -78,7 +78,7 @@ The window scrolls if it doesn't all fit. Everything sizes from the window, and 
 
 The window remembers its size and app size. It remembers its position on Windows and on X11. On Wayland the desktop chooses where windows open, so the position isn't kept. These are saved in `~/.local/share/mesh-kvm` on Debian and `%APPDATA%\mesh-kvm\data` on Windows.
 
-Devices go by their own names. Click a device's name at the top of its column and type to rename it, from either device. Leave it empty to go back to its network name.
+Devices go by their own names. To rename one, type in its cell in the Name row at the top of BOTH DEVICES, from either device. Leave it empty to go back to its network name.
 
 The tray icon sits in the notification area. Its menu has Open, Switch device, Release all input, and Quit mesh-kvm.
 
@@ -147,7 +147,7 @@ mesh-kvm is built for a network that loses packets, delays them, and now and the
 - If the other device can be heard but can't hear this one, even from the moment the link came up, as with a firewall on it, this device keeps its keyboard and mouse. It takes them back after 2.5 seconds if they had crossed, refuses to cross, and says so. Control returns in the same way once the other device can hear.
 - Text you copy while the other device can't be reached goes when the link is back. Only the newest copy waits, and for at most 10 minutes. Anything copied since on either device takes its place, and if both devices have text waiting, both end up with the later one. Images and files don't wait: a note under Clipboard says what stayed behind, and to copy it again.
 
-The ROUND TRIP and LOST figures at the top show how the link looks: the time for a packet to get there and back, and the worst loss in either direction, counting what audio loses as well as the link's own packets. Hover over one for each direction. A figure stands out from 5% loss or 150 ms. It shows `--` until it's known. While the link is down it gives no figures, and the other device shows as Link down. If the other device can't hear this one, it says that instead.
+The ROUND TRIP and LOST figures at the top show how the link looks: the time for a packet to get there and back, and the worst loss in either direction, counting what audio loses as well as the link's own packets. Each device's own figures are in a note under BOTH DEVICES that starts with its name, such as `Laptop: Link: 0.5% lost, 12 ms round trip.` Hover over that note for each direction. A figure stands out from 5% loss or 150 ms. It shows `--` until it's known. While the link is down it gives no figures, and the other device shows as Link down. If the other device can't hear this one, it says that instead.
 
 ## Arranging screens
 

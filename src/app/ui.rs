@@ -301,9 +301,12 @@ impl Window {
         self.body(ctx, snapshot, &on, now);
 
         let first_run = model::needs_peer(snapshot);
+        // Only a change waiting for an answer is a dialog. One being made or undone is a notice,
+        // as the service can be undoing it for as long as its screen is gone.
+        let waiting_change = snapshot.mode_change().filter(|(_, change)| change.is_waiting());
         let dialog_up = first_run
             || self.peer_prompt.open
-            || snapshot.mode_change().is_some()
+            || waiting_change.is_some()
             || self.show_licences
             || self.pairing.open
             || self.unpair_confirm;
@@ -312,7 +315,7 @@ impl Window {
         if first_run || self.peer_prompt.open {
             self.peer_window(ctx, snapshot, first_run);
         }
-        if let Some((device, change)) = snapshot.mode_change() {
+        if let Some((device, change)) = waiting_change {
             self.mode_prompt(ctx, snapshot, device, change);
         }
         self.pairing_window(ctx, snapshot, now);
@@ -408,13 +411,12 @@ impl Window {
         }
     }
 
-    /// Asks whether to keep a new mode. Only the device with the screen can keep it, as only
-    /// someone there can see it worked. The other device's window can still send it back, and Esc
-    /// does too. The service undoes the change by itself if nobody answers, so closing this window
-    /// can't leave a blank screen.
+    /// Asks whether to keep a new mode that is waiting for an answer. Only the device with the
+    /// screen can keep it, as only someone there can see it worked. The other device's window can
+    /// still send it back, and Esc does too. The service undoes the change by itself if nobody
+    /// answers, so closing this window can't leave a blank screen.
     fn mode_prompt(&mut self, ctx: &egui::Context, snapshot: &Snapshot, device: Device, change: &ModeChange) {
         let (mut keep, mut undo) = (false, false);
-        let waiting = change.is_waiting();
         let seconds = (change.ms_left as f32 / 1000.0).ceil() as u32;
         let target = change.to.as_ref().map_or_else(String::new, |m| m.label());
         let going_back = change.from.as_ref().map_or_else(String::new, |m| m.label());
@@ -422,35 +424,25 @@ impl Window {
         let here = snapshot.is_here(device);
         let elsewhere = format!("It can only be kept from {}.", snapshot.name(device));
         let shown = dialog::show(ctx, egui::Id::new("mode prompt"), "Keep these screen settings?", self.dialog_opacity, |ui| {
-            match change.stage.as_str() {
-                "applying" => {
-                    dialog::text(ui, &format!("Changing {screen} to {target}."), Type::Body, TEXT);
-                }
-                "going_back" => {
-                    dialog::text(ui, &format!("Putting {screen} back to {going_back}."), Type::Body, TEXT);
-                }
-                _ => {
-                    dialog::text(ui, &format!("{screen} is now {target}."), Type::Body, TEXT);
-                    let when = format!("It goes back to {going_back} in {seconds} seconds unless you keep it.");
-                    dialog::text(ui, &when, Type::Caption, TEXT_DIM);
-                    let share = change.ms_left as f32 / 1000.0 / MODE_PROMPT_SECONDS;
-                    countdown(ui, share);
-                    if !here {
-                        dialog::text(ui, &elsewhere, Type::Caption, TEXT_DIM);
-                    }
-                    dialog::buttons(ui, "mode", |ui| {
-                        let back = dialog::button(ui, "Go back now", ButtonKind::Secondary, true);
-                        dialog::focus_on_open(ui, &back);
-                        undo = back.clicked();
-                        if here {
-                            keep = dialog::button(ui, "Keep this", ButtonKind::Primary, true).clicked();
-                        }
-                    });
-                }
+            dialog::text(ui, &format!("{screen} is now {target}."), Type::Body, TEXT);
+            let when = format!("It goes back to {going_back} in {seconds} seconds unless you keep it.");
+            dialog::text(ui, &when, Type::Caption, TEXT_DIM);
+            let share = change.ms_left as f32 / 1000.0 / MODE_PROMPT_SECONDS;
+            countdown(ui, share);
+            if !here {
+                dialog::text(ui, &elsewhere, Type::Caption, TEXT_DIM);
             }
+            dialog::buttons(ui, "mode", |ui| {
+                let back = dialog::button(ui, "Go back now", ButtonKind::Secondary, true);
+                dialog::focus_on_open(ui, &back);
+                undo = back.clicked();
+                if here {
+                    keep = dialog::button(ui, "Keep this", ButtonKind::Primary, true).clicked();
+                }
+            });
         });
         undo |= shown.escaped;
-        if waiting && (keep || undo) {
+        if keep || undo {
             self.client.local_action(device, model::mode_answer(change, keep));
         }
     }
@@ -1970,6 +1962,71 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(sent, "{want} in {:?}", log.lock().unwrap());
+    }
+
+    /// Waits until `log` has a request containing `part`.
+    fn logged(log: &std::sync::Mutex<Vec<String>>, part: &str) -> bool {
+        for _ in 0..400 {
+            if log.lock().unwrap().iter().any(|b| b.contains(part)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Clicks the middle of the text `label` drawn in the last frame.
+    fn click_text(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, label: &str, now: Instant) {
+        let output = settled(ctx, window, snapshot, WINDOW_SIZE);
+        let at = texts(&output).into_iter().find(|(t, _)| t == label).expect(label).1.center();
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+    }
+
+    #[test]
+    fn a_screen_change_being_made_is_a_notice_and_the_window_keeps_working() {
+        a_screen_change_in_stage_leaves_the_window_working("applying", "Changing Big on windows-host to");
+    }
+
+    /// The service can be putting a screen back for as long as the screen is gone.
+    #[test]
+    fn a_screen_change_being_undone_is_a_notice_and_the_window_keeps_working() {
+        a_screen_change_in_stage_leaves_the_window_working("going_back", "Putting Big on windows-host back to");
+    }
+
+    /// With the other device's screen change at `stage`, its notice starts with `says`, no dialog
+    /// is up, and a table cell, Release all and Switch can all be clicked.
+    fn a_screen_change_in_stage_leaves_the_window_working(stage: &str, says: &str) {
+        let local = r#"{"node":"debian","hostname":"debian-host","ip":"192.168.8.2","peer_online":true}"#;
+        let (port, log) = logging_service(local, r#"{"ok":true}"#);
+        let mut window = Window::new(Client::start_on(port, Box::new(|| {})), ServiceStarter::default());
+        window.reduced = true;
+        for _ in 0..400 {
+            if window.client.snapshot().local.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ctx = context();
+        let mut snapshot = linked();
+        let mut change = waiting_change();
+        change.stage = stage.into();
+        let mode = if stage == "applying" { change.to.clone() } else { change.from.clone() };
+        snapshot.peer.as_mut().unwrap().display_change.change = Some(change);
+        let now = Instant::now();
+
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, WINDOW_SIZE));
+        let line = format!("{says} {}.", mode.unwrap().label());
+        assert!(text.contains(&format!("\n{line}\n")), "{stage}: {line}\n{text}");
+        assert!(!text.contains("\nKEEP THESE SCREEN SETTINGS?\n"), "{stage}: no dialog\n{text}");
+
+        click_cell(&ctx, &mut window, &snapshot, "Share mouse", 0, now);
+        assert_eq!(window.edits.shown((Device::Debian, Control::MouseSharing), 1.0, now), 0.0, "{stage}: the table");
+        click_text(&ctx, &mut window, &snapshot, "Release all", now);
+        assert!(logged(&log, "panic"), "{stage}: Release all in {:?}", log.lock().unwrap());
+        click_text(&ctx, &mut window, &snapshot, "Switch to windows-host", now);
+        assert!(logged(&log, "toggle_focus"), "{stage}: Switch in {:?}", log.lock().unwrap());
     }
 
     #[test]
