@@ -1483,7 +1483,7 @@ def test(exe_path):
     shutil.rmtree(PREFIX, ignore_errors=True)
     os.makedirs(PREFIX, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
-    env.update(WINEPREFIX=PREFIX, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
+    env.update(WINEPREFIX=PREFIX, WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d")
     # Wine looks for the desktop's Wayland socket here, and setting up a prefix can hang on it.
     env["XDG_RUNTIME_DIR"] = os.path.join(os.path.dirname(PREFIX), "wine_link_run")
     os.makedirs(env["XDG_RUNTIME_DIR"], mode=0o700, exist_ok=True)

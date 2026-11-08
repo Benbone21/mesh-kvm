@@ -71,7 +71,7 @@ def silent(timeout):
 class Wine:
     def __init__(self, log):
         self.env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
-        self.env.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=")
+        self.env.update(WINEPREFIX=str(PREFIX), WINEDEBUG="-all", WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d")
         self.env["XDG_RUNTIME_DIR"] = str(PREFIX.parent / "wine_setup_run")
         os.makedirs(self.env["XDG_RUNTIME_DIR"], mode=0o700, exist_ok=True)
         self.log = log
