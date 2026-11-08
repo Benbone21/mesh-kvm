@@ -28,6 +28,8 @@ const PEER_UNREACHABLE: u16 = 502;
 const PAIRING_WAIT: Duration = Duration::from_secs(6);
 /// A one way link has to hold this long before the link line says so while the link is down.
 const ONE_WAY_HOLD: Duration = Duration::from_secs(1);
+/// How long a setting's error stays under its row when no later change clears it.
+const ROW_ERROR_SHOWN: Duration = Duration::from_secs(10);
 const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
 
 struct Job {
@@ -163,15 +165,15 @@ impl Client {
                     let problem = send_problem(&job.title, reply);
                     if let Some(row) = job.row {
                         let mut errors = lock(&sender.row_errors);
+                        // A change to that row that works is the answer to its old error.
                         match problem {
                             Some(message) => {
                                 errors.insert(row, (message, Instant::now()));
                                 lock(&sender.refused).push(row);
                             }
-                            None if errors.get(&row).is_some_and(|(_, at)| at.elapsed() >= sender.error_hold) => {
+                            None => {
                                 errors.remove(&row);
                             }
-                            None => {}
                         }
                         continue;
                     }
@@ -228,11 +230,21 @@ impl Client {
         lock(&self.shared.last_error).as_ref().map(|(m, _)| m.clone())
     }
 
-    // Task 7's rows read this; until then only tests do.
-    #[allow(dead_code)]
-    /// Why the last change to one setting didn't go through, for that setting's row.
+    /// Why the last change to one setting didn't go through, for that setting's row. It goes
+    /// when a later change to that setting works, or after `ROW_ERROR_SHOWN`.
     pub fn row_error(&self, key: (Device, Control)) -> Option<String> {
-        lock(&self.shared.row_errors).get(&key).map(|(m, _)| m.clone())
+        let now = Instant::now();
+        lock(&self.shared.row_errors).get(&key).and_then(|entry| still_shown(entry, now)).map(str::to_string)
+    }
+
+    /// How long until the next row error goes, so the window can be drawn again then.
+    pub fn next_row_error_change(&self) -> Option<Duration> {
+        let now = Instant::now();
+        lock(&self.shared.row_errors)
+            .values()
+            .filter_map(|(_, at)| (*at + ROW_ERROR_SHOWN).checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+            .min()
     }
 
     /// The settings whose change was refused since the last call, each listed once per refusal.
@@ -377,6 +389,11 @@ impl Drop for Client {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A row error's message while it is still to be shown at `now`.
+fn still_shown(entry: &(String, Instant), now: Instant) -> Option<&str> {
+    (now.saturating_duration_since(entry.1) < ROW_ERROR_SHOWN).then_some(entry.0.as_str())
 }
 
 /// What went wrong with a queued change, if anything. The service's own error text here is for
@@ -802,7 +819,15 @@ mod tests {
     }
 
     #[test]
-    fn a_control_that_works_clears_its_rows_error_after_the_hold() {
+    fn a_row_error_goes_by_itself_after_a_while() {
+        let at = Instant::now();
+        let entry = ("Laptop didn't accept that change.".to_string(), at);
+        assert_eq!(still_shown(&entry, at + ROW_ERROR_SHOWN - Duration::from_millis(1)), Some(entry.0.as_str()));
+        assert_eq!(still_shown(&entry, at + ROW_ERROR_SHOWN), None);
+    }
+
+    #[test]
+    fn a_control_that_works_clears_its_rows_error_at_once() {
         let refuse = Arc::new(AtomicBool::new(true));
         let answer = refuse.clone();
         let (port, _) = stub(move |method, path, _| match (method, path) {
@@ -813,7 +838,7 @@ mod tests {
             ("POST", _) => (200, r#"{"ok":true}"#.into()),
             _ => (404, "{}".into()),
         });
-        let client = start_holding(port, Duration::from_millis(0));
+        let client = start_holding(port, ERROR_HOLD);
         ready(&client);
         let key = (Device::Debian, Control::Autostart);
         client.send_control(key.0, key.1, 1.0);

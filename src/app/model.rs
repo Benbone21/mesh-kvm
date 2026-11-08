@@ -21,8 +21,6 @@ const MOST_WINDOW_ZOOM: f32 = 1.75;
 const ZOOM_STEP: f32 = 0.05;
 /// The share of a monitor the smallest window may take, leaving room for its frame and a panel.
 const MOST_OF_MONITOR: f32 = 0.9;
-/// Below this width the two device columns would be too narrow.
-const TWO_COLUMNS_FROM: f32 = 1360.0;
 /// How far the snap keeps a device on the edge it's dragged along: enough of it to cross at.
 const MIN_TOUCH_ALONG_X: i32 = 280;
 const MIN_TOUCH_ALONG_Y: i32 = 240;
@@ -862,21 +860,13 @@ impl Edits {
         }
     }
 
-    // Task 7's rows read this; until then only tests do.
-    #[allow(dead_code)]
     /// Whether `key` has a value the person set that the poll hasn't shown yet.
     pub fn is_saving(&self, key: (Device, Control), polled: f64, now: Instant) -> bool {
         self.entries.get(&key).is_some_and(|e| (e.unsent || now < e.held_until) && e.value != polled)
     }
 
-    // Task 7's rows use this; `send_changes` uses `forget_sent` until then.
-    #[allow(dead_code)]
-    /// Drops an edit, for a change the service refused, so the control shows the polled value again.
-    pub fn forget(&mut self, key: (Device, Control)) {
-        self.entries.remove(&key);
-    }
-
-    /// `forget`, but only for an edit already sent, so a newer one the person made since waits.
+    /// Drops an edit already sent, for a change the service refused, so the control shows the
+    /// polled value again. A newer one the person made since waits to be sent.
     pub fn forget_sent(&mut self, key: (Device, Control)) {
         if self.entries.get(&key).is_some_and(|e| !e.unsent) {
             self.entries.remove(&key);
@@ -1315,24 +1305,6 @@ pub fn window_zoom(width: f32, height: f32) -> f32 {
     (zoom / ZOOM_STEP).round() * ZOOM_STEP
 }
 
-/// How the window's body divides up.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BodyLayout {
-    /// The width of the controls beside the arrangement.
-    pub rail: f32,
-    /// How many device columns the controls have: 2 puts the devices side by side.
-    pub columns: usize,
-}
-
-/// The arrangement gets what the controls leave, and always the full height. `width` is in points.
-pub fn body_layout(width: f32) -> BodyLayout {
-    if width >= TWO_COLUMNS_FROM {
-        BodyLayout { rail: (width * 0.44).clamp(620.0, 920.0), columns: 2 }
-    } else {
-        BodyLayout { rail: (width * 0.36).clamp(300.0, 420.0), columns: 1 }
-    }
-}
-
 /// Takes the polled layout, except that while the laptop is being dragged the layout the person
 /// is editing stays as it is.
 pub fn merge_poll(
@@ -1488,15 +1460,6 @@ mod tests {
         let later = t + HOLD + Duration::from_millis(1);
         assert!(!edits.is_saving(key, 0.0, later));
         assert_eq!(edits.shown(key, 0.0, later), 0.0, "an answer that never came snaps back once the hold is over");
-    }
-
-    #[test]
-    fn forgetting_an_edit_snaps_back_at_once() {
-        let (mut edits, t, key) = (Edits::default(), Instant::now(), (Device::Debian, Control::Autostart));
-        edits.set(key, 1.0, t);
-        edits.forget(key);
-        assert_eq!(edits.shown(key, 0.0, t), 0.0);
-        assert!(edits.take_due(t).is_empty());
     }
 
     #[test]
@@ -1971,15 +1934,6 @@ mod tests {
         assert!(window_zoom(7680.0, 4320.0) <= 1.75 + f32::EPSILON);
         // Wide but short doesn't count as big.
         assert_eq!(window_zoom(3000.0, 700.0), 1.0);
-    }
-
-    #[test]
-    fn the_devices_go_side_by_side_only_with_room_for_both() {
-        assert_eq!(body_layout(760.0), BodyLayout { rail: 300.0, columns: 1 });
-        assert_eq!(body_layout(1100.0).columns, 1);
-        let wide = body_layout(1700.0);
-        assert_eq!(wide.columns, 2);
-        assert!(1700.0 - wide.rail > 900.0, "the arrangement stays the larger part");
     }
 
     #[test]

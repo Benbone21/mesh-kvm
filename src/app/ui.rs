@@ -1,34 +1,37 @@
 //! The app window. It draws what the `Client` last polled and sends what the person changes. The
-//! decisions live in `model`; the arrangement is in `canvas`, and the device controls in `panels`.
+//! decisions live in `model`, `view` and `rows`; the top is drawn in `top`, the settings in
+//! `table` and the arrangement in `canvas`.
 
 use super::canvas::Canvas;
 use super::client::{Client, PairingReply};
 use super::launch::ServiceStarter;
-use super::model::{self, ControlsEnabled, Device, Edits, LayoutDraft, ModeChange, ServiceStart, Snapshot};
+use super::model::{self, Control, ControlsEnabled, Device, Edits, LayoutDraft, ModeChange, Picks, ServiceStart, Snapshot};
 use super::pairing::{self, PairingInput, PairingRequest, PairingView};
-use super::panels::{self, Panels, Requests, Shared};
+use super::rows::{self, ActionKind, ChoiceValue, GroupRows, Pick, RowsInput, Setting};
 use super::sparkline::Sparklines;
-use super::theme::{self, legacy::{AMBER, DEEP, PANEL, RED}, Type, SPACE_2, SPACE_3, SPACE_5, SURFACE, TEXT};
+use super::table::{Table, TableRequest};
+use super::theme::{
+    self, legacy::{AMBER, DEEP, RED}, line, Type, BG, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5, SURFACE, TEXT,
+    TEXT_DIM,
+};
 use super::top::{self, TopRequest};
 use super::updates::{self, Banner, VersionWatch};
 use super::view;
-use super::widgets::{segment, slider_row, small};
+use super::widgets::{small, status_square};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
-    self, vec2, Align2, Frame, Key, Margin, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
+    self, vec2, Align, Align2, Frame, Key, Layout, Margin, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
     ViewportCommand,
 };
-use std::ops::RangeInclusive;
+use serde_json::json;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const WINDOW_SIZE: [f32; 2] = [1100.0, 760.0];
+pub(super) const WINDOW_SIZE: [f32; 2] = [1280.0, 760.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
-/// Below this width the arrangement's settings take two rows.
-const THREE_SETTINGS_FROM: f32 = 620.0;
-
-const EDGE_PUSH_RANGE: RangeInclusive<f64> = 10.0..=180.0;
+/// The space around the layout canvas.
+const CANVAS_MARGIN: Margin = Margin::same(SPACE_5 as i8);
 /// How often to look at how starting the service is going.
 const START_CHECK: Duration = Duration::from_millis(250);
 const PEER_PROMPT_WIDTH: f32 = 380.0;
@@ -123,13 +126,13 @@ struct Window {
     starter: ServiceStarter,
     peer_prompt: PeerPrompt,
     pairing: PairingWindow,
-    /// The Settings menu was drawn this frame, so it is open and wants the fingerprint.
-    pairing_in_menu: bool,
     show_licences: bool,
     edits: Edits,
+    /// The audio devices just picked, shown ahead of the poll.
+    picks: Picks,
     layout: LayoutDraft,
     canvas: Canvas,
-    panels: Panels,
+    table: Table,
     main_change: Option<Receiver<Result<(), String>>>,
     main_error: Option<String>,
     /// The device the failed change was for, and whether the link has been seen down since.
@@ -140,7 +143,6 @@ struct Window {
     window_zoom: f32,
     /// The smallest size last given to the window.
     smallest_sent: Option<(f32, f32)>,
-    settings_height: f32,
     /// The last line about an update under way, for while its service can't be seen.
     update_under_way: Option<Banner>,
     /// The version the device that's behind was last told to look for.
@@ -173,12 +175,12 @@ impl Window {
             starter,
             peer_prompt: PeerPrompt::default(),
             pairing: PairingWindow::default(),
-            pairing_in_menu: false,
             show_licences: false,
             edits: Edits::default(),
+            picks: Picks::default(),
             layout: LayoutDraft::default(),
             canvas: Canvas::default(),
-            panels: Panels::default(),
+            table: Table::default(),
             main_change: None,
             main_error: None,
             main_choice: None,
@@ -186,7 +188,6 @@ impl Window {
             ui_scale: DEFAULT_UI_SCALE,
             window_zoom: 1.0,
             smallest_sent: None,
-            settings_height: 0.0,
             update_under_way: None,
             nudged_for: None,
             version_watch: VersionWatch::default(),
@@ -230,7 +231,6 @@ impl Window {
         self.collect_main_change();
         self.collect_peer_change();
         self.collect_pairing();
-        self.pairing_in_menu = false;
         self.clear_stale_main_error(snapshot, &on);
         let start = self.starter.state();
         self.layout.follow(snapshot.layout.clone(), self.canvas.is_dragging(), now);
@@ -240,17 +240,8 @@ impl Window {
         let mut requests = Vec::new();
         let bar = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
         egui::TopBottomPanel::top("status bar").frame(bar).show(ctx, |ui| {
-            // The Settings menu stays at the end until the settings table takes its place.
-            let menu = ui.fonts(|f| f.layout_no_wrap("Settings".into(), Type::Body.font(), TEXT)).size().x
-                + 2.0 * ui.spacing().button_padding.x
-                + ui.spacing().item_spacing.x;
-            ui.horizontal(|ui| {
-                let room = (ui.available_width() - menu).max(0.0);
-                let switch_name = line.switch_to.map(|d| snapshot.title(d));
-                let status = ui.allocate_ui(vec2(room, 0.0), |ui| top::status_bar(ui, &line, theme::tone(line.square), switch_name.as_deref()));
-                requests.extend(status.inner);
-                ui.menu_button("Settings", |ui| self.settings_menu(ui, snapshot));
-            });
+            let switch_name = line.switch_to.map(|d| snapshot.title(d));
+            requests.extend(top::status_bar(ui, &line, theme::tone(line.square), switch_name.as_deref()));
         });
         let banner = self.follow_update(ctx, snapshot);
         let updating = self.update_under_way.is_some();
@@ -270,26 +261,7 @@ impl Window {
             self.apply_top(snapshot, request);
         }
 
-        let body = model::body_layout(ctx.screen_rect().width());
-        egui::SidePanel::right("controls")
-            .exact_width(body.rail)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(Frame::new().fill(PANEL))
-            .show(ctx, |ui| self.controls(ui, snapshot, &on, body.columns, now));
-        let settings = egui::TopBottomPanel::bottom("arrangement settings")
-            .show_separator_line(false)
-            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::legacy::MARGIN, right: theme::legacy::MARGIN, top: 0, bottom: 12 }))
-            .show(ctx, |ui| self.arrangement_settings(ui, snapshot, &on, now));
-        // A panel takes the height it had last frame, so a reflow needs one more frame to settle.
-        let settings_height = settings.response.rect.height();
-        if settings_height != self.settings_height {
-            self.settings_height = settings_height;
-            ctx.request_repaint();
-        }
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(DEEP).inner_margin(Margin { left: theme::legacy::MARGIN, right: theme::legacy::MARGIN, top: theme::legacy::MARGIN, bottom: 10 }))
-            .show(ctx, |ui| self.canvas.show(ui, &mut self.layout, snapshot, now));
+        self.body(ctx, snapshot, &on, now);
 
         let first_run = model::needs_peer(snapshot);
         self.licences_window(ctx);
@@ -300,12 +272,14 @@ impl Window {
             self.mode_prompt(ctx, snapshot, device, change);
         }
         self.pairing_window(ctx, snapshot, now);
-        // The menu is drawn inside the status bar, so only now is it known whether it was open.
-        self.client.want_pairing(self.pairing.open || self.pairing_in_menu);
+        // The table shows the fingerprint whenever the service encrypts.
+        let encrypts = snapshot.local.as_ref().is_some_and(|l| !l.secure.is_empty());
+        self.client.want_pairing(self.pairing.open || encrypts);
 
         self.canvas.end_lost_drag(ctx, &mut self.layout, now);
         self.send_changes(now);
-        let wake = [self.edits.next_wake(now), self.layout.next_wake(now)].into_iter().flatten().min();
+        let wake = [self.edits.next_wake(now), self.layout.next_wake(now), self.client.next_row_error_change()];
+        let wake = wake.into_iter().flatten().min();
         if let Some(wake) = wake {
             ctx.request_repaint_after(wake);
         }
@@ -635,82 +609,6 @@ impl Window {
         self.main_change = Some(change);
     }
 
-    fn settings_menu(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
-        ui.set_min_width(260.0);
-        ui.label("App size");
-        ui.horizontal_wrapped(|ui| {
-            for scale in UI_SCALES {
-                let text = format!("{:.0}%", scale * 100.0);
-                if ui.selectable_label(self.ui_scale == scale, text).clicked() {
-                    self.ui_scale = scale;
-                }
-            }
-        });
-        ui.label(small("Ctrl and plus or minus do the same."));
-        if let Some(local) = snapshot.local.as_ref().filter(|l| l.paired == Some(true)) {
-            ui.add_space(8.0);
-            ui.label(format!("{}'s address", snapshot.title(snapshot.in_order()[1])));
-            ui.label(small(&local.peer_ip));
-            ui.add_enabled_ui(!local.peer_pinned, |ui| {
-                if ui.button("Change address").clicked() {
-                    self.peer_prompt.open = true;
-                    ui.close_menu();
-                }
-            });
-            if local.peer_pinned {
-                ui.label(small("How mesh-kvm starts on this device sets the address, so it can't be changed here."));
-            }
-        }
-        self.pairing_settings(ui, snapshot);
-        if let Some(update) = snapshot.local.as_ref().and_then(|l| l.update.as_ref()) {
-            ui.add_space(8.0);
-            ui.label("Updates");
-            ui.label(small(format!("This is version {}.", update.current)));
-            if ui.button("Check now").clicked() {
-                self.client.local_action(snapshot.in_order()[0], serde_json::json!({ "action": "check_update" }));
-            }
-            if let Some(note) = &update.note {
-                ui.label(small(note));
-            }
-        }
-        ui.add_space(8.0);
-        if ui.button("Licences").clicked() {
-            self.show_licences = true;
-            ui.close_menu();
-        }
-    }
-
-    /// Whether the devices are paired, in the Settings menu. A service that doesn't encrypt has nothing here.
-    fn pairing_settings(&mut self, ui: &mut Ui, snapshot: &Snapshot) {
-        let Some(local) = snapshot.local.as_ref().filter(|l| !l.secure.is_empty()) else { return };
-        self.pairing_in_menu = true;
-        ui.add_space(8.0);
-        if local.secure == "unpaired" {
-            if ui.button("Pair").clicked() {
-                self.open_pairing(snapshot);
-                ui.close_menu();
-            }
-            return;
-        }
-        let other = snapshot.title(snapshot.in_order()[1]);
-        ui.label(format!("Paired with {other}"));
-        ui.label(small(model::paired_line(&local.secure, &other)));
-        if let Some(fingerprint) = snapshot.pairing.as_ref().and_then(|p| p.fingerprint.as_deref()) {
-            ui.label(small(format!("Fingerprint, the same on both: {fingerprint}")));
-        }
-        let unpairing = self.pairing.unpairing.is_some();
-        if ui.add_enabled(!unpairing, egui::Button::new("Unpair")).clicked() {
-            self.pairing.unpair_error = None;
-            self.pairing.unpairing = Some(self.send_pairing(ui.ctx(), serde_json::json!({ "action": "unpair" })));
-        }
-        if unpairing {
-            ui.label(small("Still working on it."));
-        }
-        if let Some(error) = &self.pairing.unpair_error {
-            ui.label(small(error).color(RED));
-        }
-    }
-
     fn licences_window(&mut self, ctx: &egui::Context) {
         // Wide enough for the licence's own line breaks, as long as the window allows it.
         let width = LICENCES_WIDTH.min(ctx.screen_rect().width() - 2.0 * theme::legacy::MARGIN as f32);
@@ -721,159 +619,201 @@ impl Window {
         });
     }
 
-    /// Where the devices sit and which leads, under the map they belong to.
-    fn arrangement_settings(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
-        let gap = theme::legacy::MARGIN as f32;
-        let width = ui.available_width();
-        let three = width >= THREE_SETTINGS_FROM;
-        let column = if three { (width - 2.0 * gap) / 3.0 } else { (width - gap) / 2.0 };
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(column);
-                    self.position_control(ui, snapshot, on, now);
-                });
-                ui.vertical(|ui| {
-                    ui.set_width(column);
-                    self.edge_push_control(ui, on, now);
-                });
-                if three {
-                    ui.vertical(|ui| {
-                        ui.set_width(column);
-                        self.main_device_controls(ui, snapshot, on);
+    /// The settings table and the layout canvas, side by side or one above the other, or why
+    /// there are none.
+    fn body(&mut self, ctx: &egui::Context, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
+        if snapshot.local.is_none() {
+            self.no_service_body(ctx, snapshot);
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let frame = view::frame_layout(screen.width(), screen.height());
+        let groups = self.groups(snapshot, on, now);
+        let columns = snapshot.in_order().map(|device| (device, snapshot.title(device)));
+        let label_width = view::label_width(frame.settings_width);
+        let selected = self.canvas.selected.clone();
+        let scroll_to_selected = self.canvas.just_selected;
+        let settings = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
+        let (table, canvas, layout) = (&mut self.table, &mut self.canvas, &mut self.layout);
+        let mut draw_table =
+            |ui: &mut Ui| table.show(ui, &groups, columns.clone(), label_width, selected.as_ref(), scroll_to_selected, now);
+        let mut requests = Vec::new();
+        if frame.stacked {
+            egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    settings.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        requests = draw_table(ui);
                     });
-                }
+                    ui.allocate_ui(vec2(ui.available_width(), view::STACKED_CANVAS_HEIGHT), |ui| {
+                        Frame::new().inner_margin(CANVAS_MARGIN).show(ui, |ui| canvas.show(ui, layout, snapshot, now));
+                    });
+                });
+            });
+        } else if frame.body_scrolls {
+            // Too short for the table to scroll beside a squashed canvas, so both scroll together.
+            egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
+                let visible = ui.available_height();
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let size = vec2(frame.settings_width, 0.0);
+                        let column = ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+                            settings.show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                requests = draw_table(ui);
+                            });
+                        });
+                        let column = column.response.rect;
+                        ui.painter().vline(column.right() - 0.5, column.y_range(), line(1.0, LINE));
+                        let height = column.height().max(visible);
+                        ui.allocate_ui(vec2(ui.available_width(), height), |ui| {
+                            Frame::new().inner_margin(CANVAS_MARGIN).show(ui, |ui| canvas.show(ui, layout, snapshot, now));
+                        });
+                    });
+                });
+            });
+        } else {
+            egui::SidePanel::left("settings")
+                .exact_width(frame.settings_width)
+                .resizable(false)
+                .show_separator_line(true)
+                .frame(settings)
+                .show(ctx, |ui| {
+                    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| requests = draw_table(ui));
+                });
+            egui::CentralPanel::default()
+                .frame(Frame::new().fill(BG).inner_margin(CANVAS_MARGIN))
+                .show(ctx, |ui| canvas.show(ui, layout, snapshot, now));
+        }
+        self.apply_table(ctx, snapshot, requests, now);
+    }
+
+    /// With no service there is nothing to set, only why.
+    fn no_service_body(&self, ctx: &egui::Context, snapshot: &Snapshot) {
+        let start = self.starter.state();
+        let text = model::start_notice(&start, snapshot).or_else(|| model::status_message(snapshot)).unwrap_or_default();
+        let square = if model::notice_is_serious(snapshot, &start) { DANGER } else { TEXT_DIM };
+        let frame = Frame::new().fill(BG).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_4 as i8));
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = SPACE_3;
+                ui.vertical(|ui| {
+                    // In line with the middle of the first line of text.
+                    let line_height = Type::Body.font().size * 1.4;
+                    ui.add_space((line_height - theme::STATUS_SQUARE) / 2.0);
+                    status_square(ui, square);
+                });
+                let mut job = Type::Body.job(&text, TEXT);
+                job.wrap.max_width = ui.available_width();
+                ui.label(job);
             });
         });
-        if !three {
-            self.main_device_controls(ui, snapshot, on);
+    }
+
+    /// Every group of the settings table, from the poll and what the person has just changed.
+    fn groups(&self, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) -> Vec<GroupRows> {
+        let client = &self.client;
+        let row_error = |key: (Device, Control)| client.row_error(key);
+        rows::groups(&RowsInput {
+            snapshot,
+            layout: self.layout.state.as_ref(),
+            edits: &self.edits,
+            picks: &self.picks,
+            on,
+            row_error: &row_error,
+            ui_scale: self.ui_scale,
+            main_changing: self.main_change.is_some(),
+            main_error: self.main_error.as_deref(),
+            unpairing: self.pairing.unpairing.is_some(),
+            unpair_error: self.pairing.unpair_error.as_deref(),
+            now,
+        })
+    }
+
+    /// Does what the person asked for in the table.
+    fn apply_table(&mut self, ctx: &egui::Context, snapshot: &Snapshot, requests: Vec<TableRequest>, now: Instant) {
+        for request in requests {
+            match request {
+                TableRequest::Set(device, control, value) => self.edits.set((device, control), value, now),
+                TableRequest::Number(Setting::EdgePush, value) => {
+                    if let Some(state) = &mut self.layout.state {
+                        state.config.edge_resistance = value.round() as i32;
+                    }
+                    self.layout.edited(now);
+                }
+                TableRequest::Number(..) => {}
+                TableRequest::Toggle(setting) => self.toggle_game_lock(setting, now),
+                TableRequest::Pick(device, pick, value) => self.apply_pick(device, pick, value, now),
+                TableRequest::Rename(device, name) => {
+                    self.client.local_action(device, json!({ "action": "set_device_name", "name": name }));
+                }
+                TableRequest::Action(device, action) => self.apply_action(ctx, snapshot, device, action),
+                TableRequest::Hover(monitor) => self.canvas.hovered_in_controls = monitor,
+            }
         }
     }
 
-    fn position_control(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
-        let cfg = self.layout.state.as_ref().map(|s| s.config.clone()).unwrap_or_default();
-        let has_layout = self.layout.state.is_some();
-        let placements = model::placements(&cfg, snapshot.displays(Device::Debian));
-        let selected = if has_layout { model::position_label(&cfg, &placements) } else { "Not available".to_string() };
-        let mut chosen = None;
-        ui.add_enabled_ui(on.layout, |ui| {
-            ui.add(egui::Label::new(format!("Where {} sits", snapshot.name(Device::Windows))).truncate());
-            egui::ComboBox::from_id_salt("position")
-                .selected_text(selected.clone())
-                .width(ui.available_width())
-                .truncate()
-                .show_ui(ui, |ui| {
-                    for place in &placements {
-                        if ui.selectable_label(place.label == selected, &place.label).clicked() {
-                            chosen = Some(place);
-                        }
-                    }
-                });
-            if cfg.has_custom_size() && ui.button("Use the real screen sizes").clicked() {
+    /// The game locks are this device's own, set through its layout-wide actions.
+    fn toggle_game_lock(&mut self, setting: Setting, now: Instant) {
+        let (auto, action) = match setting {
+            Setting::AutoGameLock => (true, "toggle_auto_game_lock"),
+            Setting::ManualGameLock => (false, "toggle_game_lock"),
+            Setting::Device(_) | Setting::EdgePush => return,
+        };
+        if let Some(state) = &mut self.layout.state {
+            let lock = if auto { &mut state.config.auto_game_lock } else { &mut state.config.manual_game_lock };
+            *lock = !*lock;
+        }
+        self.client.master_action(action);
+        self.layout.hold(now);
+    }
+
+    fn apply_pick(&mut self, device: Device, pick: Pick, value: ChoiceValue, now: Instant) {
+        match (pick, value) {
+            (Pick::Audio(role), ChoiceValue::Id(id)) => {
+                self.client.local_action(device, json!({ "action": "set_audio_device", "role": role.name(), "id": id }));
+                self.picks.set((device, role), id, now);
+            }
+            (Pick::Bitrate, ChoiceValue::Kbps(kbps)) => self.edits.set((device, Control::AudioBitrate), f64::from(kbps), now),
+            (Pick::Mode(output), ChoiceValue::Mode(mode)) => self.client.local_action(device, model::mode_action(&output, &mode)),
+            (Pick::Placement, ChoiceValue::Placement(place)) => {
+                if let Some(state) = &mut self.layout.state {
+                    model::apply_placement(&mut state.config, &place);
+                }
+                self.layout.edited(now);
+            }
+            (Pick::UiScale, ChoiceValue::Scale(scale)) => self.ui_scale = scale,
+            // `rows` pairs each pick with its own kind of value.
+            _ => {}
+        }
+    }
+
+    fn apply_action(&mut self, ctx: &egui::Context, snapshot: &Snapshot, device: Device, action: ActionKind) {
+        match action {
+            ActionKind::TestSound => self.client.local_action(device, json!({ "action": "test_audio_chime", "target": "peer" })),
+            ActionKind::MakeMain if self.main_change.is_none() => self.choose_main(ctx, device),
+            ActionKind::MakeMain => {}
+            ActionKind::ChangeAddress => self.peer_prompt.open = true,
+            ActionKind::Pair => self.open_pairing(snapshot),
+            ActionKind::Unpair => self.unpair(ctx),
+            ActionKind::ResetSizes => {
                 self.client.master_action("reset_native_resolutions");
                 self.layout.let_poll_through();
             }
-        });
-        let Some(place) = chosen else { return };
-        if let Some(state) = &mut self.layout.state {
-            model::apply_placement(&mut state.config, place);
+            ActionKind::CheckUpdate => self.client.local_action(device, json!({ "action": "check_update" })),
+            ActionKind::ShowLicences => self.show_licences = true,
         }
-        self.layout.edited(now);
     }
 
-    fn edge_push_control(&mut self, ui: &mut Ui, on: &ControlsEnabled, now: Instant) {
-        let current = self.layout.state.as_ref().map(|s| s.config.edge_resistance);
-        let mut push = current.unwrap_or_default() as f64;
-        let text = current.map_or_else(String::new, |v| v.to_string());
-        let moved = ui.add_enabled_ui(on.layout, |ui| slider_row(ui, "Push needed to cross", text, &mut push, EDGE_PUSH_RANGE, 5.0)).inner;
-        if !moved {
+    /// Unpairs on a background thread, as the service restarts to do it.
+    fn unpair(&mut self, ctx: &egui::Context) {
+        if self.pairing.unpairing.is_some() {
             return;
         }
-        if let Some(state) = &mut self.layout.state {
-            state.config.edge_resistance = push as i32;
-        }
-        self.layout.edited(now);
-    }
-
-    fn main_device_controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled) {
-        let changing = self.main_change.is_some();
-        let current = snapshot.main_device();
-        let mut chosen = None;
-        ui.label("Main device").on_hover_text("It takes the keyboard and mouse when the devices link up.");
-        ui.add_enabled_ui(on.main_device && !changing, |ui| {
-            let gap = 2.0;
-            let width = (ui.available_width() - gap) / 2.0;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for device in snapshot.in_order() {
-                    if segment(ui, width, &snapshot.title(device), current == Some(device)).clicked() && current != Some(device) {
-                        chosen = Some(device);
-                    }
-                }
-            });
-        });
-        if let Some(device) = chosen {
-            self.choose_main(ui.ctx(), device);
-        }
-        if let Some(error) = &self.main_error {
-            ui.label(small(error).color(RED));
-        } else if changing {
-            ui.label(small("Changing the main device."));
-        }
-    }
-
-    /// Each device's sections: side by side with room for both, else one above the other.
-    fn controls(&mut self, ui: &mut Ui, snapshot: &Snapshot, on: &ControlsEnabled, columns: usize, now: Instant) {
-        let mut requests = Requests::default();
-        let mut shared =
-            Shared { edits: &mut self.edits, layout: &self.layout, canvas: &mut self.canvas, snapshot, on, now };
-        let panels = &mut self.panels;
-        let [first, second] = snapshot.in_order();
-        ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
-            Frame::new().inner_margin(Margin::same(theme::legacy::MARGIN)).show(ui, |ui| {
-                if columns >= 2 {
-                    let gap = 2.0 * theme::legacy::MARGIN as f32;
-                    let width = (ui.available_width() - gap) / 2.0;
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        for device in [first, second] {
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.set_width(width);
-                                panels.device(ui, device, &mut shared, &mut requests);
-                            });
-                        }
-                    });
-                } else {
-                    panels.device(ui, first, &mut shared, &mut requests);
-                    panels::device_divider(ui);
-                    panels.device(ui, second, &mut shared, &mut requests);
-                }
-            });
-        });
-        self.send_requests(requests, now);
-    }
-
-    fn send_requests(&mut self, requests: Requests, now: Instant) {
-        for (device, action) in requests.actions {
-            self.client.local_action(device, action);
-        }
-        let (auto, manual) = (requests.toggle_auto_game_lock, requests.toggle_manual_game_lock);
-        if !auto && !manual {
-            return;
-        }
-        if let Some(state) = &mut self.layout.state {
-            state.config.auto_game_lock ^= auto;
-            state.config.manual_game_lock ^= manual;
-        }
-        if auto {
-            self.client.master_action("toggle_auto_game_lock");
-        }
-        if manual {
-            self.client.master_action("toggle_game_lock");
-        }
-        self.layout.hold(now);
+        self.pairing.unpair_error = None;
+        self.pairing.unpairing = Some(self.send_pairing(ctx, json!({ "action": "unpair" })));
     }
 }
 
@@ -882,9 +822,11 @@ mod tests {
     use super::*;
     use crate::app::canvas::monitor_id;
     use crate::app::fixtures::*;
-    use crate::app::model::Control;
-    use crate::app::panels::device_details;
+    use crate::app::rows::device_details;
+    use crate::app::table::cell_id;
+    use crate::app::theme::{DEVICE_COLUMN, SETTINGS_WIDTH};
     use eframe::egui::{Event, PointerButton, Pos2, RawInput};
+    use std::io::{Read, Write};
 
     fn window() -> Window {
         // Nothing listens here, so whatever the tests send goes nowhere.
@@ -933,7 +875,7 @@ mod tests {
 
     #[test]
     fn draws_every_state_from_the_smallest_window_to_full_screen() {
-        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE, [1920.0, 1080.0], [3840.0, 2160.0]] {
+        for size in [MIN_WINDOW_SIZE, [899.0, 760.0], WINDOW_SIZE, [1280.0, 599.0], [1920.0, 1080.0], [3840.0, 2160.0]] {
             for snapshot in states() {
                 let (ctx, mut window) = (context(), window());
                 for _ in 0..3 {
@@ -945,7 +887,8 @@ mod tests {
 
     #[test]
     fn the_arrangement_fills_the_height_and_stays_clear_of_the_controls() {
-        for size in [MIN_WINDOW_SIZE, WINDOW_SIZE] {
+        // Below 900 wide the arrangement goes under the settings instead.
+        for size in [[900.0, 760.0], WINDOW_SIZE] {
             let (ctx, mut window, snapshot) = (context(), window(), linked());
             for _ in 0..4 {
                 frame(&ctx, &mut window, &snapshot, size, vec![], Instant::now());
@@ -953,9 +896,9 @@ mod tests {
             let screen = ctx.screen_rect();
             for device in Device::BOTH {
                 let rect = ctx.read_response(monitor_id(device, 0)).unwrap().rect;
-                let rail = model::body_layout(screen.width()).rail;
-                assert!(rect.right() <= screen.right() - rail, "{size:?} {rect:?}");
-                assert!(rect.left() >= 0.0 && rect.bottom() <= screen.bottom(), "{size:?} {rect:?}");
+                let settings_width = view::frame_layout(screen.width(), screen.height()).settings_width;
+                assert!(rect.left() >= settings_width, "{size:?} {rect:?}");
+                assert!(rect.right() <= screen.right() && rect.bottom() <= screen.bottom(), "{size:?} {rect:?}");
             }
         }
     }
@@ -1061,7 +1004,6 @@ mod tests {
         s.local.as_mut().unwrap().device_name = long.into();
         frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
         let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()));
-        // The device panels still show the whole name until the settings table replaces them.
         let shown = format!("Control {}", view::fit_name(long).0);
         assert!(text.lines().any(|l| l == shown), "{text}");
     }
@@ -1112,27 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_shows_the_version_and_any_note() {
-        let (ctx, mut window) = (context(), window());
-        let mut snapshot = linked();
-        let mut status = update("idle", false);
-        status.available = None;
-        status.note = Some("mesh-kvm hasn't been able to check for updates for 3 days.".into());
-        snapshot.local.as_mut().unwrap().update = Some(status);
-        let mut text = String::new();
-        let _ = ctx.run(RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, &snapshot));
-        });
-        let output = ctx.run(RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, &snapshot));
-        });
-        text.push_str(&drawn_text(&output));
-        assert!(text.contains("This is version 0.7.0."), "{text}");
-        assert!(text.contains("Check now"), "{text}");
-        assert!(text.contains("hasn't been able to check for updates for 3 days"), "{text}");
-    }
-
-    #[test]
     fn keep_is_offered_only_on_the_device_with_the_screen() {
         for (here, keeps) in [(true, true), (false, false)] {
             let (ctx, mut window) = (context(), window());
@@ -1147,6 +1068,24 @@ mod tests {
         }
     }
 
+    /// A window tall enough for every row of the table at once.
+    const TALL: [f32; 2] = [1280.0, 1600.0];
+
+    /// Settles a tall window, then shows the tooltip of the cell in `label`'s row and `column`.
+    fn hover_text(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, label: &str, column: usize) -> String {
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let now = Instant::now();
+        for _ in 0..3 {
+            frame(ctx, window, snapshot, TALL, vec![], now);
+        }
+        let at = ctx.read_response(cell_id(label, column)).unwrap().rect.center();
+        let mut text = String::new();
+        for _ in 0..4 {
+            text = drawn_text(&frame(ctx, window, snapshot, TALL, vec![Event::PointerMoved(at)], now));
+        }
+        text
+    }
+
     #[test]
     fn a_screen_with_no_working_mode_list_shows_its_mode_and_says_so() {
         let (ctx, mut window) = (context(), window());
@@ -1155,14 +1094,15 @@ mod tests {
         snapshot.local_displays.clear();
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
-        assert!(text.contains("2560 \u{d7} 1440 at 360 Hz"), "{text}");
-        assert!(text.contains("can't be changed from here right now"), "{text}");
+        assert!(text.contains("\n2560\u{d7}1440\n") && text.contains("\n360 Hz\n"), "{text}");
+        let label = "Screen 2 resolution";
+        assert!(hover_text(&ctx, &mut window, &snapshot, label, 0).contains("can't be changed from here right now"));
         // Listed, but only for reading.
         let mut listed = display("DP-3");
         listed.can_change = false;
         snapshot.local_displays = vec![listed];
-        let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
-        assert!(text.contains("can't be changed from here right now"), "{text}");
+        let (ctx, mut window) = (context(), self::window());
+        assert!(hover_text(&ctx, &mut window, &snapshot, "Screen 1 resolution", 0).contains("can't be changed from here right now"));
     }
 
     #[test]
@@ -1381,56 +1321,22 @@ mod tests {
     #[test]
     fn device_details_name_this_device() {
         let d = device("debian", None);
-        assert_eq!(device_details(Some(&d), true), "This device, debian-host, 192.168.8.2");
-        assert_eq!(device_details(Some(&d), false), "debian-host, 192.168.8.2");
-        assert_eq!(device_details(None, false), "Not connected");
+        assert_eq!(device_details(&d, true), "This device, debian-host, 192.168.8.2");
+        assert_eq!(device_details(&d, false), "debian-host, 192.168.8.2");
+        // The Name cells say it on hover.
+        let (window, snapshot) = (window(), linked());
+        let groups = window.groups(&snapshot, &model::enabled(&snapshot), Instant::now());
+        let name = groups.iter().flat_map(|g| &g.rows).find(|r| r.label == "Name").unwrap();
+        let tips = name.cells.clone().map(|c| c.tooltip.unwrap());
+        assert!(tips[0].ends_with("\nThis device, debian-host, 192.168.8.2"), "{tips:?}");
+        assert!(tips[1].ends_with("\nwindows-host, 192.168.8.2"), "{tips:?}");
+        let (ctx, mut window) = (context(), self::window());
+        let text = hover_text(&ctx, &mut window, &snapshot, "Name", 0);
+        assert!(text.contains("This device, debian-host"), "{text}");
     }
 
     fn paired_status() -> crate::app::pairing::PairingStatus {
         serde_json::from_str(r#"{"state":"idle","peer_name":"Laptop","fingerprint":"4F2A-91C3"}"#).unwrap()
-    }
-
-    /// The Settings menu's contents, drawn on their own.
-    fn menu_text(window: &mut Window, snapshot: &Snapshot) -> String {
-        let ctx = context();
-        let mut text = String::new();
-        for _ in 0..2 {
-            let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE.into())), ..Default::default() };
-            let output = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| window.settings_menu(ui, snapshot));
-            });
-            text = drawn_text(&output);
-        }
-        text
-    }
-
-    #[test]
-    fn the_settings_menu_shows_the_fingerprint_and_unpair_when_paired() {
-        let mut window = window();
-        let mut snapshot = secure(linked(), "encrypted");
-        snapshot.pairing = Some(paired_status());
-        let text = menu_text(&mut window, &snapshot);
-        for line in [
-            "Paired with windows-host",
-            "Everything between these devices is encrypted.",
-            "Fingerprint, the same on both: 4F2A-91C3",
-            "Unpair",
-        ] {
-            assert!(text.contains(line), "{line}\n{text}");
-        }
-        assert!(!text.contains("\nPair\n"), "{text}");
-        assert!(window.pairing_in_menu, "asking for the fingerprint while the menu is open");
-    }
-
-    #[test]
-    fn the_settings_menu_offers_pair_when_unpaired() {
-        let mut window = window();
-        let text = menu_text(&mut window, &secure(linked(), "unpaired"));
-        assert!(text.contains("\nPair\n"), "{text}");
-        assert!(!text.contains("Unpair") && !text.contains("Fingerprint"), "{text}");
-        // A service that doesn't encrypt has neither.
-        let text = menu_text(&mut window, &linked());
-        assert!(!text.contains("Pair") && !text.contains("Unpair"), "{text}");
     }
 
     #[test]
@@ -1468,6 +1374,9 @@ mod tests {
         assert!(!window.pairing.open);
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now + Duration::from_secs(4)));
         assert!(!text.contains("Paired with Laptop"), "{text}");
+        // The table still shows the fingerprint of a service that encrypts, so it keeps asking.
+        assert!(window.client.wants_pairing());
+        frame(&ctx, &mut window, &linked(), WINDOW_SIZE, vec![], now + Duration::from_secs(4));
         assert!(!window.client.wants_pairing());
     }
 
@@ -1509,5 +1418,234 @@ mod tests {
         frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
         assert!(text.contains("Set the other device's address first"), "{text}");
+    }
+
+    /// Every text shape drawn, with where it was drawn.
+    fn texts(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+        let mut all = Vec::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(shape) = &clipped.shape {
+                all.push((shape.galley.text().to_string(), shape.visual_bounding_rect()));
+            }
+        }
+        all
+    }
+
+    /// Settles the window at `size` and returns the last frame.
+    fn settled(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, size: [f32; 2]) -> egui::FullOutput {
+        for _ in 0..3 {
+            frame(ctx, window, snapshot, size, vec![], Instant::now());
+        }
+        frame(ctx, window, snapshot, size, vec![], Instant::now())
+    }
+
+    /// Clicks the middle of a table cell.
+    fn click_cell(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, label: &str, column: usize, now: Instant) {
+        let at = ctx.read_response(cell_id(label, column)).unwrap().rect.center();
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+    }
+
+    #[test]
+    fn the_table_header_names_both_devices_and_the_groups_follow() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, TALL));
+        let mut from = 0;
+        for word in ["SETTING", "DEBIAN-HOST", "WINDOWS-HOST", "INPUT", "SCREENS", "CLIPBOARD", "AUDIO", "GAMES", "STARTUP", "BOTH DEVICES", "UPDATES"] {
+            let line = format!("\n{word}\n");
+            let at = text[from..].find(&line).unwrap_or_else(|| panic!("{word} after {from}\n{text}"));
+            from += at + line.len() - 1;
+        }
+    }
+
+    #[test]
+    fn a_group_with_nothing_in_it_has_no_heading() {
+        // With no layout there are no screens to list.
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        snapshot.layout = None;
+        let text = drawn_text(&settled(&ctx, &mut window, &snapshot, TALL));
+        assert!(!text.contains("\nSCREENS\n") && text.contains("\nINPUT\n"), "{text}");
+    }
+
+    #[test]
+    fn the_settings_column_is_700_wide_and_the_layout_takes_the_rest() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("settings")).unwrap();
+        assert_eq!(panel.rect.width(), SETTINGS_WIDTH);
+        for (device, index) in [(Device::Debian, 0), (Device::Debian, 1), (Device::Windows, 0)] {
+            let rect = ctx.read_response(monitor_id(device, index)).unwrap().rect;
+            assert!(rect.left() >= SETTINGS_WIDTH, "{device:?} {index} {rect:?}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_window_stacks_the_layout_under_the_settings() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let size = [899.0, 760.0];
+        let output = settled(&ctx, &mut window, &snapshot, size);
+        let texts = texts(&output);
+        let last_row = texts.iter().find(|(t, _)| t == "Licences").map(|(_, r)| r.bottom()).unwrap();
+        for (device, index) in [(Device::Debian, 0), (Device::Debian, 1), (Device::Windows, 0)] {
+            let rect = ctx.read_response(monitor_id(device, index)).unwrap().rect;
+            assert!(rect.top() > last_row, "{device:?} {index} {rect:?} above {last_row}");
+        }
+        let top = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.top()).unwrap();
+        let first = top("ROUND TRIP");
+        assert!(top("LOST") == first && top("AUDIO LOST") == first, "{texts:?}");
+        assert!(top("AUDIO BUFFER") > first && top("LINK") > first, "{texts:?}");
+    }
+
+    #[test]
+    fn clicking_a_toggle_cell_flips_it_and_sends_once() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let now = Instant::now();
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        let key = (Device::Debian, Control::MouseSharing);
+        click_cell(&ctx, &mut window, &snapshot, "Share mouse", 0, now);
+        assert_eq!(window.edits.shown(key, 1.0, now), 0.0);
+        // Sent on the frame of the click, so nothing is left to send.
+        assert_eq!(window.edits.take_due(now), vec![]);
+    }
+
+    #[test]
+    fn a_saving_cell_ignores_another_click() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let now = Instant::now();
+        // A main device change that hasn't been answered yet.
+        let (_answer, waiting) = mpsc::channel();
+        window.main_change = Some(waiting);
+        settled(&ctx, &mut window, &snapshot, TALL);
+        let groups = window.groups(&snapshot, &model::enabled(&snapshot), now);
+        let main = groups.iter().flat_map(|g| &g.rows).find(|r| r.label == "Main device").unwrap();
+        let column = main.cells.iter().position(|c| c.saving).expect("one cell is changing");
+        let at = ctx.read_response(cell_id("Main device", column)).unwrap().rect.center();
+        for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)]] {
+            frame(&ctx, &mut window, &snapshot, TALL, events, now);
+        }
+        assert_eq!(window.main_choice, None, "no second change was asked for");
+    }
+
+    /// A service on a port of its own, answering this device's status as `local`, with no
+    /// other device, and refusing every action.
+    fn refusing_service(local: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut data = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk) else { return };
+                        if n == 0 {
+                            break;
+                        }
+                        data.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&data);
+                        let Some(end) = text.find("\r\n\r\n") else { continue };
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                            .unwrap_or(0usize);
+                        if data.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&data);
+                    let path = text.split_whitespace().nth(1).unwrap_or_default();
+                    let (status, body) = match path {
+                        "/api/local" => (200, local),
+                        "/api/local/action" => (200, r#"{"ok":false}"#),
+                        _ => (404, "{}"),
+                    };
+                    let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_refused_toggle_snaps_back_and_says_why_under_its_row() {
+        let local = r#"{"node":"debian","hostname":"debian-host","ip":"192.168.8.2","peer_online":true,"sharing":{"mouse":true,"keyboard":true}}"#;
+        let client = Client::start_on(refusing_service(local), Box::new(|| {}));
+        let (ctx, mut window) = (context(), Window::new(client, ServiceStarter::default()));
+        let mut snapshot = Snapshot::default();
+        for _ in 0..400 {
+            snapshot = window.client.snapshot();
+            if snapshot.local.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let now = Instant::now();
+        settled(&ctx, &mut window, &snapshot, WINDOW_SIZE);
+        let key = (Device::Debian, Control::MouseSharing);
+        click_cell(&ctx, &mut window, &snapshot, "Share mouse", 0, now);
+        assert_eq!(window.edits.shown(key, 1.0, now), 0.0, "it flips at once");
+        let mut text = String::new();
+        for _ in 0..400 {
+            text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+            if window.client.row_error(key).is_some() && window.edits.shown(key, 1.0, now) == 1.0 {
+                text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(window.edits.shown(key, 1.0, now), 1.0, "the polled value again");
+        assert_eq!(text.matches("didn't accept that change").count(), 1, "{text}");
+        let error = texts(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now));
+        let below = error.iter().find(|(t, _)| t.contains("didn't accept that change")).unwrap().1.top();
+        let row = error.iter().find(|(t, _)| t == "Share mouse").unwrap().1.bottom();
+        let next = error.iter().find(|(t, _)| t == "Share keyboard").unwrap().1.top();
+        assert!(row < below && below < next, "under its own row: {row} {below} {next}");
+    }
+
+    #[test]
+    fn long_names_never_widen_a_device_column() {
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = linked();
+        let name = "A desktop with a really long nam"; // 32 characters
+        assert_eq!(name.chars().count(), 32);
+        let speakers = "Speakers (High Definition Audio Device with a long name, rear)";
+        let local = snapshot.local.as_mut().unwrap();
+        local.device_name = name.into();
+        local.audio.outputs[0].name = speakers.into();
+        let output = settled(&ctx, &mut window, &snapshot, TALL);
+        let texts = texts(&output);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("A DESKTOP") && t.ends_with('\u{2026}')), "{texts:?}");
+        let columns = SPACE_5 + view::label_width(SETTINGS_WIDTH);
+        for (text, rect) in &texts {
+            // The device columns, the header's included.
+            if rect.left() >= columns - 0.5 && rect.right() <= SETTINGS_WIDTH {
+                assert!(rect.width() <= DEVICE_COLUMN, "{text} is {} wide", rect.width());
+                assert!(!text.contains(speakers) && !text.contains(name), "{text} was drawn whole");
+            }
+        }
+        assert!(hover_text(&ctx, &mut window, &snapshot, "Name", 0).contains(name));
+    }
+
+    #[test]
+    fn with_no_service_the_body_says_why() {
+        let client = Client::start_on(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(), Box::new(|| {}));
+        let starter = ServiceStarter::begin_for_test(ServiceStart::Starting);
+        let mut window = Window::new(client, starter.clone());
+        let why = "mesh-kvm couldn't start on this device. See /tmp/x.log";
+        starter.finish_for_test(why);
+        let ctx = context();
+        let output = settled(&ctx, &mut window, &Snapshot::default(), WINDOW_SIZE);
+        let stats = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("stats")).unwrap().rect.bottom();
+        let texts = texts(&output);
+        let said = texts.iter().find(|(t, r)| t == why && r.top() > stats);
+        assert!(said.is_some(), "{texts:?}");
+        let square = output.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Rect(r) => r.fill == DANGER && r.rect.width() == theme::STATUS_SQUARE && r.rect.top() > stats,
+            _ => false,
+        });
+        assert!(square, "a danger square beside it");
+        assert!(!texts.iter().any(|(t, _)| t == "SETTING"), "and nothing else");
     }
 }

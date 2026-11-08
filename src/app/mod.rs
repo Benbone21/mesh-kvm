@@ -8,11 +8,9 @@ pub mod single;
 mod canvas;
 #[cfg(test)]
 mod fixtures;
-mod panels;
-// The settings table (Task 7) draws these rows; until then only tests read them.
-#[allow(dead_code)]
 mod rows;
 mod sparkline;
+mod table;
 mod theme;
 mod top;
 mod view;

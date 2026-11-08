@@ -4,7 +4,6 @@
 use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutState, Picks, Placement, Snapshot};
 use super::theme::Tone;
 use super::ui::UI_SCALES;
-use super::view::fit_name;
 use crate::audio::BITRATES;
 use crate::platform::{DisplayInfo, DisplayMode};
 use crate::webui::UNKNOWN_ADDRESS;
@@ -21,7 +20,8 @@ const MAIN_TIP: &str = "It takes the keyboard and mouse when the devices link up
 const MAIN_NEEDS_LINK: &str = "The main device can be chosen while the devices are linked and on the same version.";
 const ADDRESS_PINNED: &str = "How mesh-kvm starts on this device sets the address, so it can't be changed here.";
 const NO_LAYOUT: &str = "The layout shows up once mesh-kvm is running on this device.";
-const DROPDOWN: &str = " \u{25be}";
+/// What a dropdown's value ends with.
+pub const DROPDOWN: &str = " \u{25be}";
 
 /// A heading in the settings table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,11 @@ impl Cell {
 
     fn new(value: String, tone: Tone, kind: CellKind) -> Cell {
         Cell { value, tone, kind, read_only: None, tooltip: None, saving: false, monitor: None }
+    }
+
+    /// A toggle that reads ON.
+    pub fn is_on(&self) -> bool {
+        matches!(self.kind, CellKind::Toggle(_)) && self.value == ON
     }
 
     /// The same cell, unchangeable for this reason and shown dimmed.
@@ -196,7 +201,19 @@ pub struct RowsInput<'a> {
 /// Every group's rows, in `ORDER`.
 pub fn groups(input: &RowsInput) -> Vec<GroupRows> {
     let rows = Rows { input, order: input.snapshot.in_order() };
-    vec![rows.input_group(), rows.screens(), rows.clipboard(), rows.audio(), rows.games(), rows.startup(), rows.both_devices(), rows.updates()]
+    ORDER
+        .iter()
+        .map(|group| match group {
+            Group::Input => rows.input_group(),
+            Group::Screens => rows.screens(),
+            Group::Clipboard => rows.clipboard(),
+            Group::Audio => rows.audio(),
+            Group::Games => rows.games(),
+            Group::Startup => rows.startup(),
+            Group::BothDevices => rows.both_devices(),
+            Group::Updates => rows.updates(),
+        })
+        .collect()
 }
 
 /// The rows of each group, worked out from one input.
@@ -371,9 +388,10 @@ impl Rows<'_, '_> {
             .chain(devices.iter().map(|d| (d.id.as_str(), d.name.as_str())))
             .map(|(id, name)| Choice { label: name.to_string(), value: ChoiceValue::Id(id.to_string()), selected: id == current })
             .collect();
-        let (shown, full) = fit_name(&model::device_label(&current, devices));
+        // The whole name: the table cuts it to its column and gives the rest on hover.
+        let shown = model::device_label(&current, devices);
         let kind = CellKind::Dropdown { pick: Pick::Audio(role), options };
-        Cell { tooltip: full, ..Cell::new(format!("{shown}{DROPDOWN}"), Tone::Text, kind) }
+        Cell::new(format!("{shown}{DROPDOWN}"), Tone::Text, kind)
     }
 
     /// A microphone is only ever switched on from its own device, as it could be listened in on.
@@ -393,9 +411,8 @@ impl Rows<'_, '_> {
             .iter()
             .map(|&kbps| Choice { label: model::bitrate_label(kbps), value: ChoiceValue::Kbps(kbps), selected: kbps == current })
             .collect();
-        let (shown, full) = fit_name(&model::bitrate_label(current));
         let kind = CellKind::Dropdown { pick: Pick::Bitrate, options };
-        Cell { saving, tooltip: full, ..Cell::new(format!("{shown}{DROPDOWN}"), Tone::Text, kind) }
+        Cell { saving, ..Cell::new(format!("{}{DROPDOWN}", model::bitrate_label(current)), Tone::Text, kind) }
     }
 
     /// Plays a chime on the other device, as heard through this one's audio.
@@ -471,8 +488,10 @@ impl Rows<'_, '_> {
     }
 
     fn name_row(&self) -> Row {
-        self.row("Name", |device, _| {
-            Cell { tooltip: Some(NAME_TIP.into()), ..Cell::new(self.input.snapshot.title(device), Tone::Text, CellKind::Name) }
+        self.row("Name", |device, status| {
+            let details = device_details(status, self.input.snapshot.is_here(device));
+            let tooltip = Some(format!("{NAME_TIP}\n{details}"));
+            Cell { tooltip, ..Cell::new(self.input.snapshot.title(device), Tone::Text, CellKind::Name) }
         })
     }
 
@@ -637,9 +656,18 @@ impl Rows<'_, '_> {
     }
 }
 
+const ON: &str = "ON";
+
+/// Which device this is, its network name and its address.
+pub fn device_details(status: &DeviceStatus, here: bool) -> String {
+    let address = if status.ip == UNKNOWN_ADDRESS { String::new() } else { format!(", {}", status.ip) };
+    let place = if here { "This device, " } else { "" };
+    format!("{place}{}{address}", status.hostname)
+}
+
 fn on_off(on: bool, setting: Setting) -> Cell {
     if on {
-        Cell::new("ON".into(), Tone::Accent, CellKind::Toggle(setting))
+        Cell::new(ON.into(), Tone::Accent, CellKind::Toggle(setting))
     } else {
         Cell::new("OFF".into(), Tone::Dim, CellKind::Toggle(setting))
     }
@@ -790,14 +818,14 @@ mod tests {
     }
 
     #[test]
-    fn a_long_audio_device_name_is_cut_with_the_whole_name_in_a_tooltip() {
+    fn a_long_audio_device_name_is_given_whole_for_the_table_to_cut() {
         let mut s = linked();
         let name = "Headphones (High Definition Audio Device, rear panel)";
         s.local.as_mut().unwrap().audio.outputs[0].name = name.into();
         let g = groups(&input(&s));
         let cell = &row(&g, "Output to send").cells[0];
-        assert_eq!(cell.value, format!("{} \u{25be}", fit_name(name).0));
-        assert_eq!(cell.tooltip.as_deref(), Some(name));
+        assert_eq!(cell.value, format!("{name} \u{25be}"));
+        assert_eq!(cell.tooltip, None);
     }
 
     #[test]

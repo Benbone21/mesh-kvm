@@ -246,8 +246,6 @@ pub struct FrameLayout {
     pub body_scrolls: bool,
 }
 
-// The stacked body (Task 7) uses this.
-#[allow(dead_code)]
 pub const STACKED_CANVAS_HEIGHT: f32 = 320.0;
 
 pub fn frame_layout(width: f32, height: f32) -> FrameLayout {
@@ -262,8 +260,6 @@ pub fn frame_layout(width: f32, height: f32) -> FrameLayout {
 }
 
 /// What a settings row's label has left after the margins and the two device columns.
-// The settings table (Task 7) uses this.
-#[allow(dead_code)]
 pub fn label_width(settings_width: f32) -> f32 {
     settings_width - 2.0 * SPACE_5 - 2.0 * DEVICE_COLUMN
 }
