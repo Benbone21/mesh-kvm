@@ -6,6 +6,7 @@ use super::canvas::Canvas;
 use super::client::{Client, PairingReply};
 use super::dialog;
 use super::launch::ServiceStarter;
+use super::motion;
 use super::model::{self, Control, ControlsEnabled, Device, Edits, LayoutDraft, ModeChange, Picks, ServiceStart, Snapshot};
 use super::pairing::{self, PairingInput, PairingRequest, PairingView};
 use super::rows::{self, ActionKind, ChoiceValue, GroupRows, Pick, RowsInput, Setting};
@@ -21,7 +22,7 @@ use super::view;
 use super::widgets::{status_square, ButtonKind};
 use crate::webui::UNKNOWN_ADDRESS;
 use eframe::egui::{
-    self, vec2, Align, Frame, Key, Layout, Margin, Modifiers, Rect, ScrollArea, Sense, Ui, ViewportCommand,
+    self, vec2, Align, Color32, Frame, Key, Layout, Margin, Modifiers, Rect, ScrollArea, Sense, Ui, ViewportCommand,
 };
 use serde_json::json;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -155,6 +156,14 @@ struct Window {
     /// A Windows copy run from somewhere other than where mesh-kvm is installed.
     not_installed: bool,
     sparklines: Sparklines,
+    /// The system asks for no animation. Read once, at the start.
+    reduced: bool,
+    /// The status square's colour when it last changed, the one it changed to, and when.
+    square: (Color32, Color32, Instant),
+    /// When the dialogs now up first appeared, for fading them in.
+    dialog_opened: Option<Instant>,
+    /// How much of the dialogs shows through, from the fade.
+    dialog_opacity: f32,
 }
 
 impl eframe::App for Window {
@@ -198,6 +207,10 @@ impl Window {
             version_watch: VersionWatch::default(),
             not_installed: cfg!(target_os = "windows") && !super::install::runs_from_installed(),
             sparklines: Sparklines::default(),
+            reduced: motion::reduced_motion(),
+            square: (Color32::TRANSPARENT, Color32::TRANSPARENT, Instant::now()),
+            dialog_opened: None,
+            dialog_opacity: 1.0,
         }
     }
 
@@ -232,6 +245,9 @@ impl Window {
 
     fn show(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) {
         self.apply_scale(ctx);
+        if self.reduced && ctx.style().animation_time != 0.0 {
+            ctx.style_mut(|style| style.animation_time = 0.0);
+        }
         let on = model::enabled(snapshot);
         self.collect_main_change();
         self.collect_peer_change();
@@ -242,11 +258,12 @@ impl Window {
 
         self.sparklines.sample(snapshot, now);
         let line = view::status_line(snapshot, &start, &on);
+        let square = self.fade_square(ctx, theme::tone(line.square), now);
         let mut requests = Vec::new();
         let bar = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
         egui::TopBottomPanel::top("status bar").frame(bar).show(ctx, |ui| {
             let switch_name = line.switch_to.map(|d| snapshot.title(d));
-            requests.extend(top::status_bar(ui, &line, theme::tone(line.square), switch_name.as_deref()));
+            requests.extend(top::status_bar(ui, &line, square, switch_name.as_deref()));
         });
         let banner = self.follow_update(ctx, snapshot);
         let updating = self.update_under_way.is_some();
@@ -269,6 +286,13 @@ impl Window {
         self.body(ctx, snapshot, &on, now);
 
         let first_run = model::needs_peer(snapshot);
+        let dialog_up = first_run
+            || self.peer_prompt.open
+            || snapshot.mode_change().is_some()
+            || self.show_licences
+            || self.pairing.open
+            || self.unpair_confirm;
+        self.fade_dialogs(ctx, dialog_up, now);
         self.licences_window(ctx);
         if first_run || self.peer_prompt.open {
             self.peer_window(ctx, snapshot, first_run);
@@ -291,6 +315,41 @@ impl Window {
         }
         if start == ServiceStart::Starting {
             ctx.request_repaint_after(START_CHECK);
+        }
+    }
+
+    /// The status square's colour now: it moves from the one it had to the new one over
+    /// `SQUARE_FADE`, and the window keeps repainting until it gets there.
+    fn fade_square(&mut self, ctx: &egui::Context, target: Color32, now: Instant) -> Color32 {
+        let shown = |window: &Self| {
+            let (from, to, at) = window.square;
+            let elapsed = now.saturating_duration_since(at).as_secs_f32();
+            (motion::cross_fade(from, to, elapsed, window.reduced), elapsed)
+        };
+        if self.square.1 == Color32::TRANSPARENT {
+            self.square = (target, target, now);
+        } else if self.square.1 != target {
+            self.square = (shown(self).0, target, now);
+        }
+        let (colour, elapsed) = shown(self);
+        if !self.reduced && self.square.0 != self.square.1 && elapsed < motion::SQUARE_FADE {
+            ctx.request_repaint();
+        }
+        colour
+    }
+
+    /// Fades the dialogs in from the moment the first one appears.
+    fn fade_dialogs(&mut self, ctx: &egui::Context, up: bool, now: Instant) {
+        if !up {
+            self.dialog_opened = None;
+            self.dialog_opacity = 1.0;
+            return;
+        }
+        let opened = *self.dialog_opened.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(opened).as_secs_f32();
+        self.dialog_opacity = motion::fade_in(elapsed, self.reduced);
+        if elapsed < motion::DIALOG_FADE && !self.reduced {
+            ctx.request_repaint();
         }
     }
 
@@ -342,7 +401,7 @@ impl Window {
         let screen = format!("{} on {}", change.name, snapshot.name(device));
         let here = snapshot.is_here(device);
         let elsewhere = format!("It can only be kept from {}.", snapshot.name(device));
-        let shown = dialog::show(ctx, egui::Id::new("mode prompt"), "Keep these screen settings?", 1.0, |ui| {
+        let shown = dialog::show(ctx, egui::Id::new("mode prompt"), "Keep these screen settings?", self.dialog_opacity, |ui| {
             match change.stage.as_str() {
                 "applying" => {
                     dialog::text(ui, &format!("Changing {screen} to {target}."), Type::Body, TEXT);
@@ -408,7 +467,7 @@ impl Window {
         let saving = self.peer_prompt.saving.is_some();
         let (mut connect, mut cancel) = (false, false);
         let prompt = &mut self.peer_prompt;
-        let shown = dialog::show(ctx, egui::Id::new("peer prompt"), "Connect to your other device", 1.0, |ui| {
+        let shown = dialog::show(ctx, egui::Id::new("peer prompt"), "Connect to your other device", self.dialog_opacity, |ui| {
             let ask = "Enter the address of the other device. mesh-kvm shows it on that device, next to its name.";
             let label = dialog::text(ui, ask, Type::Body, TEXT);
             if !this_address.is_empty() && this_address != UNKNOWN_ADDRESS {
@@ -558,12 +617,12 @@ impl Window {
             self.pairing.polled = status.map(|s| (s.clone(), now));
         }
         let left_since_poll = self.pairing.polled.as_ref().map_or(Duration::ZERO, |(_, at)| now.saturating_duration_since(*at));
-        let view = PairingView { status, other: &other, other_address: address, working, left_since_poll };
-        let request = pairing::window(ctx, &view, &mut self.pairing.input, 1.0);
+        let view = PairingView { status, other: &other, other_address: address, working, left_since_poll, reduced: self.reduced };
+        let request = pairing::window(ctx, &view, &mut self.pairing.input, self.dialog_opacity);
         self.apply_pairing(ctx, snapshot, request);
-        // The countdown on a code moves each second.
+        // The countdown on a code runs down smoothly, or a second at a time when motion is reduced.
         if state == Some("showing") {
-            ctx.request_repaint_after(Duration::from_millis(500));
+            ctx.request_repaint_after(Duration::from_millis(if self.reduced { 500 } else { 100 }));
         }
     }
 
@@ -626,7 +685,7 @@ impl Window {
             return;
         }
         let height = ctx.screen_rect().height() * LICENCES_HEIGHT;
-        let shown = dialog::show(ctx, egui::Id::new("licences"), "Licences", 1.0, |ui| {
+        let shown = dialog::show(ctx, egui::Id::new("licences"), "Licences", self.dialog_opacity, |ui| {
             ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
                 dialog::text(ui, crate::licenses::TEXT, Type::Caption, TEXT_DIM);
             });
@@ -652,7 +711,7 @@ impl Window {
         let unpairing = self.pairing.unpairing.is_some();
         let (mut unpair, mut cancel) = (false, false);
         let error = self.pairing.unpair_error.as_deref();
-        let shown = dialog::show(ctx, egui::Id::new("unpair confirm"), "Unpair", 1.0, |ui| {
+        let shown = dialog::show(ctx, egui::Id::new("unpair confirm"), "Unpair", self.dialog_opacity, |ui| {
             let ask = format!("Unpair {other}? The two devices stop sharing until you pair again.");
             dialog::text(ui, &ask, Type::Body, TEXT);
             if let Some(error) = error {
@@ -900,8 +959,10 @@ mod tests {
     fn window() -> Window {
         // Nothing listens here, so whatever the tests send goes nowhere.
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        Window::new(Client::start_on(port, Box::new(|| {})), ServiceStarter::default())
-    }
+        let mut window = Window::new(Client::start_on(port, Box::new(|| {})), ServiceStarter::default());
+        // Whatever the system under test says, these tests see a dialog whole at once.
+        window.reduced = true;
+        window    }
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
@@ -1504,6 +1565,137 @@ mod tests {
         let text = drawn_text(&frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now()));
         assert!(text.contains("is running an older mesh-kvm that can't encrypt. Update it, then pair."), "{text}");
         assert!(!text.contains("Not paired yet"), "{text}");
+    }
+
+    /// The nodes a screen reader would be given for one frame.
+    fn spoken_nodes(output: &egui::FullOutput) -> Vec<(String, Option<egui::accesskit::Toggled>, Option<egui::accesskit::Live>)> {
+        let update = output.platform_output.accesskit_update.as_ref().expect("accesskit is on");
+        update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                // A label's words are its value, and a button's are its label.
+                node.value().or_else(|| node.label()).map(|words| (words.to_string(), node.toggled(), node.live()))
+            })
+            .collect()
+    }
+
+    fn spoken_frame(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, now: Instant) -> Vec<(String, Option<egui::accesskit::Toggled>, Option<egui::accesskit::Live>)> {
+        ctx.enable_accesskit();
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![], now);
+        spoken_nodes(&frame(ctx, window, snapshot, WINDOW_SIZE, vec![], now))
+    }
+
+    #[test]
+    fn a_screen_reader_hears_each_stat_and_each_switch_by_name() {
+        use egui::accesskit::Toggled;
+        let (ctx, mut window) = (context(), window());
+        let nodes = spoken_frame(&ctx, &mut window, &link(linked(), 6, 0.4), Instant::now());
+        let find = |label: &str| nodes.iter().find(|(l, ..)| l == label);
+        assert!(find("Round trip, 6 milliseconds").is_some(), "{nodes:?}");
+        let mouse = find("Share mouse, debian-host").unwrap_or_else(|| panic!("{nodes:?}"));
+        assert_eq!(mouse.1, Some(Toggled::True));
+        let mut off = linked();
+        off.local.as_mut().unwrap().sharing.as_mut().unwrap().keyboard = false;
+        let nodes = spoken_frame(&context(), &mut self::window(), &off, Instant::now());
+        let keyboard = nodes.iter().find(|(l, ..)| l == "Share keyboard, debian-host").unwrap_or_else(|| panic!("{nodes:?}"));
+        assert_eq!(keyboard.1, Some(Toggled::False));
+    }
+
+    #[test]
+    fn the_code_is_read_digit_by_digit() {
+        let (ctx, mut window) = (context(), window());
+        let now = Instant::now();
+        let mut snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        snapshot.pairing = serde_json::from_str(r#"{"state":"showing","code":"482917","seconds_left":94}"#).ok();
+        let nodes = spoken_frame(&ctx, &mut window, &snapshot, now);
+        assert!(nodes.iter().any(|(l, ..)| l == "4 8 2 9 1 7"), "{nodes:?}");
+    }
+
+    #[test]
+    fn the_countdown_is_announced_politely_at_a_minute_and_stays_quiet_before() {
+        use egui::accesskit::Live;
+        let (ctx, mut window) = (context(), window());
+        let now = Instant::now();
+        let mut snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        snapshot.pairing = serde_json::from_str(r#"{"state":"showing","code":"482917","seconds_left":94}"#).ok();
+        let nodes = spoken_frame(&ctx, &mut window, &snapshot, now);
+        assert!(!nodes.iter().any(|(l, ..)| l.ends_with(" left")), "{nodes:?}");
+        let nodes = spoken_frame(&ctx, &mut window, &snapshot, now + Duration::from_secs(34));
+        let said = nodes.iter().find(|(l, ..)| l == "1 minute left").unwrap_or_else(|| panic!("{nodes:?}"));
+        assert_eq!(said.2, Some(Live::Polite));
+    }
+
+    #[test]
+    fn a_failed_pairing_is_a_polite_live_region() {
+        use egui::accesskit::Live;
+        let (ctx, mut window) = (context(), window());
+        let mut snapshot = secure(linked(), "unpaired");
+        window.open_pairing(&snapshot);
+        snapshot.pairing = serde_json::from_str(r#"{"state":"failed","error":"The other device went away."}"#).ok();
+        let nodes = spoken_frame(&ctx, &mut window, &snapshot, Instant::now());
+        let failed: Vec<_> = nodes.iter().filter(|(l, ..)| l == "The other device went away.").collect();
+        assert!(failed.iter().any(|f| f.2 == Some(Live::Polite)), "{failed:?}");
+    }
+
+    fn square_colour(output: &egui::FullOutput, at: Pos2) -> Option<Color32> {
+        output.shapes.iter().rev().find_map(|c| match &c.shape {
+            egui::Shape::Rect(r) if r.rect.size() == vec2(theme::STATUS_SQUARE, theme::STATUS_SQUARE) && r.rect.contains(at) => {
+                Some(r.fill)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_status_square_fades_to_its_new_colour_and_reduced_motion_jumps() {
+        let now = Instant::now();
+        let (up, down) = (linked(), link_down(linked()));
+        let mut seen = Vec::new();
+        for reduced in [false, true] {
+            let (ctx, mut window) = (context(), window());
+            window.reduced = reduced;
+            let first = frame(&ctx, &mut window, &up, WINDOW_SIZE, vec![], now);
+            let at = first
+                .shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) if r.rect.size() == vec2(theme::STATUS_SQUARE, theme::STATUS_SQUARE) => Some(r.rect.center()),
+                    _ => None,
+                })
+                .expect("the square is drawn");
+            let before = square_colour(&first, at).unwrap();
+            let t = now + Duration::from_secs(1);
+            let change = frame(&ctx, &mut window, &down, WINDOW_SIZE, vec![], t);
+            let half = frame(&ctx, &mut window, &down, WINDOW_SIZE, vec![], t + Duration::from_millis(100));
+            let done = frame(&ctx, &mut window, &down, WINDOW_SIZE, vec![], t + Duration::from_millis(250));
+            seen.push((before, square_colour(&change, at).unwrap(), square_colour(&half, at).unwrap(), square_colour(&done, at).unwrap()));
+        }
+        let (fading, reduced) = (seen[0], seen[1]);
+        assert_eq!(fading.1, fading.0, "starts from the old colour");
+        assert!(fading.2 != fading.0 && fading.2 != fading.3, "between the two: {fading:?}");
+        assert_eq!(reduced.1, reduced.3, "at once: {reduced:?}");
+        assert!(reduced.1 != reduced.0);
+    }
+
+    #[test]
+    fn a_dialog_fades_in_and_reduced_motion_shows_it_whole() {
+        let now = Instant::now();
+        let mut opacity = Vec::new();
+        for reduced in [false, true] {
+            let (ctx, mut window) = (context(), window());
+            window.reduced = reduced;
+            window.show_licences = true;
+            let snapshot = linked();
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+            let early = window.dialog_opacity;
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now + Duration::from_millis(200));
+            opacity.push((early, window.dialog_opacity));
+        }
+        assert_eq!(opacity[0], (0.0, 1.0));
+        assert_eq!(opacity[1], (1.0, 1.0));
     }
 
     #[test]

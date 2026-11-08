@@ -2,6 +2,7 @@
 //! what the view model says and hands back what the person asked for.
 
 use super::model::Snapshot;
+use super::motion;
 use super::sparkline::{Sparkline, Sparklines};
 use super::theme::{
     line, tone, Type, ACCENT, DANGER, LINE, SPACE_1, SPACE_2, SPACE_3, SPACE_5, SPARKLINE_SIZE, SPARKLINE_STROKE,
@@ -139,7 +140,8 @@ pub fn notice_line(ui: &mut Ui, notice: &Notice) -> Option<TopRequest> {
         let room = (ui.available_width() - dismiss).max(0.0);
         ui.allocate_ui(vec2(room, 0.0), |ui| {
             ui.set_width(room);
-            ui.label(Type::Body.job(&notice.text, TEXT));
+            let said = ui.label(Type::Body.job(&notice.text, TEXT));
+            motion::live(ui.ctx(), said.id);
         });
         if notice.dismiss && flat_button(ui, DISMISS, ButtonKind::Secondary, button_size(), true).clicked() {
             request = Some(TopRequest::DismissError);

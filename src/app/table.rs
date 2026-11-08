@@ -2,6 +2,7 @@
 //! each device. It draws what `rows` worked out and hands back what the person asked for.
 
 use super::model::{Control, Device};
+use super::motion;
 use super::rows::{ActionKind, Cell, CellKind, ChoiceValue, GroupRows, Note, Pick, Row, Setting, DROPDOWN};
 use super::theme::{
     line, tone, Type, ACCENT, BG, DANGER, DEVICE_COLUMN, LINE_FAINT, LINE_STRONG, RAISED, ROW_MIN_HEIGHT, SPACE_1, SPACE_2,
@@ -12,6 +13,7 @@ use super::widgets::focus_ring;
 use crate::settings::MAX_DEVICE_NAME;
 use eframe::egui::{
     self, vec2, Align, Color32, CursorIcon, Id, Layout, Margin, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, UiBuilder,
+    WidgetInfo, WidgetType,
 };
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -75,6 +77,8 @@ struct Pass<'a> {
     requests: Vec<TableRequest>,
     hovered: Option<(Device, String)>,
     scrolled: bool,
+    /// Each column's whole device name, for a screen reader.
+    names: [String; 2],
 }
 
 impl Table {
@@ -94,7 +98,7 @@ impl Table {
         // The label takes what the two device columns leave, however the window is divided.
         let label_width = label_width.min(ui.available_width() - 2.0 * DEVICE_COLUMN).max(SPACE_2 * 4.0);
         let mut frame =
-            Pass { label_width, selected, scroll_to_selected, now, requests: Vec::new(), hovered: None, scrolled: false };
+            Pass { label_width, selected, scroll_to_selected, now, requests: Vec::new(), hovered: None, scrolled: false, names: columns.clone().map(|(_, name)| name) };
         ui.spacing_mut().item_spacing.y = 0.0;
         header(ui, &columns, label_width);
         let devices = columns.map(|(device, _)| device);
@@ -126,20 +130,25 @@ impl Table {
             let left = rect.left() + frame.label_width + DEVICE_COLUMN * column as f32;
             let cell_rect = Rect::from_min_size(Pos2::new(left, rect.top()), vec2(DEVICE_COLUMN, height - 1.0));
             let id = cell_id(&row.label, column);
-            lit |= self.cell(ui, cell, cell_rect, id, devices[column], frame);
+            let spoken = match cell.kind {
+                CellKind::Toggle(_) => format!("{}, {}", row.label, frame.names[column]),
+                _ => String::new(),
+            };
+            lit |= self.cell(ui, cell, cell_rect, id, (devices[column], &spoken), frame);
         }
         if lit {
             ui.painter().set(background, Shape::rect_filled(rect, 0.0, RAISED));
         }
         if let Some(error) = &row.error {
             ui.add_space(SPACE_1);
-            ui.label(wrapped(Type::Caption.job(error, DANGER), width));
+            let said = ui.label(wrapped(Type::Caption.job(error, DANGER), width));
+            motion::live(ui.ctx(), said.id);
             ui.add_space(SPACE_1);
         }
     }
 
     /// Draws one cell. True when its row should be lit, as a clickable cell is under the pointer.
-    fn cell(&mut self, ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, device: Device, frame: &mut Pass) -> bool {
+    fn cell(&mut self, ui: &mut Ui, cell: &Cell, rect: Rect, id: Id, (device, spoken): (Device, &str), frame: &mut Pass) -> bool {
         if cell.kind == CellKind::Blank {
             return false;
         }
@@ -166,6 +175,7 @@ impl Table {
             CellKind::Blank => false,
             CellKind::Toggle(setting) if clickable => {
                 let response = clickable_text(ui, cell, rect, id, colour);
+                response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, cell.is_on(), spoken));
                 if response.clicked() {
                     let on = cell.is_on();
                     frame.requests.push(match setting {
@@ -233,6 +243,9 @@ impl Table {
             // Plain text, and anything that can't be changed right now.
             _ => {
                 let response = ui.interact(rect, id, Sense::hover());
+                if matches!(cell.kind, CellKind::Toggle(_)) {
+                    response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, false, cell.is_on(), spoken));
+                }
                 let cut = paint_value(ui, cell, rect, colour);
                 with_hover_text(response, cell, cut);
                 false

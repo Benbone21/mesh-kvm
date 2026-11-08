@@ -2,9 +2,9 @@
 //! says what the person asked for. Talking to the service is the caller's job.
 
 use super::dialog;
+use super::motion;
 use super::theme::{line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, TEXT, TEXT_DIM};
 use super::widgets::ButtonKind;
-use crate::secure::pairing::CODE_SECONDS;
 use eframe::egui::{
     self, text::CCursor, text::CCursorRange, vec2, Align, Event, Frame, Galley, Id, Layout, Margin, Rect, Sense,
     Ui, WidgetInfo, WidgetType,
@@ -50,6 +50,8 @@ pub struct PairingView<'a> {
     pub working: bool,
     /// How long ago the status's `seconds_left` was counted.
     pub left_since_poll: Duration,
+    /// The system asks for no animation, so the countdown moves a second at a time.
+    pub reduced: bool,
 }
 
 /// What the person has typed or chosen in the window.
@@ -112,7 +114,7 @@ pub fn spoken_code(code: &str) -> String {
 
 enum Screen<'a> {
     Choice,
-    Showing { code: &'a str, left: f32 },
+    Showing { code: &'a str, seconds: u64 },
     /// Typing a code, with what went wrong with the last one.
     Entering { failure: Option<String> },
     /// The showing side, as the service words what went wrong.
@@ -134,8 +136,7 @@ fn screen<'a>(view: &PairingView<'a>, input: &PairingInput) -> Screen<'a> {
         }
         ("failed", _) => Screen::Failed(error),
         ("showing", Some(code)) => {
-            let polled = view.status.and_then(|s| s.seconds_left).unwrap_or(0) as f32;
-            Screen::Showing { code, left: (polled - view.left_since_poll.as_secs_f32()).max(0.0) }
+            Screen::Showing { code, seconds: view.status.and_then(|s| s.seconds_left).unwrap_or(0) }
         }
         ("entering", _) => Screen::Entering { failure: None },
         _ if input.entering => Screen::Entering { failure: None },
@@ -182,10 +183,11 @@ pub fn window(ctx: &egui::Context, view: &PairingView, input: &mut PairingInput,
     let title = format!("Pair with {}", view.other);
     let shown = dialog::show(ctx, Id::new("pairing window"), &title, opacity, |ui| match screen {
         Screen::Choice => choice(ui, view, input, moved),
-        Screen::Showing { code, left } => showing(ui, view, code, left, moved),
+        Screen::Showing { code, seconds } => showing(ui, view, code, seconds, moved),
         Screen::Entering { failure } => entering(ui, view, input, failure.as_deref()),
         Screen::Failed(error) => {
-            dialog::text(ui, error, Type::Body, DANGER);
+            let said = dialog::text(ui, error, Type::Body, DANGER);
+            motion::live(ui.ctx(), said.id);
             working_line(ui, view);
             refusal_line(ui, input);
             let mut request = None;
@@ -199,7 +201,8 @@ pub fn window(ctx: &egui::Context, view: &PairingView, input: &mut PairingInput,
         }
         Screen::Paired => {
             let name = view.status.and_then(|s| s.peer_name.as_deref()).unwrap_or(view.other);
-            dialog::text(ui, &format!("Paired with {name}"), Type::Body, TEXT);
+            let said = dialog::text(ui, &format!("Paired with {name}"), Type::Body, TEXT);
+            motion::live(ui.ctx(), said.id);
             dialog::text(ui, "Everything between these devices is encrypted.", Type::Caption, TEXT_DIM);
             None
         }
@@ -230,7 +233,8 @@ fn working_line(ui: &mut Ui, view: &PairingView) {
 
 fn refusal_line(ui: &mut Ui, input: &PairingInput) {
     if let Some(why) = &input.refusal {
-        dialog::text(ui, why, Type::Body, DANGER);
+        let said = dialog::text(ui, why, Type::Body, DANGER);
+        motion::live(ui.ctx(), said.id);
     }
 }
 
@@ -255,7 +259,7 @@ fn choice(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, moved: bool
     request
 }
 
-fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32, moved: bool) -> Option<PairingRequest> {
+fn showing(ui: &mut Ui, view: &PairingView, code: &str, seconds: u64, moved: bool) -> Option<PairingRequest> {
     let sentence = format!("Open mesh-kvm on {}, choose Enter a code, and type:", view.other);
     dialog::text(ui, &sentence, Type::Body, TEXT);
     let shown = code_shown(code);
@@ -268,11 +272,13 @@ fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32, moved: bool) 
     ui.spacing_mut().item_spacing.y = 0.0;
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), COUNTDOWN_HEIGHT), Sense::hover());
     ui.painter().rect_filled(bar, 0.0, BG);
-    let share = (left / CODE_SECONDS as f32).clamp(0.0, 1.0);
+    let share = motion::countdown_share(seconds, view.left_since_poll, view.reduced);
     ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * share, bar.height())), 0.0, ACCENT);
     ui.add_space(gap);
     ui.spacing_mut().item_spacing.y = gap;
-    let left = format!("{} LEFT, ONE TRY", clock(left.ceil() as u64));
+    let left = (seconds as f32 - view.left_since_poll.as_secs_f32()).max(0.0).ceil() as u64;
+    announce_time(ui, left);
+    let left = format!("{} LEFT, ONE TRY", clock(left));
     let waiting = format!("WAITING FOR {}", view.other.to_uppercase());
     ui.horizontal(|ui| {
         ui.label(Type::Countdown.job(&left, TEXT_DIM));
@@ -283,6 +289,20 @@ fn showing(ui: &mut Ui, view: &PairingView, code: &str, left: f32, moved: bool) 
     let mut request = None;
     dialog::buttons(ui, "showing", |ui| request = cancel(ui, true, moved));
     request
+}
+
+/// Says "1 minute left", "30 seconds left" and "10 seconds left" as the code gets there, and
+/// keeps the last of them until the next code.
+fn announce_time(ui: &Ui, left: u64) {
+    let id = ui.id().with("last announcement");
+    if left > 60 {
+        ui.data_mut(|d| d.remove_temp::<&'static str>(id));
+    } else if let Some(said) = motion::countdown_announcement(left) {
+        ui.data_mut(|d| d.insert_temp(id, said));
+    }
+    if let Some(said) = ui.data(|d| d.get_temp::<&'static str>(id)) {
+        motion::announce(ui, "countdown", said);
+    }
 }
 
 fn entering(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, failure: Option<&str>) -> Option<PairingRequest> {
@@ -332,7 +352,8 @@ fn entering(ui: &mut Ui, view: &PairingView, input: &mut PairingInput, failure: 
     let hint = "Use this device's own keyboard. The devices can't share one until they're paired.";
     dialog::text(ui, hint, Type::Caption, TEXT_DIM);
     if let Some(failure) = failure {
-        dialog::text(ui, failure, Type::Body, DANGER);
+        let said = dialog::text(ui, failure, Type::Body, DANGER);
+        motion::live(ui.ctx(), said.id);
     }
     refusal_line(ui, input);
     dialog::buttons(ui, "entering", |ui| {
@@ -415,6 +436,7 @@ mod tests {
             other_address: Some("192.168.8.210"),
             working: false,
             left_since_poll: Duration::ZERO,
+            reduced: false,
         }
     }
 
