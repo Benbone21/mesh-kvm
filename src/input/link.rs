@@ -35,6 +35,10 @@ pub const REPORT_COPIES: usize = 2;
 /// The longest a press waits for one before it. Long enough for a copy that's a little behind,
 /// short enough not to be felt, and a clean link never waits at all.
 const HOLD_MS: u64 = 30;
+/// After the copies that go with a press, the latest presses go again this long after it. Wi-Fi
+/// loses packets in runs, which take every copy sent at once with them, and the heartbeat that
+/// would bring them next can be 400 ms away.
+const REPEAT_AFTER_MS: [u64; 3] = [15, 50, 150];
 const MAX_WAITING: usize = 64;
 /// A press this far behind the sender's clock happened before a stall, and the person has gone on
 /// to other things. A release always gets through, as it can only let something go.
@@ -199,6 +203,8 @@ pub struct PressLog {
     /// The latest ones, with when each was made.
     recent: VecDeque<(PressEvent, u64)>,
     reliable: bool,
+    /// When the newest press was made, and how many of its later repeats have gone.
+    repeats: Option<(u64, usize)>,
 }
 
 impl PressLog {
@@ -222,6 +228,20 @@ impl PressLog {
         if self.recent.len() > HISTORY {
             self.recent.pop_front();
         }
+        self.repeats = Some((now_ms, 0));
+        self.packet(now_ms)
+    }
+
+    /// The latest presses again, when one of their later repeats is due. Each goes once.
+    pub fn repeat(&mut self, now_ms: u64) -> Option<Payload> {
+        let (made, sent) = self.repeats?;
+        let due = REPEAT_AFTER_MS.get(sent).is_some_and(|after| now_ms.saturating_sub(made) >= *after);
+        if !due {
+            return None;
+        }
+        // Repeats that a slow loop let pile up go as one.
+        let sent = REPEAT_AFTER_MS.iter().filter(|after| now_ms.saturating_sub(made) >= **after).count();
+        self.repeats = Some((made, sent));
         self.packet(now_ms)
     }
 
@@ -241,6 +261,51 @@ impl PressLog {
     /// Typing from before a dropout must not turn up after it.
     pub fn forget(&mut self) {
         self.recent.clear();
+        self.repeats = None;
+    }
+}
+
+/// The least time between two movements sent. A gaming mouse reports 1000 times a second, and on
+/// Wi-Fi that many packets made the radio's stalls five times as common, with every key waiting
+/// behind them. 250 a second is still more than the laptop's screen shows.
+pub const MOTION_GAP_MS: u64 = 4;
+
+/// Gathers mouse movement so that at most one movement goes each `MOTION_GAP_MS`. A movement after
+/// a quiet spell goes at once, so only a steady stream waits, and never for longer than the gap.
+/// Anything else that goes takes a waiting movement out ahead of itself, so that a click lands
+/// where the pointer was, and what reaches the wire is in the order it happened.
+#[derive(Default)]
+pub struct MotionBatch {
+    waiting: Option<(i32, i32)>,
+    last_sent: Option<u64>,
+}
+
+impl MotionBatch {
+    /// What to send now for `payload`, in order.
+    pub fn send(&mut self, payload: Payload, now_ms: u64) -> Vec<Payload> {
+        if let Payload::MouseMoveDelta { dx, dy } = payload {
+            let (x, y) = self.waiting.take().unwrap_or((0, 0));
+            self.waiting = Some((x.saturating_add(dx), y.saturating_add(dy)));
+            return self.due(now_ms).into_iter().collect();
+        }
+        let mut out: Vec<Payload> = self.flush().into_iter().collect();
+        out.push(payload);
+        out
+    }
+
+    /// The movement gathered so far, once the gap since the last one has gone by.
+    pub fn due(&mut self, now_ms: u64) -> Option<Payload> {
+        let gap_over = self.last_sent.is_none_or(|at| now_ms.saturating_sub(at) >= MOTION_GAP_MS);
+        if !gap_over {
+            return None;
+        }
+        let payload = self.flush()?;
+        self.last_sent = Some(now_ms);
+        Some(payload)
+    }
+
+    fn flush(&mut self) -> Option<Payload> {
+        self.waiting.take().map(|(dx, dy)| Payload::MouseMoveDelta { dx, dy })
     }
 }
 
@@ -746,6 +811,107 @@ mod tests {
         log.record(tap(30, false), 150);
         assert_eq!(parts(log.tail(400)), (2, vec![at(tap(30, true), 100), at(tap(30, false), 150)]));
         assert!(log.tail(150 + HISTORY_MS).is_none());
+    }
+
+    fn moved(payloads: &[Payload]) -> Vec<(i32, i32)> {
+        payloads
+            .iter()
+            .map(|p| match p {
+                Payload::MouseMoveDelta { dx, dy } => (*dx, *dy),
+                other => panic!("expected a movement: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn movement_after_a_quiet_spell_goes_at_once() {
+        let mut batch = MotionBatch::default();
+        assert_eq!(moved(&batch.send(Payload::MouseMoveDelta { dx: 3, dy: -1 }, 100)), vec![(3, -1)]);
+        assert_eq!(moved(&batch.send(Payload::MouseMoveDelta { dx: 1, dy: 0 }, 100 + MOTION_GAP_MS)), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn a_steady_stream_goes_once_a_gap_adding_up_every_movement() {
+        let mut batch = MotionBatch::default();
+        let mut sent = Vec::new();
+        for ms in 0..100u64 {
+            sent.extend(batch.send(Payload::MouseMoveDelta { dx: 1, dy: 2 }, ms));
+            sent.extend(batch.due(ms));
+        }
+        sent.extend(batch.due(100 + MOTION_GAP_MS));
+        assert_eq!(sent.len() as u64, 100 / MOTION_GAP_MS + 1, "one at the start, then one a gap");
+        let total = moved(&sent).iter().fold((0, 0), |(x, y), (dx, dy)| (x + dx, y + dy));
+        assert_eq!(total, (100, 200), "nothing is lost on the way");
+    }
+
+    #[test]
+    fn waiting_movement_goes_no_later_than_the_gap() {
+        let mut batch = MotionBatch::default();
+        batch.send(Payload::MouseMoveDelta { dx: 1, dy: 0 }, 0);
+        assert!(batch.send(Payload::MouseMoveDelta { dx: 5, dy: 0 }, 1).is_empty());
+        assert!(batch.due(MOTION_GAP_MS - 1).is_none());
+        assert_eq!(moved(&batch.due(MOTION_GAP_MS).into_iter().collect::<Vec<_>>()), vec![(5, 0)]);
+        assert!(batch.due(MOTION_GAP_MS * 3).is_none(), "nothing more to send");
+    }
+
+    #[test]
+    fn a_click_takes_the_waiting_movement_out_ahead_of_it() {
+        let mut batch = MotionBatch::default();
+        batch.send(Payload::MouseMoveDelta { dx: 1, dy: 0 }, 0);
+        batch.send(Payload::MouseMoveDelta { dx: 7, dy: 3 }, 1);
+        let out = batch.send(Payload::MouseButton { button: 1, pressed: true }, 2);
+        assert!(matches!(out[..], [Payload::MouseMoveDelta { dx: 7, dy: 3 }, Payload::MouseButton { button: 1, pressed: true }]), "{out:?}");
+        assert!(batch.due(100).is_none());
+        assert_eq!(batch.send(Payload::Heartbeat, 100).len(), 1, "nothing waiting, so it goes alone");
+    }
+
+    #[test]
+    fn a_huge_sum_saturates_instead_of_wrapping() {
+        let mut batch = MotionBatch::default();
+        batch.send(Payload::MouseMoveDelta { dx: 0, dy: 0 }, 0);
+        batch.send(Payload::MouseMoveDelta { dx: i32::MAX, dy: i32::MIN }, 1);
+        batch.send(Payload::MouseMoveDelta { dx: 1, dy: -1 }, 2);
+        assert_eq!(moved(&batch.due(MOTION_GAP_MS).into_iter().collect::<Vec<_>>()), vec![(i32::MAX, i32::MIN)]);
+    }
+
+    #[test]
+    fn a_press_goes_again_a_little_later_and_then_stops() {
+        let mut log = reliable_log();
+        assert!(log.repeat(0).is_none(), "nothing pressed yet");
+        log.record(tap(30, true), 100);
+        assert!(log.repeat(100 + REPEAT_AFTER_MS[0] - 1).is_none());
+        assert_eq!(parts(log.repeat(100 + REPEAT_AFTER_MS[0])), (1, vec![at(tap(30, true), 100)]));
+        assert!(log.repeat(100 + REPEAT_AFTER_MS[0]).is_none(), "each repeat goes once");
+        assert!(log.repeat(100 + REPEAT_AFTER_MS[1]).is_some());
+        assert!(log.repeat(100 + REPEAT_AFTER_MS[2]).is_some());
+        assert!(log.repeat(100 + HISTORY_MS / 2).is_none(), "the heartbeat takes it from there");
+    }
+
+    #[test]
+    fn a_new_press_starts_the_repeats_again_with_both() {
+        let mut log = reliable_log();
+        log.record(tap(30, true), 0);
+        log.repeat(REPEAT_AFTER_MS[0]);
+        log.record(tap(30, false), 40);
+        assert!(log.repeat(41).is_none());
+        assert_eq!(parts(log.repeat(40 + REPEAT_AFTER_MS[0])), (2, vec![at(tap(30, true), 0), at(tap(30, false), 40)]));
+    }
+
+    #[test]
+    fn repeats_a_slow_loop_missed_go_as_one() {
+        let mut log = reliable_log();
+        log.record(tap(30, true), 0);
+        assert!(log.repeat(REPEAT_AFTER_MS[1]).is_some());
+        assert!(log.repeat(REPEAT_AFTER_MS[1] + 1).is_none());
+        assert!(log.repeat(REPEAT_AFTER_MS[2]).is_some());
+    }
+
+    #[test]
+    fn nothing_from_before_a_dropout_is_repeated() {
+        let mut log = reliable_log();
+        log.record(tap(30, true), 0);
+        log.forget();
+        assert!(log.repeat(REPEAT_AFTER_MS[0]).is_none());
     }
 
     #[test]

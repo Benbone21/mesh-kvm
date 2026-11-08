@@ -3,7 +3,7 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::protocol::{
     HeldInput, NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
@@ -1052,15 +1052,39 @@ struct UdpPeer<'a> {
     socket: &'a PeerSocket,
     seq: u64,
     presses: PressLog,
+    motion: MotionBatch,
     clock: Instant,
 }
 
-impl PeerSender for UdpPeer<'_> {
-    fn send(&mut self, payload: Payload) {
+impl UdpPeer<'_> {
+    fn now_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
+    fn send_now(&mut self, payload: Payload) {
         let pkt = Packet::new(self.seq, NodeId::Debian, payload);
         self.seq = self.seq.wrapping_add(1);
         if let Ok(bytes) = pkt.encode() {
             self.socket.send(&bytes);
+        }
+    }
+
+    /// Movement that waited out the gap, and presses due to go again.
+    fn send_due(&mut self) {
+        let now_ms = self.now_ms();
+        if let Some(motion) = self.motion.due(now_ms) {
+            self.send_now(motion);
+        }
+        if let Some(repeat) = self.presses.repeat(now_ms) {
+            self.send(repeat);
+        }
+    }
+}
+
+impl PeerSender for UdpPeer<'_> {
+    fn send(&mut self, payload: Payload) {
+        for payload in self.motion.send(payload, self.now_ms()) {
+            self.send_now(payload);
         }
     }
 
@@ -1197,6 +1221,7 @@ pub fn run_debian_node(
             socket: &peer_socket,
             seq: init_seq,
             presses: PressLog::default(),
+            motion: MotionBatch::default(),
             clock,
         },
         last_focus_change: Instant::now() - EDGE_SETTLE,
@@ -1472,6 +1497,8 @@ pub fn run_debian_node(
 
         // Straight after the reads, so held state is as fresh as it can be.
         core.backend.sync_grabs(core.router.held_forwarded());
+
+        core.peer.send_due();
 
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
