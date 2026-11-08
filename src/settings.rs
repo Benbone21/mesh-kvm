@@ -22,6 +22,11 @@ const MAX_POINTER_SPEED: f64 = 2.0;
 const DEFAULT_POINTER_SPEED: f32 = 1.0;
 const DEFAULT_MAIN_DEVICE: DeviceId = NodeId::Debian as DeviceId;
 const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+/// A new copy from a Windows update that restarts before it has proved itself starts its proving
+/// over, while the old version's watcher keeps its own deadline and puts the old version back when
+/// that passes. A restart, as after pairing, waits for the proving to end, for up to this long.
+const RESTART_HOLD_WHILE_PROVING: std::time::Duration = std::time::Duration::from_secs(120);
+const PROVING_LOOK: std::time::Duration = std::time::Duration::from_millis(500);
 pub const OK_RESPONSE: &str = r#"{"ok":true}"#;
 /// The longest device name. The layout holds names to the same length.
 pub const MAX_DEVICE_NAME: usize = 32;
@@ -340,10 +345,20 @@ pub fn restart_requested() -> bool {
 pub fn request_restart() {
     let spawned = std::thread::Builder::new().name("mesh-kvm-restart".to_string()).spawn(|| {
         std::thread::sleep(RESTART_DELAY);
+        wait_while(&crate::update::proving, RESTART_HOLD_WHILE_PROVING, PROVING_LOOK, &std::thread::sleep);
         RESTART_PENDING.store(true, Ordering::SeqCst);
     });
     if spawned.is_err() {
         RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Waits while `busy`, for up to `limit`.
+fn wait_while(busy: &dyn Fn() -> bool, limit: std::time::Duration, every: std::time::Duration, sleep: &dyn Fn(std::time::Duration)) {
+    let mut waited = std::time::Duration::ZERO;
+    while waited < limit && busy() {
+        sleep(every);
+        waited += every;
     }
 }
 
@@ -700,6 +715,26 @@ pub fn handle_common_action(act: &str, val: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_waits_for_a_new_copy_to_prove_itself_but_not_for_ever() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let looks = Cell::new(0);
+        let slept = Cell::new(Duration::ZERO);
+        let sleep = |d| slept.set(slept.get() + d);
+        let proving_for_3 = || {
+            looks.set(looks.get() + 1);
+            looks.get() <= 3
+        };
+        wait_while(&proving_for_3, RESTART_HOLD_WHILE_PROVING, PROVING_LOOK, &sleep);
+        assert_eq!(slept.get(), PROVING_LOOK * 3);
+        slept.set(Duration::ZERO);
+        wait_while(&|| false, RESTART_HOLD_WHILE_PROVING, PROVING_LOOK, &sleep);
+        assert_eq!(slept.get(), Duration::ZERO, "nothing proving, no wait");
+        wait_while(&|| true, RESTART_HOLD_WHILE_PROVING, PROVING_LOOK, &sleep);
+        assert_eq!(slept.get(), RESTART_HOLD_WHILE_PROVING, "a copy that never proves itself is the watcher's to deal with");
+    }
     use crate::router::{Router, RouterConfig};
 
     #[test]

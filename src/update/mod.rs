@@ -401,6 +401,15 @@ pub fn status_json() -> Value {
     }
 }
 
+/// True while this copy is new from an update and hasn't yet proved itself. A restart now would
+/// start the proving over, after the old version's watcher has started counting.
+pub fn proving() -> bool {
+    match UPDATER.get() {
+        Some(updater) => updater.status().proving,
+        None => proving_before_start(),
+    }
+}
+
 fn proving_before_start() -> bool {
     #[cfg(target_os = "windows")]
     {
