@@ -1264,6 +1264,62 @@ mod tests {
         assert_eq!(box_of(&window, Device::Windows), before);
     }
 
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> Event {
+        Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers }
+    }
+
+    /// Clicks Laptop's monitor, which selects it and gives it the keyboard.
+    fn click_laptop(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, now: Instant) {
+        let at = monitor_on_screen(ctx, window, snapshot, Device::Windows, 0, now).center();
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![], now);
+    }
+
+    #[test]
+    fn the_canvas_shows_its_label_and_hint() {
+        let (ctx, mut window, snapshot) = (context(), window(), linked());
+        let mut output = frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        for _ in 0..2 {
+            output = frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], Instant::now());
+        }
+        let text = drawn_text(&output);
+        assert!(text.contains("LAYOUT"), "{text}");
+        assert!(text.contains("Drag a screen to move it. The bright edge is where the mouse crosses."), "{text}");
+    }
+
+    #[test]
+    fn an_arrow_key_moves_the_selected_screen_by_ten_and_shift_by_one() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (linked(), Instant::now());
+        click_laptop(&ctx, &mut window, &snapshot, now);
+        let start = box_of(&window, Device::Windows).0;
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![key(egui::Key::ArrowRight, Default::default())], now);
+        assert_eq!(box_of(&window, Device::Windows).0, start + 10);
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![key(egui::Key::ArrowRight, egui::Modifiers::SHIFT)], now);
+        assert_eq!(box_of(&window, Device::Windows).0, start + 11);
+        assert!(window.layout.take_due(now + Duration::from_secs(5)).is_some(), "the move should be saved");
+    }
+
+    #[test]
+    fn the_selected_tile_has_a_text_border_and_the_crossing_edge_is_accent() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (linked(), Instant::now());
+        let screen = monitor_on_screen(&ctx, &mut window, &snapshot, Device::Windows, 0, now);
+        let before = frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        let bordered = |output: &egui::FullOutput, colour| {
+            output.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.rect == screen && r.stroke.color == colour && r.stroke.width == 1.0))
+        };
+        assert!(!bordered(&before, theme::TEXT));
+        assert!(bordered(&before, theme::LINE_STRONG));
+        click_laptop(&ctx, &mut window, &snapshot, now);
+        let after = frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert!(bordered(&after, theme::TEXT));
+        let seam = after.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == theme::ACCENT && stroke.width == theme::CROSSING_EDGE));
+        assert!(seam, "no accent crossing edge");
+    }
+
     #[test]
     fn main_device_runs_off_the_ui_thread_and_shows_its_error() {
         let (ctx, mut window) = (context(), window());

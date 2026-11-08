@@ -1207,6 +1207,44 @@ pub fn fit(cfg: &LayoutConfig, width: f32, height: f32) -> MapView {
     }
 }
 
+/// The least width a screen is drawn at on the map, so its text stays readable.
+pub const MIN_TILE_WIDTH: f32 = 80.0;
+
+/// The view for a map area of this size, and the size of the content to scroll. The content is
+/// larger than the area when fitting would draw a screen under `MIN_TILE_WIDTH` wide.
+pub fn tile_view(cfg: &LayoutConfig, width: f32, height: f32) -> (MapView, [f32; 2]) {
+    const PAD: f32 = 16.0;
+    let fitted = fit(cfg, width, height);
+    let all: Vec<Display> = cfg.devices.iter().flat_map(LayoutDevice::rects).collect();
+    let narrowest = all.iter().map(|m| m.w).filter(|w| *w > 0).min().unwrap_or(0) as f32;
+    if narrowest <= 0.0 || narrowest * fitted.scale >= MIN_TILE_WIDTH {
+        return (fitted, [width, height]);
+    }
+    let scale = MIN_TILE_WIDTH / narrowest;
+    let (x0, y0, x1, y1) = bounds(&all);
+    let (span_w, span_h) = (((x1 - x0) as f32).max(1.0) * scale, ((y1 - y0) as f32).max(1.0) * scale);
+    let content = [width.max(span_w + PAD * 2.0), height.max(span_h + PAD * 2.0)];
+    let view = MapView {
+        scale,
+        offset_x: (content[0] - span_w) / 2.0 - x0 as f32 * scale,
+        offset_y: (content[1] - span_h) / 2.0 - y0 as f32 * scale,
+    };
+    (view, content)
+}
+
+/// Moves a device by `(dx, dy)` layout units through the same snapping as a drag, with no magnet.
+pub fn nudge(cfg: &mut LayoutConfig, device: Device, dx: i32, dy: i32) {
+    let (x, y, ..) = cfg.device_box(device);
+    drag_device(cfg, device, x + dx, y + dy, 0);
+}
+
+/// What a screen's tile says under its device's name, like `DP-1 2560x1440` with a times sign.
+pub fn tile_caption(rect: &Display, display: Option<&DisplayInfo>) -> String {
+    let id = display.map_or_else(|| rect.name.split(" (").next().unwrap_or("").to_string(), |d| d.id.clone());
+    let size = monitor_label(rect, display).1.replace(' ', "");
+    format!("{id} {size}")
+}
+
 /// True if a monitor in the layout, called `rect_name` there, is the one the system calls `id`.
 /// The layout's name starts with that, and may go on to say more, as in `DP-2 (360Hz Native)`.
 pub fn same_monitor(rect_name: &str, id: &str) -> bool {
@@ -1448,6 +1486,54 @@ mod tests {
 
     fn has(ps: &[Placement], label: &str) -> bool {
         ps.iter().any(|p| p.label == label)
+    }
+
+    /// The layout `tests/fake_service.py --monitors 6` serves.
+    fn six_monitor_config() -> LayoutConfig {
+        let json = r#"{"devices":[
+            {"node":"Debian","x":0,"y":0,"monitors":[
+                {"name":"DP-3 (239Hz Native)","x":0,"y":360,"w":1920,"h":1080},
+                {"name":"DP-2 (359Hz Native)","x":1920,"y":0,"w":2560,"h":1440},
+                {"name":"HDMI-A-1 (60Hz Native)","x":4480,"y":-300,"w":3840,"h":2160}]},
+            {"node":"Windows","x":1920,"y":1640,"monitors":[
+                {"name":"Display 2","x":-1920,"y":-200,"w":1920,"h":1080},
+                {"name":"Display 1","x":0,"y":0,"w":2560,"h":1600},
+                {"name":"Display 3","x":2560,"y":400,"w":1920,"h":1080}]}],
+            "attach_side":"Bottom"}"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn small_screens_never_draw_under_80_wide() {
+        let cfg = six_monitor_config();
+        let (view, content) = tile_view(&cfg, 300.0, 200.0);
+        let narrowest = cfg.devices.iter().flat_map(LayoutDevice::rects).map(|m| m.w as f32 * view.scale).fold(f32::MAX, f32::min);
+        assert!(narrowest >= MIN_TILE_WIDTH - 0.01, "{narrowest}");
+        assert!(content[0] > 300.0);
+        let (roomy, content) = tile_view(&cfg, 4000.0, 2000.0);
+        assert_eq!(roomy, fit(&cfg, 4000.0, 2000.0));
+        assert_eq!(content, [4000.0, 2000.0]);
+    }
+
+    #[test]
+    fn a_nudge_moves_the_device_and_keeps_it_touching() {
+        let mut cfg = cfg();
+        let (x, y, ..) = cfg.device_box(Device::Windows);
+        nudge(&mut cfg, Device::Windows, 10, 0);
+        assert_eq!(cfg.device_box(Device::Windows).0, x + 10);
+        nudge(&mut cfg, Device::Windows, 0, -1);
+        assert_eq!(cfg.device_box(Device::Windows).1, y, "it can't move into the other device, so it stays on the edge");
+    }
+
+    #[test]
+    fn a_tile_reads_its_output_and_size() {
+        let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
+        assert_eq!(tile_caption(&rect, None), "DP-2 2560\u{d7}1440");
+        let rect = Display { name: "Display 1".into(), w: 2560, h: 1600, ..Default::default() };
+        assert_eq!(tile_caption(&rect, None), "Display 1 2560\u{d7}1600");
+        let d = DisplayInfo { id: "DP-2".into(), name: "Big".into(), ..Default::default() };
+        let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
+        assert_eq!(tile_caption(&rect, Some(&d)), "DP-2 2560\u{d7}1440");
     }
 
     #[test]
