@@ -1,8 +1,8 @@
 #!/bin/sh
 # Publishes a release: packaging/release.sh [--dry-run] [--latest <version>] <version> <notes-file>
 #
-# It checks the key, the tree and the tests, builds both targets and the .deb, checks that what was
-# built is this version with this key, writes release.json and signs it. Then it uploads a draft,
+# It checks the key, the tree and the tests, builds both targets, the .deb and the Windows installer,
+# checks that what was built is this version with this key, writes release.json and signs it. Then it uploads a draft,
 # pushes the tag and publishes a full release. The version must already be the one in Cargo.toml.
 #
 # If it fails partway through publishing, run it again: nothing can see a draft, and a tag on this
@@ -87,6 +87,7 @@ echo "Building."
 cargo build --release --locked
 cargo build --release --locked --target "$windows"
 packaging/build-deb.sh >/dev/null
+setup=$(packaging/windows/build-setup.sh "$version")
 
 windows_exe=$target/$windows/release/mesh-kvm.exe
 deb=$target/deb/mesh-kvm_${version}_amd64.deb
@@ -118,12 +119,15 @@ rm -rf "$dist"
 mkdir -p "$dist"
 cp "$windows_exe" "$dist/mesh-kvm-windows-x86_64.exe"
 cp "$deb" "$dist/"
+cp "$setup" "$dist/mesh-kvm-setup.exe"
 
 entry() {
     printf '"%s":{"size":%s,"sha256":"%s"}' "$1" "$(stat -c %s "$dist/$1")" "$(sha256sum "$dist/$1" | cut -d ' ' -f 1)"
 }
-printf '{"version":"%s","files":{%s,%s}}\n' "$version" \
-    "$(entry mesh-kvm-windows-x86_64.exe)" "$(entry "mesh-kvm_${version}_amd64.deb")" >"$dist/release.json"
+# The installer is signed for too. A device looks up only its own file, so an older one isn't
+# bothered by a name it doesn't know.
+printf '{"version":"%s","files":{%s,%s,%s}}\n' "$version" \
+    "$(entry mesh-kvm-windows-x86_64.exe)" "$(entry "mesh-kvm_${version}_amd64.deb")" "$(entry mesh-kvm-setup.exe)" >"$dist/release.json"
 
 openssl pkeyutl -sign -inkey "$key" -rawin -in "$dist/release.json" -out "$dist/release.json.sig"
 [ "$(stat -c %s "$dist/release.json.sig")" = 64 ] || die "The signature came out the wrong size."
@@ -140,7 +144,7 @@ run() {
     fi
 }
 
-assets="$dist/release.json $dist/release.json.sig $dist/mesh-kvm-windows-x86_64.exe $dist/mesh-kvm_${version}_amd64.deb"
+assets="$dist/release.json $dist/release.json.sig $dist/mesh-kvm-windows-x86_64.exe $dist/mesh-kvm_${version}_amd64.deb $dist/mesh-kvm-setup.exe"
 
 # A draft first: the updater reads only the latest full release, so nothing is offered until every
 # file is up, and a failure here can simply be run again.

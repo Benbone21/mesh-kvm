@@ -148,7 +148,7 @@ def whole_dry_run(tree):
     check("the signature verifies against the public key", True)
     manifest = json.loads(manifest_bytes)
     check("release.json has the version", manifest["version"] == version, manifest)
-    check("release.json lists both files", set(manifest["files"]) == {deb_name, "mesh-kvm-windows-x86_64.exe"}, manifest)
+    check("release.json lists the three files", set(manifest["files"]) == {deb_name, "mesh-kvm-windows-x86_64.exe", "mesh-kvm-setup.exe"}, manifest)
     for name, entry in manifest["files"].items():
         data = (dist / name).read_bytes()
         check(f"{name} matches its size and hash", entry == {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}, entry)
@@ -177,7 +177,10 @@ def whole_dry_run(tree):
     check("it tags, uploads a draft, pushes the tag and publishes, in that order", -1 not in steps and steps == sorted(steps), out[-900:])
     check("the upload is a draft", "--draft --title" in out, out[-900:])
     check("the release ends up full and latest", "--draft=false --latest --verify-tag" in out, out[-900:])
-    check("all four files would be uploaded", all(n in out for n in ["release.json.sig", deb_name, "mesh-kvm-windows-x86_64.exe"]), out[-600:])
+    check("all five files would be uploaded", all(n in out for n in ["release.json.sig", deb_name, "mesh-kvm-windows-x86_64.exe", "mesh-kvm-setup.exe"]), out[-600:])
+    setup = (dist / "mesh-kvm-setup.exe").read_bytes()
+    check("the installer is a Windows program", setup[:2] == b"MZ" and b"Nullsoft" in setup, str(setup[:2]))
+    check("the installer says its version", f"ProductVersion\0{version}\0".encode("utf-16-le") in setup)
     check("the notes come from the file given", str(tree.notes) in out, out[-600:])
 
 
