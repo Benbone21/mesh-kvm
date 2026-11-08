@@ -12,6 +12,9 @@ const ASK_AGAIN_AFTER: Duration = Duration::from_secs(20);
 /// How long the other device has to keep answering on the new version before this one follows.
 /// A new copy that answers once and then dies hasn't arrived.
 pub const STEADY_FOR: Duration = Duration::from_secs(10);
+/// On bad Wi-Fi a look can go unanswered now and then. A gap this short in a run of answers on the
+/// new version doesn't start it again; a longer one, or an answer on another version, does.
+const MISSED_FOR_AT_MOST: Duration = Duration::from_secs(6);
 
 /// What the other device says about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,13 +77,17 @@ pub fn update_peer_first(devices: &dyn Devices, target: Version) -> Result<(), S
         unclear = ask()?;
     }
     let mut waited = Duration::ZERO;
-    // When it was first seen there, in this unbroken run of looks.
+    // When it was first seen there, in this run of looks, and when it was last.
     let mut arrived_at = None;
+    let mut last_there = Duration::ZERO;
     while waited < COME_BACK_WITHIN {
         devices.wait(LOOK_EVERY);
         waited += LOOK_EVERY;
         let look = devices.look_at_peer();
-        if !look.as_ref().is_some_and(|l| on_target(l) && !l.proving) {
+        let there = look.as_ref().is_some_and(|l| on_target(l) && !l.proving);
+        if there {
+            last_there = waited;
+        } else if look.is_some() || waited - last_there > MISSED_FOR_AT_MOST {
             arrived_at = None;
         }
         match look {
@@ -201,17 +208,31 @@ mod tests {
     fn a_peer_that_keeps_dropping_out_on_the_new_version_is_not_followed() {
         let mut looks = vec![on("0.7.0")];
         for _ in 0..200 {
-            looks.extend([on("0.7.1"), on("0.7.1"), None]);
+            looks.extend([on("0.7.1"), on("0.7.1"), None, None, None, None]);
         }
         let devices = fake(looks);
         assert!(update_peer_first(&devices, v("0.7.1")).is_err());
     }
 
     #[test]
-    fn a_peer_must_keep_answering_on_the_new_version_for_a_while_first() {
-        let devices = fake(vec![on("0.7.0"), on("0.7.1"), None, on("0.7.1")]);
+    fn a_look_missed_now_and_then_on_bad_wifi_does_not_start_the_wait_again() {
+        let devices = fake(vec![on("0.7.0"), on("0.7.1"), None, on("0.7.1"), on("0.7.1"), None, None, on("0.7.1")]);
         assert_eq!(update_peer_first(&devices, v("0.7.1")), Ok(()));
-        assert_eq!(devices.waited.get(), LOOK_EVERY * 3 + STEADY_FOR, "the run started again after the gap");
+        assert_eq!(devices.waited.get(), LOOK_EVERY * 7, "counted from the first answer there");
+    }
+
+    #[test]
+    fn a_peer_back_on_the_old_version_starts_the_wait_again() {
+        let devices = fake(vec![on("0.7.0"), on("0.7.1"), on("0.7.1"), on("0.7.0"), on("0.7.1")]);
+        assert_eq!(update_peer_first(&devices, v("0.7.1")), Ok(()));
+        assert_eq!(devices.waited.get(), LOOK_EVERY * 4 + STEADY_FOR);
+    }
+
+    #[test]
+    fn a_peer_must_keep_answering_on_the_new_version_for_a_while_first() {
+        let devices = fake(vec![on("0.7.0"), on("0.7.1"), None, None, None, None, on("0.7.1")]);
+        assert_eq!(update_peer_first(&devices, v("0.7.1")), Ok(()));
+        assert_eq!(devices.waited.get(), LOOK_EVERY * 6 + STEADY_FOR, "the run started again after the long gap");
     }
 
     #[test]

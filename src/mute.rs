@@ -5,7 +5,7 @@
 //! those change under us when a headset, dock or screen comes and goes.
 
 use crate::audio::{
-    devices, peer_listening, peer_ready, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
+    devices, peer_listening, peer_ready, peer_reporting, reaching_peer, AUDIO_CAPTURE_SURVIVES_MUTE, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_PLAY_ONLY_ON_OTHER,
     AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS,
 };
 use crate::settings::write_atomically;
@@ -36,6 +36,11 @@ const UNSETTLED_HOLD: Duration = Duration::from_secs(3);
 /// With a capture proven under a mute, silence never ends a run. Sound going out that the far side
 /// doesn't hear for this long does: it can't play it, so it had better come out here.
 const UNHEARD_LIMIT: Duration = Duration::from_secs(5);
+/// With a capture proven under a mute, how long the far side's last word that Play is on still
+/// counts while its reports have stopped coming, as they do on bad Wi-Fi with the input link up.
+/// Real sound going out still has to be heard within `UNHEARD_LIMIT`, so this can't keep anyone
+/// from hearing it for longer than that.
+const REPORT_GAP_HOLD: Duration = Duration::from_secs(30);
 /// Sound vanishing on a mute this many times running stops the muting for a while. Muting only
 /// happens with a capture that a mute can't reach, so this is a safety net: what it mostly sees is
 /// short sounds. A capture that really was being silenced would come round every few seconds, so
@@ -490,6 +495,8 @@ struct Readings {
     peer_listening: bool,
     /// The far side has Play on, so it would play what arrives, output open or not.
     peer_ready: bool,
+    /// A report has come from the far side lately. Without one, none of the above is known.
+    peer_reporting: bool,
     /// The far side says real sound is coming out of that output.
     peer_hearing: bool,
     /// Sound from the far side is playing here, on the output that would be muted.
@@ -502,6 +509,8 @@ struct LiveSignals {
     tx: Recent,
     rx: Recent,
     hold: SoundHold,
+    /// When the far side last said Play is on.
+    ready_at: Option<Instant>,
 }
 
 impl LiveSignals {
@@ -523,6 +532,7 @@ impl LiveSignals {
                 peer_online: AUDIO_PEER_ONLINE.load(Ordering::Relaxed),
                 peer_listening: peer_listening(now, RECENT_AUDIO),
                 peer_ready: peer_ready(now, RECENT_AUDIO),
+                peer_reporting: peer_reporting(now, RECENT_AUDIO),
                 peer_hearing: reaching_peer(now, RECENT_AUDIO),
                 playing_here,
             },
@@ -537,7 +547,13 @@ impl LiveSignals {
         self.sound_packets = r.sound_packets;
         let confirmed = r.capture_running && sending_sound && r.peer_hearing;
         // A proven capture's run outlasts any pause, and the far side may shut its output in one.
-        let can_play = r.peer_listening || (r.capture_proven_under_mute && r.peer_ready);
+        // Its reports can stop for a while on bad Wi-Fi too: until it says otherwise, Play stays on.
+        if r.peer_reporting {
+            self.ready_at = r.peer_ready.then_some(now);
+        }
+        let ready = r.peer_ready
+            || (!r.peer_reporting && self.ready_at.is_some_and(|at| now.duration_since(at) < REPORT_GAP_HOLD));
+        let can_play = r.peer_listening || (r.capture_proven_under_mute && ready);
         let connected = r.capture_running && can_play;
         let requested = r.setting && r.output_chosen && r.peer_online && r.capture_survives_mute;
         MuteInputs {
@@ -1132,6 +1148,7 @@ mod tests {
         peer_online: true,
         peer_listening: true,
         peer_ready: false,
+        peer_reporting: true,
         peer_hearing: false,
         playing_here: false,
     };
@@ -1458,6 +1475,91 @@ mod tests {
         let play_off = Readings { peer_listening: false, peer_ready: false, ..PROVEN_QUIET };
         run(&mut c, &mut signals, play_off, t + STEP * 300);
         assert!(!c.backend.is(SPEAKERS));
+    }
+
+    /// Reports have stopped coming, as on bad Wi-Fi, while the input link is still up.
+    const NO_REPORTS: Readings =
+        Readings { peer_listening: false, peer_ready: false, peer_reporting: false, peer_hearing: false, ..PROVEN_QUIET };
+
+    #[test]
+    fn a_proven_capture_stays_muted_when_reports_stop_for_a_while_in_a_pause() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-report-gap"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..100 {
+            // Gaps of up to 20 seconds, then reports again.
+            let r = if second % 30 < 20 { NO_REPORTS } else { PROVEN_QUIET };
+            run(&mut c, &mut signals, r, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        drop(c);
+        assert_eq!(outputs.writes.len(), 1, "muted once, and left: {:?}", outputs.writes);
+    }
+
+    #[test]
+    fn a_proven_capture_gives_the_output_back_when_reports_stay_away() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-reports-gone"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        let gone_at = 10 + REPORT_GAP_HOLD.as_secs() as u32;
+        for second in 10..gone_at - 1 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+            assert!(c.backend.is(SPEAKERS), "{second}");
+        }
+        for second in gone_at - 1..gone_at + 2 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        assert!(!c.backend.is(SPEAKERS), "nothing has said Play is on for too long");
+    }
+
+    #[test]
+    fn a_proven_capture_without_reports_gives_the_output_back_once_sound_goes_unheard() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-reports-gone-sound"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..15 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        for second in 15..22 {
+            run(&mut c, &mut signals, Readings { sound_packets: u64::from(second), ..NO_REPORTS }, t + STEP * second);
+        }
+        assert!(!c.backend.is(SPEAKERS), "sound nobody reports hearing comes out here");
+    }
+
+    #[test]
+    fn a_report_saying_play_is_off_counts_at_once_even_after_a_gap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("proven-gap-then-off"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        proven_run_started(&mut c, &mut signals, t);
+        for second in 10..15 {
+            run(&mut c, &mut signals, NO_REPORTS, t + STEP * second);
+        }
+        let play_off = Readings { peer_listening: false, peer_ready: false, ..PROVEN_QUIET };
+        run(&mut c, &mut signals, play_off, t + STEP * 15);
+        assert!(!c.backend.is(SPEAKERS));
+    }
+
+    #[test]
+    fn a_capture_not_proven_is_not_held_through_a_report_gap() {
+        let (mut outputs, flag) = (Outputs::default(), flag("unproven-report-gap"));
+        let mut c = MuteController::new(&mut outputs, flag);
+        let mut signals = LiveSignals::default();
+        let t = Instant::now();
+        for second in 0..10 {
+            run(&mut c, &mut signals, Readings { peer_ready: true, ..sounding(second + 1) }, t + STEP * second as u32);
+        }
+        assert!(c.backend.is(SPEAKERS));
+        let gap = Readings { sound_packets: 10, peer_listening: false, peer_ready: false, peer_reporting: false, ..QUIET_LINK };
+        run(&mut c, &mut signals, gap, t + STEP * 10);
+        assert!(!c.backend.is(SPEAKERS), "as before");
     }
 
     #[test]

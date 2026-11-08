@@ -126,6 +126,11 @@ pub fn peer_ready(now: Instant, within: Duration) -> bool {
     heard_back(now, within).ready
 }
 
+/// True while reports are coming from the other device at all.
+pub fn peer_reporting(now: Instant, within: Duration) -> bool {
+    heard_back(now, within).at.is_some()
+}
+
 /// What is being sent out, ready for the sender.
 #[derive(Default)]
 pub struct Hub {
