@@ -1240,9 +1240,9 @@ pub fn nudge(cfg: &mut LayoutConfig, device: Device, dx: i32, dy: i32) {
 
 /// What a screen's tile says under its device's name, like `DP-1 2560x1440` with a times sign.
 pub fn tile_caption(rect: &Display, display: Option<&DisplayInfo>) -> String {
-    let id = display.map_or_else(|| rect.name.split(" (").next().unwrap_or("").to_string(), |d| d.id.clone());
+    let id = display.map_or_else(|| rect.name.split(" (").next().unwrap_or("").trim().to_string(), |d| d.id.clone());
     let size = monitor_label(rect, display).1.replace(' ', "");
-    format!("{id} {size}")
+    format!("{id} {size}").trim_start().to_string()
 }
 
 /// True if a monitor in the layout, called `rect_name` there, is the one the system calls `id`.
@@ -1534,6 +1534,8 @@ mod tests {
         let d = DisplayInfo { id: "DP-2".into(), name: "Big".into(), ..Default::default() };
         let rect = Display { name: "DP-2 (360Hz Native)".into(), w: 2560, h: 1440, ..Default::default() };
         assert_eq!(tile_caption(&rect, Some(&d)), "DP-2 2560\u{d7}1440");
+        let rect = Display { name: " (60Hz)".into(), w: 1920, h: 1080, ..Default::default() };
+        assert_eq!(tile_caption(&rect, None), "1920\u{d7}1080");
     }
 
     #[test]

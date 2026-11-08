@@ -6,7 +6,7 @@ use super::theme::{self, line, Type, ACCENT, BG, CROSSING_EDGE, LINE_STRONG, SPA
 use super::view::fit_name;
 use super::widgets::{fitted, focus_ring};
 use eframe::egui::{
-    self, vec2, CursorIcon, FontFamily, FontId, Key, Modifiers, Painter, Pos2, Rect, ScrollArea, Sense, Shape,
+    self, vec2, CursorIcon, EventFilter, FontFamily, FontId, Key, Modifiers, Painter, Pos2, Rect, ScrollArea, Sense, Shape,
     StrokeKind, Ui, UiBuilder,
 };
 use std::time::Instant;
@@ -43,6 +43,8 @@ pub struct Canvas {
     pub hovered_in_controls: Option<MonitorKey>,
     /// True for one frame after a click, so the controls can bring that monitor into view.
     pub just_selected: bool,
+    /// The tile that had the keyboard last frame.
+    focused: Option<MonitorKey>,
 }
 
 pub fn monitor_id(device: Device, index: usize) -> egui::Id {
@@ -85,10 +87,14 @@ impl Canvas {
             None => model::tile_view(&cfg, map.width(), map.height()),
         };
         ui.scope_builder(UiBuilder::new().max_rect(map), |ui| {
-            ScrollArea::both().id_salt("layout canvas").auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
-                let (inner, _) = ui.allocate_exact_size(vec2(content[0], content[1]), Sense::hover());
-                self.map(ui, inner, &cfg, view, content, snapshot, draft, now);
-            });
+            if content[0] > map.width() + 0.5 || content[1] > map.height() + 0.5 {
+                ScrollArea::both().id_salt("layout canvas").auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
+                    let (inner, _) = ui.allocate_exact_size(vec2(content[0], content[1]), Sense::hover());
+                    self.map(ui, inner, &cfg, view, content, snapshot, draft, now);
+                });
+            } else {
+                self.map(ui, map, &cfg, view, content, snapshot, draft, now);
+            }
         });
     }
 
@@ -191,7 +197,20 @@ impl Canvas {
                 if response.drag_stopped() {
                     self.finish_drag(draft, now);
                 }
+                if response.has_focus() {
+                    // A tile that gets the keyboard is the selected one.
+                    let key = (*device, m.name.clone());
+                    if self.focused.as_ref() != Some(&key) {
+                        self.selected = Some(key.clone());
+                        self.focused = Some(key);
+                    }
+                } else if self.focused.as_ref() == Some(&(*device, m.name.clone())) {
+                    self.focused = None;
+                }
                 if response.has_focus() && self.drag.is_none() {
+                    // The arrows move the device, so they must not also move the focus.
+                    let arrows = EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() };
+                    ui.memory_mut(|m| m.set_focus_lock_filter(response.id, arrows));
                     self.arrow_keys(ui, *device, draft, now);
                 }
             }

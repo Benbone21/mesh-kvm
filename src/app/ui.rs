@@ -1321,6 +1321,32 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_keep_the_focus_on_the_tile_they_move() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (linked(), Instant::now());
+        click_laptop(&ctx, &mut window, &snapshot, now);
+        let laptop = monitor_id(Device::Windows, 0);
+        assert!(ctx.memory(|m| m.has_focus(laptop)));
+        let (start, debian) = (box_of(&window, Device::Windows), box_of(&window, Device::Debian));
+        for k in [egui::Key::ArrowUp, egui::Key::ArrowLeft, egui::Key::ArrowLeft] {
+            frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![key(k, Default::default())], now);
+            assert!(ctx.memory(|m| m.has_focus(laptop)), "focus left the tile after {k:?}");
+        }
+        assert_eq!(box_of(&window, Device::Debian), debian, "only the laptop should move");
+        assert_ne!(box_of(&window, Device::Windows), start);
+    }
+
+    #[test]
+    fn a_tile_that_gets_the_keyboard_is_selected() {
+        let (ctx, mut window) = (context(), window());
+        let (snapshot, now) = (linked(), Instant::now());
+        monitor_on_screen(&ctx, &mut window, &snapshot, Device::Windows, 0, now);
+        ctx.memory_mut(|m| m.request_focus(monitor_id(Device::Debian, 1)));
+        frame(&ctx, &mut window, &snapshot, WINDOW_SIZE, vec![], now);
+        assert_eq!(window.canvas.selected.as_ref().map(|k| k.0), Some(Device::Debian));
+    }
+
+    #[test]
     fn main_device_runs_off_the_ui_thread_and_shows_its_error() {
         let (ctx, mut window) = (context(), window());
         let snapshot = Snapshot::default();
