@@ -22,6 +22,8 @@ mod live;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod virtual_linux;
+#[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "windows")]
 mod wasapi;
@@ -72,6 +74,8 @@ pub static AUDIO_TX_PEAK_PCT: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
 /// What the other device says it is losing of what's sent, in percent.
 pub static AUDIO_TX_LOSS: AtomicU32 = AtomicU32::new(0);
+/// Apps playing on the other device's speakers here are being captured, to be sent.
+pub static AUDIO_SPEAKERS_CAPTURE_LIVE: AtomicBool = AtomicBool::new(false);
 /// The capture of an output is running.
 pub static AUDIO_OUTPUT_CAPTURE_LIVE: AtomicBool = AtomicBool::new(false);
 /// Muting the output won't silence what's captured from it. On Linux that's always so, as capture
@@ -257,6 +261,21 @@ pub fn trigger_test_chime(play_local: bool, send_to_peer: bool) {
             }
         }
     });
+}
+
+/// Notes whether the link to the other device is up, and tells the engine at once when that changes,
+/// as the other device's mic and speakers come and go with it.
+pub fn set_peer_online(online: bool) {
+    if AUDIO_PEER_ONLINE.swap(online, Ordering::Relaxed) != online {
+        platform::choices_changed();
+    }
+}
+
+/// Takes away what the audio engine added to this device's sound settings. Every way the service
+/// stops runs this, through `mute::shutdown`.
+pub fn shut_down() {
+    #[cfg(target_os = "linux")]
+    platform::shut_down();
 }
 
 /// Tells the audio engine to look at the choices now.

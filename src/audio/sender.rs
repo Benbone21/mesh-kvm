@@ -3,7 +3,7 @@
 use super::codec::{Format, OpusEncoder, MAX_PACKET};
 use super::mix::{self, Activity, Limiter, Mixer};
 use super::packet::{self, Body, Stream};
-use super::{devices, note_heard_back, note_mic_heard_back, note_other_version, AUDIO_MIC_TX_LOSS, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS};
+use super::{devices, note_heard_back, note_mic_heard_back, note_other_version, AUDIO_MIC_TX_LOSS, peak_pct, Hub, AUDIO_BITRATE_KBPS, AUDIO_TX_LOSS, AUDIO_TX_PACKETS, AUDIO_TX_PEAK_PCT, AUDIO_TX_SOUND_PACKETS, AUDIO_SPEAKERS_CAPTURE_LIVE};
 use super::{CHANNELS, OPUS_FRAME, PCM_FRAME};
 use crate::secure::datagram::{Channel, Opened, OVERHEAD};
 use std::net::{SocketAddr, UdpSocket};
@@ -302,6 +302,12 @@ fn chime_playing(hub: &Hub, now: Instant) -> bool {
     hub.chime.activity().data.is_some_and(|at| now.saturating_duration_since(at) < CHIME_WITHIN)
 }
 
+/// Whether the sound stream has anything to send: the output chosen to send, the chime, or the apps
+/// playing on the other device's speakers here, which are sent whatever output is chosen.
+fn sound_selected(output_chosen: bool, chime: bool, speakers: bool) -> bool {
+    output_chosen || chime || speakers
+}
+
 /// Runs until `stop`. Frames go out the moment a source has one, so this adds no delay of its own.
 pub fn send_loop(socket: &UdpSocket, target: SocketAddr, channel: &Channel, hub: &Hub, stop: &AtomicBool) {
     let _ = socket.set_nonblocking(true);
@@ -314,7 +320,8 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, channel: &Channel, hub:
     let mic_sources = [&hub.mic];
     let mut wire = Wire::new(socket, target, channel);
     while !stop.load(Ordering::Relaxed) {
-        let sending = devices::sending();
+        let speakers = AUDIO_SPEAKERS_CAPTURE_LIVE.load(Ordering::Relaxed);
+        let sending = devices::sending() || speakers;
         hub.signal.wait(if sending { WAIT_WHEN_SENDING } else { WAIT_WHEN_IDLE });
         let now_ms = clock.elapsed().as_millis() as u64;
         read_reports(socket, target, channel, now_ms);
@@ -326,7 +333,7 @@ pub fn send_loop(socket: &UdpSocket, target: SocketAddr, channel: &Channel, hub:
         sound.packetizer.set_quality(kbps, AUDIO_TX_LOSS.load(Ordering::Relaxed));
         mic.packetizer.set_quality(kbps, AUDIO_MIC_TX_LOSS.load(Ordering::Relaxed));
         let choice = devices::choice();
-        let sound_selected = choice.output != devices::NONE || chime_playing(hub, Instant::now());
+        let sound_selected = sound_selected(choice.output != devices::NONE, chime_playing(hub, Instant::now()), speakers);
         let mic_selected = choice.input != devices::NONE;
         sound.pass(&sound_sources, sound_selected, &mut |data| wire.send(data), &mut |frame, sent, now| {
             AUDIO_TX_PEAK_PCT.store(peak_pct(frame), Ordering::Relaxed);
@@ -356,6 +363,14 @@ mod tests {
         let mut sent = Vec::new();
         packetizer.frame(pcm, &mut |data| sent.push(data.to_vec()));
         sent
+    }
+
+    #[test]
+    fn the_other_device_s_speakers_are_sent_even_with_output_to_send_off() {
+        assert!(!sound_selected(false, false, false));
+        assert!(sound_selected(false, false, true), "an app playing on the virtual speaker");
+        assert!(sound_selected(true, false, false));
+        assert!(sound_selected(false, true, false), "the chime");
     }
 
     #[test]

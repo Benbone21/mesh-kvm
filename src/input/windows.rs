@@ -939,7 +939,7 @@ pub fn run_windows_node(
                     let main = router.main();
                     (router.online(), router.active(), router.panicked(), router.captive(), main)
                 };
-                crate::audio::AUDIO_PEER_ONLINE.store(status.0, Ordering::Relaxed);
+                crate::audio::set_peer_online(status.0);
                 link().set_online(status.0);
                 let version = link().peer_version(now_ms());
                 let mut log = presses();
