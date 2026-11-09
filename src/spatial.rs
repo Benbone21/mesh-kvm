@@ -1678,6 +1678,8 @@ mod tests {
     #[test]
     fn the_code_is_never_in_the_status_the_peer_can_read() {
         use crate::webui::{HttpRequest, Source};
+        // The status says whether another version is arriving, which the audio tests note.
+        let _quiet = crate::audio::tests::no_other_version();
         let state = Arc::new(shared_at(0, NodeId::Debian, None));
         let platform: Arc<dyn Platform> = Arc::new(NoScreens);
         let pairing = test_pairing("code");

@@ -538,9 +538,56 @@ fn pairing_now() -> (bool, Option<String>) {
 }
 
 /// Brings the other device's mic and speakers in line with the pairing and the link.
-fn look_at_virtual_devices() {
+fn look_at_virtual_devices(graph: Option<&Graph>) {
     let (paired, peer) = pairing_now();
-    virtual_linux::look(paired, AUDIO_PEER_ONLINE.load(Ordering::Relaxed), peer.as_deref());
+    virtual_linux::look(paired, AUDIO_PEER_ONLINE.load(Ordering::Relaxed), peer.as_deref(), graph.map(virtual_devices_in));
+}
+
+/// Whether the other device's mic and speakers are in the graph.
+fn virtual_devices_in(graph: &Graph) -> (bool, bool) {
+    let has = |name: &str| graph.nodes.iter().any(|node| node.name == name);
+    (has(virtual_linux::MIC_NAME), has(SPEAKERS_NAME))
+}
+
+/// As the engine sees them, for the live test.
+#[cfg(test)]
+pub(super) fn virtual_devices_in_graph_now() -> Option<(bool, bool)> {
+    read_graph().as_ref().map(virtual_devices_in)
+}
+
+/// The input and the output to play on, once kept off our own devices.
+#[derive(Debug)]
+struct Steered {
+    input: Resolved,
+    play: Resolved,
+    notes: Vec<String>,
+}
+
+/// Whether a choice follows the system default, and the default is one of ours.
+fn follows_us(resolved: &Resolved, default: Option<&String>) -> bool {
+    matches!(resolved, Resolved::Default | Resolved::Missing) && default.is_some_and(|name| name.starts_with(PREFIX))
+}
+
+/// Choices that follow the system default don't follow it onto our own devices, which someone may
+/// well make the default so that apps use them. Our mic as the default would send the other
+/// device's own mic back to it, so nothing is captured. Our speakers as the default would swallow
+/// what's received, so it plays on the first real output instead, if there is one.
+fn steer_clear_of_ours(input: Resolved, play: Resolved, lists: &Lists) -> Steered {
+    let mut notes = Vec::new();
+    let input = if follows_us(&input, lists.default_input.as_ref()) {
+        notes.push("The system's default microphone is the other device's mic, so nothing is sent from it. Choose a microphone or line-in.".to_string());
+        Resolved::Off
+    } else {
+        input
+    };
+    let play = match lists.outputs.first() {
+        Some(real) if follows_us(&play, lists.default_output.as_ref()) => {
+            notes.push(format!("The system's default output is the other device's speakers, so received audio plays on {}.", real.name));
+            Resolved::Device(real.id.clone())
+        }
+        _ => play,
+    };
+    Steered { input, play, notes }
 }
 
 /// How long to wait before looking at the graph.
@@ -557,11 +604,12 @@ fn engine() {
     loop {
         WAKE.wait(LOOK_EVERY);
         std::thread::sleep(look_wait(last_look, Instant::now()));
-        // Before the graph, so that the devices go when the link does whatever the graph is up to.
-        look_at_virtual_devices();
         let now = Instant::now();
         last_look = Some(now);
-        let Some(graph) = read_graph() else {
+        let graph = read_graph();
+        // Whatever the graph is up to, so that the devices go when the link does.
+        look_at_virtual_devices(graph.as_ref());
+        let Some(graph) = graph else {
             // No sound server yet. The captures stay as they are: it may just be restarting.
             AUDIO_OUTPUT_CAPTURE_LIVE.store(false, Ordering::Relaxed);
             AUDIO_SPEAKERS_CAPTURE_LIVE.store(false, Ordering::Relaxed);
@@ -575,6 +623,9 @@ fn engine() {
             Resolved::Off => Resolved::Default,
             other => other,
         };
+        // The notes about a missing choice are about the choice, so they're worked out before this.
+        let (input_missing, play_missing) = (input.missing_note("microphone or line-in"), play.missing_note("output to play on"));
+        let Steered { input, play, notes: steered_notes } = steer_clear_of_ours(input, play, &lists);
 
         let sink = sent.id(lists.default_output.as_ref());
         // What apps play on the other device's speakers is sent whatever output is chosen to send.
@@ -595,9 +646,9 @@ fn engine() {
         let apps_running = sink.as_deref().is_some_and(|sink| graph.apps_running_on(sink));
         let output_health = output.health(sent != Resolved::Off && apps_running, false, now);
         let notes = [
-            input.missing_note("microphone or line-in"),
+            input_missing,
             sent.missing_note("output to send"),
-            play.missing_note("output to play on"),
+            play_missing,
             (input != Resolved::Off).then(|| mic_health.note("microphone or line-in", "", now)).flatten(),
             (sent != Resolved::Off).then(|| output_health.note("output to send", "", now)).flatten(),
         ];
@@ -607,7 +658,7 @@ fn engine() {
             play: play.id(lists.default_output.as_ref()),
             echo_safe: true,
             hint: String::new(),
-            notes: notes.into_iter().flatten().collect(),
+            notes: notes.into_iter().flatten().chain(steered_notes).collect(),
         });
         devices::set_lists(lists);
     }
@@ -1167,6 +1218,42 @@ mod tests {
         assert_eq!(sinks_to_send(None, true), [SPEAKERS_NAME]);
         assert_eq!(sinks_to_send(Some("speakers"), false), ["speakers"]);
         assert!(sinks_to_send(None, false).is_empty());
+    }
+
+    fn lists_with_defaults(input: &str, output: &str) -> Lists {
+        let mut lists = graph().lists();
+        lists.default_input = Some(input.to_string());
+        lists.default_output = Some(output.to_string());
+        lists
+    }
+
+    #[test]
+    fn the_peer_s_mic_as_the_system_default_is_never_sent_back() {
+        let lists = lists_with_defaults(MIC_NAME, "speakers");
+        for input in [Resolved::Default, Resolved::Missing] {
+            let steered = steer_clear_of_ours(input, Resolved::Default, &lists);
+            assert_eq!(steered.input, Resolved::Off);
+            assert_eq!(steered.play, Resolved::Default);
+            assert_eq!(steered.notes.len(), 1);
+        }
+        let chosen = steer_clear_of_ours(Resolved::Device("mic".into()), Resolved::Default, &lists);
+        assert_eq!(chosen.input, Resolved::Device("mic".into()), "a chosen mic is the one used");
+        assert!(chosen.notes.is_empty());
+    }
+
+    #[test]
+    fn the_peer_s_speakers_as_the_system_default_don_t_take_what_is_received() {
+        let lists = lists_with_defaults("mic", SPEAKERS_NAME);
+        let steered = steer_clear_of_ours(Resolved::Default, Resolved::Default, &lists);
+        assert_eq!(steered.input, Resolved::Default);
+        assert_eq!(steered.play, Resolved::Device("headset".into()), "the first real output");
+        assert_eq!(steered.notes.len(), 1);
+        let nowhere = Lists { outputs: Vec::new(), ..lists.clone() };
+        assert_eq!(steer_clear_of_ours(Resolved::Default, Resolved::Default, &nowhere).play, Resolved::Default, "with no other, as before");
+        let real = lists_with_defaults("mic", "speakers");
+        let steered = steer_clear_of_ours(Resolved::Default, Resolved::Default, &real);
+        assert_eq!((steered.input, steered.play), (Resolved::Default, Resolved::Default));
+        assert!(steered.notes.is_empty());
     }
 
     #[test]

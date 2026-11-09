@@ -490,7 +490,7 @@ pub fn start_audio_sender(target_addr: SocketAddr, channel: Arc<Channel>) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::secure::datagram::{Label, LinkSecurity, Role};
     use crate::secure::keys::{Pairing, PeerKey};
@@ -499,8 +499,16 @@ mod tests {
 
     /// For a test that looks at the note about another version or the bytes sent, or that changes
     /// them, as there is one of each.
-    pub(super) fn figures_to_myself() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn figures_to_myself() -> std::sync::MutexGuard<'static, ()> {
         FIGURES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// For a test elsewhere that needs no other version noted: one left by an audio test lasts
+    /// `OTHER_VERSION_FOR`, so it is cleared, and none is noted while this is held.
+    pub(crate) fn no_other_version() -> std::sync::MutexGuard<'static, ()> {
+        let figures = figures_to_myself();
+        *OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        figures
     }
 
     /// A sender and a receiver that know each other, with no session yet.

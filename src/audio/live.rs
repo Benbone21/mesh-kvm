@@ -259,6 +259,7 @@ fn virtual_devices() {
     assert_eq!(devices.present(), Some("Live Test"), "{:?}", devices.error());
     assert!(pactl_list("sources").contains(virtual_linux::MIC_NAME));
     assert!(pactl_list("sinks").contains(virtual_linux::SPEAKERS_NAME));
+    assert_eq!(linux::virtual_devices_in_graph_now(), Some((true, true)), "the engine sees both at once");
 
     // Half a second in, so the source has settled.
     let recorded = record_tone_from_virtual_mic(1.5);
@@ -270,6 +271,7 @@ fn virtual_devices() {
     assert_eq!(devices.present(), None);
     assert!(!pactl_list("sources").contains(virtual_linux::MIC_NAME));
     assert!(!pactl_list("sinks").contains(virtual_linux::SPEAKERS_NAME));
+    assert_eq!(linux::virtual_devices_in_graph_now(), Some((false, false)));
 
     // A service killed with its devices up leaves them behind; the next start clears them.
     let mut killed = virtual_linux::VirtualDevices::default();

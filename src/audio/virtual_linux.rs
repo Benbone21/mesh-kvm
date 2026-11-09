@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -131,6 +132,20 @@ impl VirtualDevices {
         self.error = None;
     }
 
+    /// Squares what this keeps with the sound server's graph, which the engine reads on every look.
+    /// A device missing from it is gone: the sound server restarted, or someone unloaded it. The ids
+    /// kept may belong to other modules by now, so nothing is unloaded by them. What of ours is
+    /// still there goes by name, in case a device was only slow to show, and the next step loads
+    /// both again.
+    pub fn notice_graph(&mut self, mic_there: bool, speakers_there: bool, run: &mut dyn FnMut(&[String]) -> Option<String>) {
+        if self.loaded.is_none() || (mic_there && speakers_there) {
+            return;
+        }
+        self.loaded = None;
+        self.failed_at = None;
+        clear_leftovers(run);
+    }
+
     /// The name both devices go by, while both are loaded.
     pub fn present(&self) -> Option<&str> {
         self.loaded.as_ref().map(|loaded| loaded.name.as_str())
@@ -215,15 +230,28 @@ static DEVICES: Mutex<Option<VirtualDevices>> = Mutex::new(None);
 static PRESENT: Mutex<Option<String>> = Mutex::new(None);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
-/// Runs one step of the service's devices, and publishes the result. After `shut_down` nothing more
-/// is loaded.
-fn step_service(wanted: Option<String>, stopping: bool) {
+/// Set at service stop. Nothing is loaded after it, whatever the engine is in the middle of.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+/// How long the stop waits for the devices to go. A stuck sound server mustn't hold up the exit:
+/// what's left is cleared at the next start.
+const SHUT_DOWN_WAIT: Duration = Duration::from_secs(2);
+
+fn publish(state: Option<&VirtualDevices>) {
+    *PRESENT.lock().unwrap_or_else(PoisonError::into_inner) = state.and_then(VirtualDevices::present).map(String::from);
+    *LAST_ERROR.lock().unwrap_or_else(PoisonError::into_inner) = state.and_then(VirtualDevices::error).map(String::from);
+}
+
+/// Runs one step of the service's devices, and publishes the result.
+fn step_service(wanted: Option<String>, graph: Option<(bool, bool)>) {
     let mut devices = DEVICES.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = devices.as_mut() else { return };
-    state.step(wanted, &mut pactl);
-    *PRESENT.lock().unwrap_or_else(PoisonError::into_inner) = state.present().map(String::from);
-    *LAST_ERROR.lock().unwrap_or_else(PoisonError::into_inner) = state.error().map(String::from);
-    if stopping {
+    if let Some((mic_there, speakers_there)) = graph {
+        state.notice_graph(mic_there, speakers_there, &mut pactl);
+    }
+    let stopped = STOPPED.load(Ordering::SeqCst);
+    state.step(if stopped { None } else { wanted }, &mut pactl);
+    publish(Some(state));
+    if stopped {
         *devices = None;
     }
 }
@@ -231,18 +259,41 @@ fn step_service(wanted: Option<String>, stopping: bool) {
 /// At the engine's start: clears what a killed service left, and starts keeping the devices.
 pub fn start() {
     let mut devices = DEVICES.lock().unwrap_or_else(PoisonError::into_inner);
+    if STOPPED.load(Ordering::SeqCst) {
+        return;
+    }
     clear_leftovers(&mut pactl);
-    *devices = Some(VirtualDevices::default());
+    // Checked again, as a stop may have come while that ran.
+    if !STOPPED.load(Ordering::SeqCst) {
+        *devices = Some(VirtualDevices::default());
+    }
 }
 
-/// On every look: the devices exist while paired and linked.
-pub fn look(paired: bool, online: bool, peer: Option<&str>) {
-    step_service(wanted(paired, online, peer), false);
+/// On every look: the devices exist while paired and linked. `graph` says whether the mic and the
+/// speakers are in the sound server's graph, when it could be read.
+pub fn look(paired: bool, online: bool, peer: Option<&str>, graph: Option<(bool, bool)>) {
+    step_service(wanted(paired, online, peer), graph);
 }
 
-/// At service stop: the devices go, and stay gone.
+/// Whether `work`, run on a thread of its own, is done within `limit`. If not, it carries on alone.
+fn finishes_within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-devices-stop".to_string()).spawn(move || {
+        work();
+        let _ = done.send(());
+    });
+    spawned.is_ok() && finished.recv_timeout(limit).is_ok()
+}
+
+/// At service stop: the devices go, and stay gone. It waits at most `SHUT_DOWN_WAIT`, which may be
+/// spent waiting for the engine to finish a step: the step after a stop takes the devices away.
 pub fn shut_down() {
-    step_service(None, true);
+    STOPPED.store(true, Ordering::SeqCst);
+    *PRESENT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    let finished = finishes_within(SHUT_DOWN_WAIT, || step_service(None, None));
+    if !finished {
+        crate::settings::log_note("The other device's mic and speakers were still going at stop; the next start clears them.");
+    }
 }
 
 /// The other device's clean name, while both devices are loaded.
@@ -326,7 +377,7 @@ mod tests {
                         return None;
                     }
                     self.next_id += 1;
-                    self.loaded.insert(self.next_id, args[1].clone());
+                    self.loaded.insert(self.next_id, args[1..].join(" "));
                     self.ever_loaded.push(self.next_id);
                     Some(format!("{}\n", self.next_id))
                 }
@@ -336,7 +387,16 @@ mod tests {
                     self.unloaded.push(id);
                     Some(String::new())
                 }
-                Some("list") => Some(self.listing.clone()),
+                Some("list") if !self.listing.is_empty() => Some(self.listing.clone()),
+                Some("list") => Some(
+                    self.loaded
+                        .iter()
+                        .map(|(id, args)| {
+                            let (module, rest) = args.split_once(' ').unwrap_or((args, ""));
+                            format!("{id}\t{module}\t{rest}\n")
+                        })
+                        .collect(),
+                ),
                 _ => None,
             }
         }
@@ -353,7 +413,7 @@ mod tests {
             assert!(fake.loaded.len() <= 2, "{:?}", fake.loaded);
             assert_eq!(devices.present(), expect.as_deref());
             if expect.is_some() {
-                let kinds: Vec<&str> = fake.loaded.values().map(String::as_str).collect();
+                let kinds: Vec<&str> = fake.loaded.values().map(|args| args.split(' ').next().unwrap()).collect();
                 assert_eq!(kinds, ["module-pipe-source", "module-null-sink"]);
             }
         }
@@ -391,6 +451,63 @@ mod tests {
         assert_eq!(fake.loaded.len(), 2);
         assert_eq!(devices.present(), Some("Laptop"));
         assert_eq!(devices.error(), None, "cleared on success");
+    }
+
+    #[test]
+    fn a_sound_server_restart_is_noticed_and_the_devices_come_back() {
+        let mut fake = FakePactl::default();
+        let mut devices = VirtualDevices::default();
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        // The sound server restarts: its modules are gone, and their ids may go to others.
+        fake.loaded.clear();
+        devices.notice_graph(false, false, &mut |args| fake.run(args));
+        assert_eq!(devices.present(), None, "it doesn't claim what isn't there");
+        assert!(fake.unloaded.is_empty(), "no stale id is unloaded");
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        assert_eq!(fake.loaded.len(), 2);
+        assert_eq!(devices.present(), Some("Laptop"));
+    }
+
+    #[test]
+    fn a_device_only_late_to_show_in_the_graph_is_never_doubled() {
+        let mut fake = FakePactl::default();
+        let mut devices = VirtualDevices::default();
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        devices.notice_graph(true, false, &mut |args| fake.run(args));
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        assert_eq!(fake.loaded.len(), 2, "{:?}", fake.loaded);
+        assert_eq!(fake.unloaded, [1, 2]);
+    }
+
+    #[test]
+    fn both_devices_in_the_graph_change_nothing() {
+        let mut fake = FakePactl::default();
+        let mut devices = VirtualDevices::default();
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        let mut calls = 0;
+        devices.notice_graph(true, true, &mut |_| {
+            calls += 1;
+            None
+        });
+        assert_eq!(calls, 0);
+        assert_eq!(devices.present(), Some("Laptop"));
+    }
+
+    #[test]
+    fn a_stopped_service_never_loads_again() {
+        shut_down();
+        start();
+        look(true, true, Some("Laptop"), Some((false, false)));
+        assert_eq!(present(), None);
+        assert!(DEVICES.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stuck_teardown_does_not_hold_up_the_exit() {
+        let started = Instant::now();
+        assert!(!finishes_within(Duration::from_millis(50), || std::thread::sleep(Duration::from_secs(5))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(finishes_within(Duration::from_secs(5), || {}));
     }
 
     #[test]
