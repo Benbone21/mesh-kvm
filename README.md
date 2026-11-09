@@ -106,6 +106,12 @@ Each device has its own audio controls, and sound can go both ways at once.
 - Audio quality chooses the bitrate of what this device sends: 64, 96, 128 or 256 kbit/s, or Uncompressed at about 1.6 Mbit/s. Each packet adds about 32 kbit/s on the network on top of that. On poor Wi-Fi, use a lower one: smaller packets get through more often.
 - The lines under each part say how the audio is doing: how much is lost on the way, how much couldn't be repaired, and how much is held back to smooth out the network. A note appears if a capture can't be opened, delivers nothing, or a microphone gives only silence.
 
+### Virtual mics and speakers
+
+While the laptop is paired and linked, Debian gets two devices in its sound settings: a microphone called `<laptop name> mic (mesh-kvm)`, which records the laptop's chosen mic, and an output called `<laptop name> speakers (mesh-kvm)`, where anything played comes out of the laptop. They go away when the link drops.
+
+On the laptop, install [VB-Cable](https://vb-audio.com/Cable/). Debian's mic then plays into CABLE Input, and apps pick CABLE Output as their mic. Without VB-Cable the app says to install it. The received mic is never played on the speakers. The Virtual devices row in the app shows how this stands on each device. Packets are now version 3, so both devices must update together.
+
 ### Play only on the other device
 
 On Windows, muting an output also silences an ordinary recording of it, and it follows the volume slider too. A test on the laptop showed that exactly. So with this on, mesh-kvm asks Windows for all sound except its own, which comes from before the mute and the volume slider. That has three effects: every app's sound on every output is sent, a small line under Output to send says so, and the level sent no longer changes with the laptop's volume. It also means the output chosen no longer decides what's sent, so the Windows default output is muted as well. If Windows won't do this, nothing is muted, sound plays on both devices, and a note says why. Debian doesn't need any of this.
