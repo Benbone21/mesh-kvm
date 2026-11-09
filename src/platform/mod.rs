@@ -5,6 +5,7 @@
 //! rewrites the audio code, so moving it behind this trait first would only be done twice.
 
 pub mod detach;
+pub mod limited;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "windows")]

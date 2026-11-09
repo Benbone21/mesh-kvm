@@ -761,6 +761,7 @@ unsafe extern "system" fn session_window_proc(
         // Zero means the session isn't ending after all.
         WM_ENDSESSION if wparam != 0 => {
             crate::mute::shutdown();
+            crate::linklog::stop("session_end", None);
             0
         }
         WM_CLOSE => {
@@ -769,8 +770,16 @@ unsafe extern "system" fn session_window_proc(
         }
         WM_POWERBROADCAST => {
             match wparam as u32 {
-                PBT_APMSUSPEND => crate::mute::before_sleep(),
-                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => crate::mute::after_sleep(),
+                PBT_APMSUSPEND => {
+                    crate::linklog::record("suspend", crate::linklog::Details::new());
+                    crate::mute::before_sleep();
+                }
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                    // Automatic comes with every wake, and the other once someone is there.
+                    let how = if wparam as u32 == PBT_APMRESUMEAUTOMATIC { "automatic" } else { "user" };
+                    crate::linklog::record("resume", crate::linklog::Details::new().num("how", how));
+                    crate::mute::after_sleep();
+                }
                 _ => {}
             }
             1
@@ -792,8 +801,9 @@ fn restart_service() -> ! {
     WindowsBackend.set_blocking(false, false);
     WindowsBackend.release_held();
     crate::mute::shutdown();
-    let problem = crate::app::launch::restart_service();
-    crate::settings::log_fatal(&format!("mesh-kvm couldn't start itself again: {problem}"));
+    let problem = format!("mesh-kvm couldn't start itself again: {}", crate::app::launch::restart_service());
+    crate::linklog::stop("failed", Some(&problem));
+    crate::settings::log_fatal(&problem);
     std::process::exit(1);
 }
 
@@ -912,8 +922,11 @@ pub fn run_windows_node(
             let mut logged = None;
             let mut ticks = 0u32;
             let mut config = None;
+            let mut link_watch = crate::linklog::LinkWatch::new(now_ms());
+            let mut loop_clock = crate::linklog::LoopClock::new("watchdog", TICK_INTERVAL.as_millis() as u64);
             loop {
                 std::thread::sleep(TICK_INTERVAL);
+                loop_clock.tick();
                 if crate::settings::restart_requested() {
                     restart_service();
                 }
@@ -1004,6 +1017,9 @@ pub fn run_windows_node(
                         telemetry.cursor_y = y;
                     }
                 }
+
+                let look = crate::linklog::Look::of(&mut router(), &mut link(), &mut loop_clock, now_ms());
+                crate::linklog::note(link_watch.look(look));
 
                 ticks = ticks.wrapping_add(1);
                 if ticks.is_multiple_of(TICKS_PER_HEARTBEAT) {

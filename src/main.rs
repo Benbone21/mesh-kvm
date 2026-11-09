@@ -7,6 +7,7 @@ mod displays;
 mod keymap;
 mod input;
 mod licenses;
+mod linklog;
 mod mute;
 mod platform;
 mod protocol;
@@ -90,6 +91,10 @@ struct Cli {
     /// Enter the code the other device shows, through the running service
     #[arg(long, value_name = "CODE")]
     pair: Option<String>,
+
+    /// Print the link log of this device, then the other device's, through the running service
+    #[arg(long)]
+    link_log: bool,
 
     /// Open the app window for the service on this device, and exit when it closes
     #[arg(long, alias = "studio")]
@@ -306,6 +311,9 @@ fn main() {
     if cli.pair_show || cli.pair.is_some() {
         std::process::exit(run_pair_command(&cli));
     }
+    if cli.link_log {
+        std::process::exit(run_link_log());
+    }
 
     if cli.app {
         run_app_window();
@@ -335,6 +343,7 @@ fn main() {
 fn fail(message: &str) -> ! {
     // A new copy that fails hasn't proved itself, however long stopping takes.
     update::note_service_failing();
+    linklog::stop("failed", Some(message));
     eprintln!("Error: {}", message);
     settings::log_fatal(message);
     mute::shutdown();
@@ -396,23 +405,32 @@ fn run_pair_command(cli: &Cli) -> i32 {
     pair_through(&mut call, &body.to_string(), cli.pair.is_none(), &mut say, &|| std::thread::sleep(PAIR_POLL_EVERY))
 }
 
-/// Where a Windows build says things: it has no console of its own. Redirected output is left
-/// alone, then the calling terminal is attached, and with neither the lines go in message boxes.
+/// Where a Windows build prints: redirected output is left alone, then the calling terminal is
+/// attached. It has no console of its own, so there may be neither.
 #[cfg(target_os = "windows")]
-fn windows_output() -> Box<dyn FnMut(&str)> {
+fn windows_console() -> Option<Box<dyn FnMut(&str)>> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE};
     let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     if !out.is_null() && out != INVALID_HANDLE_VALUE {
-        return Box::new(|line| println!("{line}"));
+        return Some(Box::new(|line| println!("{line}")));
     }
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
         use std::io::Write;
         if let Ok(mut console) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-            return Box::new(move |line| {
+            return Some(Box::new(move |line| {
                 let _ = writeln!(console, "{line}");
-            });
+            }));
         }
+    }
+    None
+}
+
+/// Where a Windows build says things: the console, and with none the lines go in message boxes.
+#[cfg(target_os = "windows")]
+fn windows_output() -> Box<dyn FnMut(&str)> {
+    if let Some(console) = windows_console() {
+        return console;
     }
     let icon = windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION;
     // A box waits to be closed. The code's stays up on its own thread while pairing goes on, and
@@ -425,6 +443,90 @@ fn windows_output() -> Box<dyn FnMut(&str)> {
             let _ = shown.join();
         }
     })
+}
+
+/// For this device's service, and for the other device's answer to come through the proxy, which
+/// waits out a slow link: up to 3 seconds to connect and 10 for the answer.
+const LINK_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const PEER_LINK_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn run_link_log() -> i32 {
+    let mut call = |method: &str, path: &str, body: &str| {
+        let wait = if path.starts_with("/api/peer/") { PEER_LINK_LOG_WAIT } else { LINK_LOG_WAIT };
+        webui::http_call_port_waiting("127.0.0.1", webui::UI_PORT, method, path, body, wait)
+    };
+    let (text, status) = link_log_text(&mut call, &|| linklog::file_tail(linklog::DEFAULT_LINES));
+    #[cfg(target_os = "windows")]
+    match windows_console() {
+        Some(mut say) => say(text.trim_end()),
+        // Too long for a box, so it goes in a file the box names.
+        None => {
+            let path = settings::config_dir().join("link-logs.txt");
+            let said = match std::fs::write(&path, &text) {
+                Ok(()) => format!("The link logs of both devices are in {}.", path.display()),
+                Err(e) => format!("Couldn't write the link logs to {}: {e}", path.display()),
+            };
+            show_box(&said, windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    print!("{text}");
+    status
+}
+
+/// This device's link log, then the other device's, each under a heading, and the exit status: 0
+/// when both were read. With the service down, this device's file is read instead.
+fn link_log_text(call: Call, own_file: &dyn Fn() -> Option<String>) -> (String, i32) {
+    let path = format!("{}?lines={}", linklog::PATH, linklog::DEFAULT_LINES);
+    let or_nothing = |body: String| if body.is_empty() { "Nothing logged yet.\n".to_string() } else { body };
+    let mut text = String::from("=== This device ===\n");
+    let mut status = 0;
+    let running = match call("GET", &path, "") {
+        Ok((200, body)) => {
+            text.push_str(&or_nothing(body));
+            true
+        }
+        Ok((code, _)) => {
+            text.push_str(&format!("The service refused ({code}). It may be a version without a link log.\n"));
+            status = 1;
+            true
+        }
+        Err(_) => {
+            text.push_str(&match own_file() {
+                Some(file) => format!("mesh-kvm isn't running on this device. Its link log file:\n{}", or_nothing(file)),
+                None => "mesh-kvm isn't running on this device, and has no link log file yet.\n".to_string(),
+            });
+            status = 1;
+            false
+        }
+    };
+    text.push_str("\n=== The other device ===\n");
+    if !running {
+        text.push_str("The service on this device isn't running, so the other device can't be asked.\n");
+        return (text, 1);
+    }
+    match call("GET", &format!("/api/peer{path}"), "") {
+        Ok((200, body)) => text.push_str(&or_nothing(body)),
+        Ok((404, _)) => {
+            text.push_str("The other device has no link log: it runs an older version.\n");
+            status = 1;
+        }
+        Ok((502, body)) => {
+            let said = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+            let error = said["error"].as_str().unwrap_or("no answer");
+            text.push_str(&format!("The other device can't be reached: {error}\n"));
+            status = 1;
+        }
+        Ok((code, _)) => {
+            text.push_str(&format!("The other device refused ({code}).\n"));
+            status = 1;
+        }
+        Err(e) => {
+            text.push_str(&format!("The service on this device stopped answering: {e}\n"));
+            status = 1;
+        }
+    }
+    (text, status)
 }
 
 fn said_paired(say: &mut dyn FnMut(&str), status: &serde_json::Value) -> i32 {
@@ -528,6 +630,8 @@ fn run_service(cli: Cli) {
         cli.role,
         if peer_text.is_empty() { "none yet" } else { &peer_text },
     );
+
+    linklog::start(&peer_text);
 
     let platform = platform::current(cli.width.zip(cli.height));
     let state = spatial::SharedSpatialState::load(platform.as_ref(), peer_text, pinned);
@@ -639,6 +743,7 @@ fn run_service(cli: Cli) {
     if settings::restart_requested() {
         restart();
     }
+    linklog::stop("ended", None);
 }
 
 /// An address left by an install from before addresses were saved.
@@ -804,6 +909,53 @@ mod tests {
         // Idle with no loss in between is a cancel.
         let (status, _) = pair_run(ok(r#"{"ok":true}"#), &[ok(showing), ok(r#"{"state":"idle","peer_name":"Laptop"}"#)], true);
         assert_eq!(status, 1);
+    }
+
+    /// What `--link-log` says, with each path answered by `answers` and `file` for the file here.
+    fn link_log_run(answers: &[(&str, Result<(u16, String), String>)], file: Option<&str>) -> (String, i32) {
+        let mut asked = Vec::new();
+        let mut call = |method: &str, path: &str, _body: &str| {
+            assert_eq!(method, "GET");
+            asked.push(path.to_string());
+            answers.iter().find(|(p, _)| *p == path).map_or(Err("not asked for".to_string()), |(_, a)| a.clone())
+        };
+        let said = super::link_log_text(&mut call, &|| file.map(str::to_string));
+        let peer_asked = asked.iter().any(|p| p.starts_with("/api/peer/"));
+        assert!(asked.iter().all(|p| p.ends_with("/api/local/linklog?lines=500")), "{asked:?}");
+        assert_eq!(peer_asked, answers.iter().any(|(p, _)| p.starts_with("/api/peer/")), "{asked:?}");
+        said
+    }
+
+    const HERE: &str = "/api/local/linklog?lines=500";
+    const THERE: &str = "/api/peer/api/local/linklog?lines=500";
+
+    #[test]
+    fn link_log_prints_both_devices_under_headings() {
+        let (text, status) = link_log_run(&[(HERE, ok("a up\n")), (THERE, ok("b down\n"))], None);
+        assert_eq!(status, 0);
+        assert_eq!(text, "=== This device ===\na up\n\n=== The other device ===\nb down\n");
+    }
+
+    #[test]
+    fn link_log_says_plainly_what_could_not_be_reached() {
+        let unreachable = Ok((502, r#"{"error":"peer unreachable: timed out","peer":"192.168.8.210"}"#.to_string()));
+        let (text, status) = link_log_run(&[(HERE, ok("a up\n")), (THERE, unreachable)], None);
+        assert_eq!(status, 1);
+        assert!(text.ends_with("=== The other device ===\nThe other device can't be reached: peer unreachable: timed out\n"), "{text}");
+        let (text, _) = link_log_run(&[(HERE, ok("")), (THERE, Ok((404, "{}".into())))], None);
+        assert!(text.contains("Nothing logged yet."), "{text}");
+        assert!(text.contains("an older version"), "{text}");
+        let (text, status) = link_log_run(&[], Some("old line\n"));
+        assert_eq!(status, 1);
+        assert!(text.contains("mesh-kvm isn't running on this device. Its link log file:\nold line\n"), "{text}");
+        assert!(text.contains("so the other device can't be asked"), "{text}");
+        let (text, _) = link_log_run(&[], None);
+        assert!(text.contains("isn't running on this device, and has no link log file yet"), "{text}");
+    }
+
+    #[test]
+    fn the_link_log_flag_is_parsed() {
+        assert!(Cli::try_parse_from(["mesh-kvm", "--link-log"]).unwrap().link_log);
     }
 
     #[test]

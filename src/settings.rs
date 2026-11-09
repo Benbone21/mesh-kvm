@@ -364,8 +364,16 @@ fn wait_while(busy: &dyn Fn() -> bool, limit: std::time::Duration, every: std::t
 
 /// Keeps the address a pairing came from, when none was set. The caller restarts the service.
 pub fn learn_peer(ip: &str) {
-    *peer_slot() = ip.to_string();
+    note_peer_change(&std::mem::replace(&mut *peer_slot(), ip.to_string()), ip, "pairing");
     save_current();
+}
+
+/// The peer's address in the link log, when it changes. The service starts again on it.
+fn note_peer_change(was: &str, now: &str, how: &str) {
+    if was != now {
+        let details = crate::linklog::Details::new().text("from", if was.is_empty() { "-" } else { was });
+        crate::linklog::record("peer_addr", details.text("to", now).text("how", how));
+    }
 }
 
 /// Who is asking `set_peer`, and what the service can say about the address.
@@ -400,7 +408,7 @@ fn change_peer(val: &serde_json::Value, who: PeerChange, save: impl FnOnce(), re
         return refuse("That's this device's own address. Enter the other device's address.");
     }
     if *peer_slot() != ip {
-        *peer_slot() = ip;
+        note_peer_change(&std::mem::replace(&mut *peer_slot(), ip.clone()), &ip, "app");
         save();
         restart();
     }

@@ -494,6 +494,29 @@ pub struct LinkQuality {
     pub old_peer: bool,
 }
 
+/// Round trips as each answer measured them, unsmoothed, since the link log last took them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundTrips {
+    pub min_ms: f32,
+    pub max_ms: f32,
+    pub sum_ms: f32,
+    pub count: u32,
+}
+
+impl RoundTrips {
+    fn add(trips: &mut Option<RoundTrips>, ms: f32) {
+        let t = trips.get_or_insert(RoundTrips { min_ms: ms, max_ms: ms, sum_ms: 0.0, count: 0 });
+        t.min_ms = t.min_ms.min(ms);
+        t.max_ms = t.max_ms.max(ms);
+        t.sum_ms += ms;
+        t.count += 1;
+    }
+
+    pub fn average_ms(&self) -> f32 {
+        self.sum_ms / self.count.max(1) as f32
+    }
+}
+
 /// One device's side of the link to the other.
 #[derive(Default)]
 pub struct PeerLink {
@@ -516,6 +539,7 @@ pub struct PeerLink {
     /// The last valid handshake heard from the peer.
     handshake_at: Option<u64>,
     online: bool,
+    round_trips: Option<RoundTrips>,
 }
 
 impl PeerLink {
@@ -593,6 +617,7 @@ impl PeerLink {
                 self.answer = Some((state.echo, now_ms));
                 let took = now_ms.saturating_sub(sent_ms).saturating_sub(u64::from(state.echo_age_ms)) as f32;
                 self.round_trip_ms = Some(self.round_trip_ms.map_or(took, |was| was + (took - was) * SMOOTHING));
+                RoundTrips::add(&mut self.round_trips, took);
                 if state.main {
                     events.push(Event::MainAnswered);
                 }
@@ -600,6 +625,11 @@ impl PeerLink {
             events.push(Event::PeerHeard { sent_ms, panicked: state.panicked });
         }
         events
+    }
+
+    /// The round trips measured since the last call, for the link log.
+    pub fn take_round_trips(&mut self) -> Option<RoundTrips> {
+        self.round_trips.take()
     }
 
     fn worst_loss(&self) -> u8 {
@@ -1442,6 +1472,20 @@ mod tests {
         b.heard_state(&from_a, sent_ms + one_way_ms);
         let from_b = b.next_state(HeldInput::default(), false, false, 0, sent_ms + one_way_ms + held_ms);
         a.heard_state(&from_b, sent_ms + 2 * one_way_ms + held_ms)
+    }
+
+    #[test]
+    fn each_round_trip_is_kept_unsmoothed_for_the_link_log() {
+        let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
+        a.set_online(true);
+        assert_eq!(a.take_round_trips(), None);
+        answered(&mut a, &mut b, 1000, 30, 10);
+        answered(&mut a, &mut b, 1400, 5, 10);
+        answered(&mut a, &mut b, 1800, 100, 10);
+        let trips = a.take_round_trips().unwrap();
+        assert_eq!((trips.min_ms, trips.max_ms, trips.count), (10.0, 200.0, 3));
+        assert!((trips.average_ms() - 90.0).abs() < 0.01, "{trips:?}");
+        assert_eq!(a.take_round_trips(), None, "each window starts empty");
     }
 
     #[test]

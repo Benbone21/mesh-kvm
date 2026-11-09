@@ -155,15 +155,95 @@ struct ApiConnection {
     opened: Instant,
 }
 
+/// What the link log says of the connection: not yet used, or how it went last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Unused,
+    Up,
+    Down,
+}
+
+/// A `control_down` whose error has changed is logged again, but no more often than this.
+const DOWN_AGAIN_AFTER: Duration = Duration::from_secs(10);
+
+/// When the connection's ups and downs are worth a line: each change, and a new error while it
+/// stays down, so a timeout and a refusal can be told apart.
+struct ControlNote {
+    state: State,
+    /// The error last logged.
+    error: String,
+    logged_at: Option<Instant>,
+}
+
+impl ControlNote {
+    const fn new() -> ControlNote {
+        ControlNote { state: State::Unused, error: String::new(), logged_at: None }
+    }
+
+    /// The word to log for this outcome, if any.
+    fn note(&mut self, result: Result<(), &str>, now: Instant) -> Option<&'static str> {
+        match result {
+            Ok(()) if self.state == State::Up => None,
+            Ok(()) => {
+                self.state = State::Up;
+                self.logged_at = Some(now);
+                Some("control_up")
+            }
+            Err(error) => {
+                let again = error != self.error && self.logged_at.is_none_or(|at| now.duration_since(at) >= DOWN_AGAIN_AFTER);
+                if self.state == State::Down && !again {
+                    return None;
+                }
+                self.state = State::Down;
+                self.error = error.to_string();
+                self.logged_at = Some(now);
+                Some("control_down")
+            }
+        }
+    }
+}
+
 /// The one connection requests to the peer go over, and whether it is still good.
 struct Link {
     connection: Mutex<Option<ApiConnection>>,
     max_age: Duration,
+    note: Mutex<ControlNote>,
+    /// Its ups and downs go in the link log.
+    logged: bool,
 }
 
 impl Link {
     const fn new(max_age: Duration) -> Link {
-        Link { connection: Mutex::new(None), max_age }
+        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()), logged: true }
+    }
+
+    /// A connection of its own for something that only asks now and then, so that it never holds up
+    /// the app's requests, and nothing it meets counts as news of the connection.
+    const fn unlogged(max_age: Duration) -> Link {
+        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()), logged: false }
+    }
+
+    /// Logs `control_up` and `control_down` as the connection changes.
+    fn note(&self, result: Result<(), &str>, target: Option<SocketAddr>) {
+        if !self.logged {
+            return;
+        }
+        let word = self.note.lock().unwrap_or_else(|e| e.into_inner()).note(result, Instant::now());
+        let Some(word) = word else { return };
+        let to = target.map_or("-".to_string(), |t| t.to_string());
+        let details = crate::linklog::Details::new().text("to", &to);
+        match result {
+            Ok(()) => crate::linklog::record(word, details),
+            Err(error) => crate::linklog::record(word, details.text("error", error)),
+        }
+    }
+
+    fn state_text(&self) -> &'static str {
+        match self.note.lock().unwrap_or_else(|e| e.into_inner()).state {
+            State::Up => "up",
+            State::Down => "down",
+            State::Unused => "unused",
+        }
     }
 
     /// One request, with one in flight at a time. A failure drops the connection and gives the error:
@@ -184,27 +264,46 @@ impl Link {
         connect: Duration,
         answer: Duration,
     ) -> Result<(u16, String), String> {
-        let request = ApiRequest { method: method.into(), path: path.into(), body: body.into() };
-        let size = bincode::serialized_size(&request).map_err(|e| e.to_string())?;
-        if size > MAX_FRAME as u64 {
-            return Err("the message is too large".into());
-        }
+        let request = request_for(method, path, body)?;
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        self.call_on(&mut slot, pairing, target, &request, connect, answer)
+    }
+
+    fn call_on(
+        &self,
+        slot: &mut Option<ApiConnection>,
+        pairing: Option<&Pairing>,
+        target: Option<SocketAddr>,
+        request: &ApiRequest,
+        connect: Duration,
+        answer: Duration,
+    ) -> Result<(u16, String), String> {
         if slot.as_ref().is_some_and(|c| c.opened.elapsed() >= self.max_age) {
             *slot = None;
         }
         if slot.is_none() {
             let target = target.ok_or("no peer")?;
-            let stream = open_with(pairing, target, Purpose::Api, connect)?;
+            let stream = open_with(pairing, target, Purpose::Api, connect).inspect_err(|e| self.note(Err(e), Some(target)))?;
+            self.note(Ok(()), Some(target));
             *slot = Some(ApiConnection { stream, opened: Instant::now() });
         }
         let Some(connection) = slot.as_mut() else { return Err("no connection".into()) };
-        let result = exchange(&mut connection.stream, &request, answer);
-        if result.is_err() {
+        let result = exchange(&mut connection.stream, request, answer);
+        if let Err(e) = &result {
             *slot = None;
+            self.note(Err(e), target);
         }
         result
     }
+}
+
+fn request_for(method: &str, path: &str, body: &str) -> Result<ApiRequest, String> {
+    let request = ApiRequest { method: method.into(), path: path.into(), body: body.into() };
+    let size = bincode::serialized_size(&request).map_err(|e| e.to_string())?;
+    if size > MAX_FRAME as u64 {
+        return Err("the message is too large".into());
+    }
+    Ok(request)
 }
 
 fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> Result<(u16, String), String> {
@@ -220,10 +319,30 @@ fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> 
 
 static TARGET: OnceLock<SocketAddr> = OnceLock::new();
 static PEER_LINK: Link = Link::new(HOUR);
+static CLOCK_LINK: Link = Link::unlogged(HOUR);
+/// The clock look's whole budget: an answer later than this says little about the clock anyway.
+const CLOCK_CONNECT_WAIT: Duration = Duration::from_millis(350);
+const CLOCK_ANSWER_WAIT: Duration = Duration::from_millis(1000);
 
 /// Where the peer's control listener is. Until it's set, the peer can't be called.
 pub fn set_target(target: SocketAddr) {
     let _ = TARGET.set(target);
+}
+
+/// The connection to the peer's API as it last went: `up`, `down`, or `unused` while nothing has
+/// needed it. Nothing tries it just to find out: the link log's look at the other device's clock
+/// has a connection of its own, which isn't counted.
+pub fn control_state() -> &'static str {
+    PEER_LINK.state_text()
+}
+
+/// A request for the link log's look at the other device's clock, on a connection of its own and
+/// within a short budget, so it neither waits behind nor holds up the app's requests, and its
+/// failures are no `control_down`. `None` when this device has no peer to call.
+pub fn peer_clock_call(path: &str) -> Option<Result<(u16, String), String>> {
+    let target = TARGET.get().copied()?;
+    let pairing = super::services().pairing.as_deref();
+    Some(CLOCK_LINK.call_within(pairing, Some(target), "GET", path, "", CLOCK_CONNECT_WAIT, CLOCK_ANSWER_WAIT))
 }
 
 /// A request to the other device's API. Fails when this device isn't paired.
@@ -422,6 +541,48 @@ mod tests {
         });
         serve(listener, "127.0.0.1".parse().unwrap(), Arc::new(server), incoming).unwrap();
         (addr, count)
+    }
+
+    #[test]
+    fn the_connection_is_said_to_be_up_or_down_as_it_last_went() {
+        let (a, b) = paired_pair();
+        let (addr, _) = serving_api(b, 1);
+        let link = Link::new(HOUR);
+        assert_eq!(link.state_text(), "unused");
+        assert!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").is_err(), "the first is closed on it");
+        assert_eq!(link.state_text(), "down");
+        link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap();
+        assert_eq!(link.state_text(), "up");
+        let nobody = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let fresh = Link::new(HOUR);
+        assert!(fresh.call(Some(&a), Some(nobody), "GET", "/api/state", "").is_err());
+        assert_eq!(fresh.state_text(), "down", "a connect that fails");
+    }
+
+    #[test]
+    fn a_new_error_while_down_is_logged_again_but_not_too_often() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut note = ControlNote::new();
+        assert_eq!(note.note(Err("timed out"), at(0)), Some("control_down"));
+        assert_eq!(note.note(Err("timed out"), at(20)), None, "the same error");
+        assert_eq!(note.note(Err("refused"), at(25)), Some("control_down"), "a new one");
+        assert_eq!(note.note(Err("timed out"), at(30)), None, "too soon after the last");
+        assert_eq!(note.note(Err("timed out"), at(36)), Some("control_down"));
+        assert_eq!(note.note(Ok(()), at(37)), Some("control_up"));
+        assert_eq!(note.note(Ok(()), at(38)), None);
+        assert_eq!(note.note(Err("timed out"), at(39)), Some("control_down"), "going down is always news");
+    }
+
+    #[test]
+    fn a_connection_of_its_own_is_no_news_of_the_shared_one() {
+        let (a, b) = paired_pair();
+        let (addr, _) = serving_api(b, 1);
+        let quiet = Link::unlogged(HOUR);
+        assert!(quiet.call(Some(&a), Some(addr), "GET", "/api/state", "").is_err(), "the first is closed on it");
+        assert_eq!(quiet.state_text(), "unused", "its failures go unnoted");
+        assert_eq!(quiet.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        assert_eq!(quiet.state_text(), "unused");
     }
 
     #[test]
