@@ -1270,7 +1270,7 @@ pub fn run_debian_node(
             break Ok(());
         }
 
-        loop_clock.tick(now_ms());
+        loop_clock.tick();
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
         crate::audio::AUDIO_PEER_ONLINE.store(core.router.online(), Ordering::Relaxed);

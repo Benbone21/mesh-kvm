@@ -157,10 +157,10 @@ Each device keeps a record of what the link did, so that a drop can be looked in
 - `gap` for a stall that recovered before the link went: over 0.3 seconds in the middle of a stream of packets, or 0.7 seconds otherwise. `while_busy` says which.
 - `one_way` when the other device stops hearing this one with the link up, and again when it hears it once more.
 - A `sample` every 10 seconds. It also has how late this device's own input loop came round at worst (`loop_late_ms`), and how far the other device's clock is ahead (`peer_clock_ms`), which lines the two logs up. A `stall` is the input loop over 0.3 seconds late.
-- `control_up` and `control_down` for the encrypted connection that requests to the other device go over, with the error. The app and the layout sync use it, and so does a look at the other device's clock once a minute. The clipboard has connections of its own, and they aren't in the log.
+- `control_up` and `control_down` for the encrypted connection that requests to the other device go over, with the error. The app and the layout sync use it, so with the app closed it may say nothing for a long time. The clipboard and the once-a-minute look at the other device's clock have connections of their own, and they aren't in the log.
 - `net`, `roam` and `signal` when this device's addresses or Wi-Fi change. `wifi=unknown` means the Wi-Fi couldn't be read, with why, and not that it went. On Windows 11 that can be the location permission Windows wants before it says anything about Wi-Fi.
 - `asleep` when the device slept, and on Windows `suspend` and `resume`.
-- `peer_addr`, and `start`, `restarting` and `stop`. A `start` with no `stop` or `restarting` before it means the service was killed.
+- `peer_addr`, and `start`, `restarting`, `restart_failed` and `stop`. A `start` with no `stop` or `restarting` before it means the service was killed.
 
 Both directions going at once with the Wi-Fi changing points to the network. A `one_way` points to a firewall or one side, a `stall` to this device being too busy, and an `asleep` or `roam` just before a `down` explains it. `mesh-kvm --link-log` prints the last 500 lines of this device's log, then the other device's, and says so if either can't be reached. The app's API serves them at `/api/local/linklog?lines=N`, up to 2000, including what the service before a restart wrote.
 

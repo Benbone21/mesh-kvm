@@ -203,23 +203,31 @@ impl ControlNote {
     }
 }
 
-/// Why a call that would only use a free connection made none.
-pub const BUSY: &str = "the connection is in use";
-
 /// The one connection requests to the peer go over, and whether it is still good.
 struct Link {
     connection: Mutex<Option<ApiConnection>>,
     max_age: Duration,
     note: Mutex<ControlNote>,
+    /// Its ups and downs go in the link log.
+    logged: bool,
 }
 
 impl Link {
     const fn new(max_age: Duration) -> Link {
-        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()) }
+        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()), logged: true }
+    }
+
+    /// A connection of its own for something that only asks now and then, so that it never holds up
+    /// the app's requests, and nothing it meets counts as news of the connection.
+    const fn unlogged(max_age: Duration) -> Link {
+        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()), logged: false }
     }
 
     /// Logs `control_up` and `control_down` as the connection changes.
     fn note(&self, result: Result<(), &str>, target: Option<SocketAddr>) {
+        if !self.logged {
+            return;
+        }
         let word = self.note.lock().unwrap_or_else(|e| e.into_inner()).note(result, Instant::now());
         let Some(word) = word else { return };
         let to = target.map_or("-".to_string(), |t| t.to_string());
@@ -259,17 +267,6 @@ impl Link {
         let request = request_for(method, path, body)?;
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         self.call_on(&mut slot, pairing, target, &request, connect, answer)
-    }
-
-    /// `call`, only if no other call is under way: `Err(BUSY)` and nothing sent if one is.
-    fn call_if_free(&self, pairing: Option<&Pairing>, target: Option<SocketAddr>, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-        let request = request_for(method, path, body)?;
-        let mut slot = match self.connection.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Err(BUSY.into()),
-        };
-        self.call_on(&mut slot, pairing, target, &request, CONNECT_WAIT, ANSWER_WAIT)
     }
 
     fn call_on(
@@ -322,6 +319,10 @@ fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> 
 
 static TARGET: OnceLock<SocketAddr> = OnceLock::new();
 static PEER_LINK: Link = Link::new(HOUR);
+static CLOCK_LINK: Link = Link::unlogged(HOUR);
+/// The clock look's whole budget: an answer later than this says little about the clock anyway.
+const CLOCK_CONNECT_WAIT: Duration = Duration::from_millis(350);
+const CLOCK_ANSWER_WAIT: Duration = Duration::from_millis(1000);
 
 /// Where the peer's control listener is. Until it's set, the peer can't be called.
 pub fn set_target(target: SocketAddr) {
@@ -329,16 +330,19 @@ pub fn set_target(target: SocketAddr) {
 }
 
 /// The connection to the peer's API as it last went: `up`, `down`, or `unused` while nothing has
-/// needed it. Nothing tries it just to find out.
+/// needed it. Nothing tries it just to find out: the link log's look at the other device's clock
+/// has a connection of its own, which isn't counted.
 pub fn control_state() -> &'static str {
     PEER_LINK.state_text()
 }
 
-/// A request to the other device's API, only when nothing else is using the connection, for
-/// asking now and then without holding up the app. `None` when this device has no peer to call.
-pub fn peer_call_if_free(method: &str, path: &str, body: &str) -> Option<Result<(u16, String), String>> {
+/// A request for the link log's look at the other device's clock, on a connection of its own and
+/// within a short budget, so it neither waits behind nor holds up the app's requests, and its
+/// failures are no `control_down`. `None` when this device has no peer to call.
+pub fn peer_clock_call(path: &str) -> Option<Result<(u16, String), String>> {
     let target = TARGET.get().copied()?;
-    Some(PEER_LINK.call_if_free(super::services().pairing.as_deref(), Some(target), method, path, body))
+    let pairing = super::services().pairing.as_deref();
+    Some(CLOCK_LINK.call_within(pairing, Some(target), "GET", path, "", CLOCK_CONNECT_WAIT, CLOCK_ANSWER_WAIT))
 }
 
 /// A request to the other device's API. Fails when this device isn't paired.
@@ -571,15 +575,14 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_only_wants_a_free_connection_waits_for_nothing() {
+    fn a_connection_of_its_own_is_no_news_of_the_shared_one() {
         let (a, b) = paired_pair();
-        let (addr, _) = serving_api(b, 0);
-        let link = Link::new(HOUR);
-        assert_eq!(link.call_if_free(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
-        let held = link.connection.lock().unwrap();
-        assert_eq!(link.call_if_free(Some(&a), Some(addr), "GET", "/api/state", ""), Err(BUSY.to_string()));
-        drop(held);
-        assert_eq!(link.state_text(), "up", "being busy is no news of the connection");
+        let (addr, _) = serving_api(b, 1);
+        let quiet = Link::unlogged(HOUR);
+        assert!(quiet.call(Some(&a), Some(addr), "GET", "/api/state", "").is_err(), "the first is closed on it");
+        assert_eq!(quiet.state_text(), "unused", "its failures go unnoted");
+        assert_eq!(quiet.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        assert_eq!(quiet.state_text(), "unused");
     }
 
     #[test]

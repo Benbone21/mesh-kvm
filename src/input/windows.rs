@@ -801,8 +801,9 @@ fn restart_service() -> ! {
     WindowsBackend.set_blocking(false, false);
     WindowsBackend.release_held();
     crate::mute::shutdown();
-    let problem = crate::app::launch::restart_service();
-    crate::settings::log_fatal(&format!("mesh-kvm couldn't start itself again: {problem}"));
+    let problem = format!("mesh-kvm couldn't start itself again: {}", crate::app::launch::restart_service());
+    crate::linklog::stop("failed", Some(&problem));
+    crate::settings::log_fatal(&problem);
     std::process::exit(1);
 }
 
@@ -925,7 +926,7 @@ pub fn run_windows_node(
             let mut loop_clock = crate::linklog::LoopClock::new("watchdog", TICK_INTERVAL.as_millis() as u64);
             loop {
                 std::thread::sleep(TICK_INTERVAL);
-                loop_clock.tick(now_ms());
+                loop_clock.tick();
                 if crate::settings::restart_requested() {
                     restart_service();
                 }

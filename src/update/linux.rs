@@ -108,7 +108,7 @@ fn too_long_note() -> String {
 
 /// Starts the new version: through systemd if that's what runs this service, or else by itself.
 fn restart() -> ! {
-    crate::linklog::stop("update", None);
+    crate::linklog::restarting("update");
     let under_systemd = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", UNIT])
         .status()
@@ -117,8 +117,9 @@ fn restart() -> ! {
         let _ = Command::new("systemctl").args(["--user", "--no-block", "restart", UNIT]).status();
         std::thread::sleep(RESTART_WAIT);
     }
-    let problem = restart_service();
-    crate::settings::log_fatal(&format!("mesh-kvm couldn't start itself after updating: {problem}"));
+    let problem = format!("mesh-kvm couldn't start itself after updating: {}", restart_service());
+    crate::linklog::stop("failed", Some(&problem));
+    crate::settings::log_fatal(&problem);
     std::process::exit(1);
 }
 

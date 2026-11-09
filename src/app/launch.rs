@@ -541,8 +541,14 @@ fn retry_while_taken<T>(patience: Duration, mut bind: impl FnMut() -> std::io::R
 
 /// Replaces this service with a new one, which reads the settings again. Only returns on failure.
 pub fn restart_service() -> String {
-    // Not a `stop`: starting again can fail, and the failure is the stop.
-    crate::linklog::record_and_wait("restarting", crate::linklog::Details::new());
+    crate::linklog::restarting("restart");
+    let problem = start_again();
+    crate::linklog::restart_failed(&problem);
+    problem
+}
+
+/// Only returns on failure.
+fn start_again() -> String {
     let args = restart_args(std::env::args().skip(1).collect());
     #[cfg(unix)]
     {

@@ -83,8 +83,7 @@ pub fn start(peer: &str) {
         return;
     }
     let path = crate::settings::config_dir().join(FILE_NAME);
-    let read = |path: &PathBuf| std::fs::read_to_string(path).ok();
-    *RING.lock().unwrap_or_else(PoisonError::into_inner) = seeded(read(&older_path(&path)), read(&path));
+    *RING.lock().unwrap_or_else(PoisonError::into_inner) = seeded(read_tail(&older_path(&path)), read_tail(&path));
     let file = LogFile::new(path, MAX_FILE_BYTES);
     let _ = std::thread::Builder::new().name("mesh-kvm-linklog".into()).spawn(move || write_lines(rx, file));
     let _ = std::thread::Builder::new().name("mesh-kvm-linklog-clock".into()).spawn(watch_clock);
@@ -98,8 +97,29 @@ pub fn start(peer: &str) {
     record("start", details);
 }
 
-/// A `stop` line, waited for briefly so that it's written before the process goes.
+/// Set once a `restarting` is logged, so that the old service's end says it once.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+/// A `restarting` line, waited for, the first time this is called. The new service's `start`
+/// follows it; if starting again fails, a `stop` with the reason does instead.
+pub fn restarting(reason: &str) {
+    if !RESTARTING.swap(true, Ordering::Relaxed) {
+        record_and_wait("restarting", Details::new().text("reason", reason));
+    }
+}
+
+/// Starting again failed, and this process carries on or stops with its own line.
+pub fn restart_failed(error: &str) {
+    RESTARTING.store(false, Ordering::Relaxed);
+    record("restart_failed", Details::new().text("error", error));
+}
+
+/// A `stop` line, waited for briefly so that it's written before the process goes. Once a
+/// restart is under way, only a failure is worth one.
 pub fn stop(reason: &str, error: Option<&str>) {
+    if RESTARTING.load(Ordering::Relaxed) && error.is_none() {
+        return;
+    }
     let mut details = Details::new().text("reason", reason);
     if let Some(error) = error {
         details = details.text("error", error);
@@ -182,12 +202,36 @@ fn seeded(older: Option<String>, newer: Option<String>) -> VecDeque<String> {
 /// The end of this device's log files, for `--link-log` when the service isn't answering.
 pub fn file_tail(lines: usize) -> Option<String> {
     let path = crate::settings::config_dir().join(FILE_NAME);
-    let older = std::fs::read_to_string(older_path(&path)).ok();
-    let newer = std::fs::read_to_string(&path).ok();
+    let older = read_tail(&older_path(&path));
+    let newer = read_tail(&path);
     if older.is_none() && newer.is_none() {
         return None;
     }
     Some(tail_of(&seeded(older, newer), lines))
+}
+
+/// The most read back from each file: well over `KEPT_LINES` lines.
+const TAIL_BYTES: u64 = 512 * 1024;
+
+/// The end of a log file. A line cut through at the start is left out, and a byte that isn't
+/// UTF-8 costs only itself.
+fn read_tail(path: &std::path::Path) -> Option<String> {
+    read_tail_within(path, TAIL_BYTES)
+}
+
+fn read_tail_within(path: &std::path::Path, most: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = len.saturating_sub(most);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(most).read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if from > 0 {
+        text = text.split_once('\n').map_or_else(String::new, |(_, rest)| rest.to_string());
+    }
+    Some(text)
 }
 
 fn older_path(path: &std::path::Path) -> PathBuf {
@@ -428,7 +472,7 @@ fn write_lines(rx: Receiver<Msg>, mut file: LogFile) {
 // ---- The input loops ----
 
 /// How late an input loop comes round. Each loop keeps one and ticks it every time round; a tick
-/// is a subtraction and a comparison.
+/// reads a clock and makes a subtraction and a comparison.
 pub struct LoopClock {
     name: &'static str,
     every_ms: u64,
@@ -442,9 +486,10 @@ impl LoopClock {
         LoopClock { name, every_ms, last: None, worst_ms: 0 }
     }
 
-    /// Records a `stall` when this time round came more than `STALL_MS` late.
-    pub fn tick(&mut self, now_ms: u64) {
-        if let Some(late_ms) = self.lateness(now_ms) {
+    /// Records a `stall` when this time round came more than `STALL_MS` late. It goes by a clock
+    /// that stops while the device sleeps, so the time round after a sleep is no stall.
+    pub fn tick(&mut self) {
+        if let Some(late_ms) = self.lateness(awake_ms()) {
             record("stall", Details::new().num("late_ms", late_ms).num("loop", self.name));
         }
     }
@@ -639,8 +684,8 @@ impl LinkWatch {
 }
 
 /// Records what a `LinkWatch` found, with what else goes with it: the latest Wi-Fi signal on a
-/// `down`, and audio, the control connection and the other device's clock on a sample. Only
-/// atomics are read here.
+/// `down`, and audio, the control connection and the other device's clock on a sample. Nothing
+/// here waits: atomics, and the control connection's note, whose lock is never held over a call.
 pub fn note(events: Vec<LinkEvent>) {
     for event in events {
         let (word, mut details) = describe(&event, PEER.get().map_or("-", String::as_str));
@@ -721,9 +766,29 @@ fn describe(event: &LinkEvent, peer: &str) -> (&'static str, Details) {
 
 // ---- The device: its clock ----
 
-/// Time lost between two looks at the clock, `slept_ms` apart. On Linux the monotonic clock stops
-/// while the device sleeps, so the wall clock gets ahead of it; on Windows both go on, and the
-/// look simply comes late. A wall clock that's set forward looks like the first.
+/// Milliseconds on a clock that stops while the device sleeps. On Linux that's the monotonic
+/// clock, as `Instant` is. On Windows `Instant` goes on through a sleep, and the unbiased interrupt
+/// time doesn't.
+pub fn awake_ms() -> u64 {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn QueryUnbiasedInterruptTime(unbiased: *mut u64) -> i32;
+        }
+        let mut hundred_ns = 0u64;
+        if unsafe { QueryUnbiasedInterruptTime(&mut hundred_ns) } != 0 {
+            return hundred_ns / 10_000;
+        }
+    }
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Time lost between two looks at the clock, `slept_ms` apart, as the wall clock and `awake_ms`
+/// saw it. The second stops while the device sleeps, so the wall clock gets ahead of it. A look
+/// that simply comes late is the other case: this thread didn't get to run. A wall clock that's
+/// set forward looks like the first.
 fn asleep(wall_ms: i64, mono_ms: u64, slept_ms: u64) -> Option<(u64, &'static str)> {
     let ahead = wall_ms.saturating_sub(mono_ms as i64);
     let late = mono_ms.saturating_sub(slept_ms);
@@ -739,9 +804,9 @@ fn asleep(wall_ms: i64, mono_ms: u64, slept_ms: u64) -> Option<(u64, &'static st
 /// A thread of its own, so that nothing the network look waits on can keep this from seeing a sleep.
 fn watch_clock() {
     loop {
-        let (wall, mono) = (wall_ms(), Instant::now());
+        let (wall, awake) = (wall_ms(), awake_ms());
         std::thread::sleep(CLOCK_EVERY);
-        let lost = asleep(wall_ms() - wall, mono.elapsed().as_millis() as u64, CLOCK_EVERY.as_millis() as u64);
+        let lost = asleep(wall_ms() - wall, awake_ms().saturating_sub(awake), CLOCK_EVERY.as_millis() as u64);
         if let Some((ms, how)) = lost {
             record("asleep", Details::new().num("ms", ms).num("how", how));
             LOOK_NOW.store(true, Ordering::Relaxed);
@@ -1110,11 +1175,11 @@ fn clock_offset(sent_ms: i64, back_ms: i64, peer_ms: i64) -> Option<(i64, u32)> 
     (0..=PEER_CLOCK_MAX_RTT_MS).contains(&rtt).then(|| (peer_ms - (sent_ms + back_ms) / 2, rtt as u32))
 }
 
-/// Asks the other device the time, when the connection to it is free: this never waits behind,
-/// or holds up, anything the app is asking.
+/// Asks the other device the time, on a connection of its own and within a short budget. A
+/// failure leaves the offset as it was, and is no news of the link.
 fn look_at_peer_clock() {
     let sent = wall_ms();
-    let Some(Ok((200, body))) = crate::secure::control::peer_call_if_free("GET", CLOCK_PATH, "") else { return };
+    let Some(Ok((200, body))) = crate::secure::control::peer_clock_call(CLOCK_PATH) else { return };
     let back = wall_ms();
     let said = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v["unix_ms"].as_i64());
     if let Some((ahead, rtt)) = said.and_then(|peer| clock_offset(sent, back, peer)) {
@@ -1235,6 +1300,30 @@ mod tests {
         assert_eq!(seeded(None, Some(newer)).len(), 1000);
         assert!(seeded(None, None).is_empty());
         assert_eq!(seeded(Some("a\n\nb".into()), None), VecDeque::from(["a".to_string(), "b".to_string()]), "no blank lines");
+    }
+
+    #[test]
+    fn the_end_of_a_file_is_read_back_whatever_bytes_are_in_it() {
+        let dir = scratch("tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let mut bytes = b"one\nt\xffwo\n".to_vec();
+        bytes.extend((0..100).flat_map(|n| format!("line {n:03}\n").into_bytes()));
+        std::fs::write(&path, &bytes).unwrap();
+        let all = read_tail_within(&path, 1 << 20).unwrap();
+        assert!(all.starts_with("one\nt\u{fffd}wo\nline 000\n"), "a bad byte costs only itself: {:?}", &all[..20]);
+        let end = read_tail_within(&path, 25).unwrap();
+        assert_eq!(end, "line 098\nline 099\n", "only whole lines from the end");
+        assert_eq!(read_tail_within(&dir.join("none"), 25), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_clock_that_stops_in_sleep_still_goes_forward() {
+        let first = awake_ms();
+        std::thread::sleep(Duration::from_millis(30));
+        let gone = awake_ms() - first;
+        assert!((20..2000).contains(&gone), "{gone}");
     }
 
     #[test]
@@ -1420,7 +1509,7 @@ mod tests {
         assert_eq!(asleep(1003, 1001, 1000), None);
         assert_eq!(asleep(4000, 1000, 1000), None, "a clock set three seconds on");
         assert_eq!(asleep(61_000, 1000, 1000), Some((60_000, "clock")), "Linux: the monotonic clock stopped");
-        assert_eq!(asleep(61_000, 61_000, 1000), Some((60_000, "late")), "Windows: both went on, and the look came late");
+        assert_eq!(asleep(61_000, 61_000, 1000), Some((60_000, "late")), "both went on, and the look came late");
         assert_eq!(asleep(-50_000, 1000, 1000), None, "a clock set back is no sleep");
     }
 
