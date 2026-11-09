@@ -1232,6 +1232,7 @@ pub fn run_debian_node(
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry_sync = Instant::now();
     let mut link = PeerLink::default();
+    let mut link_watch = crate::linklog::LinkWatch::new(now_ms());
 
     let mut udp_buf = [0u8; MAX_DATAGRAM];
     let mut opened = Vec::new();
@@ -1524,6 +1525,8 @@ pub fn run_debian_node(
                 guard.telemetry.main_conflict = core.router.main_conflict();
                 guard.telemetry.link = link.quality(&core.router, now_ms());
             }
+            let look = crate::linklog::Look::of(&mut core.router, &mut link, now_ms());
+            crate::linklog::note(link_watch.look(look));
         }
 
         // Heartbeat, with what the other device needs to check its own edges (every 400ms)

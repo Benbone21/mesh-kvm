@@ -7,7 +7,7 @@ use crate::webui::{self, Handler, HttpRequest};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -155,15 +155,43 @@ struct ApiConnection {
     opened: Instant,
 }
 
+/// What the link log says of the connection: not yet used, or how it went last.
+const UNUSED: u8 = 0;
+const UP: u8 = 1;
+const DOWN: u8 = 2;
+
 /// The one connection requests to the peer go over, and whether it is still good.
 struct Link {
     connection: Mutex<Option<ApiConnection>>,
     max_age: Duration,
+    state: AtomicU8,
 }
 
 impl Link {
     const fn new(max_age: Duration) -> Link {
-        Link { connection: Mutex::new(None), max_age }
+        Link { connection: Mutex::new(None), max_age, state: AtomicU8::new(UNUSED) }
+    }
+
+    /// Logs `control_up` and `control_down` as the connection changes, and nothing in between.
+    fn note(&self, result: Result<(), &str>, target: Option<SocketAddr>) {
+        let now = if result.is_ok() { UP } else { DOWN };
+        if self.state.swap(now, Ordering::Relaxed) == now {
+            return;
+        }
+        let to = target.map_or("-".to_string(), |t| t.to_string());
+        let details = crate::linklog::Details::new().text("to", &to);
+        match result {
+            Ok(()) => crate::linklog::record("control_up", details),
+            Err(error) => crate::linklog::record("control_down", details.text("error", error)),
+        }
+    }
+
+    fn state_text(&self) -> &'static str {
+        match self.state.load(Ordering::Relaxed) {
+            UP => "up",
+            DOWN => "down",
+            _ => "unused",
+        }
     }
 
     /// One request, with one in flight at a time. A failure drops the connection and gives the error:
@@ -195,13 +223,15 @@ impl Link {
         }
         if slot.is_none() {
             let target = target.ok_or("no peer")?;
-            let stream = open_with(pairing, target, Purpose::Api, connect)?;
+            let stream = open_with(pairing, target, Purpose::Api, connect).inspect_err(|e| self.note(Err(e), Some(target)))?;
+            self.note(Ok(()), Some(target));
             *slot = Some(ApiConnection { stream, opened: Instant::now() });
         }
         let Some(connection) = slot.as_mut() else { return Err("no connection".into()) };
         let result = exchange(&mut connection.stream, &request, answer);
-        if result.is_err() {
+        if let Err(e) = &result {
             *slot = None;
+            self.note(Err(e), target);
         }
         result
     }
@@ -224,6 +254,12 @@ static PEER_LINK: Link = Link::new(HOUR);
 /// Where the peer's control listener is. Until it's set, the peer can't be called.
 pub fn set_target(target: SocketAddr) {
     let _ = TARGET.set(target);
+}
+
+/// The connection to the peer's API as it last went: `up`, `down`, or `unused` while nothing has
+/// needed it. Nothing tries it just to find out.
+pub fn control_state() -> &'static str {
+    PEER_LINK.state_text()
 }
 
 /// A request to the other device's API. Fails when this device isn't paired.
@@ -422,6 +458,22 @@ mod tests {
         });
         serve(listener, "127.0.0.1".parse().unwrap(), Arc::new(server), incoming).unwrap();
         (addr, count)
+    }
+
+    #[test]
+    fn the_connection_is_said_to_be_up_or_down_as_it_last_went() {
+        let (a, b) = paired_pair();
+        let (addr, _) = serving_api(b, 1);
+        let link = Link::new(HOUR);
+        assert_eq!(link.state_text(), "unused");
+        assert!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").is_err(), "the first is closed on it");
+        assert_eq!(link.state_text(), "down");
+        link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap();
+        assert_eq!(link.state_text(), "up");
+        let nobody = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let fresh = Link::new(HOUR);
+        assert!(fresh.call(Some(&a), Some(nobody), "GET", "/api/state", "").is_err());
+        assert_eq!(fresh.state_text(), "down", "a connect that fails");
     }
 
     #[test]

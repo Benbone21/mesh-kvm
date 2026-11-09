@@ -39,6 +39,7 @@ pub fn answer(from_app_here: bool) -> String {
 /// Ends the service. Under systemd the unit is stopped, or systemd would start it again; anywhere
 /// else the service ends by itself, the same way it does when it's told to stop.
 fn stop() -> ! {
+    crate::linklog::stop("quit", None);
     #[cfg(target_os = "windows")]
     crate::input::windows::let_go();
     #[cfg(target_os = "linux")]

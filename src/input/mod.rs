@@ -79,6 +79,7 @@ impl PeerSocket {
         let mut sealed = Vec::new();
         if self.channel.seal(bytes, &mut sealed) {
             let _ = self.socket.send_to(&sealed, self.peer);
+            crate::linklog::packet_out();
         }
     }
 
@@ -92,6 +93,7 @@ impl PeerSocket {
         }
         match self.channel.open(datagram, now_ms, plain) {
             Opened::Data(bytes) => {
+                crate::linklog::packet_in();
                 let packet = Packet::decode(bytes);
                 if packet.is_err() && bytes.starts_with(&PACKET_MAGIC) {
                     note(Unopened::Unreadable);

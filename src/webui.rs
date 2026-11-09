@@ -2,6 +2,7 @@
 //!
 //! Every node (Debian + Windows) exposes the following. Any other path, including `/`, is a 404:
 //!   GET  /api/local              -> this node's live status (node-specific handler)
+//!   GET  /api/local/linklog      -> the last lines of this node's link log, as plain text (?lines=N)
 //!   POST /api/local/action       -> this node's local actions (audio, autostart, focus, panic...)
 //!   ANY  /api/peer/<path>        -> sent to the other device over the encrypted control connection
 //!   GET  /api/state              -> this node's copy of the layout, and live telemetry
@@ -188,12 +189,26 @@ pub fn answer(req: &HttpRequest, handler: &Handler) -> (u16, String) {
     if !req.may_change_state() || (req.path.starts_with("/api/peer") && !req.may_use_proxy()) {
         return (403, REFUSED.to_string());
     }
+    if req.method == "GET" {
+        if let Some(text) = crate::linklog::answer(&req.path) {
+            return (200, text);
+        }
+    }
     if req.path.starts_with("/api/") && !req.path.starts_with("/api/peer") {
         if let Some(body) = handler(req) {
             return (200, body);
         }
     }
     (404, NOT_FOUND.to_string())
+}
+
+/// Everything is JSON but the link log.
+fn content_type(path: &str) -> &'static str {
+    if crate::linklog::is_log_path(path) {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/json"
+    }
 }
 
 fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
@@ -218,7 +233,8 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         match call(&req.method, target, &req.body) {
             Ok((status, body)) => {
                 let st = if status == 200 { "200 OK".to_string() } else { format!("{} Peer", status) };
-                respond(&mut stream, &st, "application/json", &body)
+                let ctype = if status == 200 { content_type(target) } else { "application/json" };
+                respond(&mut stream, &st, ctype, &body)
             }
             Err(e) => respond(
                 &mut stream,
@@ -236,7 +252,8 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         403 => "403 Forbidden",
         _ => "404 Not Found",
     };
-    respond(&mut stream, line, "application/json", &body);
+    let ctype = if status == 200 { content_type(&req.path) } else { "application/json" };
+    respond(&mut stream, line, ctype, &body);
 }
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) {
@@ -422,6 +439,30 @@ mod tests {
         assert_eq!(ask("GET", "/"), 404);
         assert_eq!(ask("GET", "/api/peer/api/state"), 403);
         assert_eq!(ask("POST", "/api/peer"), 403);
+    }
+
+    #[test]
+    fn the_link_log_is_a_read_open_to_both_devices_and_through_the_proxy() {
+        let path = "/api/local/linklog?lines=5";
+        for source in [Source::Local, Source::Peer, Source::Browser] {
+            assert!(request("GET", path, source).may_change_state(), "{source:?}");
+        }
+        assert!(request("GET", "/api/peer/api/local/linklog", Source::Local).may_use_proxy());
+        assert!(request("GET", "/api/peer/api/local/linklog", Source::Browser).may_use_proxy(), "as any read");
+        assert!(!request("GET", "/api/peer/api/local/linklog", Source::Peer).may_use_proxy(), "never back to the asker");
+        let handler: Handler = Arc::new(|_| None);
+        assert_eq!(answer(&HttpRequest::from_peer("GET", path, ""), &handler).0, 200, "the handler needn't know it");
+        assert_eq!(answer(&HttpRequest::from_peer("POST", path, ""), &handler).0, 404, "only read");
+        assert_eq!(answer(&request("DELETE", path, Source::Browser), &handler).0, 403);
+    }
+
+    #[test]
+    fn the_link_log_comes_as_plain_text() {
+        let reply = exchange("GET /api/local/linklog?lines=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".into());
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        assert!(reply.contains("Content-Type: text/plain; charset=utf-8"), "{reply}");
+        let reply = exchange("GET /api/state HTTP/1.1\r\n\r\n".into());
+        assert!(reply.contains("Content-Type: application/json"), "{reply}");
     }
 
     #[test]

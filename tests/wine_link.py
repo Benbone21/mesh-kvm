@@ -321,6 +321,17 @@ def call(path, body=None, headers=None):
         return json.load(e)
 
 
+def link_log(lines=None):
+    """The exe's link log as text, and the type it came as."""
+    path = "/api/local/linklog" + ("" if lines is None else f"?lines={lines}")
+    with urllib.request.urlopen(LOCAL + path, timeout=3) as r:
+        return r.read().decode(), r.headers.get("Content-Type", "")
+
+
+def link_log_lines():
+    return link_log(2000)[0].splitlines()
+
+
 def bincode_text(text):
     raw = text.encode()
     return struct.pack("<Q", len(raw)) + raw
@@ -895,6 +906,7 @@ def link_state_checks(peer, inbox):
 
 def dropout_checks(peer, inbox):
     beats = Beats(peer, inbox)
+    logged_before = len(link_log_lines())
     # Control is with Debian, so the laptop's keyboard and mouse go there.
     st = peer.drive_to_debian()
     beats.pump(0.5)
@@ -950,6 +962,29 @@ def dropout_checks(peer, inbox):
     call("/api/local/action", {"action": "set_main_device", "device": DEBIAN})
     beats.pump(0.6)
     check("back to Debian as main", local()["main_device"] == DEBIAN, str(local()["main_device"]))
+    link_log_checks(logged_before)
+
+
+def link_log_checks(logged_before):
+    """The exe kept a record of the dropouts just played: each `down` with how long it heard nothing,
+    and the `up` after it."""
+    text, kind = link_log()
+    check("the link log comes as plain text", kind.startswith("text/plain"), kind)
+    lines = text.splitlines()
+    check("and has the service's start, with its version and OS",
+          any(" start " in line and "os=windows" in line for line in lines), "\n".join(lines[:3]))
+    check("each line is a time with milliseconds and offset, then a word",
+          all(re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d [a-z_]+", line) for line in lines), "\n".join(lines[-5:]))
+    scene = link_log_lines()[logged_before:]
+    downs = [line for line in scene if line.split(" ")[1] == "down"]
+    silent = [int(m.group(1)) for m in (re.search(r" silent_ms=(\d+)", line) for line in downs) if m]
+    check("the dropouts are logged as down, after 1.35 s of silence",
+          bool(downs) and all(ms >= 1350 for ms in silent) and len(silent) == len(downs), "\n".join(downs) or "\n".join(scene))
+    check("with the peer's address on them", all(f"peer={PEER}:" in line for line in downs), "\n".join(downs))
+    after_down = scene[scene.index(downs[0]) + 1:] if downs else []
+    check("and the link coming back as up", any(line.split(" ")[1] == "up" for line in after_down), "\n".join(scene))
+    one, _ = link_log(1)
+    check("?lines=1 gives one line", len(one.splitlines()) == 1 and one.strip() in link_log_lines(), one)
 
 
 def api_checks(peer, inbox):

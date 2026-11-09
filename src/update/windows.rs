@@ -47,6 +47,7 @@ impl Installer for Swap {
         }
         #[cfg(feature = "test-hooks")]
         super::trust::linger_if_told();
+        crate::linklog::stop("update", None);
         std::process::exit(0);
     }
 }

@@ -132,6 +132,7 @@ fn run_limited(mut command: Command, limit: Duration) -> Ran {
 
 /// Starts the new version: through systemd if that's what runs this service, or else by itself.
 fn restart() -> ! {
+    crate::linklog::stop("update", None);
     let under_systemd = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", UNIT])
         .status()
