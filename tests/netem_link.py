@@ -17,7 +17,7 @@ or audio, and all of it ends when this script does:
 
 The test binary is what `cargo test --release --no-run` prints. The scenes are clean, loss, delay,
 reorder, mixed, dropout, reverse, flood, stay, stayreverse, oneway, oneway-start, outage,
-outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy, bursty and reconnect. numpy must be importable. Set AUDIO_TMP
+outagereverse, flapping, panic, release, restart, restart-receiver, queued, lossy, bursty, reconnect, sparse and squeeze. numpy must be importable. Set AUDIO_TMP
 to keep the sound servers' files somewhere other than /tmp. Keep it under about 70 characters: past
 that their sockets don't fit in a socket path, the servers don't start, and every tone comes out silent.
 From a long checkout, a private mount keeps it short:
@@ -207,11 +207,23 @@ class Person:
         self.long_seen += key in self.receiver.last.get("held", [])
         self.release(key)
 
-    def pause(self, seconds):
+    def pause(self, seconds, move_every=0.005):
         end = time.time() + seconds
         while time.time() < end and self.running:
             self.sender.do(move=2)
-            time.sleep(0.005)
+            time.sleep(move_every)
+
+    def sparse(self, rng, move_every=0.005):
+        """One tap or click at a time with a pause after it, the way a game or a menu is used, so
+        that no later press comes along to bring one that was lost."""
+        turn = 0
+        while self.running:
+            turn += 1
+            key = BUTTONS + 1 if turn % 4 == 0 else self.KEYS[turn % len(self.KEYS)]
+            self.press(key)
+            self.pause(rng.uniform(0.03, 0.08), move_every)
+            self.release(key)
+            self.pause(rng.uniform(0.3, 0.7), move_every)
 
     def stop(self):
         self.running = False
@@ -655,6 +667,44 @@ def stays_put(name, args, seconds):
         device.stop()
 
 
+def press_times(person, target, name):
+    """When each press landed after it was made, and how many took longer than can go unfelt."""
+    time.sleep(1)
+    gone = target.wait_for(lambda s: not s["held"] and not s["buttons"], 3)
+    check("nothing is left down at the end", gone is not None, str(target.last.get("held")))
+    total, in_order, misplaced, times = person.delivery()
+    times = sorted(times)
+    slow = sum(t > 100 for t in times)
+    median = float(np.median(times)) if times else 0.0
+    p99 = times[min(len(times) - 1, int(len(times) * 0.99))] if times else 0.0
+    print(f"    {total} presses, {in_order} in order, {misplaced} out of place. Took {median:.1f} ms typically, {p99:.0f} ms at the 99th, "
+          f"{times[-1] if times else 0:.0f} ms at most, {slow} over 100 ms. Slowest: {[round(t) for t in times[-6:]]}. "
+          f"Stuck after release at most {person.worst:.0f} ms", flush=True)
+    check("nothing lands out of order", misplaced == 0, str(misplaced))
+    numbers.append((name, f"{in_order}/{total} in order", f"median {median:.1f} ms, p99 {p99:.0f} ms, max {times[-1] if times else 0:.0f} ms",
+                    f"{slow} over 100 ms", f"stuck {person.worst:.0f} ms"))
+    return times
+
+
+def sparse_taps(name, args, seconds, move_every=0.005):
+    """Taps far apart on a link that loses packets in runs, as Wi-Fi does."""
+    print(f"\n=== {name}: netem {' '.join(args)}, a tap every half second or so, the mouse moving every {move_every * 1000:.0f} ms", flush=True)
+    clean()
+    source, target, _, _ = forwarding_pair(seconds + 10)
+    netem(*args)
+    person = Person(source, target)
+    typist = threading.Thread(target=person.sparse, args=(random.Random(name), move_every), daemon=True)
+    typist.start()
+    time.sleep(seconds)
+    person.running = False
+    typist.join()
+    person.stop()
+    clean()
+    press_times(person, target, name)
+    source.stop()
+    target.stop()
+
+
 def tbf(rate):
     subprocess.run([TC, "qdisc", "change", "dev", "lo", "root", "tbf", "rate", rate, "burst", "1600", "limit", "20000000"], check=True)
 
@@ -799,7 +849,7 @@ def main():
     audio.BIN = sys.argv[1]
     which = sys.argv[2:] or ["clean", "loss", "delay", "reorder", "mixed", "dropout", "reverse", "flood", "stay", "stayreverse", "oneway",
                              "oneway-start", "outage", "outagereverse", "flapping", "panic", "release", "restart", "restart-receiver", "queued", "lossy", "bursty",
-                             "reconnect"]
+                             "reconnect", "sparse", "squeeze"]
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     audio.BASE = tempfile.mkdtemp(prefix="mknet.", dir=os.environ.get("AUDIO_TMP", "/tmp"))
     try:
@@ -845,6 +895,12 @@ def main():
         if "bursty" in which:
             # A good state with 2% chance of a burst, of 4 packets or so, all lost.
             stays_put("bursty", ["loss", "gemodel", "2%", "25%", "100%", "0%"], int(os.environ.get("BOUNCE_SECONDS", 120)))
+        if "sparse" in which:
+            # Runs of about ten packets lost, one run in a hundred packets: 50 ms or so of nothing.
+            sparse_taps("sparse", ["loss", "gemodel", "1%", "10%", "100%", "0%"], int(os.environ.get("SPARSE_SECONDS", 60)))
+        if "squeeze" in which:
+            # Wi-Fi in a bad spot: less room than a 1000 Hz mouse needs, and a deep queue in front of it.
+            sparse_taps("squeeze", ["rate", "400kbit", "limit", "4000"], int(os.environ.get("SPARSE_SECONDS", 30)), move_every=0.001)
         if "panic" in which:
             panic_on_receiver()
         if "release" in which:

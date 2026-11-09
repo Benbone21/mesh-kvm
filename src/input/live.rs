@@ -3,7 +3,7 @@
 //! thing, and only the keyboard and mouse are pretend: this records what would have been injected,
 //! so the test can't reach the real desktop.
 
-use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::protocol::{NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM};
 use crate::router::{DeviceId, Event, Router, RouterConfig, Sharing, KEEP_CURSOR};
@@ -84,6 +84,7 @@ struct Udp {
     node: NodeId,
     seq: u64,
     presses: PressLog,
+    motion: MotionBatch,
     start: Instant,
     showing: Showing,
 }
@@ -115,8 +116,23 @@ impl Showing {
     }
 }
 
-impl PeerSender for Udp {
-    fn send(&mut self, payload: Payload) {
+impl Udp {
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64 + 1
+    }
+
+    /// Movement that waited out the gap, and presses due to go again, as the real loops send them.
+    fn send_due(&mut self) {
+        let now_ms = self.now_ms();
+        if let Some(motion) = self.motion.due(now_ms) {
+            self.send_now(motion);
+        }
+        if let Some(repeat) = self.presses.repeat(now_ms) {
+            self.send(repeat);
+        }
+    }
+
+    fn send_now(&mut self, payload: Payload) {
         let has_keys = matches!(payload, Payload::Presses { .. } | Payload::KeyEvent { .. });
         let packet = Packet::new(self.seq, self.node, payload);
         self.seq = self.seq.wrapping_add(1);
@@ -125,6 +141,14 @@ impl PeerSender for Udp {
                 self.showing.keys_sent(&bytes);
             }
             self.socket.send(&bytes);
+        }
+    }
+}
+
+impl PeerSender for Udp {
+    fn send(&mut self, payload: Payload) {
+        for payload in self.motion.send(payload, self.now_ms()) {
+            self.send_now(payload);
         }
     }
 
@@ -252,6 +276,7 @@ fn whole_device() {
             node,
             seq: number("MK_SEQ", now_us),
             presses: PressLog::default(),
+            motion: MotionBatch::default(),
             start,
             showing: Showing::from_env(),
         },
@@ -299,6 +324,7 @@ fn whole_device() {
         while let Ok(line) = read.try_recv() {
             device.act(&line);
         }
+        device.udp.send_due();
         let now = Instant::now();
         if now >= next_beat {
             next_beat = now + HEARTBEAT;

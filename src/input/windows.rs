@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
-use super::link::{press_event, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
@@ -91,6 +91,9 @@ static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static LINK: LazyLock<Mutex<PeerLink>> = LazyLock::new(Mutex::default);
 /// The hooks number their presses here, so it is only ever held to do that.
 static PRESSES: LazyLock<Mutex<PressLog>> = LazyLock::new(Mutex::default);
+/// Movement from the mouse hook, gathered so that it goes at most once a `MOTION_GAP_MS`. Held while
+/// sending, so that what it lets out keeps its place on the wire.
+static MOTION: LazyLock<Mutex<MotionBatch>> = LazyLock::new(Mutex::default);
 /// Buttons injected for the peer and not yet released.
 static BUTTONS_HELD_MASK: AtomicU8 = AtomicU8::new(0);
 /// Keys injected for the peer and not yet released, by evdev code.
@@ -148,6 +151,10 @@ fn link() -> MutexGuard<'static, PeerLink> {
 
 fn presses() -> MutexGuard<'static, PressLog> {
     PRESSES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn motion() -> MutexGuard<'static, MotionBatch> {
+    MOTION.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn edge_state() -> MutexGuard<'static, EdgeWatch> {
@@ -273,7 +280,18 @@ fn is_windows_game_captive() -> bool {
 /// the channel sends by itself doesn't hold the link up.
 #[inline]
 fn send_udp_payload(payload: Payload) {
-    send_numbered(SEQ_COUNTER.fetch_add(1, Ordering::Relaxed), payload);
+    let mut motion = motion();
+    for payload in motion.send(payload, now_ms()) {
+        send_numbered(SEQ_COUNTER.fetch_add(1, Ordering::Relaxed), payload);
+    }
+}
+
+/// Movement that waited out the gap. The hooks only add to it, so the UDP thread lets it out.
+fn send_due_motion() {
+    let mut motion = motion();
+    if let Some(payload) = motion.due(now_ms()) {
+        send_numbered(SEQ_COUNTER.fetch_add(1, Ordering::Relaxed), payload);
+    }
 }
 
 fn send_numbered(seq: u64, payload: Payload) {
@@ -1018,6 +1036,12 @@ pub fn run_windows_node(
                 rx_peer.tick(now_ms());
                 if let Some(at) = rx_peer.handshake_news(&mut handshake_known) {
                     link().handshake_heard(at);
+                }
+                // The hooks send presses and movement, and this loop sends what had to wait.
+                send_due_motion();
+                let repeat = presses().repeat(now_ms());
+                if let Some(repeat) = repeat {
+                    send_udp_payload(repeat);
                 }
                 match rx_peer.socket.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
