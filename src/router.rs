@@ -18,6 +18,9 @@ use crate::protocol::{HeldInput, SwitchEdge};
 pub type DeviceId = u8;
 pub const LINK_TIMEOUT_MS: u64 = 1350;
 pub const SWITCH_RACE_MS: u64 = 200;
+/// Silence from the peer longer than this, short of a dropout, is a stall worth noting. Heartbeats
+/// come every 400 ms, so this is one gone missing or 300 ms late.
+pub const QUIET_MS: u64 = 700;
 /// How often the main device repeats its view of the active device: with every heartbeat, as one
 /// copy a second was lost for 2.5 seconds in a row every couple of minutes on a poor link.
 pub const ACTIVE_VIEW_INTERVAL_MS: u64 = 400;
@@ -140,6 +143,8 @@ pub struct Router {
     /// Newest `now_ms` seen from any event.
     now: u64,
     last_alive: u64,
+    /// The longest silence over `QUIET_MS` that a packet has ended since `take_quiet`.
+    quiet: Option<u64>,
     /// When this device last sent `SendActiveView`.
     last_view: u64,
     /// When a non-main device last heard from main that it hears us. `None` until the first
@@ -207,6 +212,7 @@ impl Router {
             peer_game_lock: false,
             now: 0,
             last_alive: 0,
+            quiet: None,
             last_view: 0,
             view_heard: None,
             peer_views: None,
@@ -240,6 +246,18 @@ impl Router {
     }
     pub fn online(&self) -> bool {
         self.online
+    }
+    /// When the peer was last heard, and when the link last came up, in the router's time.
+    pub fn last_alive(&self) -> u64 {
+        self.last_alive
+    }
+    pub fn online_since(&self) -> u64 {
+        self.online_since
+    }
+    /// The longest silence from the peer over `QUIET_MS` that has ended since the last call. One
+    /// that ended a dropout is in it too.
+    pub fn take_quiet(&mut self) -> Option<u64> {
+        self.quiet.take()
     }
     pub fn panicked(&self) -> bool {
         self.panicked
@@ -374,6 +392,10 @@ impl Router {
                 }
             }
             Event::PeerAlive { now_ms } => {
+                let quiet = now_ms.saturating_sub(self.last_alive);
+                if self.last_alive > 0 && quiet > QUIET_MS {
+                    self.quiet = self.quiet.max(Some(quiet));
+                }
                 // A gap longer than the timeout is a loss followed by a fresh link-up.
                 if self.online && now_ms.saturating_sub(self.last_alive) > LINK_TIMEOUT_MS {
                     self.link_lost(&mut out.actions);
@@ -1369,6 +1391,32 @@ mod tests {
         assert!(r.online());
         r.handle(Event::Tick { now_ms: 2000 + 1351 });
         assert!(!r.online());
+    }
+
+    #[test]
+    fn a_quiet_spell_is_measured_when_it_ends() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::PeerAlive { now_ms: 1400 });
+        assert_eq!(r.take_quiet(), None, "a heartbeat's usual spacing is no gap");
+        r.handle(Event::Tick { now_ms: 2000 });
+        assert_eq!(r.take_quiet(), None, "still going on");
+        r.handle(Event::PeerAlive { now_ms: 2300 });
+        r.handle(Event::PeerAlive { now_ms: 2310 });
+        assert_eq!(r.take_quiet(), Some(900));
+        assert_eq!(r.take_quiet(), None, "taken once");
+        assert_eq!(r.last_alive(), 2310);
+        assert_eq!(r.online_since(), 1000);
+    }
+
+    #[test]
+    fn the_longest_quiet_spell_is_kept_until_taken() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::PeerAlive { now_ms: 1000 + QUIET_MS + 100 });
+        r.handle(Event::PeerAlive { now_ms: 1000 + 2 * QUIET_MS + 150 });
+        assert_eq!(r.take_quiet(), Some(QUIET_MS + 100));
+        assert!(r.online());
     }
 
     #[test]
