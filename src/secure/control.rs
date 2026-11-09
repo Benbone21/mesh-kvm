@@ -7,7 +7,7 @@ use crate::webui::{self, Handler, HttpRequest};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -156,41 +156,85 @@ struct ApiConnection {
 }
 
 /// What the link log says of the connection: not yet used, or how it went last.
-const UNUSED: u8 = 0;
-const UP: u8 = 1;
-const DOWN: u8 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Unused,
+    Up,
+    Down,
+}
+
+/// A `control_down` whose error has changed is logged again, but no more often than this.
+const DOWN_AGAIN_AFTER: Duration = Duration::from_secs(10);
+
+/// When the connection's ups and downs are worth a line: each change, and a new error while it
+/// stays down, so a timeout and a refusal can be told apart.
+struct ControlNote {
+    state: State,
+    /// The error last logged.
+    error: String,
+    logged_at: Option<Instant>,
+}
+
+impl ControlNote {
+    const fn new() -> ControlNote {
+        ControlNote { state: State::Unused, error: String::new(), logged_at: None }
+    }
+
+    /// The word to log for this outcome, if any.
+    fn note(&mut self, result: Result<(), &str>, now: Instant) -> Option<&'static str> {
+        match result {
+            Ok(()) if self.state == State::Up => None,
+            Ok(()) => {
+                self.state = State::Up;
+                self.logged_at = Some(now);
+                Some("control_up")
+            }
+            Err(error) => {
+                let again = error != self.error && self.logged_at.is_none_or(|at| now.duration_since(at) >= DOWN_AGAIN_AFTER);
+                if self.state == State::Down && !again {
+                    return None;
+                }
+                self.state = State::Down;
+                self.error = error.to_string();
+                self.logged_at = Some(now);
+                Some("control_down")
+            }
+        }
+    }
+}
+
+/// Why a call that would only use a free connection made none.
+pub const BUSY: &str = "the connection is in use";
 
 /// The one connection requests to the peer go over, and whether it is still good.
 struct Link {
     connection: Mutex<Option<ApiConnection>>,
     max_age: Duration,
-    state: AtomicU8,
+    note: Mutex<ControlNote>,
 }
 
 impl Link {
     const fn new(max_age: Duration) -> Link {
-        Link { connection: Mutex::new(None), max_age, state: AtomicU8::new(UNUSED) }
+        Link { connection: Mutex::new(None), max_age, note: Mutex::new(ControlNote::new()) }
     }
 
-    /// Logs `control_up` and `control_down` as the connection changes, and nothing in between.
+    /// Logs `control_up` and `control_down` as the connection changes.
     fn note(&self, result: Result<(), &str>, target: Option<SocketAddr>) {
-        let now = if result.is_ok() { UP } else { DOWN };
-        if self.state.swap(now, Ordering::Relaxed) == now {
-            return;
-        }
+        let word = self.note.lock().unwrap_or_else(|e| e.into_inner()).note(result, Instant::now());
+        let Some(word) = word else { return };
         let to = target.map_or("-".to_string(), |t| t.to_string());
         let details = crate::linklog::Details::new().text("to", &to);
         match result {
-            Ok(()) => crate::linklog::record("control_up", details),
-            Err(error) => crate::linklog::record("control_down", details.text("error", error)),
+            Ok(()) => crate::linklog::record(word, details),
+            Err(error) => crate::linklog::record(word, details.text("error", error)),
         }
     }
 
     fn state_text(&self) -> &'static str {
-        match self.state.load(Ordering::Relaxed) {
-            UP => "up",
-            DOWN => "down",
-            _ => "unused",
+        match self.note.lock().unwrap_or_else(|e| e.into_inner()).state {
+            State::Up => "up",
+            State::Down => "down",
+            State::Unused => "unused",
         }
     }
 
@@ -212,12 +256,31 @@ impl Link {
         connect: Duration,
         answer: Duration,
     ) -> Result<(u16, String), String> {
-        let request = ApiRequest { method: method.into(), path: path.into(), body: body.into() };
-        let size = bincode::serialized_size(&request).map_err(|e| e.to_string())?;
-        if size > MAX_FRAME as u64 {
-            return Err("the message is too large".into());
-        }
+        let request = request_for(method, path, body)?;
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        self.call_on(&mut slot, pairing, target, &request, connect, answer)
+    }
+
+    /// `call`, only if no other call is under way: `Err(BUSY)` and nothing sent if one is.
+    fn call_if_free(&self, pairing: Option<&Pairing>, target: Option<SocketAddr>, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+        let request = request_for(method, path, body)?;
+        let mut slot = match self.connection.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(BUSY.into()),
+        };
+        self.call_on(&mut slot, pairing, target, &request, CONNECT_WAIT, ANSWER_WAIT)
+    }
+
+    fn call_on(
+        &self,
+        slot: &mut Option<ApiConnection>,
+        pairing: Option<&Pairing>,
+        target: Option<SocketAddr>,
+        request: &ApiRequest,
+        connect: Duration,
+        answer: Duration,
+    ) -> Result<(u16, String), String> {
         if slot.as_ref().is_some_and(|c| c.opened.elapsed() >= self.max_age) {
             *slot = None;
         }
@@ -228,13 +291,22 @@ impl Link {
             *slot = Some(ApiConnection { stream, opened: Instant::now() });
         }
         let Some(connection) = slot.as_mut() else { return Err("no connection".into()) };
-        let result = exchange(&mut connection.stream, &request, answer);
+        let result = exchange(&mut connection.stream, request, answer);
         if let Err(e) = &result {
             *slot = None;
             self.note(Err(e), target);
         }
         result
     }
+}
+
+fn request_for(method: &str, path: &str, body: &str) -> Result<ApiRequest, String> {
+    let request = ApiRequest { method: method.into(), path: path.into(), body: body.into() };
+    let size = bincode::serialized_size(&request).map_err(|e| e.to_string())?;
+    if size > MAX_FRAME as u64 {
+        return Err("the message is too large".into());
+    }
+    Ok(request)
 }
 
 fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> Result<(u16, String), String> {
@@ -260,6 +332,13 @@ pub fn set_target(target: SocketAddr) {
 /// needed it. Nothing tries it just to find out.
 pub fn control_state() -> &'static str {
     PEER_LINK.state_text()
+}
+
+/// A request to the other device's API, only when nothing else is using the connection, for
+/// asking now and then without holding up the app. `None` when this device has no peer to call.
+pub fn peer_call_if_free(method: &str, path: &str, body: &str) -> Option<Result<(u16, String), String>> {
+    let target = TARGET.get().copied()?;
+    Some(PEER_LINK.call_if_free(super::services().pairing.as_deref(), Some(target), method, path, body))
 }
 
 /// A request to the other device's API. Fails when this device isn't paired.
@@ -474,6 +553,33 @@ mod tests {
         let fresh = Link::new(HOUR);
         assert!(fresh.call(Some(&a), Some(nobody), "GET", "/api/state", "").is_err());
         assert_eq!(fresh.state_text(), "down", "a connect that fails");
+    }
+
+    #[test]
+    fn a_new_error_while_down_is_logged_again_but_not_too_often() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut note = ControlNote::new();
+        assert_eq!(note.note(Err("timed out"), at(0)), Some("control_down"));
+        assert_eq!(note.note(Err("timed out"), at(20)), None, "the same error");
+        assert_eq!(note.note(Err("refused"), at(25)), Some("control_down"), "a new one");
+        assert_eq!(note.note(Err("timed out"), at(30)), None, "too soon after the last");
+        assert_eq!(note.note(Err("timed out"), at(36)), Some("control_down"));
+        assert_eq!(note.note(Ok(()), at(37)), Some("control_up"));
+        assert_eq!(note.note(Ok(()), at(38)), None);
+        assert_eq!(note.note(Err("timed out"), at(39)), Some("control_down"), "going down is always news");
+    }
+
+    #[test]
+    fn a_call_that_only_wants_a_free_connection_waits_for_nothing() {
+        let (a, b) = paired_pair();
+        let (addr, _) = serving_api(b, 0);
+        let link = Link::new(HOUR);
+        assert_eq!(link.call_if_free(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        let held = link.connection.lock().unwrap();
+        assert_eq!(link.call_if_free(Some(&a), Some(addr), "GET", "/api/state", ""), Err(BUSY.to_string()));
+        drop(held);
+        assert_eq!(link.state_text(), "up", "being busy is no news of the connection");
     }
 
     #[test]

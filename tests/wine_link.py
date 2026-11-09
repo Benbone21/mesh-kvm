@@ -906,7 +906,7 @@ def link_state_checks(peer, inbox):
 
 def dropout_checks(peer, inbox):
     beats = Beats(peer, inbox)
-    logged_before = len(link_log_lines())
+    logged_before = link_log_lines()[-1:]
     # Control is with Debian, so the laptop's keyboard and mouse go there.
     st = peer.drive_to_debian()
     beats.pump(0.5)
@@ -965,6 +965,15 @@ def dropout_checks(peer, inbox):
     link_log_checks(logged_before)
 
 
+def after(anchor, lines):
+    """What came after the line `anchor` holds. The memory keeps a fixed number of lines, so a count
+    would drift once it's full; a line with milliseconds on it is near enough to unique."""
+    if not anchor:
+        return lines
+    at = len(lines) - 1 - lines[::-1].index(anchor[0]) if anchor[0] in lines else -1
+    return lines[at + 1:]
+
+
 def link_log_checks(logged_before):
     """The exe kept a record of the dropouts just played: each `down` with how long it heard nothing,
     and the `up` after it."""
@@ -975,7 +984,7 @@ def link_log_checks(logged_before):
           any(" start " in line and "os=windows" in line for line in lines), "\n".join(lines[:3]))
     check("each line is a time with milliseconds and offset, then a word",
           all(re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d [a-z_]+", line) for line in lines), "\n".join(lines[-5:]))
-    scene = link_log_lines()[logged_before:]
+    scene = after(logged_before, link_log_lines())
     downs = [line for line in scene if line.split(" ")[1] == "down"]
     silent = [int(m.group(1)) for m in (re.search(r" silent_ms=(\d+)", line) for line in downs) if m]
     check("the dropouts are logged as down, after 1.35 s of silence",
@@ -985,6 +994,12 @@ def link_log_checks(logged_before):
     check("and the link coming back as up", any(line.split(" ")[1] == "up" for line in after_down), "\n".join(scene))
     one, _ = link_log(1)
     check("?lines=1 gives one line", len(one.splitlines()) == 1 and one.strip() in link_log_lines(), one)
+    samples = [line for line in link_log_lines() if line.split(" ")[1] == "sample"]
+    check("a sample every 10 s says how late the loop came and what's known of the other clock",
+          bool(samples) and all(" loop_late_ms=" in line and " peer_clock_ms=" in line for line in samples), "\n".join(samples[-2:]))
+    with urllib.request.urlopen(LOCAL + "/api/local/clock", timeout=3) as r:
+        clock = json.load(r)
+    check("the exe gives its clock for the other device's log", abs(clock["unix_ms"] / 1000 - time.time()) < 5, str(clock))
 
 
 def api_checks(peer, inbox):
@@ -1233,6 +1248,11 @@ def saved_peer_checks(exe):
     st = wait_for(lambda s: s["peer_ip"] == ANOTHER_PEER, 30)
     check("the service restarted itself on the new address", (st or {}).get("peer_ip") == ANOTHER_PEER, str(st))
     check("the new address is saved", json.load(open(settings_file())).get("peer_ip") == ANOTHER_PEER)
+    words = [line.split(" ")[1] for line in link_log_lines()]
+    restarted = len(words) - 1 - words[::-1].index("restarting") if "restarting" in words else len(words)
+    check("the link log was kept through the restarts, which it names",
+          "down" in words[:restarted] and "peer_addr" in words[:restarted] and "start" in words[restarted:],
+          " ".join(words[-30:]))
     # This copy isn't the installed one, so it writes no launchers and installs nothing.
     programs = glob.glob(f"{PREFIX}/drive_c/users/*/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")
     written = [p for p in glob.glob(f"{programs[0]}/**/mesh-kvm*", recursive=True)] if programs else []

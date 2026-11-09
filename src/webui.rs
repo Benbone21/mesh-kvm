@@ -229,7 +229,9 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         }
         let target = if rest.is_empty() { "/" } else { rest };
         use crate::secure::control::{peer_call, peer_call_patiently};
-        let call = if req.body.contains("install_update") { peer_call_patiently } else { peer_call };
+        // The link log can be long, and is most wanted on a link that's slow.
+        let patient = req.body.contains("install_update") || crate::linklog::is_log_path(target);
+        let call = if patient { peer_call_patiently } else { peer_call };
         match call(&req.method, target, &req.body) {
             Ok((status, body)) => {
                 let st = if status == 200 { "200 OK".to_string() } else { format!("{} Peer", status) };

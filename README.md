@@ -151,7 +151,18 @@ The ROUND TRIP and LOST figures at the top show how the link looks: the time for
 
 ### The link log
 
-Each device keeps a record of what the link did, so that a drop can be looked into afterwards from both ends. It's `link.log`, in `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows, and it moves to `link.log.1` once it passes 2 MB. Each line is a local time to the millisecond, a word, then details: `up` and `down` with how long nothing was heard, the round trip, the loss each way and the address; `gap` for a stall of over 0.7 seconds that recovered before the link went; a `sample` every 10 seconds; `control_up` and `control_down` for the encrypted connection the app and clipboard use, with the error; `net`, `roam` and `signal` when this device's addresses or Wi-Fi change; `asleep` when the device slept; `peer_addr`; and `start` and `stop`. A `start` with no `stop` before it means the service was killed. Both directions going at once with the Wi-Fi changing points to the network, a `one_way=true` to a firewall or one side, and an `asleep` or `roam` just before a `down` explains it. `mesh-kvm --link-log` prints this device's log, then the other device's, and says so if either can't be reached. The app's API serves the last lines at `/api/local/linklog?lines=N`.
+Each device keeps a record of what the link did, so that a drop can be looked into afterwards from both ends. It's `link.log`, in `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows, and it moves to `link.log.1` once it passes 2 MB. Each line is a local time to the millisecond, a word, then details:
+
+- `up` and `down`, with how long nothing was heard, and on a `down` the round trip, the loss each way and the address.
+- `gap` for a stall that recovered before the link went: over 0.3 seconds in the middle of a stream of packets, or 0.7 seconds otherwise. `while_busy` says which.
+- `one_way` when the other device stops hearing this one with the link up, and again when it hears it once more.
+- A `sample` every 10 seconds. It also has how late this device's own input loop came round at worst (`loop_late_ms`), and how far the other device's clock is ahead (`peer_clock_ms`), which lines the two logs up. A `stall` is the input loop over 0.3 seconds late.
+- `control_up` and `control_down` for the encrypted connection that requests to the other device go over, with the error. The app and the layout sync use it, and so does a look at the other device's clock once a minute. The clipboard has connections of its own, and they aren't in the log.
+- `net`, `roam` and `signal` when this device's addresses or Wi-Fi change. `wifi=unknown` means the Wi-Fi couldn't be read, with why, and not that it went. On Windows 11 that can be the location permission Windows wants before it says anything about Wi-Fi.
+- `asleep` when the device slept, and on Windows `suspend` and `resume`.
+- `peer_addr`, and `start`, `restarting` and `stop`. A `start` with no `stop` or `restarting` before it means the service was killed.
+
+Both directions going at once with the Wi-Fi changing points to the network. A `one_way` points to a firewall or one side, a `stall` to this device being too busy, and an `asleep` or `roam` just before a `down` explains it. `mesh-kvm --link-log` prints the last 500 lines of this device's log, then the other device's, and says so if either can't be reached. The app's API serves them at `/api/local/linklog?lines=N`, up to 2000, including what the service before a restart wrote.
 
 ## Arranging screens
 

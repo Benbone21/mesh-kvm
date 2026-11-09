@@ -445,14 +445,17 @@ fn windows_output() -> Box<dyn FnMut(&str)> {
     })
 }
 
-/// Long enough for the other device's answer to come through the proxy on a slow link.
-const LINK_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+/// For this device's service, and for the other device's answer to come through the proxy, which
+/// waits out a slow link: up to 3 seconds to connect and 10 for the answer.
+const LINK_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const PEER_LINK_LOG_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn run_link_log() -> i32 {
     let mut call = |method: &str, path: &str, body: &str| {
-        webui::http_call_port_waiting("127.0.0.1", webui::UI_PORT, method, path, body, LINK_LOG_WAIT)
+        let wait = if path.starts_with("/api/peer/") { PEER_LINK_LOG_WAIT } else { LINK_LOG_WAIT };
+        webui::http_call_port_waiting("127.0.0.1", webui::UI_PORT, method, path, body, wait)
     };
-    let (text, status) = link_log_text(&mut call, &|| linklog::file_tail(linklog::KEPT_LINES));
+    let (text, status) = link_log_text(&mut call, &|| linklog::file_tail(linklog::DEFAULT_LINES));
     #[cfg(target_os = "windows")]
     match windows_console() {
         Some(mut say) => say(text.trim_end()),
@@ -474,7 +477,7 @@ fn run_link_log() -> i32 {
 /// This device's link log, then the other device's, each under a heading, and the exit status: 0
 /// when both were read. With the service down, this device's file is read instead.
 fn link_log_text(call: Call, own_file: &dyn Fn() -> Option<String>) -> (String, i32) {
-    let path = format!("{}?lines={}", linklog::PATH, linklog::KEPT_LINES);
+    let path = format!("{}?lines={}", linklog::PATH, linklog::DEFAULT_LINES);
     let or_nothing = |body: String| if body.is_empty() { "Nothing logged yet.\n".to_string() } else { body };
     let mut text = String::from("=== This device ===\n");
     let mut status = 0;
@@ -918,13 +921,13 @@ mod tests {
         };
         let said = super::link_log_text(&mut call, &|| file.map(str::to_string));
         let peer_asked = asked.iter().any(|p| p.starts_with("/api/peer/"));
-        assert!(asked.iter().all(|p| p.ends_with("/api/local/linklog?lines=2000")), "{asked:?}");
+        assert!(asked.iter().all(|p| p.ends_with("/api/local/linklog?lines=500")), "{asked:?}");
         assert_eq!(peer_asked, answers.iter().any(|(p, _)| p.starts_with("/api/peer/")), "{asked:?}");
         said
     }
 
-    const HERE: &str = "/api/local/linklog?lines=2000";
-    const THERE: &str = "/api/peer/api/local/linklog?lines=2000";
+    const HERE: &str = "/api/local/linklog?lines=500";
+    const THERE: &str = "/api/peer/api/local/linklog?lines=500";
 
     #[test]
     fn link_log_prints_both_devices_under_headings() {

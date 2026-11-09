@@ -21,6 +21,19 @@ pub const SWITCH_RACE_MS: u64 = 200;
 /// Silence from the peer longer than this, short of a dropout, is a stall worth noting. Heartbeats
 /// come every 400 ms, so this is one gone missing or 300 ms late.
 pub const QUIET_MS: u64 = 700;
+/// While packets stream in, as with movement from the other device, a shorter silence is a stall.
+pub const BUSY_QUIET_MS: u64 = 300;
+/// Packets this close together are a run, and a run this long is a stream. A heartbeat's copies
+/// come together, and are no stream.
+const RUN_GAP_MS: u64 = 50;
+const STREAM_MS: u64 = 100;
+
+/// A silence from the peer that a packet ended, and whether it broke a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quiet {
+    pub ms: u64,
+    pub busy: bool,
+}
 /// How often the main device repeats its view of the active device: with every heartbeat, as one
 /// copy a second was lost for 2.5 seconds in a row every couple of minutes on a poor link.
 pub const ACTIVE_VIEW_INTERVAL_MS: u64 = 400;
@@ -143,8 +156,10 @@ pub struct Router {
     /// Newest `now_ms` seen from any event.
     now: u64,
     last_alive: u64,
-    /// The longest silence over `QUIET_MS` that a packet has ended since `take_quiet`.
-    quiet: Option<u64>,
+    /// The longest silence worth noting that a packet has ended since `take_quiet`.
+    quiet: Option<Quiet>,
+    /// When the current run of closely spaced packets began.
+    run_start: u64,
     /// When this device last sent `SendActiveView`.
     last_view: u64,
     /// When a non-main device last heard from main that it hears us. `None` until the first
@@ -213,6 +228,7 @@ impl Router {
             now: 0,
             last_alive: 0,
             quiet: None,
+            run_start: 0,
             last_view: 0,
             view_heard: None,
             peer_views: None,
@@ -254,9 +270,9 @@ impl Router {
     pub fn online_since(&self) -> u64 {
         self.online_since
     }
-    /// The longest silence from the peer over `QUIET_MS` that has ended since the last call. One
-    /// that ended a dropout is in it too.
-    pub fn take_quiet(&mut self) -> Option<u64> {
+    /// The longest silence from the peer over `QUIET_MS`, or over `BUSY_QUIET_MS` in a stream,
+    /// that has ended since the last call. One that ended a dropout is in it too.
+    pub fn take_quiet(&mut self) -> Option<Quiet> {
         self.quiet.take()
     }
     pub fn panicked(&self) -> bool {
@@ -393,8 +409,13 @@ impl Router {
             }
             Event::PeerAlive { now_ms } => {
                 let quiet = now_ms.saturating_sub(self.last_alive);
-                if self.last_alive > 0 && quiet > QUIET_MS {
-                    self.quiet = self.quiet.max(Some(quiet));
+                let busy = self.last_alive.saturating_sub(self.run_start) >= STREAM_MS;
+                let limit = if busy { BUSY_QUIET_MS } else { QUIET_MS };
+                if self.last_alive > 0 && quiet > limit && self.quiet.is_none_or(|q| quiet > q.ms) {
+                    self.quiet = Some(Quiet { ms: quiet, busy });
+                }
+                if quiet > RUN_GAP_MS {
+                    self.run_start = now_ms;
                 }
                 // A gap longer than the timeout is a loss followed by a fresh link-up.
                 if self.online && now_ms.saturating_sub(self.last_alive) > LINK_TIMEOUT_MS {
@@ -1403,7 +1424,7 @@ mod tests {
         assert_eq!(r.take_quiet(), None, "still going on");
         r.handle(Event::PeerAlive { now_ms: 2300 });
         r.handle(Event::PeerAlive { now_ms: 2310 });
-        assert_eq!(r.take_quiet(), Some(900));
+        assert_eq!(r.take_quiet(), Some(Quiet { ms: 900, busy: false }));
         assert_eq!(r.take_quiet(), None, "taken once");
         assert_eq!(r.last_alive(), 2310);
         assert_eq!(r.online_since(), 1000);
@@ -1415,8 +1436,27 @@ mod tests {
         online(&mut r);
         r.handle(Event::PeerAlive { now_ms: 1000 + QUIET_MS + 100 });
         r.handle(Event::PeerAlive { now_ms: 1000 + 2 * QUIET_MS + 150 });
-        assert_eq!(r.take_quiet(), Some(QUIET_MS + 100));
+        assert_eq!(r.take_quiet().map(|q| q.ms), Some(QUIET_MS + 100));
         assert!(r.online());
+    }
+
+    #[test]
+    fn a_shorter_quiet_spell_counts_when_it_breaks_a_stream() {
+        let mut r = router(0);
+        online(&mut r);
+        // A heartbeat's copies come together, which is no stream.
+        r.handle(Event::PeerAlive { now_ms: 1001 });
+        r.handle(Event::PeerAlive { now_ms: 1400 });
+        assert_eq!(r.take_quiet(), None);
+        // Movement every 8 ms for a while, then 350 ms of nothing.
+        for now_ms in (1408..=1800).step_by(8) {
+            r.handle(Event::PeerAlive { now_ms });
+        }
+        r.handle(Event::PeerAlive { now_ms: 1800 + BUSY_QUIET_MS + 50 });
+        assert_eq!(r.take_quiet(), Some(Quiet { ms: BUSY_QUIET_MS + 50, busy: true }));
+        // The packet after a spell starts a new run, so the next 350 ms is no stream broken.
+        r.handle(Event::PeerAlive { now_ms: 1800 + 2 * BUSY_QUIET_MS + 100 });
+        assert_eq!(r.take_quiet(), None);
     }
 
     #[test]

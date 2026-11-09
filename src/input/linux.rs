@@ -1233,6 +1233,8 @@ pub fn run_debian_node(
     let mut last_telemetry_sync = Instant::now();
     let mut link = PeerLink::default();
     let mut link_watch = crate::linklog::LinkWatch::new(now_ms());
+    // Each time round is half a millisecond's sleep and the work, so anything past a millisecond is late.
+    let mut loop_clock = crate::linklog::LoopClock::new("input", 1);
 
     let mut udp_buf = [0u8; MAX_DATAGRAM];
     let mut opened = Vec::new();
@@ -1268,6 +1270,7 @@ pub fn run_debian_node(
             break Ok(());
         }
 
+        loop_clock.tick(now_ms());
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
         crate::audio::AUDIO_PEER_ONLINE.store(core.router.online(), Ordering::Relaxed);
@@ -1525,7 +1528,7 @@ pub fn run_debian_node(
                 guard.telemetry.main_conflict = core.router.main_conflict();
                 guard.telemetry.link = link.quality(&core.router, now_ms());
             }
-            let look = crate::linklog::Look::of(&mut core.router, &mut link, now_ms());
+            let look = crate::linklog::Look::of(&mut core.router, &mut link, &mut loop_clock, now_ms());
             crate::linklog::note(link_watch.look(look));
         }
 

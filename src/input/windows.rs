@@ -922,8 +922,10 @@ pub fn run_windows_node(
             let mut ticks = 0u32;
             let mut config = None;
             let mut link_watch = crate::linklog::LinkWatch::new(now_ms());
+            let mut loop_clock = crate::linklog::LoopClock::new("watchdog", TICK_INTERVAL.as_millis() as u64);
             loop {
                 std::thread::sleep(TICK_INTERVAL);
+                loop_clock.tick(now_ms());
                 if crate::settings::restart_requested() {
                     restart_service();
                 }
@@ -1015,7 +1017,7 @@ pub fn run_windows_node(
                     }
                 }
 
-                let look = crate::linklog::Look::of(&mut router(), &mut link(), now_ms());
+                let look = crate::linklog::Look::of(&mut router(), &mut link(), &mut loop_clock, now_ms());
                 crate::linklog::note(link_watch.look(look));
 
                 ticks = ticks.wrapping_add(1);

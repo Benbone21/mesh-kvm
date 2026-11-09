@@ -7,7 +7,8 @@ use super::trust::Version;
 use super::Installer;
 use crate::app::launch::{restart_service, running_exe};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use crate::platform::limited::{run_limited, OnExpiry, Ran};
+use std::process::Command;
 use std::time::Duration;
 
 const INSTALLED_EXE: &str = "/usr/bin/mesh-kvm";
@@ -41,7 +42,7 @@ impl Installer for Deb {
         }
         let mut command = Command::new(PKEXEC);
         command.arg("--disable-internal-agent").arg(HELPER).arg(ready.version.to_string());
-        let output = match run_limited(command, INSTALL_LIMIT) {
+        let output = match run_limited(command, INSTALL_LIMIT, OnExpiry::Leave) {
             Ran::Finished(output) => output,
             Ran::TimedOut => return Err(too_long_note()),
             Ran::CouldNotStart(why) => return Err(format!("The update couldn't start: {why} The old version keeps running. To update by hand, run: {by_hand}")),
@@ -56,7 +57,7 @@ impl Installer for Deb {
     fn preflight(&self) -> Preflight {
         let mut command = Command::new(PKCHECK);
         command.args(["--action-id", ACTION, "--process", &std::process::id().to_string()]);
-        match run_limited(command, PREFLIGHT_LIMIT) {
+        match run_limited(command, PREFLIGHT_LIMIT, OnExpiry::Leave) {
             Ran::Finished(output) => read_pkcheck(output.status.code()),
             _ => Preflight::Unknown,
         }
@@ -103,31 +104,6 @@ fn too_long_note() -> String {
         "The update has taken over {} minutes, so mesh-kvm has stopped waiting. apt may still be running, and if it finishes the new version starts at the next restart.",
         INSTALL_LIMIT.as_secs() / 60
     )
-}
-
-enum Ran {
-    Finished(Output),
-    TimedOut,
-    CouldNotStart(String),
-}
-
-/// Runs `command` for at most `limit`. A root helper can't be stopped from here and shouldn't be,
-/// halfway through `apt`, so running out of time only ends the wait.
-fn run_limited(mut command: Command, limit: Duration) -> Ran {
-    let spawned = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-    let child = match spawned {
-        Ok(child) => child,
-        Err(e) => return Ran::CouldNotStart(e.to_string()),
-    };
-    let (done, finished) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done.send(child.wait_with_output());
-    });
-    match finished.recv_timeout(limit) {
-        Ok(Ok(output)) => Ran::Finished(output),
-        Ok(Err(e)) => Ran::CouldNotStart(e.to_string()),
-        Err(_) => Ran::TimedOut,
-    }
 }
 
 /// Starts the new version: through systemd if that's what runs this service, or else by itself.
@@ -231,7 +207,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut command = Command::new("sleep");
         command.arg("30");
-        assert!(matches!(run_limited(command, Duration::from_millis(100)), Ran::TimedOut));
+        assert!(matches!(run_limited(command, Duration::from_millis(100), OnExpiry::Leave), Ran::TimedOut));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -239,7 +215,7 @@ mod tests {
     fn a_helper_within_the_limit_gives_its_output() {
         let mut command = Command::new("echo");
         command.arg("done");
-        let Ran::Finished(output) = run_limited(command, Duration::from_secs(5)) else { panic!("it finished") };
+        let Ran::Finished(output) = run_limited(command, Duration::from_secs(5), OnExpiry::Leave) else { panic!("it finished") };
         assert_eq!(output.stdout, b"done\n");
     }
 

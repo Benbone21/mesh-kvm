@@ -1,21 +1,23 @@
 //! The link log: what the link between the two devices did, one line per event, so that a drop can
 //! be looked into afterwards from both ends. Lines go to `link.log` in the config folder, which
 //! moves to `link.log.1` once it passes 2 MB, and the last ones stay in memory for the API, which
-//! still has them when the file can't be written.
+//! still has them when the file can't be written. A new service starts with the end of the file
+//! in memory, so a restart loses nothing from the API.
 //!
 //! Nothing here may hold up an input loop. A loop looks at the link a few times a second, which
 //! costs a comparison or two, and hands any event it finds to a bounded queue; a thread of its own
-//! writes them. A full queue drops the event. A second thread watches this device's network and
-//! its clock.
+//! writes them. A full queue drops the event. Two more threads look at this device's clock every
+//! second and at its network now and then, the network with a limit on each program it runs.
 
 use crate::input::link::{LinkQuality, PeerLink, RoundTrips};
-use crate::router::Router;
+use crate::platform::limited::{run_limited, OnExpiry, Ran};
+use crate::router::{Quiet, Router};
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::{Display, Write as _};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,21 +26,35 @@ pub const FILE_NAME: &str = "link.log";
 /// What the API serves, and how many lines it gives when not told.
 pub const PATH: &str = "/api/local/linklog";
 pub const DEFAULT_LINES: usize = 500;
+/// This device's wall clock, for the other device to line the two logs up by.
+pub const CLOCK_PATH: &str = "/api/local/clock";
 /// Lines kept in memory, and the most the API gives.
 pub const KEPT_LINES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const QUEUE: usize = 4096;
 const SAMPLE_EVERY_MS: u64 = 10_000;
-const NET_EVERY: Duration = Duration::from_secs(5);
+/// The network is looked at this often while things are changing, and less often once they settle.
+const NET_QUICK: Duration = Duration::from_secs(5);
+const NET_SLOW: Duration = Duration::from_secs(30);
+const QUICK_FOR: Duration = Duration::from_secs(60);
+const NET_WAKE: Duration = Duration::from_millis(250);
+/// The most any program run for a look at the network may take.
+const COMMAND_LIMIT: Duration = Duration::from_secs(3);
+const PEER_CLOCK_EVERY: Duration = Duration::from_secs(60);
+/// An answer slower than this says too little about the other device's clock.
+const PEER_CLOCK_MAX_RTT_MS: i64 = 2000;
 const CLOCK_EVERY: Duration = Duration::from_secs(1);
 /// Lost time past this between two looks at the clock means the device slept, or this didn't run.
 const ASLEEP_MS: u64 = 5000;
+/// An input loop this late is a `stall`.
+pub const STALL_MS: u64 = 300;
 /// Wi-Fi signal is logged when it moves this far, in percent, from what was last logged.
 const SIGNAL_STEP: u32 = 10;
 /// How long stopping waits for the lines before it to be written.
 const FLUSH_WAIT: Duration = Duration::from_millis(500);
 const REOPEN_EVERY: Duration = Duration::from_secs(10);
 const NO_SIGNAL: u32 = u32::MAX;
+const NO_CLOCK: i64 = i64::MIN;
 
 enum Msg {
     Line(Entry),
@@ -52,6 +68,9 @@ static PACKETS_IN: AtomicU64 = AtomicU64::new(0);
 static PACKETS_OUT: AtomicU64 = AtomicU64::new(0);
 /// The latest Wi-Fi signal, for each `down`.
 static SIGNAL: AtomicU32 = AtomicU32::new(NO_SIGNAL);
+/// How far the other device's clock is ahead of this one's, and how long the answer took.
+static PEER_CLOCK_MS: AtomicI64 = AtomicI64::new(NO_CLOCK);
+static PEER_CLOCK_RTT_MS: AtomicU32 = AtomicU32::new(0);
 /// A `down` or a sleep asks for a look at the network straight away.
 static LOOK_NOW: AtomicBool = AtomicBool::new(false);
 
@@ -63,9 +82,13 @@ pub fn start(peer: &str) {
     if QUEUE_TX.set(tx).is_err() {
         return;
     }
-    let file = LogFile::new(crate::settings::config_dir().join(FILE_NAME), MAX_FILE_BYTES);
+    let path = crate::settings::config_dir().join(FILE_NAME);
+    let read = |path: &PathBuf| std::fs::read_to_string(path).ok();
+    *RING.lock().unwrap_or_else(PoisonError::into_inner) = seeded(read(&older_path(&path)), read(&path));
+    let file = LogFile::new(path, MAX_FILE_BYTES);
     let _ = std::thread::Builder::new().name("mesh-kvm-linklog".into()).spawn(move || write_lines(rx, file));
-    let _ = std::thread::Builder::new().name("mesh-kvm-linklog-net".into()).spawn(watch_device);
+    let _ = std::thread::Builder::new().name("mesh-kvm-linklog-clock".into()).spawn(watch_clock);
+    let _ = std::thread::Builder::new().name("mesh-kvm-linklog-net".into()).spawn(watch_network);
     let details = Details::new()
         .text("version", &crate::update::trust::running_version().to_string())
         .text("os", std::env::consts::OS)
@@ -77,12 +100,17 @@ pub fn start(peer: &str) {
 
 /// A `stop` line, waited for briefly so that it's written before the process goes.
 pub fn stop(reason: &str, error: Option<&str>) {
-    let Some(tx) = QUEUE_TX.get() else { return };
     let mut details = Details::new().text("reason", reason);
     if let Some(error) = error {
         details = details.text("error", error);
     }
-    record("stop", details);
+    record_and_wait("stop", details);
+}
+
+/// Records one event, and waits briefly for it to be written, as the process may be about to go.
+pub fn record_and_wait(word: &'static str, details: Details) {
+    let Some(tx) = QUEUE_TX.get() else { return };
+    record(word, details);
     let (done, wait) = sync_channel(1);
     if tx.try_send(Msg::Flush(done)).is_ok() {
         let _ = wait.recv_timeout(FLUSH_WAIT);
@@ -107,8 +135,12 @@ fn packets() -> (u64, u64) {
     (PACKETS_IN.load(Ordering::Relaxed), PACKETS_OUT.load(Ordering::Relaxed))
 }
 
-/// The API's answer for `path`, if it is the link log's: the last lines, as plain text.
+/// The API's answer for `path`, if it is the link log's: the last lines as plain text, or this
+/// device's clock.
 pub fn answer(path: &str) -> Option<String> {
+    if path == CLOCK_PATH {
+        return Some(serde_json::json!({ "unix_ms": wall_ms() }).to_string());
+    }
     lines_asked(path).map(|lines| tail_of(&RING.lock().unwrap_or_else(PoisonError::into_inner), lines))
 }
 
@@ -136,11 +168,30 @@ fn tail_of(ring: &VecDeque<String>, lines: usize) -> String {
     text
 }
 
-/// The end of this device's `link.log`, for `--link-log` when the service isn't answering.
+/// The last lines of the older file and then the newer one.
+fn seeded(older: Option<String>, newer: Option<String>) -> VecDeque<String> {
+    let mut ring = VecDeque::new();
+    for text in [older, newer].into_iter().flatten() {
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            keep(&mut ring, line.to_string());
+        }
+    }
+    ring
+}
+
+/// The end of this device's log files, for `--link-log` when the service isn't answering.
 pub fn file_tail(lines: usize) -> Option<String> {
-    let text = std::fs::read_to_string(crate::settings::config_dir().join(FILE_NAME)).ok()?;
-    let ring: VecDeque<String> = text.lines().map(str::to_string).collect();
-    Some(tail_of(&ring, lines))
+    let path = crate::settings::config_dir().join(FILE_NAME);
+    let older = std::fs::read_to_string(older_path(&path)).ok();
+    let newer = std::fs::read_to_string(&path).ok();
+    if older.is_none() && newer.is_none() {
+        return None;
+    }
+    Some(tail_of(&seeded(older, newer), lines))
+}
+
+fn older_path(path: &std::path::Path) -> PathBuf {
+    path.with_file_name(format!("{FILE_NAME}.1"))
 }
 
 fn keep(ring: &mut VecDeque<String>, line: String) {
@@ -294,7 +345,8 @@ fn utc_offset_s(_unix_ms: i64) -> i32 {
 // ---- The file ----
 
 /// `link.log`, moved aside once it passes its limit. One that can't be opened is tried again now
-/// and then, and the lines meanwhile are only in memory.
+/// and then, and the lines meanwhile are only in memory. One that can't be moved aside is emptied,
+/// so the file never grows past its limit.
 struct LogFile {
     path: PathBuf,
     limit: u64,
@@ -310,42 +362,51 @@ impl LogFile {
 
     fn write(&mut self, line: &str) {
         if self.file.is_none() && self.retry_at.is_none_or(|at| Instant::now() >= at) {
-            self.open();
+            self.open(false);
         }
-        let bytes = line.len() as u64 + 1;
-        if self.file.is_some() && self.size > 0 && self.size + bytes > self.limit {
+        let bytes = format!("{line}\n");
+        if self.file.is_some() && self.size > 0 && self.size + bytes.len() as u64 > self.limit {
             self.rotate();
         }
         let Some(file) = self.file.as_mut() else { return };
-        if writeln!(file, "{line}").and_then(|_| file.flush()).is_ok() {
-            self.size += bytes;
+        if file.write_all(bytes.as_bytes()).is_ok() {
+            self.size += bytes.len() as u64;
         } else {
             self.file = None;
             self.retry_at = Some(Instant::now() + REOPEN_EVERY);
         }
     }
 
-    fn open(&mut self) {
+    fn open(&mut self, empty: bool) {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+        let mut options = std::fs::OpenOptions::new();
+        if empty {
+            options.write(true).truncate(true).create(true);
+        } else {
+            options.append(true).create(true);
+        }
+        match options.open(&self.path) {
             Ok(file) => {
                 self.size = file.metadata().map_or(0, |m| m.len());
                 self.file = Some(file);
                 self.retry_at = None;
             }
-            Err(_) => self.retry_at = Some(Instant::now() + REOPEN_EVERY),
+            Err(_) => {
+                self.file = None;
+                self.retry_at = Some(Instant::now() + REOPEN_EVERY);
+            }
         }
     }
 
     /// Closed first, as Windows can't move an open file.
     fn rotate(&mut self) {
         self.file = None;
-        let old = self.path.with_file_name(format!("{FILE_NAME}.1"));
+        let old = older_path(&self.path);
         let _ = std::fs::remove_file(&old);
-        let _ = std::fs::rename(&self.path, &old);
-        self.open();
+        let moved = std::fs::rename(&self.path, &old).is_ok();
+        self.open(!moved);
     }
 }
 
@@ -364,9 +425,45 @@ fn write_lines(rx: Receiver<Msg>, mut file: LogFile) {
     }
 }
 
-// ---- The link ----
+// ---- The input loops ----
 
-/// The figures that go with `up` and `down`.
+/// How late an input loop comes round. Each loop keeps one and ticks it every time round; a tick
+/// is a subtraction and a comparison.
+pub struct LoopClock {
+    name: &'static str,
+    every_ms: u64,
+    last: Option<u64>,
+    worst_ms: u64,
+}
+
+impl LoopClock {
+    /// For a loop meant to come round every `every_ms`.
+    pub fn new(name: &'static str, every_ms: u64) -> LoopClock {
+        LoopClock { name, every_ms, last: None, worst_ms: 0 }
+    }
+
+    /// Records a `stall` when this time round came more than `STALL_MS` late.
+    pub fn tick(&mut self, now_ms: u64) {
+        if let Some(late_ms) = self.lateness(now_ms) {
+            record("stall", Details::new().num("late_ms", late_ms).num("loop", self.name));
+        }
+    }
+
+    /// The lateness of a stall, if this was one.
+    fn lateness(&mut self, now_ms: u64) -> Option<u64> {
+        let late = self.last.map_or(0, |last| now_ms.saturating_sub(last).saturating_sub(self.every_ms));
+        self.last = Some(now_ms);
+        self.worst_ms = self.worst_ms.max(late);
+        (late > STALL_MS).then_some(late)
+    }
+
+    /// The worst lateness since the last call.
+    pub fn take_worst(&mut self) -> u64 {
+        std::mem::take(&mut self.worst_ms)
+    }
+}
+
+/// The figures that go with `down`, `gap` and `one_way`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Figures {
     pub round_trip_ms: Option<u32>,
@@ -388,15 +485,18 @@ pub struct Look {
     pub online: bool,
     pub online_since: u64,
     pub last_alive: u64,
-    pub quiet: Option<u64>,
+    pub quiet: Option<Quiet>,
     pub figures: Figures,
     pub round_trips: Option<RoundTrips>,
     pub packets: (u64, u64),
+    /// The worst lateness of the input loop since the last look.
+    pub loop_late_ms: u64,
 }
 
 impl Look {
-    /// What the router and link say now. This takes their quiet spell and round trips.
-    pub fn of(router: &mut Router, link: &mut PeerLink, now_ms: u64) -> Look {
+    /// What the router, the link and the loop say now. This takes their quiet spell, round trips
+    /// and lateness.
+    pub fn of(router: &mut Router, link: &mut PeerLink, clock: &mut LoopClock, now_ms: u64) -> Look {
         Look {
             now_ms,
             online: router.online(),
@@ -406,19 +506,24 @@ impl Look {
             figures: (&link.quality(router, now_ms)).into(),
             round_trips: link.take_round_trips(),
             packets: packets(),
+            loop_late_ms: clock.take_worst(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkEvent {
-    /// `silent_ms` is how long nothing came before this, unknown for the first.
-    Up { down_ms: u64, silent_ms: Option<u64>, figures: Figures },
+    /// `silent_ms` is how long nothing came before this, unknown for the first. Its figures are
+    /// still to come, so it has none.
+    Up { down_ms: u64, silent_ms: Option<u64> },
     /// With the figures from just before.
     Down { silent_ms: u64, up_ms: u64, figures: Figures },
-    /// A silence over `QUIET_MS` that ended with the link still up.
-    Gap { silent_ms: u64 },
-    Sample { online: bool, round_trips: Option<RoundTrips>, figures: Figures, in_per_s: f32, out_per_s: f32 },
+    /// A silence that ended with the link still up: over `QUIET_MS`, or over `BUSY_QUIET_MS` when
+    /// it broke a stream. `in_per_s` is the rate since the last sample.
+    Gap { silent_ms: u64, busy: bool, figures: Figures, in_per_s: f32 },
+    /// The other device stopped hearing this one with the link up, or started again.
+    OneWay { on: bool, figures: Figures },
+    Sample { online: bool, round_trips: Option<RoundTrips>, figures: Figures, in_per_s: f32, out_per_s: f32, loop_late_ms: u64 },
 }
 
 /// Turns looks at the link into events. The input loops keep one each and look every tick of their
@@ -430,7 +535,9 @@ pub struct LinkWatch {
     changed_at: u64,
     /// The figures from the last look with the link up: they go when it does.
     figures: Figures,
+    one_way: bool,
     round_trips: Option<RoundTrips>,
+    loop_late_ms: u64,
     sampled_at: u64,
     sampled_packets: (u64, u64),
 }
@@ -446,7 +553,9 @@ impl LinkWatch {
             online_since: 0,
             changed_at: now_ms,
             figures: Figures::default(),
+            one_way: false,
             round_trips: None,
+            loop_late_ms: 0,
             sampled_at: now_ms,
             sampled_packets: packets,
         }
@@ -465,11 +574,14 @@ impl LinkWatch {
                 None => t,
             });
         }
+        self.loop_late_ms = self.loop_late_ms.max(look.loop_late_ms);
+        let quiet_ms = look.quiet.map(|q| q.ms);
         match (self.online, look.online) {
             (false, true) => {
                 let down_ms = look.online_since.saturating_sub(self.changed_at);
-                events.push(LinkEvent::Up { down_ms, silent_ms: look.quiet, figures: look.figures });
+                events.push(LinkEvent::Up { down_ms, silent_ms: quiet_ms });
                 self.changed_at = look.online_since;
+                self.one_way = false;
             }
             (true, false) => {
                 let silent_ms = look.now_ms.saturating_sub(look.last_alive);
@@ -480,44 +592,55 @@ impl LinkWatch {
             // The link went down and up again between two looks: the packet that ended the silence
             // found it past the timeout.
             (true, true) if look.online_since != self.online_since => {
-                let silent_ms = look.quiet.unwrap_or(0);
+                let silent_ms = quiet_ms.unwrap_or(0);
                 let up_ms = look.online_since.saturating_sub(self.online_since + silent_ms);
                 events.push(LinkEvent::Down { silent_ms, up_ms, figures: self.figures });
-                events.push(LinkEvent::Up { down_ms: 0, silent_ms: look.quiet, figures: look.figures });
+                events.push(LinkEvent::Up { down_ms: 0, silent_ms: quiet_ms });
                 self.changed_at = look.online_since;
+                self.one_way = false;
             }
             (true, true) => {
-                if let Some(silent_ms) = look.quiet {
-                    events.push(LinkEvent::Gap { silent_ms });
+                if let Some(quiet) = look.quiet {
+                    let in_per_s = self.rate(look.now_ms, look.packets.0, self.sampled_packets.0);
+                    events.push(LinkEvent::Gap { silent_ms: quiet.ms, busy: quiet.busy, figures: look.figures, in_per_s });
                 }
             }
             (false, false) => {}
+        }
+        if look.online && look.figures.one_way != self.one_way {
+            self.one_way = look.figures.one_way;
+            events.push(LinkEvent::OneWay { on: self.one_way, figures: look.figures });
         }
         self.online = look.online;
         self.online_since = look.online_since;
         if look.online {
             self.figures = look.figures;
         }
-        let window = look.now_ms.saturating_sub(self.sampled_at);
-        if window >= SAMPLE_EVERY_MS {
-            let seconds = window as f32 / 1000.0;
-            let per_s = |now: u64, was: u64| now.saturating_sub(was) as f32 / seconds;
+        if look.now_ms.saturating_sub(self.sampled_at) >= SAMPLE_EVERY_MS {
             events.push(LinkEvent::Sample {
                 online: look.online,
                 round_trips: self.round_trips.take(),
                 figures: look.figures,
-                in_per_s: per_s(look.packets.0, self.sampled_packets.0),
-                out_per_s: per_s(look.packets.1, self.sampled_packets.1),
+                in_per_s: self.rate(look.now_ms, look.packets.0, self.sampled_packets.0),
+                out_per_s: self.rate(look.now_ms, look.packets.1, self.sampled_packets.1),
+                loop_late_ms: std::mem::take(&mut self.loop_late_ms),
             });
             self.sampled_at = look.now_ms;
             self.sampled_packets = look.packets;
         }
         events
     }
+
+    /// Packets per second since the last sample.
+    fn rate(&self, now_ms: u64, now: u64, was: u64) -> f32 {
+        let seconds = now_ms.saturating_sub(self.sampled_at).max(1) as f32 / 1000.0;
+        now.saturating_sub(was) as f32 / seconds
+    }
 }
 
 /// Records what a `LinkWatch` found, with what else goes with it: the latest Wi-Fi signal on a
-/// `down`, and audio and the control connection on a sample. Only atomics are read here.
+/// `down`, and audio, the control connection and the other device's clock on a sample. Only
+/// atomics are read here.
 pub fn note(events: Vec<LinkEvent>) {
     for event in events {
         let (word, mut details) = describe(&event, PEER.get().map_or("-", String::as_str));
@@ -536,6 +659,7 @@ pub fn note(events: Vec<LinkEvent>) {
                     details = details.num("audio_loss", format!("{loss:.1}")).num("audio_buffer_ms", AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed));
                 }
                 details = details.num("control", crate::secure::control::control_state());
+                details = peer_clock(details, PEER_CLOCK_MS.load(Ordering::Relaxed), PEER_CLOCK_RTT_MS.load(Ordering::Relaxed));
             }
             _ => {}
         }
@@ -543,44 +667,89 @@ pub fn note(events: Vec<LinkEvent>) {
     }
 }
 
+/// `peer_clock_ms` is how far the other device's clock is ahead of this one's, give or take half
+/// of `peer_clock_rtt_ms`: add it to a time here to find the same moment in the other log.
+fn peer_clock(details: Details, ahead_ms: i64, rtt_ms: u32) -> Details {
+    if ahead_ms == NO_CLOCK {
+        return details.num("peer_clock_ms", "-");
+    }
+    details.num("peer_clock_ms", format!("{ahead_ms:+}")).num("peer_clock_rtt_ms", rtt_ms)
+}
+
+fn loss(details: Details, f: &Figures) -> Details {
+    details.opt("loss_in", f.loss_in.map(|l| format!("{l:.2}"))).opt("loss_out", f.loss_out.map(|l| format!("{l:.2}")))
+}
+
 fn figures(details: Details, f: &Figures) -> Details {
-    details
-        .opt("rtt_ms", f.round_trip_ms)
-        .opt("loss_in", f.loss_in.map(|l| format!("{l:.2}")))
-        .opt("loss_out", f.loss_out.map(|l| format!("{l:.2}")))
-        .num("one_way", f.one_way)
+    loss(details.opt("rtt_ms", f.round_trip_ms), f).num("one_way", f.one_way)
 }
 
 fn describe(event: &LinkEvent, peer: &str) -> (&'static str, Details) {
     match event {
-        LinkEvent::Up { down_ms, silent_ms, figures: f } => {
-            let details = Details::new().num("down_ms", down_ms).opt("silent_ms", *silent_ms);
-            ("up", figures(details, f).text("peer", peer))
+        LinkEvent::Up { down_ms, silent_ms } => {
+            ("up", Details::new().num("down_ms", down_ms).opt("silent_ms", *silent_ms).text("peer", peer))
         }
         LinkEvent::Down { silent_ms, up_ms, figures: f } => {
             let details = Details::new().num("silent_ms", silent_ms);
             ("down", figures(details, f).text("peer", peer).num("up_ms", up_ms))
         }
-        LinkEvent::Gap { silent_ms } => ("gap", Details::new().num("silent_ms", silent_ms)),
-        LinkEvent::Sample { online, round_trips, figures: f, in_per_s, out_per_s } => {
+        LinkEvent::Gap { silent_ms, busy, figures: f, in_per_s } => {
+            let details = Details::new().num("silent_ms", silent_ms).num("while_busy", busy);
+            ("gap", loss(details, f).num("in_pps", format!("{in_per_s:.1}")))
+        }
+        LinkEvent::OneWay { on, figures: f } => {
+            let details = Details::new().num("state", if *on { "on" } else { "off" }).opt("rtt_ms", f.round_trip_ms);
+            ("one_way", loss(details, f))
+        }
+        LinkEvent::Sample { online, round_trips, figures: f, in_per_s, out_per_s, loop_late_ms } => {
             let ms = |pick: fn(&RoundTrips) -> f32| round_trips.as_ref().map(|t| format!("{:.0}", pick(t)));
             let details = Details::new()
                 .num("link", if *online { "up" } else { "down" })
                 .opt("rtt_min_ms", ms(|t| t.min_ms))
                 .opt("rtt_avg_ms", ms(RoundTrips::average_ms))
                 .opt("rtt_max_ms", ms(|t| t.max_ms))
-                .num("answers", round_trips.map_or(0, |t| t.count))
-                .opt("loss_in", f.loss_in.map(|l| format!("{l:.2}")))
-                .opt("loss_out", f.loss_out.map(|l| format!("{l:.2}")))
+                .num("answers", round_trips.map_or(0, |t| t.count));
+            let details = loss(details, f)
                 .num("one_way", f.one_way)
                 .num("in_pps", format!("{in_per_s:.1}"))
-                .num("out_pps", format!("{out_per_s:.1}"));
+                .num("out_pps", format!("{out_per_s:.1}"))
+                .num("loop_late_ms", loop_late_ms);
             ("sample", details)
         }
     }
 }
 
-// ---- The device: its network and its clock ----
+// ---- The device: its clock ----
+
+/// Time lost between two looks at the clock, `slept_ms` apart. On Linux the monotonic clock stops
+/// while the device sleeps, so the wall clock gets ahead of it; on Windows both go on, and the
+/// look simply comes late. A wall clock that's set forward looks like the first.
+fn asleep(wall_ms: i64, mono_ms: u64, slept_ms: u64) -> Option<(u64, &'static str)> {
+    let ahead = wall_ms.saturating_sub(mono_ms as i64);
+    let late = mono_ms.saturating_sub(slept_ms);
+    if ahead > ASLEEP_MS as i64 && ahead as u64 >= late {
+        Some((ahead as u64, "clock"))
+    } else if late > ASLEEP_MS {
+        Some((late, "late"))
+    } else {
+        None
+    }
+}
+
+/// A thread of its own, so that nothing the network look waits on can keep this from seeing a sleep.
+fn watch_clock() {
+    loop {
+        let (wall, mono) = (wall_ms(), Instant::now());
+        std::thread::sleep(CLOCK_EVERY);
+        let lost = asleep(wall_ms() - wall, mono.elapsed().as_millis() as u64, CLOCK_EVERY.as_millis() as u64);
+        if let Some((ms, how)) = lost {
+            record("asleep", Details::new().num("ms", ms).num("how", how));
+            LOOK_NOW.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+// ---- The device: its network ----
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Wifi {
@@ -605,12 +774,26 @@ impl Wifi {
     }
 }
 
+/// What a look at the Wi-Fi found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WifiRead {
+    Connected(Wifi),
+    NotConnected,
+    /// Connecting or authenticating: a roam in the middle, say. Nothing is said until it settles.
+    Changing,
+    /// It couldn't be read, and why. That's no reason to think it went.
+    Unknown(String),
+}
+
 /// Compares each look at the network with the one before and says what changed.
 #[derive(Default)]
 struct NetWatch {
+    started: bool,
     addrs: Option<BTreeSet<String>>,
-    /// `None` before the first look.
+    /// The Wi-Fi as last read, `None` until it has been.
     wifi: Option<Option<Wifi>>,
+    /// Why the Wi-Fi couldn't be read, when it couldn't, as last logged.
+    wifi_error: Option<String>,
     signal_logged: Option<u32>,
 }
 
@@ -622,22 +805,36 @@ fn joined(addrs: &BTreeSet<String>) -> String {
     }
 }
 
+fn wifi_details(details: Details, wifi: &Option<Wifi>) -> Details {
+    match wifi {
+        Some(w) => w.add_to(details),
+        None => details.num("wifi", "none"),
+    }
+}
+
 impl NetWatch {
     /// `addrs` is `None` when they couldn't be read this time, which is no change.
-    fn look(&mut self, addrs: Option<BTreeSet<String>>, wifi: Option<Wifi>) -> Vec<(&'static str, Details)> {
+    fn look(&mut self, addrs: Option<BTreeSet<String>>, wifi: WifiRead) -> Vec<(&'static str, Details)> {
         let mut lines = Vec::new();
-        let Some(was_wifi) = self.wifi.clone() else {
-            let mut details = Details::new().text("addrs", &addrs.as_ref().map_or("-".to_string(), joined));
-            details = match &wifi {
-                Some(w) => w.add_to(details),
-                None => details.num("wifi", "none"),
+        if !self.started {
+            self.started = true;
+            let details = Details::new().text("addrs", &addrs.as_ref().map_or("-".to_string(), joined));
+            let details = match &wifi {
+                WifiRead::Connected(w) => w.add_to(details),
+                WifiRead::NotConnected => details.num("wifi", "none"),
+                WifiRead::Changing => details.num("wifi", "changing"),
+                WifiRead::Unknown(error) => details.num("wifi", "unknown").text("error", error),
             };
             lines.push(("net", details));
-            self.signal_logged = wifi.as_ref().and_then(|w| w.signal);
             self.addrs = addrs;
-            self.wifi = Some(wifi);
+            match wifi {
+                WifiRead::Connected(w) => self.known(Some(w)),
+                WifiRead::NotConnected => self.known(None),
+                WifiRead::Changing => {}
+                WifiRead::Unknown(error) => self.wifi_error = Some(error),
+            }
             return lines;
-        };
+        }
         if let (Some(now), Some(was)) = (&addrs, &self.addrs) {
             if now != was {
                 let added: BTreeSet<String> = now.difference(was).cloned().collect();
@@ -649,50 +846,86 @@ impl NetWatch {
         if addrs.is_some() {
             self.addrs = addrs;
         }
-        match (&was_wifi, &wifi) {
-            (Some(was), Some(now)) if was.ssid != now.ssid => {
+        let now = match wifi {
+            WifiRead::Changing => return lines,
+            WifiRead::Unknown(error) => {
+                if self.wifi_error.as_ref() != Some(&error) {
+                    lines.push(("net", Details::new().num("wifi", "unknown").text("error", &error)));
+                    self.wifi_error = Some(error);
+                }
+                return lines;
+            }
+            WifiRead::Connected(w) => Some(w),
+            WifiRead::NotConnected => None,
+        };
+        // Readable again after it wasn't: what it is now, whether or not that's a change.
+        let was_unknown = self.wifi_error.take().is_some();
+        match (self.wifi.clone(), &now) {
+            (Some(Some(was)), Some(now)) if was.ssid != now.ssid => {
                 lines.push(("net", now.add_to(Details::new()).text("was_ssid", &was.ssid)));
-                self.signal_logged = now.signal;
             }
-            (Some(was), Some(now)) if was.bssid != now.bssid => {
+            (Some(Some(was)), Some(now)) if was.bssid != now.bssid => {
                 lines.push(("roam", now.add_to(Details::new().text("from", &was.bssid).text("to", &now.bssid))));
-                self.signal_logged = now.signal;
             }
-            (Some(was), None) => lines.push(("net", Details::new().num("wifi", "none").text("was_ssid", &was.ssid))),
-            (None, Some(now)) => {
-                lines.push(("net", now.add_to(Details::new())));
-                self.signal_logged = now.signal;
-            }
-            (Some(_), Some(now)) => {
-                if let (Some(signal), Some(logged)) = (now.signal, self.signal_logged) {
+            (Some(Some(was)), None) => lines.push(("net", Details::new().num("wifi", "none").text("was_ssid", &was.ssid))),
+            (None | Some(None), Some(_)) => lines.push(("net", wifi_details(Details::new(), &now))),
+            (None, None) => lines.push(("net", Details::new().num("wifi", "none"))),
+            (Some(Some(_)), Some(now)) => {
+                if was_unknown {
+                    lines.push(("net", now.add_to(Details::new())));
+                } else if let (Some(signal), Some(logged)) = (now.signal, self.signal_logged) {
                     if signal.abs_diff(logged) >= SIGNAL_STEP {
                         lines.push(("signal", Details::new().num("signal", signal).num("was", logged).text("bssid", &now.bssid)));
                         self.signal_logged = Some(signal);
                     }
-                } else if now.signal.is_some() {
+                    return lines;
+                } else {
                     self.signal_logged = now.signal;
+                    return lines;
                 }
             }
-            (None, None) => {}
+            (Some(None), None) => {
+                if was_unknown {
+                    lines.push(("net", Details::new().num("wifi", "none")));
+                }
+            }
         }
-        self.wifi = Some(wifi);
+        self.known(now);
         lines
+    }
+
+    fn known(&mut self, wifi: Option<Wifi>) {
+        self.signal_logged = wifi.as_ref().and_then(|w| w.signal);
+        self.wifi = Some(wifi);
     }
 }
 
-/// `ip -o -4 addr show`: `2: wlp3s0    inet 192.168.8.5/24 brd ...`, loopback left out.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_ip_addr(text: &str) -> BTreeSet<String> {
-    text.lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            let name = words.nth(1)?;
-            if words.next()? != "inet" || name == "lo" {
-                return None;
-            }
-            Some(format!("{name}={}", words.next()?))
-        })
-        .collect()
+/// This device's IPv4 addresses with their prefixes, loopback left out.
+#[cfg(target_os = "linux")]
+fn interface_addrs() -> Option<BTreeSet<String>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut addrs = BTreeSet::new();
+    let mut at = list;
+    while !at.is_null() {
+        let entry = unsafe { &*at };
+        at = entry.ifa_next;
+        if entry.ifa_addr.is_null() || i32::from(unsafe { (*entry.ifa_addr).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+        if name == "lo" {
+            continue;
+        }
+        let ipv4 = |sockaddr: *const libc::sockaddr| u32::from_be(unsafe { (*(sockaddr as *const libc::sockaddr_in)).sin_addr.s_addr });
+        let ip = std::net::Ipv4Addr::from(ipv4(entry.ifa_addr));
+        let prefix = if entry.ifa_netmask.is_null() { 32 } else { ipv4(entry.ifa_netmask).count_ones() };
+        addrs.insert(format!("{name}={ip}/{prefix}"));
+    }
+    unsafe { libc::freeifaddrs(list) };
+    Some(addrs)
 }
 
 /// `ipconfig`: each adapter's IPv4 address under its heading. Only the word IPv4 is relied on, as
@@ -717,6 +950,7 @@ fn parse_ipconfig(text: &str) -> BTreeSet<String> {
     addrs
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn first_ipv4(text: &str) -> Option<String> {
     let start = text.find(|c: char| c.is_ascii_digit())?;
     let candidate: String = text[start..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
@@ -763,38 +997,67 @@ fn split_terse(line: &str) -> Vec<String> {
     fields
 }
 
-/// `netsh wlan show interfaces`: the first interface that's connected.
+/// What Windows 11 24H2 and later says in place of Wi-Fi details until location is allowed.
+const LOCATION_NOTE: &str = "location permission";
+const NO_WIRELESS: &str = "no wireless interface";
+
+/// `netsh wlan show interfaces`, run to the end: the first interface that's connected, or one on
+/// its way there, or what kept it from saying.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn parse_netsh(text: &str) -> Option<Wifi> {
-    let mut found: Option<Wifi> = None;
-    let mut connected = true;
+fn read_netsh(text: &str, success: bool) -> WifiRead {
+    if let Some(line) = text.lines().find(|line| line.to_lowercase().contains(LOCATION_NOTE)) {
+        return WifiRead::Unknown(line.trim().to_string());
+    }
+    if text.to_lowercase().contains(NO_WIRELESS) {
+        return WifiRead::NotConnected;
+    }
+    match parse_netsh(text) {
+        WifiRead::NotConnected if !success => WifiRead::Unknown(first_line(text, "netsh failed")),
+        read => read,
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_netsh(text: &str) -> WifiRead {
+    let mut found: Option<(Wifi, String)> = None;
     for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else { continue };
         let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
-        match key.as_str() {
-            "name" => {
-                if found.as_ref().is_some_and(|w| connected && !w.ssid.is_empty()) {
-                    break;
-                }
-                found = Some(Wifi::default());
-                connected = true;
+        if key == "name" {
+            if found.as_ref().is_some_and(|(w, state)| state == "connected" && !w.ssid.is_empty()) {
+                break;
             }
-            "state" => connected = value.eq_ignore_ascii_case("connected"),
-            "ssid" => found.get_or_insert_with(Wifi::default).ssid = value.to_string(),
-            "bssid" | "ap bssid" => found.get_or_insert_with(Wifi::default).bssid = value.to_lowercase(),
-            "signal" => found.get_or_insert_with(Wifi::default).signal = value.trim_end_matches('%').trim().parse().ok(),
-            "channel" => found.get_or_insert_with(Wifi::default).channel = value.to_string(),
-            "band" => found.get_or_insert_with(Wifi::default).freq = value.to_string(),
+            found = Some((Wifi::default(), String::new()));
+            continue;
+        }
+        let (wifi, state) = found.get_or_insert_with(|| (Wifi::default(), String::new()));
+        match key.as_str() {
+            "state" => *state = value.to_ascii_lowercase(),
+            "ssid" => wifi.ssid = value.to_string(),
+            "bssid" | "ap bssid" => wifi.bssid = value.to_lowercase(),
+            "signal" => wifi.signal = value.trim_end_matches('%').trim().parse().ok(),
+            "channel" => wifi.channel = value.to_string(),
+            "band" => wifi.freq = value.to_string(),
             _ => {}
         }
     }
-    found.filter(|w| connected && !w.ssid.is_empty())
+    match found {
+        Some((wifi, state)) if (state == "connected" || state.is_empty()) && !wifi.ssid.is_empty() => WifiRead::Connected(wifi),
+        Some((_, state)) if ["associating", "authenticating", "discovering"].contains(&state.as_str()) => WifiRead::Changing,
+        _ => WifiRead::NotConnected,
+    }
 }
 
+fn first_line(text: &str, otherwise: &str) -> String {
+    text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or(otherwise).to_string()
+}
+
+/// Runs a program for at most `COMMAND_LIMIT`, killing it then: whether it succeeded, and what it
+/// wrote, its errors after its output. `Err` when it couldn't start or ran out of time.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
-fn command_text(program: &str, args: &[&str]) -> Option<String> {
+fn command_text(program: &str, args: &[&str]) -> Result<(bool, String), String> {
     let mut command = std::process::Command::new(program);
-    command.args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    command.args(args);
     #[cfg(unix)]
     command.env("LC_ALL", "C");
     #[cfg(windows)]
@@ -802,62 +1065,91 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    let out = command.output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    match run_limited(command, COMMAND_LIMIT, OnExpiry::Kill) {
+        Ran::Finished(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok((out.status.success(), text))
+        }
+        Ran::TimedOut => Err(format!("{program} didn't answer within {} s", COMMAND_LIMIT.as_secs())),
+        Ran::CouldNotStart(why) => Err(format!("{program}: {why}")),
+    }
 }
 
 /// This device's addresses and Wi-Fi. A scan is never asked for, as one holds up the radio.
-fn this_network() -> (Option<BTreeSet<String>>, Option<Wifi>) {
+fn this_network() -> (Option<BTreeSet<String>>, WifiRead) {
     #[cfg(target_os = "linux")]
     {
-        let addrs = command_text("ip", &["-o", "-4", "addr", "show"]).map(|t| parse_ip_addr(&t));
         let fields = ["-t", "-f", "ACTIVE,SSID,BSSID,SIGNAL,FREQ,CHAN", "dev", "wifi", "list", "--rescan", "no"];
-        (addrs, command_text("nmcli", &fields).and_then(|t| parse_nmcli(&t)))
+        let wifi = match command_text("nmcli", &fields) {
+            Ok((true, text)) => parse_nmcli(&text).map_or(WifiRead::NotConnected, WifiRead::Connected),
+            Ok((false, text)) => WifiRead::Unknown(first_line(&text, "nmcli failed")),
+            Err(why) => WifiRead::Unknown(why),
+        };
+        (interface_addrs(), wifi)
     }
     #[cfg(windows)]
     {
-        let addrs = command_text("ipconfig", &[]).map(|t| parse_ipconfig(&t));
-        (addrs, command_text("netsh", &["wlan", "show", "interfaces"]).and_then(|t| parse_netsh(&t)))
+        let addrs = command_text("ipconfig", &[]).ok().filter(|(ok, _)| *ok).map(|(_, text)| parse_ipconfig(&text));
+        let wifi = match command_text("netsh", &["wlan", "show", "interfaces"]) {
+            Ok((success, text)) => read_netsh(&text, success),
+            Err(why) => WifiRead::Unknown(why),
+        };
+        (addrs, wifi)
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        (None, None)
+        (None, WifiRead::Unknown("not looked at on this system".into()))
     }
 }
 
-/// Time lost between two looks at the clock, `slept_ms` apart. On Linux the monotonic clock stops
-/// while the device sleeps, so the wall clock gets ahead of it; on Windows both go on, and the
-/// look simply comes late. A wall clock that's set forward looks like the first.
-fn asleep(wall_ms: i64, mono_ms: u64, slept_ms: u64) -> Option<(u64, &'static str)> {
-    let ahead = wall_ms.saturating_sub(mono_ms as i64);
-    let late = mono_ms.saturating_sub(slept_ms);
-    if ahead > ASLEEP_MS as i64 && ahead as u64 >= late {
-        Some((ahead as u64, "clock"))
-    } else if late > ASLEEP_MS {
-        Some((late, "late"))
-    } else {
-        None
+/// How far the other device's clock is ahead, from its answer at `peer_ms` to a request sent at
+/// `sent_ms` and answered at `back_ms`, with the round trip. `None` for an answer too slow to say.
+fn clock_offset(sent_ms: i64, back_ms: i64, peer_ms: i64) -> Option<(i64, u32)> {
+    let rtt = back_ms - sent_ms;
+    (0..=PEER_CLOCK_MAX_RTT_MS).contains(&rtt).then(|| (peer_ms - (sent_ms + back_ms) / 2, rtt as u32))
+}
+
+/// Asks the other device the time, when the connection to it is free: this never waits behind,
+/// or holds up, anything the app is asking.
+fn look_at_peer_clock() {
+    let sent = wall_ms();
+    let Some(Ok((200, body))) = crate::secure::control::peer_call_if_free("GET", CLOCK_PATH, "") else { return };
+    let back = wall_ms();
+    let said = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v["unix_ms"].as_i64());
+    if let Some((ahead, rtt)) = said.and_then(|peer| clock_offset(sent, back, peer)) {
+        PEER_CLOCK_MS.store(ahead, Ordering::Relaxed);
+        PEER_CLOCK_RTT_MS.store(rtt, Ordering::Relaxed);
     }
 }
 
-fn watch_device() {
+fn watch_network() {
     let mut net = NetWatch::default();
-    let mut net_due = Instant::now();
+    let mut quick_until = Instant::now() + QUICK_FOR;
+    let mut clock_due = Instant::now();
     loop {
-        if Instant::now() >= net_due || LOOK_NOW.swap(false, Ordering::Relaxed) {
-            let (addrs, wifi) = this_network();
-            SIGNAL.store(wifi.as_ref().and_then(|w| w.signal).unwrap_or(NO_SIGNAL), Ordering::Relaxed);
-            for (word, details) in net.look(addrs, wifi) {
-                record(word, details);
-            }
-            net_due = Instant::now() + NET_EVERY;
+        let asked = LOOK_NOW.swap(false, Ordering::Relaxed);
+        let (addrs, wifi) = this_network();
+        let signal = match &wifi {
+            WifiRead::Connected(w) => w.signal.unwrap_or(NO_SIGNAL),
+            _ => NO_SIGNAL,
+        };
+        SIGNAL.store(signal, Ordering::Relaxed);
+        let lines = net.look(addrs, wifi);
+        if asked || !lines.is_empty() {
+            quick_until = Instant::now() + QUICK_FOR;
         }
-        let (wall, mono) = (wall_ms(), Instant::now());
-        std::thread::sleep(CLOCK_EVERY);
-        let lost = asleep(wall_ms() - wall, mono.elapsed().as_millis() as u64, CLOCK_EVERY.as_millis() as u64);
-        if let Some((ms, how)) = lost {
-            record("asleep", Details::new().num("ms", ms).num("how", how));
-            LOOK_NOW.store(true, Ordering::Relaxed);
+        for (word, details) in lines {
+            record(word, details);
+        }
+        if Instant::now() >= clock_due {
+            look_at_peer_clock();
+            clock_due = Instant::now() + PEER_CLOCK_EVERY;
+        }
+        let every = if Instant::now() < quick_until { NET_QUICK } else { NET_SLOW };
+        let next = Instant::now() + every;
+        while Instant::now() < next && !LOOK_NOW.load(Ordering::Relaxed) {
+            std::thread::sleep(NET_WAKE);
         }
     }
 }
@@ -880,6 +1172,12 @@ mod tests {
         );
         assert_eq!(line_of("start", Details::new(), 951_848_999_999, 5 * 3600 + 1800), "2000-02-29T23:59:59.999+05:30 start");
         assert_eq!(line_of("x", Details::new(), 0, 0), "1970-01-01T00:00:00.000+00:00 x");
+    }
+
+    #[test]
+    fn up_has_no_figures_as_none_are_known_yet() {
+        let (word, details) = describe(&LinkEvent::Up { down_ms: 2610, silent_ms: Some(3990) }, "10.0.0.5:24850");
+        assert_eq!(format!("{word} {}", details.0), "up down_ms=2610 silent_ms=3990 peer=10.0.0.5:24850");
     }
 
     #[test]
@@ -920,6 +1218,36 @@ mod tests {
         assert_eq!(tail_of(&VecDeque::new(), 5), "");
     }
 
+    #[test]
+    fn the_clock_is_served_too_as_json() {
+        let said: serde_json::Value = serde_json::from_str(&answer(CLOCK_PATH).unwrap()).unwrap();
+        assert!((said["unix_ms"].as_i64().unwrap() - wall_ms()).abs() < 5000);
+        assert!(!is_log_path(CLOCK_PATH), "it isn't plain text");
+    }
+
+    #[test]
+    fn a_new_service_starts_with_the_end_of_both_files() {
+        let older: String = (0..1500).map(|n| format!("old {n}\n")).collect();
+        let newer: String = (0..1000).map(|n| format!("new {n}\n")).collect();
+        let ring = seeded(Some(older), Some(newer.clone()));
+        assert_eq!(ring.len(), KEPT_LINES);
+        assert_eq!((ring.front().unwrap().as_str(), ring.back().unwrap().as_str()), ("old 500", "new 999"));
+        assert_eq!(seeded(None, Some(newer)).len(), 1000);
+        assert!(seeded(None, None).is_empty());
+        assert_eq!(seeded(Some("a\n\nb".into()), None), VecDeque::from(["a".to_string(), "b".to_string()]), "no blank lines");
+    }
+
+    #[test]
+    fn the_other_clock_is_measured_from_the_middle_of_the_round_trip() {
+        assert_eq!(clock_offset(1000, 1020, 5010), Some((4000, 20)));
+        assert_eq!(clock_offset(1000, 1010, 900), Some((-105, 10)));
+        assert_eq!(clock_offset(1000, 4000, 2500), None, "too slow to say");
+        assert_eq!(clock_offset(1000, 990, 1000), None, "this clock went back meanwhile");
+        assert_eq!(peer_clock(Details::new(), 4000, 20).0, "peer_clock_ms=+4000 peer_clock_rtt_ms=20");
+        assert_eq!(peer_clock(Details::new(), -105, 10).0, "peer_clock_ms=-105 peer_clock_rtt_ms=10");
+        assert_eq!(peer_clock(Details::new(), NO_CLOCK, 0).0, "peer_clock_ms=-");
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mesh-kvm-linklog-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -946,6 +1274,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_cannot_move_aside_is_emptied_and_never_grows_past_its_limit() {
+        let dir = scratch("stuck");
+        let path = dir.join(FILE_NAME);
+        // A folder with something in it where the older copy goes: it can't be removed or replaced.
+        std::fs::create_dir_all(dir.join("link.log.1").join("in the way")).unwrap();
+        let mut file = LogFile::new(path.clone(), 40);
+        for n in 0..20 {
+            file.write(&format!("line {n:02} xxxxxxx"));
+            assert!(std::fs::metadata(&path).unwrap().len() <= 40, "after line {n}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line 18 xxxxxxx\nline 19 xxxxxxx\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_file_carries_on_from_its_size_and_one_that_cannot_open_is_no_harm() {
         let dir = scratch("resume");
         std::fs::create_dir_all(&dir).unwrap();
@@ -962,13 +1305,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_loop_that_comes_round_late_is_a_stall_and_its_worst_goes_in_the_sample() {
+        let mut clock = LoopClock::new("watchdog", 100);
+        assert_eq!(clock.lateness(1000), None, "the first time round says nothing");
+        assert_eq!(clock.lateness(1100), None);
+        assert_eq!(clock.lateness(1350), None, "150 ms late is no stall");
+        assert_eq!(clock.lateness(1800), Some(350));
+        assert_eq!(clock.lateness(1900), None);
+        assert_eq!(clock.take_worst(), 350);
+        assert_eq!(clock.take_worst(), 0, "each sample starts again");
+    }
+
     fn up_figures() -> Figures {
         Figures { round_trip_ms: Some(12), loss_in: Some(1.5), loss_out: Some(0.0), one_way: false }
     }
 
     fn look(now_ms: u64, online: bool, online_since: u64, last_alive: u64, quiet: Option<u64>) -> Look {
         let figures = if online { up_figures() } else { Figures::default() };
-        Look { now_ms, online, online_since, last_alive, quiet, figures, round_trips: None, packets: (0, 0) }
+        let quiet = quiet.map(|ms| Quiet { ms, busy: false });
+        Look { now_ms, online, online_since, last_alive, quiet, figures, round_trips: None, packets: (0, 0), loop_late_ms: 0 }
     }
 
     #[test]
@@ -976,22 +1332,28 @@ mod tests {
         let mut watch = LinkWatch::starting(1000, (0, 0));
         assert_eq!(watch.look(look(1040, false, 0, 0, None)), vec![]);
         let up = watch.look(look(3000, true, 2990, 2990, None));
-        assert_eq!(up, vec![LinkEvent::Up { down_ms: 1990, silent_ms: None, figures: up_figures() }]);
+        assert_eq!(up, vec![LinkEvent::Up { down_ms: 1990, silent_ms: None }]);
         assert_eq!(watch.look(look(5000, true, 2990, 4990, None)), vec![]);
         // The link layer has already forgotten its figures by the look that finds it down.
         let down = watch.look(look(6380, false, 2990, 5000, None));
         assert_eq!(down, vec![LinkEvent::Down { silent_ms: 1380, up_ms: 3390, figures: up_figures() }]);
         let back = watch.look(look(9000, true, 8990, 8990, Some(3990)));
-        assert_eq!(back, vec![LinkEvent::Up { down_ms: 2610, silent_ms: Some(3990), figures: up_figures() }]);
+        assert_eq!(back, vec![LinkEvent::Up { down_ms: 2610, silent_ms: Some(3990) }]);
     }
 
     #[test]
-    fn a_stall_that_recovers_is_a_gap_of_its_length() {
+    fn a_stall_that_recovers_is_a_gap_of_its_length_with_what_was_going_on() {
         let mut watch = LinkWatch::starting(0, (0, 0));
         watch.look(look(100, true, 100, 100, None));
         assert_eq!(watch.look(look(140, true, 100, 140, None)), vec![]);
-        assert_eq!(watch.look(look(1100, true, 100, 1090, Some(950))), vec![LinkEvent::Gap { silent_ms: 950 }]);
+        let mut stalled = look(2000, true, 100, 1990, None);
+        stalled.quiet = Some(Quiet { ms: 350, busy: true });
+        stalled.packets = (300, 0);
+        let gap = LinkEvent::Gap { silent_ms: 350, busy: true, figures: up_figures(), in_per_s: 150.0 };
+        assert_eq!(watch.look(stalled), vec![gap]);
         assert!(watch.online, "a gap leaves the link up");
+        let (word, details) = describe(&gap, "-");
+        assert_eq!(format!("{word} {}", details.0), "gap silent_ms=350 while_busy=true loss_in=1.50 loss_out=0.00 in_pps=150.0");
     }
 
     #[test]
@@ -1001,40 +1363,56 @@ mod tests {
         let events = watch.look(look(1700, true, 1690, 1690, Some(1500)));
         assert_eq!(
             events,
-            vec![
-                LinkEvent::Down { silent_ms: 1500, up_ms: 90, figures: up_figures() },
-                LinkEvent::Up { down_ms: 0, silent_ms: Some(1500), figures: up_figures() },
-            ]
+            vec![LinkEvent::Down { silent_ms: 1500, up_ms: 90, figures: up_figures() }, LinkEvent::Up { down_ms: 0, silent_ms: Some(1500) }]
         );
     }
 
     #[test]
-    fn a_sample_every_ten_seconds_with_the_round_trips_and_packets_in_between() {
+    fn the_other_device_going_deaf_and_hearing_again_are_events() {
+        let mut watch = LinkWatch::starting(0, (0, 0));
+        watch.look(look(100, true, 100, 100, None));
+        let mut deaf = look(3000, true, 100, 3000, None);
+        deaf.figures = Figures { one_way: true, ..Figures::default() };
+        assert_eq!(watch.look(deaf), vec![LinkEvent::OneWay { on: true, figures: deaf.figures }]);
+        assert_eq!(watch.look(deaf), vec![], "said once");
+        let (word, details) = describe(&LinkEvent::OneWay { on: true, figures: deaf.figures }, "-");
+        assert_eq!(format!("{word} {}", details.0), "one_way state=on rtt_ms=- loss_in=- loss_out=-");
+        assert_eq!(watch.look(look(3400, true, 100, 3400, None)), vec![LinkEvent::OneWay { on: false, figures: up_figures() }]);
+        // Down while deaf, then up: it starts again from hearing.
+        watch.look(deaf);
+        watch.look(look(5000, false, 100, 3400, None));
+        assert_eq!(watch.look(look(6000, true, 6000, 6000, Some(2600))), vec![LinkEvent::Up { down_ms: 1000, silent_ms: Some(2600) }]);
+    }
+
+    #[test]
+    fn a_sample_every_ten_seconds_with_the_round_trips_packets_and_lateness_in_between() {
         let mut watch = LinkWatch::starting(0, (100, 50));
         let trips = |min_ms, max_ms, sum_ms, count| Some(RoundTrips { min_ms, max_ms, sum_ms, count });
         let mut first = look(5000, true, 10, 5000, None);
         first.round_trips = trips(8.0, 20.0, 28.0, 2);
+        first.loop_late_ms = 40;
         watch.look(first);
         let mut second = look(10_000, true, 10, 10_000, None);
         second.round_trips = trips(5.0, 9.0, 14.0, 2);
         second.packets = (600, 350);
+        second.loop_late_ms = 7;
         let events = watch.look(second);
-        let Some(LinkEvent::Sample { online, round_trips: Some(t), in_per_s, out_per_s, .. }) = events.last().copied() else {
+        let Some(LinkEvent::Sample { online, round_trips: Some(t), in_per_s, out_per_s, loop_late_ms, .. }) = events.last().copied() else {
             panic!("{events:?}")
         };
         assert!(online);
         assert_eq!((t.min_ms, t.max_ms, t.count, t.average_ms()), (5.0, 20.0, 4, 10.5));
-        assert_eq!((in_per_s, out_per_s), (50.0, 30.0));
+        assert_eq!((in_per_s, out_per_s, loop_late_ms), (50.0, 30.0, 40));
         let (word, details) = describe(&events[events.len() - 1], "-");
         assert_eq!(word, "sample");
         assert_eq!(
             details.0,
-            "link=up rtt_min_ms=5 rtt_avg_ms=10 rtt_max_ms=20 answers=4 loss_in=1.50 loss_out=0.00 one_way=false in_pps=50.0 out_pps=30.0"
+            "link=up rtt_min_ms=5 rtt_avg_ms=10 rtt_max_ms=20 answers=4 loss_in=1.50 loss_out=0.00 one_way=false in_pps=50.0 out_pps=30.0 loop_late_ms=40"
         );
         let mut third = look(20_000, false, 10, 10_000, None);
         third.packets = (600, 350);
         let quiet = watch.look(third);
-        assert!(matches!(quiet.last(), Some(LinkEvent::Sample { online: false, round_trips: None, .. })), "{quiet:?}");
+        assert!(matches!(quiet.last(), Some(LinkEvent::Sample { online: false, round_trips: None, loop_late_ms: 0, .. })), "{quiet:?}");
     }
 
     #[test]
@@ -1050,8 +1428,8 @@ mod tests {
         Some(items.iter().map(|s| s.to_string()).collect())
     }
 
-    fn wifi(bssid: &str, signal: u32) -> Option<Wifi> {
-        Some(Wifi { ssid: "Home Net".into(), bssid: bssid.into(), signal: Some(signal), channel: "36".into(), freq: "5180 MHz".into() })
+    fn wifi(bssid: &str, signal: u32) -> WifiRead {
+        WifiRead::Connected(Wifi { ssid: "Home Net".into(), bssid: bssid.into(), signal: Some(signal), channel: "36".into(), freq: "5180 MHz".into() })
     }
 
     fn texts(lines: Vec<(&'static str, Details)>) -> Vec<String> {
@@ -1075,19 +1453,46 @@ mod tests {
             ]
         );
         assert!(net.look(set(&["wlan0=192.168.8.7/24", "tun0=10.8.0.2/24"]), wifi("cc:dd", 56)).is_empty(), "measured from the roam");
-        assert_eq!(texts(net.look(set(&[]), None)), vec![
-            "net added=- removed=tun0=10.8.0.2/24,wlan0=192.168.8.7/24 addrs=-",
-            r#"net wifi=none was_ssid="Home Net""#,
-        ]);
+        assert_eq!(
+            texts(net.look(set(&[]), WifiRead::NotConnected)),
+            vec!["net added=- removed=tun0=10.8.0.2/24,wlan0=192.168.8.7/24 addrs=-", r#"net wifi=none was_ssid="Home Net""#]
+        );
     }
 
     #[test]
-    fn ip_addr_output_gives_each_address_but_loopback() {
-        let text = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
-                    2: enp3s0    inet 192.168.8.20/24 brd 192.168.8.255 scope global dynamic noprefixroute enp3s0\\       valid_lft 85000sec\n\
-                    3: wlp4s0    inet 10.0.0.7/24 brd 10.0.0.255 scope global wlp4s0\\       valid_lft forever\n";
-        assert_eq!(parse_ip_addr(text), set(&["enp3s0=192.168.8.20/24", "wlp4s0=10.0.0.7/24"]).unwrap());
-        assert!(parse_ip_addr("").is_empty());
+    fn wifi_that_cannot_be_read_is_unknown_and_no_disconnect() {
+        let mut net = NetWatch::default();
+        net.look(set(&[]), wifi("aa:bb", 70));
+        let stuck = || WifiRead::Unknown("nmcli didn't answer within 3 s".into());
+        assert_eq!(texts(net.look(set(&[]), stuck())), vec![r#"net wifi=unknown error="nmcli didn't answer within 3 s""#]);
+        assert!(net.look(set(&[]), stuck()).is_empty(), "said once while it stays the same");
+        let other = WifiRead::Unknown("NetworkManager is not running.".into());
+        assert_eq!(texts(net.look(set(&[]), other)), vec![r#"net wifi=unknown error="NetworkManager is not running.""#]);
+        assert_eq!(texts(net.look(set(&[]), wifi("aa:bb", 72))), vec![r#"net ssid="Home Net" bssid=aa:bb signal=72 chan=36 freq="5180 MHz""#], "back, as it was");
+        assert_eq!(texts(net.look(set(&[]), wifi("aa:bb", 73))), Vec::<String>::new());
+        net.look(set(&[]), stuck());
+        assert_eq!(texts(net.look(set(&[]), wifi("cc:dd", 70)))[0].split(' ').next(), Some("roam"), "measured against the last known");
+        let mut first = NetWatch::default();
+        assert_eq!(texts(first.look(None, stuck())), vec![r#"net addrs=- wifi=unknown error="nmcli didn't answer within 3 s""#]);
+        assert!(first.look(None, stuck()).is_empty());
+        assert_eq!(texts(first.look(None, WifiRead::NotConnected)), vec!["net wifi=none"]);
+    }
+
+    #[test]
+    fn a_roam_through_authenticating_is_a_roam() {
+        let mut net = NetWatch::default();
+        net.look(set(&[]), wifi("aa:bb", 70));
+        assert!(net.look(set(&[]), WifiRead::Changing).is_empty());
+        assert_eq!(texts(net.look(set(&[]), wifi("cc:dd", 70)))[0].split(' ').next(), Some("roam"));
+    }
+
+    #[test]
+    fn interface_addresses_leave_out_loopback() {
+        #[cfg(target_os = "linux")]
+        {
+            let addrs = interface_addrs().unwrap();
+            assert!(addrs.iter().all(|a| !a.starts_with("lo=") && a.contains('/')), "{addrs:?}");
+        }
     }
 
     #[test]
@@ -1107,12 +1512,23 @@ mod tests {
                     State                  : connected\r\n    SSID                   : Home Net\r\n    AP BSSID               : 3c:84:6a:12:34:56\r\n    \
                     Band                   : 5 GHz\r\n    Channel                : 36\r\n    Receive rate (Mbps)    : 1201\r\n    Signal                 : 91% \r\n    \
                     Profile                : Home Net\r\n";
-        let wifi = parse_netsh(text).unwrap();
+        let WifiRead::Connected(wifi) = read_netsh(text, true) else { panic!("connected") };
         assert_eq!((wifi.ssid.as_str(), wifi.bssid.as_str()), ("Home Net", "3c:84:6a:12:34:56"));
         assert_eq!((wifi.signal, wifi.channel.as_str(), wifi.freq.as_str()), (Some(91), "36", "5 GHz"));
         let older = "    Name : Wi-Fi\n    State : connected\n    SSID : Cafe\n    BSSID : 00:11:22:33:44:55\n    Signal : 40%\n";
-        assert_eq!(parse_netsh(older).unwrap().bssid, "00:11:22:33:44:55");
-        assert_eq!(parse_netsh("    Name : Wi-Fi\n    State : disconnected\n"), None);
+        assert!(matches!(read_netsh(older, true), WifiRead::Connected(w) if w.bssid == "00:11:22:33:44:55"));
+        assert_eq!(read_netsh("    Name : Wi-Fi\n    State : disconnected\n", true), WifiRead::NotConnected);
+        assert_eq!(read_netsh("    Name : Wi-Fi\n    State : authenticating\n    SSID : Cafe\n", true), WifiRead::Changing);
+        assert_eq!(read_netsh("    Name : Wi-Fi\n    State : associating\n", true), WifiRead::Changing);
+    }
+
+    #[test]
+    fn netsh_saying_why_it_cannot_tell_is_unknown() {
+        let location = "\r\nNetwork shell commands need location permission to access WLAN information. Turn on Location services on the Location page in Privacy & security settings.\r\n\r\nFunction WlanQueryInterface returns error 5:\r\nAccess is denied.\r\n";
+        let WifiRead::Unknown(error) = read_netsh(location, false) else { panic!("unknown") };
+        assert!(error.starts_with("Network shell commands need location permission"), "{error}");
+        assert_eq!(read_netsh("There is no wireless interface on the system.\r\n", true), WifiRead::NotConnected);
+        assert_eq!(read_netsh("The Wireless AutoConfig Service (wlansvc) is not running.\r\n", false), WifiRead::Unknown("The Wireless AutoConfig Service (wlansvc) is not running.".into()));
     }
 
     #[test]
@@ -1122,5 +1538,18 @@ mod tests {
                     Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n\r\nEthernet adapter Ethernet 2:\r\n\r\n   Media State . . . . . . . . . . . : Media disconnected\r\n\r\n\
                     Ethernet adapter vEthernet (WSL):\r\n\r\n   IPv4-Adresse  . . . . . . . . . . : 172.20.0.1\r\n";
         assert_eq!(parse_ipconfig(text), set(&["Wi-Fi=192.168.8.210", "vEthernet (WSL)=172.20.0.1"]).unwrap());
+    }
+
+    #[test]
+    fn a_program_that_hangs_is_cut_off_and_says_so() {
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let said = command_text("sleep", &["30"]);
+            assert_eq!(said, Err("sleep didn't answer within 3 s".to_string()));
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(command_text("/nonexistent/nmcli", &[]).is_err());
+            assert_eq!(command_text("sh", &["-c", "echo out; echo err >&2; exit 2"]), Ok((false, "out\nerr\n".to_string())));
+        }
     }
 }
