@@ -149,10 +149,20 @@ pub fn peer_ready(now: Instant, within: Duration) -> bool {
     heard_back(now, within).ready
 }
 
-#[allow(dead_code)] // read by the sending side's mic warning, which comes later
 /// True while the other device says it would take a microphone stream: it has somewhere to put it.
 pub fn peer_mic_ready(now: Instant, within: Duration) -> bool {
     heard_within(&MIC_HEARD_BACK, now, within).ready
+}
+
+/// How this device offers the other one's microphone, for the status: the kind, whether it's there
+/// now, and why not if it failed. None where no kind applies.
+pub fn virtual_status() -> Option<(&'static str, bool, Option<String>)> {
+    #[cfg(target_os = "linux")]
+    return Some(("linux", virtual_linux::present().is_some(), virtual_linux::last_error()));
+    #[cfg(target_os = "windows")]
+    return Some(if wasapi::cable_found() { ("cable", true, None) } else { ("no_cable", false, None) });
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    None
 }
 
 /// True while reports are coming from the other device at all.

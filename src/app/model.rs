@@ -164,6 +164,34 @@ pub struct AudioStatus {
     pub rx_buffer_ms: u32,
     /// Audio is arriving from a mesh-kvm of another version, and being ignored.
     pub rx_other_version: bool,
+    /// The other device says it would take a microphone stream.
+    pub tx_mic_ready: bool,
+    /// How this device shows the other one's mic. Missing from an older service.
+    #[serde(rename = "virtual")]
+    pub virtual_devices: Option<VirtualDevices>,
+}
+
+/// What kind of virtual mic this device has for the other one's microphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualKind {
+    /// Debian: a mic and speakers made while linked.
+    Linux,
+    /// Windows with VB-Cable installed.
+    Cable,
+    /// Windows without it.
+    NoCable,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct VirtualDevices {
+    pub kind: VirtualKind,
+    /// The devices (or the cable) are there to use right now.
+    #[serde(default)]
+    pub present: bool,
+    /// Why the devices couldn't be added.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// A microphone, line-in or output, by the id it's saved under and the name it's shown by.

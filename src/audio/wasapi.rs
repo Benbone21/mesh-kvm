@@ -144,7 +144,6 @@ fn cable(found: &[Device]) -> Cable {
 
 /// Whether the cable is installed, for the status JSON (which reads it once the app shows the
 /// cable line).
-#[allow(dead_code)]
 pub fn cable_found() -> bool {
     virtual_mic_ready()
 }

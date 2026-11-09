@@ -551,6 +551,9 @@ pub fn audio_status_json() -> serde_json::Value {
         "rx_buffer_ms": AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed),
         "rx_live": AUDIO_RX_LIVE.load(Ordering::Relaxed),
         "rx_other_version": other_version_arriving(now),
+        "virtual": crate::audio::virtual_status().map(|(kind, present, error)| serde_json::json!({ "kind": kind, "present": present, "error": error })),
+        "tx_mic_ready": crate::audio::peer_mic_ready(now, std::time::Duration::from_secs(2)),
+        "rx_mic_live": crate::audio::AUDIO_RX_MIC_LIVE.load(Ordering::Relaxed),
     })
 }
 
@@ -1228,6 +1231,18 @@ mod tests {
         for field in ["rx_loss", "rx_unrepaired", "rx_buffer_ms", "tx_loss", "tx_reaching", "inputs", "outputs", "notes"] {
             assert!(!status[field].is_null(), "{field}");
         }
+    }
+
+    #[test]
+    fn status_says_how_the_other_devices_mic_is_offered() {
+        let status = audio_status_json();
+        assert!(status["tx_mic_ready"].is_boolean() && status["rx_mic_live"].is_boolean());
+        #[cfg(target_os = "linux")]
+        assert_eq!(status["virtual"]["kind"], "linux");
+        #[cfg(target_os = "windows")]
+        assert!(matches!(status["virtual"]["kind"].as_str(), Some("cable" | "no_cable")));
+        assert!(status["virtual"]["present"].is_boolean());
+        assert!(status["virtual"]["error"].is_null() || status["virtual"]["error"].is_string());
     }
 
     #[test]

@@ -303,7 +303,6 @@ pub fn present() -> Option<String> {
 
 /// The first line of what `pactl` said when the latest load failed. Cleared when one works. For the
 /// app's status, which shows why the devices aren't there.
-#[allow(dead_code)]
 pub fn last_error() -> Option<String> {
     LAST_ERROR.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
