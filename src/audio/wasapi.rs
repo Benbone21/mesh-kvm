@@ -72,6 +72,10 @@ static EXCLUSION: Mutex<Exclusion> =
     Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None });
 /// The output to play on, with `None` meaning the default.
 static PLAY_DEVICE: Mutex<Option<Pick>> = Mutex::new(None);
+/// VB-Cable's endpoints as of the last look at the devices.
+static CABLE: Mutex<Cable> = Mutex::new(Cable { input: None, output: None });
+/// How to find the cable's render endpoint through `cpal`.
+static CABLE_PICK: Mutex<Option<Pick>> = Mutex::new(None);
 
 pub fn choices_changed() {
     WAKE.notify();
@@ -118,7 +122,35 @@ struct Endpoints {
     picks: HashMap<String, Pick>,
 }
 
-/// Takes endpoints in enumeration order. Same-named ones get told apart in the dropdown too.
+/// VB-Cable's two ends: "CABLE Input" is a render endpoint that mesh-kvm plays the other device's
+/// mic into, and "CABLE Output" is the capture endpoint that apps pick as their microphone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Cable {
+    input: Option<Device>,
+    output: Option<Device>,
+}
+
+const CABLE_INPUT: &str = "CABLE Input";
+const CABLE_OUTPUT: &str = "CABLE Output";
+
+fn is_cable(device: &Device) -> bool {
+    device.name.contains(CABLE_INPUT) || device.name.contains(CABLE_OUTPUT)
+}
+
+fn cable(found: &[Device]) -> Cable {
+    let by = |part: &str| found.iter().find(|device| device.name.contains(part)).cloned();
+    Cable { input: by(CABLE_INPUT), output: by(CABLE_OUTPUT) }
+}
+
+/// Whether the cable is installed, for the status JSON (which reads it once the app shows the
+/// cable line).
+#[allow(dead_code)]
+pub fn cable_found() -> bool {
+    virtual_mic_ready()
+}
+
+/// Takes endpoints in enumeration order. The cable's two ends are left out of what's shown (they
+/// are not for choosing) but still counted, as `cpal` counts them, and can be found by id. Same-named ones get told apart in the dropdown too.
 fn sort_out(found: Vec<Device>) -> Endpoints {
     let mut totals: HashMap<&str, usize> = HashMap::new();
     for device in &found {
@@ -135,7 +167,9 @@ fn sort_out(found: Vec<Device>) -> Endpoints {
         } else {
             device.name.clone()
         };
-        devices.push(Device { id: device.id.clone(), name });
+        if !is_cable(device) {
+            devices.push(Device { id: device.id.clone(), name });
+        }
         *nth += 1;
     }
     devices.sort_by(|a, b| a.name.cmp(&b.name));
@@ -144,21 +178,21 @@ fn sort_out(found: Vec<Device>) -> Endpoints {
 
 /// Goes through endpoints the way `cpal` does, so that "the second one with this name" is the same
 /// device to both.
-fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Endpoints {
+fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> (Endpoints, Cable) {
     let Ok(collection) = (unsafe { all.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }) else {
-        return Endpoints::default();
+        return (Endpoints::default(), Cable::default());
     };
     let count = unsafe { collection.GetCount() }.unwrap_or(0);
     let flows_this_way = |device: &IMMDevice| {
         device.cast::<IMMEndpoint>().and_then(|endpoint| unsafe { endpoint.GetDataFlow() }).is_ok_and(|f| f == flow)
     };
-    sort_out(
-        (0..count)
-            .filter_map(|index| unsafe { collection.Item(index) }.ok())
-            .filter(flows_this_way)
-            .filter_map(|device| describe(&device))
-            .collect(),
-    )
+    let found: Vec<Device> = (0..count)
+        .filter_map(|index| unsafe { collection.Item(index) }.ok())
+        .filter(flows_this_way)
+        .filter_map(|device| describe(&device))
+        .collect();
+    let cable = cable(&found);
+    (sort_out(found), cable)
 }
 
 fn default_endpoint(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String> {
@@ -174,7 +208,12 @@ struct Found {
 
 fn read_lists() -> Option<Found> {
     let all = enumerator().ok()?;
-    let (inputs, outputs) = (endpoints(&all, eCapture), endpoints(&all, eRender));
+    let ((inputs, capture_cable), (outputs, render_cable)) = (endpoints(&all, eCapture), endpoints(&all, eRender));
+    // CABLE Input is a render endpoint and CABLE Output a capture one.
+    let found = Cable { input: render_cable.input, output: capture_cable.output };
+    *CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner) =
+        found.input.as_ref().and_then(|device| outputs.picks.get(&device.id).cloned());
+    *CABLE.lock().unwrap_or_else(PoisonError::into_inner) = found;
     Some(Found {
         lists: Lists {
             inputs: inputs.devices,
@@ -951,7 +990,9 @@ where
     )
 }
 
-fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool) {
+/// Plays `stream` on an output until told to stop. `live` is the flag that says a player is
+/// running, for the sound stream.
+fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool, live: Option<&AtomicBool>) {
     let Some(device) = find_output(pick) else { return };
     let Ok(supported) = device.default_output_config() else { return };
     let format = supported.sample_format();
@@ -968,12 +1009,16 @@ fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool)
     };
     match built {
         Ok(stream) => {
-            AUDIO_PLAYER_LIVE.store(true, Ordering::Relaxed);
+            if let Some(live) = live {
+                live.store(true, Ordering::Relaxed);
+            }
             hold(stream, stop, &failed);
         }
         Err(e) => eprintln!("[Audio] Couldn't open the output: {e}"),
     }
-    AUDIO_PLAYER_LIVE.store(false, Ordering::Relaxed);
+    if let Some(live) = live {
+        live.store(false, Ordering::Relaxed);
+    }
 }
 
 fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
@@ -992,7 +1037,7 @@ fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
         let idle = last_alive.is_none_or(|at| now.duration_since(at) >= PLAYER_IDLE_CLOSE);
         let wanted = (!muted && !idle).then(|| PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner).clone());
         let for_player = Arc::clone(&stream);
-        player.ensure(wanted, now, move |pick, stop| play_on(pick.as_ref(), for_player, &stop));
+        player.ensure(wanted, now, move |pick, stop| play_on(pick.as_ref(), for_player, &stop, Some(&AUDIO_PLAYER_LIVE)));
         if muted && alive {
             drain_received(&stream, PLAYER_OFF_TICK, now);
         } else if muted || idle {
@@ -1014,22 +1059,57 @@ pub fn start_playback(stream: Arc<Mutex<RxStream>>) {
 
 /// How often a mic with nowhere to play is drained.
 const MIC_DRAIN_TICK: Duration = Duration::from_millis(20);
+/// The most one drain takes, after the thread was held up.
+const MIC_DRAIN_MOST: Duration = Duration::from_millis(200);
 
-/// Until there is a virtual microphone to play the peer's mic on, it is drained and dropped: it is
-/// never played on the speakers.
-pub fn start_mic_playback(stream: Arc<Mutex<RxStream>>) {
-    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-mic".to_string()).spawn(move || loop {
-        super::drain_mic(&stream, MIC_DRAIN_TICK, Instant::now());
+/// How much went by since the last drain.
+struct DrainClock {
+    last: Instant,
+}
+
+impl DrainClock {
+    fn new(now: Instant) -> Self {
+        Self { last: now }
+    }
+
+    fn elapsed(&mut self, now: Instant) -> Duration {
+        let elapsed = now.saturating_duration_since(self.last).min(MIC_DRAIN_MOST);
+        self.last = now;
+        elapsed
+    }
+}
+
+fn supervise_mic(stream: Arc<Mutex<RxStream>>) {
+    let mut player = Worker::<Pick>::default();
+    let mut drain = DrainClock::new(Instant::now());
+    loop {
+        let now = Instant::now();
+        // Only ever the cable: with none, the mic is dropped rather than played on the speakers.
+        // Sound excluded from the sent output is this process's own, which covers this feed: the
+        // process-exclusion loopback leaves out this process, so the cable feed can't echo back.
+        let wanted = CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let for_player = Arc::clone(&stream);
+        player.ensure(wanted, now, move |pick, stop| play_on(Some(pick), for_player, &stop, None));
+        let elapsed = drain.elapsed(now);
+        if !player.alive() {
+            super::drain_mic(&stream, elapsed, now);
+        }
         std::thread::sleep(MIC_DRAIN_TICK);
-    });
+    }
+}
+
+/// Plays the peer's mic into VB-Cable's "CABLE Input" while it exists, and drains it by the clock
+/// otherwise. It is never played on the speakers.
+pub fn start_mic_playback(stream: Arc<Mutex<RxStream>>) {
+    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-mic".to_string()).spawn(move || supervise_mic(stream));
     if let Err(e) = spawned {
-        crate::settings::log_note(&format!("Couldn't start the mic drain: {e}"));
+        crate::settings::log_note(&format!("Couldn't start the mic playback: {e}"));
     }
 }
 
 /// Whether the peer's mic has a virtual microphone to go to here.
 pub fn virtual_mic_ready() -> bool {
-    false
+    CABLE.lock().unwrap_or_else(PoisonError::into_inner).input.is_some()
 }
 
 /// Windows has no way to play the test sound on its own speakers from here.
@@ -1218,6 +1298,45 @@ mod tests {
 
     fn device(id: &str, name: &str) -> Device {
         Device { id: id.into(), name: name.into() }
+    }
+
+    fn dev(id: &str, name: &str) -> Device {
+        device(id, name)
+    }
+
+    impl Endpoints {
+        fn all_names(&self) -> Vec<String> {
+            self.devices.iter().map(|d| d.name.clone()).collect()
+        }
+    }
+
+    #[test]
+    fn the_cable_is_found_by_name_and_kept_out_of_the_lists() {
+        let found = vec![
+            dev("{a}", "Speakers (Realtek)"),
+            dev("{b}", "CABLE Input (VB-Audio Virtual Cable)"),
+            dev("{c}", "CABLE Output (VB-Audio Virtual Cable)"),
+        ];
+        let cable = cable(&found);
+        assert_eq!(cable.input.unwrap().id, "{b}");
+        assert_eq!(cable.output.unwrap().id, "{c}");
+        let kept = sort_out(found);
+        assert!(kept.all_names().iter().all(|n| !n.contains("CABLE")));
+        assert_eq!(kept.all_names(), ["Speakers (Realtek)"]);
+        assert_eq!(kept.picks["{b}"], Pick { name: "CABLE Input (VB-Audio Virtual Cable)".into(), nth: 0 });
+    }
+
+    #[test]
+    fn no_cable_means_no_virtual_mic() {
+        assert!(cable(&[dev("{a}", "Speakers (Realtek)")]).input.is_none());
+    }
+
+    #[test]
+    fn a_mic_drain_never_takes_more_than_a_stall_s_worth() {
+        let t = Instant::now();
+        let mut clock = DrainClock::new(t);
+        assert_eq!(clock.elapsed(t + Duration::from_millis(30)), Duration::from_millis(30));
+        assert_eq!(clock.elapsed(t + Duration::from_secs(9)), MIC_DRAIN_MOST);
     }
 
     #[test]
