@@ -154,13 +154,28 @@ pub fn peer_mic_ready(now: Instant, within: Duration) -> bool {
     heard_within(&MIC_HEARD_BACK, now, within).ready
 }
 
-/// How this device offers the other one's microphone, for the status: the kind, whether it's there
-/// now, and why not if it failed. None where no kind applies.
-pub fn virtual_status() -> Option<(&'static str, bool, Option<String>)> {
+/// How this device offers the other one's microphone, for the status. None where no kind applies.
+pub struct VirtualStatus {
+    pub kind: &'static str,
+    /// There to use now.
+    pub present: bool,
+    /// Why not, if adding them failed.
+    pub error: Option<String>,
+    /// The other device's name as the devices carry it, while they're there.
+    pub name: Option<String>,
+}
+
+pub fn virtual_status() -> Option<VirtualStatus> {
     #[cfg(target_os = "linux")]
-    return Some(("linux", virtual_linux::present().is_some(), virtual_linux::last_error()));
+    return Some({
+        let name = virtual_linux::present();
+        VirtualStatus { kind: "linux", present: name.is_some(), error: virtual_linux::last_error(), name }
+    });
     #[cfg(target_os = "windows")]
-    return Some(if wasapi::cable_found() { ("cable", true, None) } else { ("no_cable", false, None) });
+    return Some({
+        let found = wasapi::cable_found();
+        VirtualStatus { kind: if found { "cable" } else { "no_cable" }, present: found, error: None, name: None }
+    });
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     None
 }

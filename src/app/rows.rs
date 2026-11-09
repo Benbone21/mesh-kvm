@@ -403,7 +403,11 @@ impl Rows<'_, '_> {
         let peer = self.input.snapshot.name(device.other());
         match virtual_devices.kind {
             VirtualKind::Linux => match (&virtual_devices.error, virtual_devices.present) {
-                (_, true) => Cell::new(format!("{peer} mic, {peer} speakers \u{2014} in sound settings"), Tone::Text, CellKind::Plain),
+                (_, true) => {
+                    // As the sound settings list them, from a service that says; an older one doesn't.
+                    let shown = virtual_devices.name.as_deref().unwrap_or(&peer);
+                    Cell::new(format!("{shown} mic, {shown} speakers \u{2014} in sound settings"), Tone::Text, CellKind::Plain)
+                }
                 (Some(error), false) => Cell::new(format!("Couldn't add the devices: {error}"), Tone::Warn, CellKind::Plain),
                 (None, false) => Cell::new("Appears when linked".into(), Tone::Dim, CellKind::Plain),
             },
@@ -807,7 +811,19 @@ mod tests {
 
     fn virtual_of(snapshot: &mut Snapshot, device: Device, kind: model::VirtualKind, present: bool, error: Option<&str>) {
         let status = if device == Device::Debian { snapshot.local.as_mut() } else { snapshot.peer.as_mut() }.unwrap();
-        status.audio.virtual_devices = Some(model::VirtualDevices { kind, present, error: error.map(str::to_string) });
+        status.audio.virtual_devices = Some(model::VirtualDevices { kind, present, error: error.map(str::to_string), name: None });
+    }
+
+    #[test]
+    fn the_debian_cell_names_the_devices_as_the_sound_settings_do() {
+        let mut s = linked();
+        virtual_of(&mut s, Device::Debian, model::VirtualKind::Linux, true, None);
+        s.local.as_mut().unwrap().audio.virtual_devices.as_mut().unwrap().name = Some("Bobs PC".into());
+        let g = groups(&input(&s));
+        assert_eq!(row(&g, "Virtual devices").cells[0].value, "Bobs PC mic, Bobs PC speakers \u{2014} in sound settings");
+        let from_json: model::AudioStatus =
+            serde_json::from_str(r#"{"virtual":{"kind":"linux","present":true,"error":null,"name":"Bobs PC"}}"#).unwrap();
+        assert_eq!(from_json.virtual_devices.and_then(|v| v.name).as_deref(), Some("Bobs PC"));
     }
 
     #[test]
@@ -881,7 +897,8 @@ mod tests {
         let g = groups(&input(&s));
         assert_eq!(row(&g, "Virtual devices").cells[1], Cell::blank());
         let from_json: model::AudioStatus = serde_json::from_str(r#"{"virtual":{"kind":"no_cable","present":false,"error":null},"tx_mic_ready":true}"#).unwrap();
-        assert_eq!(from_json.virtual_devices.map(|v| v.kind), Some(model::VirtualKind::NoCable));
+        assert_eq!(from_json.virtual_devices.as_ref().map(|v| v.kind), Some(model::VirtualKind::NoCable));
+        assert_eq!(from_json.virtual_devices.and_then(|v| v.name), None, "an older service gives no name");
         assert!(from_json.tx_mic_ready);
     }
 

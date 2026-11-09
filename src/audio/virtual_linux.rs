@@ -22,7 +22,7 @@ const MARK: &str = "mesh-kvm-peer-";
 /// How long a failed load is left before it's tried again.
 pub const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Loading a module can be slow while the sound server is busy. One that answers after this may
-/// have loaded anyway, and the next start clears it.
+/// have loaded anyway: the retry, or the unlink, clears it by name first.
 const PACTL_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The FIFO the mic source reads from.
@@ -106,11 +106,20 @@ impl VirtualDevices {
             }
         }
         let Some(name) = wanted else {
-            self.failed_at = None;
+            // A load given up on may have finished anyway, after its ids were lost.
+            if self.failed_at.take().is_some() {
+                clear_leftovers(run);
+            }
+            self.error = None;
             return;
         };
         if self.loaded.is_some() || self.failed_at.is_some_and(|at| now.duration_since(at) < RETRY_AFTER) {
             return;
+        }
+        if self.failed_at.is_some() {
+            // The load that failed may have been only slow, and loaded after `pactl` was given up
+            // on: it goes by name, so the retry doesn't make a second pair on the same FIFO.
+            clear_leftovers(run);
         }
         let mut ids = Vec::new();
         for kind in [Kind::Mic, Kind::Speakers] {
@@ -364,6 +373,8 @@ mod tests {
         loads: usize,
         /// Loads of these modules fail.
         failing: Vec<&'static str>,
+        /// Loads of these modules take too long: they're given up on, but load anyway.
+        slow: Vec<&'static str>,
         listing: String,
     }
 
@@ -378,6 +389,9 @@ mod tests {
                     self.next_id += 1;
                     self.loaded.insert(self.next_id, args[1..].join(" "));
                     self.ever_loaded.push(self.next_id);
+                    if self.slow.contains(&args[1].as_str()) {
+                        return None;
+                    }
                     Some(format!("{}\n", self.next_id))
                 }
                 Some("unload-module") => {
@@ -450,6 +464,42 @@ mod tests {
         assert_eq!(fake.loaded.len(), 2);
         assert_eq!(devices.present(), Some("Laptop"));
         assert_eq!(devices.error(), None, "cleared on success");
+    }
+
+    #[test]
+    fn a_load_given_up_on_that_loaded_anyway_is_not_doubled_by_the_retry() {
+        let mut fake = FakePactl { slow: vec!["module-null-sink"], ..Default::default() };
+        let mut devices = VirtualDevices::default();
+        let t = Instant::now();
+        devices.step_at(Some("Laptop".into()), &mut |args| fake.run(args), t);
+        assert_eq!(devices.present(), None);
+        assert_eq!(fake.loaded.len(), 1, "the speakers loaded after all; the mic was taken away");
+        fake.slow.clear();
+        devices.step_at(Some("Laptop".into()), &mut |args| fake.run(args), t + RETRY_AFTER);
+        assert_eq!(devices.present(), Some("Laptop"));
+        let kinds: Vec<&str> = fake.loaded.values().map(|args| args.split(' ').next().unwrap()).collect();
+        assert_eq!(kinds, ["module-pipe-source", "module-null-sink"], "one of each, not two speakers");
+    }
+
+    #[test]
+    fn unlinking_after_a_failure_forgets_the_error() {
+        let mut fake = FakePactl { failing: vec!["module-null-sink"], ..Default::default() };
+        let mut devices = VirtualDevices::default();
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        assert!(devices.error().is_some());
+        devices.step(None, &mut |args| fake.run(args));
+        assert_eq!(devices.error(), None, "the cell goes back to 'Appears when linked'");
+        assert!(fake.loaded.is_empty());
+    }
+
+    #[test]
+    fn unlinking_after_a_slow_load_takes_away_what_loaded_late() {
+        let mut fake = FakePactl { slow: vec!["module-null-sink"], ..Default::default() };
+        let mut devices = VirtualDevices::default();
+        devices.step(Some("Laptop".into()), &mut |args| fake.run(args));
+        assert_eq!(fake.loaded.len(), 1);
+        devices.step(None, &mut |args| fake.run(args));
+        assert!(fake.loaded.is_empty(), "{:?}", fake.loaded);
     }
 
     #[test]

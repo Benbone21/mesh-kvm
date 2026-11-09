@@ -828,6 +828,67 @@ fn echo_safe(sent: Option<&str>, play: Option<&str>, failing: bool) -> bool {
     sent != play || !failing
 }
 
+#[derive(Debug)]
+struct Steered {
+    input: Resolved,
+    sent: Resolved,
+    play: Resolved,
+    notes: Vec<String>,
+}
+
+/// Whether a choice follows the Windows default, and the default is this end of the cable.
+fn follows_cable(resolved: &Resolved, default: Option<&String>, end: Option<&Device>) -> bool {
+    matches!(resolved, Resolved::Default | Resolved::Missing) && end.is_some_and(|end| default == Some(&end.id))
+}
+
+/// Choices that follow the Windows default don't follow it onto VB-Cable, which often makes itself
+/// the default when it's installed. CABLE Output as the default microphone would send the other
+/// device's own mic back to it, so nothing is captured. CABLE Input as the default output carries
+/// what's played into the other device's mic: received sound would go into that mic, and sending it
+/// would send that mic back as sound. So both use the first real output instead, if there is one,
+/// and with none, nothing is sent.
+fn steer_clear_of_cable(input: Resolved, sent: Resolved, play: Resolved, lists: &Lists, cable: &Cable) -> Steered {
+    let mut notes = Vec::new();
+    let input = if follows_cable(&input, lists.default_input.as_ref(), cable.output.as_ref()) {
+        notes.push("The Windows default microphone is CABLE Output, which carries the other device's mic, so nothing is sent from it. Choose a microphone or line-in.".to_string());
+        Resolved::Off
+    } else {
+        input
+    };
+    let on_cable = |resolved: &Resolved| follows_cable(resolved, lists.default_output.as_ref(), cable.input.as_ref());
+    let real = lists.outputs.first();
+    let sent = match real {
+        _ if !on_cable(&sent) => sent,
+        Some(real) => {
+            notes.push(format!("The Windows default output is CABLE Input, which carries the other device's mic, so {} is sent instead.", real.name));
+            Resolved::Device(real.id.clone())
+        }
+        None => {
+            notes.push("The Windows default output is CABLE Input, which carries the other device's mic, so nothing is sent from it. Choose an output to send.".to_string());
+            Resolved::Off
+        }
+    };
+    let play = match real {
+        Some(real) if on_cable(&play) => {
+            notes.push(format!("The Windows default output is CABLE Input, which carries the other device's mic, so received audio plays on {}.", real.name));
+            Resolved::Device(real.id.clone())
+        }
+        _ => play,
+    };
+    Steered { input, sent, play, notes }
+}
+
+/// What else to mute, never the cable: muting it would silence the other device's mic.
+fn also_mute_but_the_cable(sent: Option<&str>, default: Option<&str>, play_only: bool, cable: &Cable) -> Option<String> {
+    also_mute(sent, default, play_only).filter(|id| cable.input.as_ref().is_none_or(|end| &end.id != id))
+}
+
+/// The cable to play the other device's mic into, while it's there and the mic is arriving. Held open
+/// with nothing arriving, the stream would keep Windows from sleeping by itself.
+fn mic_player_wanted(cable: Option<Pick>, last_alive: Option<Instant>, now: Instant) -> Option<Pick> {
+    cable.filter(|_| last_alive.is_some_and(|at| now.duration_since(at) < PLAYER_IDLE_CLOSE))
+}
+
 fn engine() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let mut mic = Worker::<Option<Pick>>::default();
@@ -844,6 +905,14 @@ fn engine() {
             Resolved::Off => Resolved::Default,
             other => other,
         };
+        // The notes about a missing choice are about the choice, so they're worked out before this.
+        let missing = [
+            input.missing_note("microphone or line-in"),
+            sent.missing_note("output to send"),
+            play.missing_note("output to play on"),
+        ];
+        let cable = CABLE.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let Steered { input, sent, play, notes: steered_notes } = steer_clear_of_cable(input, sent, play, &lists, &cable);
         let sent_id = sent.id(lists.default_output.as_ref());
         let play_id = play.id(lists.default_output.as_ref());
         let (may_try, failing) = {
@@ -875,9 +944,6 @@ fn engine() {
         let peaks = if compare { read_peaks(sent_id.as_deref(), default_id) } else { None };
         let on_wrong_output = wrong_output.note(peaks, now);
         let notes = [
-            input.missing_note("microphone or line-in"),
-            sent.missing_note("output to send"),
-            play.missing_note("output to play on"),
             no_mute_note(play_only, sent != Resolved::Off, failing),
             on_wrong_output.then(|| wrong_output_note(sent_id.as_deref(), default_id, &lists)).flatten(),
             (input != Resolved::Off)
@@ -890,11 +956,11 @@ fn engine() {
         ];
         devices::set_in_use(InUse {
             output: sent_id.clone(),
-            also_mute: also_mute(sent_id.as_deref(), lists.default_output.as_deref(), play_only),
+            also_mute: also_mute_but_the_cable(sent_id.as_deref(), lists.default_output.as_deref(), play_only, &cable),
             play: play_id.clone(),
             echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
             hint: if excluding { ALL_SOUND_HINT.to_string() } else { String::new() },
-            notes: notes.into_iter().flatten().collect(),
+            notes: missing.into_iter().flatten().chain(steered_notes).chain(notes.into_iter().flatten()).collect(),
         });
         devices::set_lists(lists);
     }
@@ -1081,12 +1147,19 @@ impl DrainClock {
 fn supervise_mic(stream: Arc<Mutex<RxStream>>) {
     let mut player = Worker::<Pick>::default();
     let mut drain = DrainClock::new(Instant::now());
+    let mut last_alive = None;
     loop {
         let now = Instant::now();
+        if stream.lock().unwrap_or_else(PoisonError::into_inner).alive(now) {
+            last_alive = Some(now);
+        }
         // Only ever the cable: with none, the mic is dropped rather than played on the speakers.
-        // Sound excluded from the sent output is this process's own, which covers this feed: the
-        // process-exclusion loopback leaves out this process, so the cable feed can't echo back.
-        let wanted = CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        // It can't come back as sound sent to the other device: the cable is never sent, as it's
+        // left out of the lists and a default on it is steered to a real output, so ordinary
+        // loopback never records it, and process-exclusion loopback leaves this process out, which
+        // takes this feed with it.
+        let cable = CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let wanted = mic_player_wanted(cable, last_alive, now);
         let for_player = Arc::clone(&stream);
         player.ensure(wanted, now, move |pick, stop| play_on(Some(pick), for_player, &stop, None));
         let elapsed = drain.elapsed(now);
@@ -1323,6 +1396,75 @@ mod tests {
         assert!(kept.all_names().iter().all(|n| !n.contains("CABLE")));
         assert_eq!(kept.all_names(), ["Speakers (Realtek)"]);
         assert_eq!(kept.picks["{b}"], Pick { name: "CABLE Input (VB-Audio Virtual Cable)".into(), nth: 0 });
+    }
+
+    fn lists_with_defaults(input: &str, output: &str) -> (Lists, Cable) {
+        let lists = Lists {
+            inputs: vec![dev("{mic}", "Microphone (Realtek)")],
+            outputs: vec![dev("{headset}", "Headset"), dev("{speakers}", "Speakers (Realtek)")],
+            default_input: Some(input.to_string()),
+            default_output: Some(output.to_string()),
+        };
+        let cable = Cable {
+            input: Some(dev("{cable-in}", "CABLE Input (VB-Audio Virtual Cable)")),
+            output: Some(dev("{cable-out}", "CABLE Output (VB-Audio Virtual Cable)")),
+        };
+        (lists, cable)
+    }
+
+    #[test]
+    fn the_peer_s_mic_as_the_system_default_is_never_sent_back() {
+        let (lists, cable) = lists_with_defaults("{cable-out}", "{speakers}");
+        for input in [Resolved::Default, Resolved::Missing] {
+            let steered = steer_clear_of_cable(input, Resolved::Default, Resolved::Default, &lists, &cable);
+            assert_eq!(steered.input, Resolved::Off);
+            assert_eq!((steered.sent, steered.play), (Resolved::Default, Resolved::Default));
+            assert_eq!(steered.notes.len(), 1);
+        }
+        let chosen = steer_clear_of_cable(Resolved::Device("{mic}".into()), Resolved::Default, Resolved::Default, &lists, &cable);
+        assert_eq!(chosen.input, Resolved::Device("{mic}".into()), "a chosen mic is the one used");
+        assert!(chosen.notes.is_empty());
+    }
+
+    #[test]
+    fn the_peer_s_speakers_as_the_system_default_don_t_take_what_is_received() {
+        let (lists, cable) = lists_with_defaults("{mic}", "{cable-in}");
+        let steered = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Missing, &lists, &cable);
+        assert_eq!(steered.input, Resolved::Default);
+        assert_eq!(steered.play, Resolved::Device("{headset}".into()), "received sound plays on the first real output");
+        assert_eq!(steered.sent, Resolved::Device("{headset}".into()), "and the cable, which carries the other mic, isn't sent");
+        assert_eq!(steered.notes.len(), 2, "{:?}", steered.notes);
+        let chosen = steer_clear_of_cable(
+            Resolved::Default,
+            Resolved::Device("{speakers}".into()),
+            Resolved::Off,
+            &lists,
+            &cable,
+        );
+        assert_eq!((chosen.sent, chosen.play), (Resolved::Device("{speakers}".into()), Resolved::Off), "choices are kept");
+        assert!(chosen.notes.is_empty());
+        let none_real = Lists { outputs: Vec::new(), ..lists.clone() };
+        let stuck = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Default, &none_real, &cable);
+        assert_eq!(stuck.sent, Resolved::Off, "nothing else to send: the cable isn't sent");
+        let without = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Default, &lists, &Cable::default());
+        assert!(without.notes.is_empty(), "no cable, nothing to steer clear of");
+    }
+
+    #[test]
+    fn the_cable_is_never_muted_as_the_windows_default() {
+        let (_, cable) = lists_with_defaults("{mic}", "{cable-in}");
+        assert_eq!(also_mute_but_the_cable(Some("{headset}"), Some("{cable-in}"), true, &cable), None);
+        assert_eq!(also_mute_but_the_cable(Some("{headset}"), Some("{speakers}"), true, &cable).as_deref(), Some("{speakers}"));
+    }
+
+    #[test]
+    fn the_mic_player_lets_the_cable_go_when_nothing_arrives() {
+        let pick = Some(Pick { name: "CABLE Input (VB-Audio Virtual Cable)".into(), nth: 0 });
+        let t = Instant::now();
+        assert_eq!(mic_player_wanted(pick.clone(), None, t), None, "nothing ever arrived");
+        assert_eq!(mic_player_wanted(pick.clone(), Some(t), t + Duration::from_millis(500)), pick, "arriving");
+        assert_eq!(mic_player_wanted(pick.clone(), Some(t), t + PLAYER_IDLE_CLOSE), None, "quiet for long enough");
+        assert_eq!(mic_player_wanted(None, Some(t), t), None, "no cable");
     }
 
     #[test]

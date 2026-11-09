@@ -192,6 +192,10 @@ pub struct VirtualDevices {
     /// Why the devices couldn't be added.
     #[serde(default)]
     pub error: Option<String>,
+    /// The other device's name as the devices carry it in the sound settings, while they're there.
+    /// Missing from an older service.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A microphone, line-in or output, by the id it's saved under and the name it's shown by.

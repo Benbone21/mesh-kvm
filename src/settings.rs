@@ -551,7 +551,8 @@ pub fn audio_status_json() -> serde_json::Value {
         "rx_buffer_ms": AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed),
         "rx_live": AUDIO_RX_LIVE.load(Ordering::Relaxed),
         "rx_other_version": other_version_arriving(now),
-        "virtual": crate::audio::virtual_status().map(|(kind, present, error)| serde_json::json!({ "kind": kind, "present": present, "error": error })),
+        "virtual": crate::audio::virtual_status()
+            .map(|v| serde_json::json!({ "kind": v.kind, "present": v.present, "error": v.error, "name": v.name })),
         "tx_mic_ready": crate::audio::peer_mic_ready(now, std::time::Duration::from_secs(2)),
         "rx_mic_live": crate::audio::AUDIO_RX_MIC_LIVE.load(Ordering::Relaxed),
     })
@@ -1243,6 +1244,9 @@ mod tests {
         assert!(matches!(status["virtual"]["kind"].as_str(), Some("cable" | "no_cable")));
         assert!(status["virtual"]["present"].is_boolean());
         assert!(status["virtual"]["error"].is_null() || status["virtual"]["error"].is_string());
+        let name = &status["virtual"]["name"];
+        assert!(status["virtual"].get("name").is_some(), "the name is always given, null when there's none");
+        assert_eq!(name.is_string(), status["virtual"]["kind"] == "linux" && status["virtual"]["present"] == true, "{name}");
     }
 
     #[test]

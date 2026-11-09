@@ -100,7 +100,7 @@ Changes take effect straight away and are kept when mesh-kvm restarts.
 
 Each device has its own audio controls, and sound can go both ways at once.
 
-- Microphone or line-in to send, and Output to send, choose what this device sends. Each lists your real devices by name, or None. Choosing anything starts sending, and if you choose both they are sent mixed, turned down just enough that the sum doesn't clip. A microphone can only be chosen on the device it belongs to, though the other device can turn it off.
+- Microphone or line-in to send, and Output to send, choose what this device sends. Each lists your real devices by name, or None. Choosing anything starts sending. The microphone goes only to the other device's virtual mic, never to its speakers (see Virtual mics and speakers below), and the output's sound plays on the other device's speakers. Send volume and the limiter that keeps the sound from clipping apply to the output's sound only. A microphone can only be chosen on the device it belongs to, though the other device can turn it off.
 - Play received audio on chooses where sound from the other device plays. Play audio from the other device turns it off.
 - Play only on the other device mutes the output you chose to send, so you hear that sound on one device only. It is on by default. On Windows it also mutes the default output if that's a different one, and changes what's sent: see below.
 - Audio quality chooses the bitrate of what this device sends: 64, 96, 128 or 256 kbit/s, or Uncompressed at about 1.6 Mbit/s. Each packet adds about 32 kbit/s on the network on top of that. On poor Wi-Fi, use a lower one: smaller packets get through more often.
@@ -110,7 +110,7 @@ Each device has its own audio controls, and sound can go both ways at once.
 
 While the laptop is paired and linked, Debian gets two devices in its sound settings: a microphone called `<laptop name> mic (mesh-kvm)`, which records the laptop's chosen mic, and an output called `<laptop name> speakers (mesh-kvm)`, where anything played comes out of the laptop. They go away when the link drops.
 
-On the laptop, install [VB-Cable](https://vb-audio.com/Cable/). Debian's mic then plays into CABLE Input, and apps pick CABLE Output as their mic. Without VB-Cable the app says to install it. The received mic is never played on the speakers. The Virtual devices row in the app shows how this stands on each device. Packets are now version 3, so both devices must update together.
+On the laptop, install [VB-Cable](https://vb-audio.com/Cable/). Debian's mic then plays into CABLE Input, and apps pick CABLE Output as their mic. Without VB-Cable the app says to install it. The received mic is never played on the speakers. If one of these devices, or VB-Cable, is the system default, choices left on System default steer clear of it and a note says so: nothing is sent from the virtual mic, and received sound plays on, and on Windows is sent from, the first real output. The Virtual devices row in the app shows how this stands on each device. Packets are now version 3, so both devices must update together.
 
 ### Play only on the other device
 

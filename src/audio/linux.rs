@@ -533,8 +533,15 @@ fn sinks_to_send(chosen: Option<&str>, speakers_present: bool) -> Vec<&str> {
 
 /// Whether the other device is paired, and what it's called.
 fn pairing_now() -> (bool, Option<String>) {
-    let peer = crate::secure::pairing::peer_name();
-    (peer.is_some(), peer)
+    pairing_with(crate::secure::pairing::peer_name(), crate::spatial::peer_name_now())
+}
+
+/// Whether the other device is paired, and what it's called now: the name it last reported, which
+/// follows a rename, or else the one it had when paired.
+fn pairing_with(paired_as: Option<String>, live: Option<String>) -> (bool, Option<String>) {
+    let paired = paired_as.is_some();
+    let live = live.filter(|name| !name.trim().is_empty());
+    (paired, if paired { live.or(paired_as) } else { None })
 }
 
 /// Brings the other device's mic and speakers in line with the pairing and the link.
@@ -1225,6 +1232,15 @@ mod tests {
         lists.default_input = Some(input.to_string());
         lists.default_output = Some(output.to_string());
         lists
+    }
+
+    #[test]
+    fn the_devices_take_the_peer_s_name_as_it_is_now() {
+        let paired = Some("OLDNAME".to_string());
+        assert_eq!(pairing_with(paired.clone(), Some("NEWNAME".into())), (true, Some("NEWNAME".into())), "a rename follows");
+        assert_eq!(pairing_with(paired.clone(), None), (true, Some("OLDNAME".into())), "before any heartbeat");
+        assert_eq!(pairing_with(paired, Some("  ".into())), (true, Some("OLDNAME".into())), "a blank name isn't a name");
+        assert_eq!(pairing_with(None, Some("NEWNAME".into())), (false, None), "unpaired, nothing");
     }
 
     #[test]
