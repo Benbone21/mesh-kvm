@@ -710,6 +710,41 @@ impl PeerLink {
     }
 }
 
+/// How often a heartbeat goes out.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const HEARTBEAT_MS: u64 = 400;
+
+/// When Debian's heartbeat is due: every `HEARTBEAT_MS`, and once at once when the link comes
+/// up, so the other side hears this one's state without waiting out the period. A link that flaps
+/// adds at most one beat for each time it comes up.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct HeartbeatPace {
+    last_ms: Option<u64>,
+    early: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl HeartbeatPace {
+    /// The link has just come up, as this side first heard the peer again.
+    pub fn link_up(&mut self) {
+        self.early = true;
+    }
+
+    pub fn due(&mut self, now_ms: u64) -> bool {
+        let due = std::mem::take(&mut self.early) || self.last_ms.is_none_or(|at| now_ms.saturating_sub(at) >= HEARTBEAT_MS);
+        if due {
+            self.last_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
+/// Whether hearing the peer brought the link up: the router had it down before and up after.
+pub fn came_up(was_online: bool, online: bool) -> bool {
+    !was_online && online
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1582,5 +1617,35 @@ mod tests {
         assert_eq!(a.peer_version(0), PeerVersion::Same);
         a.arrived(&heartbeat(5), 100);
         assert_eq!(a.peer_version(100 + VERSION_WAIT_MS), PeerVersion::Older);
+    }
+
+    #[test]
+    fn a_heartbeat_goes_out_at_once_when_the_link_comes_up_and_then_on_time() {
+        let mut pace = HeartbeatPace::default();
+        assert!(pace.due(0));
+        assert!(!pace.due(399));
+        assert!(pace.due(400));
+        assert!(!pace.due(500));
+        pace.link_up();
+        assert!(pace.due(510), "straight away");
+        assert!(!pace.due(511), "one extra only");
+        assert!(!pace.due(900));
+        assert!(pace.due(910), "the period starts again from the early one");
+    }
+
+    #[test]
+    fn a_flapping_link_adds_at_most_one_beat_each_time_it_comes_up() {
+        let mut pace = HeartbeatPace::default();
+        pace.due(0);
+        let mut beats = 0;
+        for ms in 1..400 {
+            // Up on every millisecond: still only one early beat between checks.
+            pace.link_up();
+            pace.link_up();
+            beats += u32::from(pace.due(ms));
+        }
+        assert_eq!(beats, 399, "one per coming up, never more");
+        assert!(came_up(false, true));
+        assert!(!came_up(true, true) && !came_up(false, false) && !came_up(true, false));
     }
 }

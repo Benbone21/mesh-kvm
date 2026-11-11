@@ -3,7 +3,7 @@
 use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
-use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::link::{came_up, press_event, HeartbeatPace, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::grab::{hand_back_press, wait_for_releases, GrabNews, GrabOps, GrabSlot};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::protocol::{
@@ -1334,7 +1334,7 @@ pub fn run_debian_node(
     };
 
     let mut hotkeys = HotkeyFilter::default();
-    let mut last_heartbeat = Instant::now();
+    let mut heartbeat = HeartbeatPace::default();
     let mut last_telemetry_sync = Instant::now();
     let mut link = PeerLink::default();
     let mut link_watch = crate::linklog::LinkWatch::new(now_ms());
@@ -1423,7 +1423,11 @@ pub fn run_debian_node(
             let Some(pkt) = peer_socket.open(&udp_buf[..len], src_addr, now_ms(), &mut opened, &mut |what| link.note(what, now_ms())) else {
                 continue;
             };
+            let was_online = core.router.online();
             core.route(Event::PeerAlive { now_ms: now_ms() });
+            if came_up(was_online, core.router.online()) {
+                heartbeat.link_up();
+            }
             if !link.arrived(&pkt, now_ms()) {
                 continue;
             }
@@ -1657,8 +1661,7 @@ pub fn run_debian_node(
         }
 
         // Heartbeat, with what the other device needs to check its own edges (every 400ms)
-        if last_heartbeat.elapsed() >= Duration::from_millis(400) {
-            last_heartbeat = Instant::now();
+        if heartbeat.due(now_ms()) {
             core.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);

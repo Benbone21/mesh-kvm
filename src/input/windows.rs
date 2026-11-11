@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
-use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::link::{came_up, press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
 use crate::protocol::{
@@ -1066,7 +1066,12 @@ pub fn run_windows_node(
                         let Some(pkt) = rx_peer.open(&buf[..len], src_addr, now_ms(), &mut opened, note) else {
                             continue;
                         };
+                        let was_online = router().online();
                         route(Event::PeerAlive { now_ms: now_ms() });
+                        // The other side hears this one's state at once, not at the next beat.
+                        if came_up(was_online, router().online()) {
+                            send_link_state();
+                        }
                         if !link().arrived(&pkt, now_ms()) {
                             continue;
                         }
