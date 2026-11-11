@@ -97,13 +97,17 @@ pub struct DeviceLayout {
     /// Stands in for all the monitors when set, in place of their native sizes.
     #[serde(default)]
     pub custom_size: Option<(i32, i32)>,
+    /// The device has said what its monitors are: they aren't a placeholder. A layout saved before
+    /// this was kept had them from the device.
+    #[serde(default = "default_true")]
+    pub reported: bool,
 }
 
 impl DeviceLayout {
     fn placeholder(node: NodeId) -> Self {
         let (w, h) = PLACEHOLDER_SIZE;
         let monitors = vec![MonitorRect { name: "Display".to_string(), x: 0, y: 0, w, h }];
-        Self { node, name: String::new(), x: 0, y: 0, monitors, custom_size: None }
+        Self { node, name: String::new(), x: 0, y: 0, monitors, custom_size: None, reported: false }
     }
 
     /// This device's screens in the shared layout.
@@ -236,6 +240,7 @@ impl LegacyLayout {
                     y: 0,
                     monitors: self.debian_monitors,
                     custom_size: None,
+                    reported: true,
                 },
                 DeviceLayout {
                     node: NodeId::Windows,
@@ -244,6 +249,7 @@ impl LegacyLayout {
                     y: self.win_y,
                     monitors: vec![MonitorRect { name: "Laptop display".to_string(), x: 0, y: 0, w, h }],
                     custom_size: custom.then_some((self.win_w, self.win_h)),
+                    reported: true,
                 },
             ],
             attach_side: self.attach_side,
@@ -388,6 +394,10 @@ impl SpatialConfig {
         if renamed {
             device.name = name;
         }
+        let first = !monitors.is_empty() && !device.reported;
+        if first {
+            device.reported = true;
+        }
         let moved = !monitors.is_empty() && device.monitors != monitors;
         if moved {
             device.monitors = monitors;
@@ -430,8 +440,9 @@ impl SpatialConfig {
     /// if it moved.
     /// It does this once per layout: `aligned_once` is kept in the file, so an offset made on
     /// purpose afterwards stays.
+    /// The look waits until both devices have said what their monitors are: a placeholder isn't.
     pub fn align_exactly(&mut self, me: NodeId) -> bool {
-        if std::mem::replace(&mut self.aligned_once, true) {
+        if !self.devices.iter().all(|d| d.reported) || std::mem::replace(&mut self.aligned_once, true) {
             return false;
         }
         let Some((wl, wt, wr, wb)) = bounds(&self.rects(NodeId::Windows)) else { return false };
@@ -1029,8 +1040,14 @@ pub fn heartbeat_payloads(config: &SpatialConfig, me: NodeId) -> Vec<Payload> {
 /// lock just means the next heartbeat does this instead.
 pub fn note_peer_displays(state: &RwLock<SharedSpatialState>, name: &str, monitors: Vec<MonitorRect>) {
     if let Ok(mut guard) = state.try_write() {
-        let peer = guard.me.other();
-        if guard.config.report_monitors(peer, name, monitors) {
+        let (me, peer) = (guard.me, guard.me.other());
+        let changed = guard.config.report_monitors(peer, name, monitors);
+        // The first time both devices' monitors are known is the layout's one look at alignment.
+        let looked_before = guard.config.aligned_once;
+        if guard.config.align_exactly(me) {
+            crate::settings::log_note("Lined the laptop up exactly with the monitor it was a few pixels off.");
+        }
+        if changed || guard.config.aligned_once != looked_before {
             guard.save();
         }
     }
@@ -1382,6 +1399,7 @@ mod tests {
                     y: 0,
                     monitors: vec![dp3(), dp2()],
                     custom_size: None,
+                    reported: true,
                 },
                 DeviceLayout {
                     node: NodeId::Windows,
@@ -1390,6 +1408,7 @@ mod tests {
                     y: win_y,
                     monitors: vec![rect("Laptop", 0, 0, 1920, 1080)],
                     custom_size: None,
+                    reported: true,
                 },
             ],
             attach_side,
@@ -1470,6 +1489,26 @@ mod tests {
         let mut fine = layout(TouchSide::Bottom, 2240, 1440);
         assert!(!fine.align_exactly(NodeId::Debian));
         assert!(fine.aligned_once);
+    }
+
+    #[test]
+    fn the_one_look_waits_for_both_devices_real_monitors() {
+        let mut c = SpatialConfig::fresh(NodeId::Debian, Some(SwitchEdge::Bottom));
+        assert!(!c.align_exactly(NodeId::Debian), "placeholders only");
+        assert!(!c.aligned_once, "and the look isn't spent on them");
+        c.report_monitors(NodeId::Debian, "desk", vec![dp3(), dp2()]);
+        assert!(!c.align_exactly(NodeId::Debian));
+        assert!(!c.aligned_once, "the laptop's are still a placeholder");
+        c.report_monitors(NodeId::Windows, "laptop", vec![rect("Laptop", 0, 0, 2560, 1600)]);
+        let mut place = c.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| (p.x, p.y) = (1925, 1440));
+        c.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Debian);
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 1920);
+        assert!(c.aligned_once);
+        // A layout saved before devices said so had real monitors in it.
+        let old = parse_layout(OLD_LAYOUT).unwrap().config;
+        assert!(old.devices.iter().all(|d| d.reported));
     }
 
     #[test]
