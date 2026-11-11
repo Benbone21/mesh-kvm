@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Hands on a connection that has proved it is the paired device.
@@ -166,6 +166,18 @@ const LINK_DOWN: u8 = 2;
 const OFFLINE: &str = "the other device is offline";
 /// The budget for making the connection again in the background when the link comes back.
 const RECONNECT_WAIT: Duration = Duration::from_millis(1750);
+/// The most a call waits for a reconnect under way, which may be finishing behind another call.
+const RECONNECT_SETTLE: Duration = Duration::from_secs(2);
+
+/// Whether a call heeds what the link is said to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Fails at once while the link is down: the app's calls and the layout sync.
+    WhileLinked,
+    /// Tries whatever the link is said to be: updating and unpairing, which must get through even
+    /// when the input link can't, as after an update that changed it.
+    AnyLink,
+}
 
 /// What the link log says of the connection: not yet used, or how it went last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,10 +238,10 @@ struct Link {
     online: AtomicU8,
     /// Goes up each time the link goes down or up.
     generation: AtomicU64,
-    /// Held while a background reconnect is connecting, so a call waits for it instead of racing it.
-    reconnecting: Mutex<()>,
-    /// What a background reconnect made, for the next call to take.
-    fresh: Mutex<Option<ApiConnection>>,
+    /// Background reconnects under way. A call waits for them, up to `RECONNECT_SETTLE`, instead of
+    /// racing them, and before it takes `connection`, which they need to put their connection in.
+    reconnects: Mutex<u32>,
+    settled: Condvar,
 }
 
 impl Link {
@@ -245,8 +257,8 @@ impl Link {
             logged,
             online: AtomicU8::new(LINK_UNKNOWN),
             generation: AtomicU64::new(0),
-            reconnecting: Mutex::new(()),
-            fresh: Mutex::new(None),
+            reconnects: Mutex::new(0),
+            settled: Condvar::new(),
         }
     }
 
@@ -282,41 +294,66 @@ impl Link {
     /// Hears from the input loop whether the link is up, every time round, so it must not wait:
     /// what a change needs done is done on a thread of its own. A connection made before a change
     /// is never used after it. Going down drops it; coming back makes a new one with
-    /// `reconnect_with`, if given, within `RECONNECT_WAIT`, so the app's next call finds it ready.
+    /// `reconnect_with`, if given, within `RECONNECT_WAIT`, and puts it in place unless a call has
+    /// made one meanwhile, so nothing is left open unused.
     fn set_online(&'static self, online: bool, reconnect_with: Option<(Arc<Pairing>, SocketAddr)>) {
         let state = if online { LINK_UP } else { LINK_DOWN };
         if self.online.swap(state, Ordering::SeqCst) == state {
             return;
         }
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let current = move || self.generation() == generation;
-        let _ = std::thread::Builder::new().name("mesh-kvm-control-link".to_string()).spawn(move || {
-            drop(self.fresh.lock().unwrap_or_else(|e| e.into_inner()).take());
-            if !online {
-                let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-                if slot.as_ref().is_some_and(|c| c.generation != self.generation()) {
-                    *slot = None;
-                }
-                return;
-            }
-            let Some((pairing, target)) = reconnect_with else { return };
-            let _busy = self.reconnecting.lock().unwrap_or_else(|e| e.into_inner());
-            if !current() {
-                return;
-            }
-            let opened = open_with(Some(&pairing), target, Purpose::Api, RECONNECT_WAIT);
-            // A link that has changed again since makes this outcome old news.
-            if !current() {
-                return;
-            }
-            match opened {
-                Ok(stream) => {
-                    self.note(Ok(()), Some(target));
-                    *self.fresh.lock().unwrap_or_else(|e| e.into_inner()) = Some(ApiConnection { stream, opened: Instant::now(), generation });
-                }
-                Err(e) => self.note(Err(&e), Some(target)),
+        let reconnect = if online { reconnect_with } else { None };
+        if reconnect.is_some() {
+            *self.reconnects.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        }
+        let counted = reconnect.is_some();
+        let spawned = std::thread::Builder::new().name("mesh-kvm-control-link".to_string()).spawn(move || {
+            let _done = counted.then(|| Settles(self));
+            match reconnect {
+                None => self.drop_stale(),
+                Some((pairing, target)) => self.reconnect(generation, &pairing, target),
             }
         });
+        if spawned.is_err() && counted {
+            drop(Settles(self));
+        }
+    }
+
+    /// Drops a connection made before the link last changed.
+    fn drop_stale(&self) {
+        let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(|c| c.generation != self.generation()) {
+            *slot = None;
+        }
+    }
+
+    fn reconnect(&self, generation: u64, pairing: &Pairing, target: SocketAddr) {
+        let current = || self.generation() == generation;
+        if !current() {
+            return;
+        }
+        let opened = open_with(Some(pairing), target, Purpose::Api, RECONNECT_WAIT);
+        // A link that has changed again since makes this outcome old news.
+        if !current() {
+            return;
+        }
+        match opened {
+            Ok(stream) => {
+                let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+                // A call that couldn't wait made one already: this one would only sit open.
+                if current() && !slot.as_ref().is_some_and(|c| c.generation == generation) {
+                    self.note(Ok(()), Some(target));
+                    *slot = Some(ApiConnection { stream, opened: Instant::now(), generation });
+                }
+            }
+            Err(e) => self.note(Err(&e), Some(target)),
+        }
+    }
+
+    /// Waits, up to `RECONNECT_SETTLE`, for reconnects under way.
+    fn wait_for_reconnects(&self) {
+        let count = self.reconnects.lock().unwrap_or_else(|e| e.into_inner());
+        drop(self.settled.wait_timeout_while(count, RECONNECT_SETTLE, |n| *n > 0));
     }
 
     fn state_text(&self) -> &'static str {
@@ -333,6 +370,12 @@ impl Link {
         self.call_within(pairing, target, method, path, body, CONNECT_WAIT, ANSWER_WAIT)
     }
 
+    /// `call_within` whatever the link is said to be.
+    #[allow(clippy::too_many_arguments)]
+    fn call_any_link(&self, pairing: Option<&Pairing>, target: Option<SocketAddr>, method: &str, path: &str, body: &str, connect: Duration, answer: Duration) -> Result<(u16, String), String> {
+        self.call_gated(Gate::AnyLink, pairing, target, method, path, body, connect, answer)
+    }
+
     /// `call` with its own waits for connecting and for the answer.
     #[allow(clippy::too_many_arguments)]
     fn call_within(
@@ -345,13 +388,33 @@ impl Link {
         connect: Duration,
         answer: Duration,
     ) -> Result<(u16, String), String> {
+        self.call_gated(Gate::WhileLinked, pairing, target, method, path, body, connect, answer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_gated(
+        &self,
+        gate: Gate,
+        pairing: Option<&Pairing>,
+        target: Option<SocketAddr>,
+        method: &str,
+        path: &str,
+        body: &str,
+        connect: Duration,
+        answer: Duration,
+    ) -> Result<(u16, String), String> {
         // With the link down nothing is tried, and nothing waits its turn for a connection that can't work.
-        if self.offline() {
+        let refused = || gate == Gate::WhileLinked && self.offline();
+        if refused() {
             return Err(OFFLINE.into());
         }
         let request = request_for(method, path, body)?;
+        self.wait_for_reconnects();
+        if refused() {
+            return Err(OFFLINE.into());
+        }
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-        if self.offline() {
+        if refused() {
             return Err(OFFLINE.into());
         }
         self.call_on(&mut slot, pairing, target, &request, connect, answer)
@@ -371,12 +434,6 @@ impl Link {
             *slot = None;
         }
         if slot.is_none() {
-            // A reconnect under way is waited for, and what it made is used.
-            drop(self.reconnecting.lock().unwrap_or_else(|e| e.into_inner()));
-            let fresh = self.fresh.lock().unwrap_or_else(|e| e.into_inner()).take();
-            *slot = fresh.filter(|c| c.generation == self.generation());
-        }
-        if slot.is_none() {
             let target = target.ok_or("no peer")?;
             let stream = open_with(pairing, target, Purpose::Api, connect).inspect_err(|e| self.note(Err(e), Some(target)))?;
             self.note(Ok(()), Some(target));
@@ -389,6 +446,17 @@ impl Link {
             self.note(Err(e), target);
         }
         result
+    }
+}
+
+/// Counts a reconnect as done when it goes, however it ended, and wakes the calls waiting on it.
+struct Settles(&'static Link);
+
+impl Drop for Settles {
+    fn drop(&mut self) {
+        let mut count = self.0.reconnects.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        self.0.settled.notify_all();
     }
 }
 
@@ -456,6 +524,18 @@ pub fn peer_clock_call(path: &str) -> Option<Result<(u16, String), String>> {
 /// A request to the other device's API. Fails when this device isn't paired.
 pub fn peer_call(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     PEER_LINK.call(super::services().pairing.as_deref(), TARGET.get().copied(), method, path, body)
+}
+
+/// `peer_call` for updating and unpairing: tried even while the input link is said to be down, as
+/// a device on a newer version may not speak its UDP, and the TCP connection may still get there.
+pub fn peer_call_any_link(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+    PEER_LINK.call_any_link(super::services().pairing.as_deref(), TARGET.get().copied(), method, path, body, CONNECT_WAIT, ANSWER_WAIT)
+}
+
+/// `peer_call_any_link` for a request that matters enough to wait out a slow link, like installing.
+pub fn peer_call_any_link_patiently(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+    let pairing = super::services().pairing.as_deref();
+    PEER_LINK.call_any_link(pairing, TARGET.get().copied(), method, path, body, PATIENT_CONNECT_WAIT, PATIENT_ANSWER_WAIT)
 }
 
 /// `peer_call` for a request that matters enough to wait out a slow link.
@@ -863,6 +943,81 @@ mod tests {
         link.set_online(true, Some((Arc::new(a.clone()), addr)));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_update_or_unpair_call_goes_whatever_the_link_is_said_to_be() {
+        let (a, b) = paired_pair();
+        let (addr, count) = serving_api(b, 0);
+        let link = leaked();
+        link.set_online(false, None);
+        let answer = link.call_any_link(Some(&a), Some(addr), "GET", "/api/state", "", CONNECT_WAIT, ANSWER_WAIT);
+        assert_eq!(answer.unwrap().0, 200, "UDP may be down while TCP works");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap_err().contains("offline"), "the app's calls still fail fast");
+    }
+
+    /// A listener that takes connections and never says a word, so a handshake waits out its limit.
+    fn silent() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for tcp in listener.incoming() {
+                held.push(tcp);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_link_that_flaps_keeps_the_newest_reconnect() {
+        let (a, b) = paired_pair();
+        let (addr, count) = serving_api(b, 0);
+        let link = leaked();
+        let pairing = Arc::new(a.clone());
+        for _ in 0..20 {
+            link.set_online(false, None);
+            link.set_online(true, Some((Arc::clone(&pairing), addr)));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let made = count.load(Ordering::SeqCst);
+        assert_eq!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        assert_eq!(count.load(Ordering::SeqCst), made, "the call found the newest reconnect still there");
+    }
+
+    #[test]
+    fn a_call_straight_after_the_link_comes_up_uses_the_reconnect_and_leaves_nothing_open() {
+        let (a, b) = paired_pair();
+        let (addr, count) = serving_api(b, 0);
+        let link = leaked();
+        link.set_online(false, None);
+        link.set_online(true, Some((Arc::new(a.clone()), addr)));
+        assert_eq!(link.call(Some(&a), Some(addr), "GET", "/api/state", "").unwrap().0, 200);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one connection, not the call's and an idle one");
+    }
+
+    #[test]
+    fn a_call_waiting_for_a_reconnect_fails_once_the_link_drops_and_never_waits_long() {
+        let (a, _) = paired_pair();
+        let nobody = silent();
+        let link = leaked();
+        link.set_online(false, None);
+        link.set_online(true, Some((Arc::new(a.clone()), nobody)));
+        let started = Instant::now();
+        let pairing = a.clone();
+        let caller = std::thread::spawn(move || link.call(Some(&pairing), Some(nobody), "GET", "/api/state", ""));
+        std::thread::sleep(Duration::from_millis(100));
+        link.set_online(false, None);
+        let err = caller.join().unwrap().unwrap_err();
+        assert!(err.contains("offline"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(2300), "{:?}", started.elapsed());
+        // And with the link staying up, the wait for the reconnect is bounded too.
+        link.set_online(true, Some((Arc::new(a.clone()), nobody)));
+        let started = Instant::now();
+        let _ = link.call(Some(&a), Some(nobody), "GET", "/api/state", "");
+        assert!(started.elapsed() < Duration::from_millis(2600), "{:?}", started.elapsed());
     }
 
     #[test]
