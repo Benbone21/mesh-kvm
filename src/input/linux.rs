@@ -896,7 +896,7 @@ function send() {
     lastEmit = now;
     seq = (seq % 2000000000) + 1;
     callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Update",
-             Math.round(p.x), Math.round(p.y), isGameWindow(), seq, now % 1000000000);
+             Math.round(p.x) | 0, Math.round(p.y) | 0, isGameWindow() | 0, seq | 0, (now % 1000000000) | 0);
 }
 try {
     timer = new QTimer();
@@ -947,12 +947,16 @@ struct Reading {
     /// script sends neither.
     seq: Option<u32>,
     kwin_ms: Option<i64>,
+    /// The stamp came as a double, which has lost its last digits, so it is no stamp.
+    bad_stamp: bool,
 }
 
 /// Puts dbus-monitor's lines back together into calls: a header line, then one line per argument.
 #[derive(Default)]
 struct MonitorReader {
     args: Vec<i64>,
+    /// Which of `args` came as a double.
+    doubles: Vec<bool>,
     in_update: bool,
 }
 
@@ -964,6 +968,7 @@ impl MonitorReader {
             // An older script's call has three arguments, and ends only when the next one starts.
             let legacy = (self.in_update && self.args.len() == 3).then(|| self.reading());
             self.args.clear();
+            self.doubles.clear();
             self.in_update = trimmed.starts_with("method call") && trimmed.ends_with("member=Update");
             return legacy;
         }
@@ -975,11 +980,13 @@ impl MonitorReader {
             value.parse::<i64>().ok().or_else(|| value.parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| v.round() as i64))
         });
         self.args.push(number?);
+        self.doubles.push(trimmed.starts_with("double "));
         if self.args.len() < 5 {
             return None;
         }
         let reading = self.reading();
         self.args.clear();
+        self.doubles.clear();
         self.in_update = false;
         Some(reading)
     }
@@ -987,12 +994,14 @@ impl MonitorReader {
     fn reading(&self) -> Reading {
         let arg = |i: usize| self.args.get(i).copied();
         let int = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let bad_stamp = self.doubles.get(4).copied().unwrap_or(false);
         Reading {
             x: int(arg(0).unwrap_or(0)),
             y: int(arg(1).unwrap_or(0)),
             game: arg(2).unwrap_or(0) != 0,
             seq: arg(3).map(|v| v as u32),
-            kwin_ms: arg(4),
+            kwin_ms: arg(4).filter(|_| !bad_stamp),
+            bad_stamp,
         }
     }
 }
@@ -1067,8 +1076,13 @@ fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<A
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = MonitorReader::default();
                     let mut unnumbered = 0u32;
+                    let mut said_bad_stamp = false;
                     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                         let Some(reading) = reader.feed(&line) else { continue };
+                        if reading.bad_stamp && !said_bad_stamp {
+                            said_bad_stamp = true;
+                            crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "bad_stamp"));
+                        }
                         kwin_game_active.store(reading.game, Ordering::Relaxed);
                         let seq = reading.seq.unwrap_or_else(|| {
                             unnumbered = unnumbered.wrapping_add(1);
@@ -1922,11 +1936,29 @@ mod tests {
         let mut r = MonitorReader::default();
         let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 77", "   int32 123456789"];
         let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
-        assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: Some(123_456_789) }]);
+        assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: Some(123_456_789), bad_stamp: false }]);
         // Numbers that come through as doubles are read too, and a game flag.
         let lines = [UPDATE, "   double 10", "   double 20.4", "   int32 1", "   uint32 78", "   int64 5"];
         let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
-        assert_eq!(got, vec![Reading { x: 10, y: 20, game: true, seq: Some(78), kwin_ms: Some(5) }]);
+        assert_eq!(got, vec![Reading { x: 10, y: 20, game: true, seq: Some(78), kwin_ms: Some(5), bad_stamp: false }]);
+    }
+
+    #[test]
+    fn a_stamp_that_comes_as_a_double_is_no_stamp() {
+        // KWin sends JavaScript numbers as int32 today; a double here has lost the milliseconds.
+        let mut r = MonitorReader::default();
+        let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 77", "   double 7.34568e+08"];
+        let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
+        assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: None, bad_stamp: true }]);
+        let lines = [UPDATE, "   int32 1", "   int32 2", "   int32 0", "   int32 78", "   int32 734568123"];
+        assert_eq!(lines.iter().filter_map(|l| r.feed(l)).next().map(|g| (g.kwin_ms, g.bad_stamp)), Some((Some(734_568_123), false)));
+    }
+
+    #[test]
+    fn the_script_sends_whole_numbers() {
+        for arg in ["Math.round(p.x) | 0", "Math.round(p.y) | 0", "isGameWindow() | 0", "seq | 0", "(now % 1000000000) | 0"] {
+            assert!(KWIN_SCRIPT.contains(arg), "{arg}");
+        }
     }
 
     #[test]
@@ -1935,7 +1967,7 @@ mod tests {
         for line in [UPDATE, "   int32 1", "   int32 2", "   int32 0"] {
             assert_eq!(r.feed(line), None);
         }
-        assert_eq!(r.feed(UPDATE), Some(Reading { x: 1, y: 2, game: false, seq: None, kwin_ms: None }));
+        assert_eq!(r.feed(UPDATE), Some(Reading { x: 1, y: 2, game: false, seq: None, kwin_ms: None, bad_stamp: false }));
     }
 
     #[test]
