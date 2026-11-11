@@ -22,7 +22,12 @@ pub const SWITCH_RACE_MS: u64 = 200;
 /// come every 400 ms, so this is one gone missing or 300 ms late.
 pub const QUIET_MS: u64 = 700;
 /// While packets stream in, as with movement from the other device, a shorter silence is a stall.
-pub const BUSY_QUIET_MS: u64 = 300;
+/// A stream that simply ended is followed by nothing until the next 400 ms heartbeat, so this is
+/// past that, with a margin.
+pub const BUSY_QUIET_MS: u64 = 450;
+/// With keys or buttons from the peer held down here, more packets were certainly due (a release
+/// at least), so in a stream a silence of this much is a stall.
+pub const HELD_QUIET_MS: u64 = 300;
 /// Packets this close together are a run, and a run this long is a stream. A heartbeat's copies
 /// come together, and are no stream.
 const RUN_GAP_MS: u64 = 50;
@@ -270,7 +275,8 @@ impl Router {
     pub fn online_since(&self) -> u64 {
         self.online_since
     }
-    /// The longest silence from the peer over `QUIET_MS`, or over `BUSY_QUIET_MS` in a stream,
+    /// The longest silence from the peer over `QUIET_MS`, or over `BUSY_QUIET_MS` in a stream
+    /// (`HELD_QUIET_MS` with the peer holding keys or buttons here),
     /// that has ended since the last call. One that ended a dropout is in it too.
     pub fn take_quiet(&mut self) -> Option<Quiet> {
         self.quiet.take()
@@ -410,7 +416,12 @@ impl Router {
             Event::PeerAlive { now_ms } => {
                 let quiet = now_ms.saturating_sub(self.last_alive);
                 let busy = self.last_alive.saturating_sub(self.run_start) >= STREAM_MS;
-                let limit = if busy { BUSY_QUIET_MS } else { QUIET_MS };
+                let held = self.held_here() > 0;
+                let limit = match (busy, held) {
+                    (true, true) => HELD_QUIET_MS,
+                    (true, false) => BUSY_QUIET_MS,
+                    (false, _) => QUIET_MS,
+                };
                 if self.last_alive > 0 && quiet > limit && self.quiet.is_none_or(|q| quiet > q.ms) {
                     self.quiet = Some(Quiet { ms: quiet, busy });
                 }
@@ -1454,9 +1465,36 @@ mod tests {
         }
         r.handle(Event::PeerAlive { now_ms: 1800 + BUSY_QUIET_MS + 50 });
         assert_eq!(r.take_quiet(), Some(Quiet { ms: BUSY_QUIET_MS + 50, busy: true }));
-        // The packet after a spell starts a new run, so the next 350 ms is no stream broken.
+        // The packet after a spell starts a new run, so the next 500 ms is no stream broken.
         r.handle(Event::PeerAlive { now_ms: 1800 + 2 * BUSY_QUIET_MS + 100 });
         assert_eq!(r.take_quiet(), None);
+    }
+
+    #[test]
+    fn the_pause_after_movement_until_the_next_heartbeat_is_no_stall() {
+        let mut r = router(0);
+        online(&mut r);
+        for now_ms in (1008..=1400).step_by(8) {
+            r.handle(Event::PeerAlive { now_ms });
+        }
+        // The mouse stopped; the next packet is the heartbeat, up to 400 ms on.
+        r.handle(Event::PeerAlive { now_ms: 1400 + 400 });
+        assert_eq!(r.take_quiet(), None);
+        assert!(BUSY_QUIET_MS >= 450, "past the heartbeat with a margin");
+    }
+
+    #[test]
+    fn with_a_key_held_from_the_peer_a_shorter_silence_is_a_stall() {
+        let mut r = router(0);
+        online(&mut r);
+        r.handle(Event::PeerKey { scancode: 30, pressed: true });
+        assert!(r.held_here() > 0, "{}", r.held_here());
+        for now_ms in (1008..=1400).step_by(8) {
+            r.handle(Event::PeerAlive { now_ms });
+        }
+        // More was certainly due: the key's release, or its repeats.
+        r.handle(Event::PeerAlive { now_ms: 1400 + HELD_QUIET_MS + 50 });
+        assert_eq!(r.take_quiet(), Some(Quiet { ms: HELD_QUIET_MS + 50, busy: true }));
     }
 
     #[test]

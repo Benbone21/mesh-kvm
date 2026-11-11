@@ -618,7 +618,7 @@ pub enum LinkEvent {
     Up { down_ms: u64, silent_ms: Option<u64> },
     /// With the figures from just before.
     Down { silent_ms: u64, up_ms: u64, figures: Figures },
-    /// A silence that ended with the link still up: over `QUIET_MS`, or over `BUSY_QUIET_MS` when
+    /// A silence that ended with the link still up: over `QUIET_MS`, or over `BUSY_QUIET_MS` (`HELD_QUIET_MS` with keys held) when
     /// it broke a stream. `in_per_s` is the rate since the last sample.
     Gap { silent_ms: u64, busy: bool, figures: Figures, in_per_s: f32 },
     /// The other device stopped hearing this one with the link up, or started again.
