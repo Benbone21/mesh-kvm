@@ -2,7 +2,9 @@
 //! can be tested: count a push at KWin's position, judge it, hold it, decide it again when the next
 //! position comes, and say what happened in the link log.
 
-use crate::crossing::{judge, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Sample, Spot, TrackerNews};
+use crate::crossing::{
+    judge, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Respawn, Sample, Spot, TrackerNews, Trust, HELD_SILENT_MS,
+};
 use crate::protocol::NodeId;
 use crate::spatial::{EdgeWatch, SpatialConfig};
 
@@ -48,14 +50,28 @@ pub trait Router {
 struct Held {
     from_peer: bool,
     since_ms: u64,
+    since_us: i64,
+    /// It found the tracker silent, and was counted towards a restart.
+    silent: bool,
 }
 
-/// Debian's edge: the push, the cursor's position, a push held for a better one, and the refusals.
+/// Debian's edge: the push, the cursor's position, a push held for a better one, the refusals, and
+/// whether the tracker answers.
+///
+/// The tracker's silence is only looked at while a push is held. Near an outer edge KWin sends a
+/// position every 16 ms even with the cursor still, so a held push with none for `HELD_SILENT_MS`
+/// has a silent tracker, and crosses at the last position, guard strips still applying. Nowhere
+/// else does a missing position mean anything: a still mouse, a pointer a game has locked, or the
+/// laptop in control all send nothing, rightly.
 pub struct DebianEdge {
     pub edge: EdgeWatch,
     pub track: CursorTrack,
     holding: Option<Held>,
     refusals: RefusalLog,
+    /// `cursor_tracker state=silent` was said, and `back` is owed.
+    said_silent: bool,
+    respawn: Respawn,
+    respawn_due: bool,
 }
 
 /// The moment, on both clocks the decision uses.
@@ -67,7 +83,15 @@ pub struct Now {
 
 impl DebianEdge {
     pub fn new(now_us: i64, start: (i32, i32)) -> Self {
-        Self { edge: EdgeWatch::new(), track: CursorTrack::new(now_us, start), holding: None, refusals: RefusalLog::new() }
+        Self {
+            edge: EdgeWatch::new(),
+            track: CursorTrack::new(now_us, start),
+            holding: None,
+            refusals: RefusalLog::new(),
+            said_silent: false,
+            respawn: Respawn::default(),
+            respawn_due: false,
+        }
     }
 
     /// Control changed hands: any push is forgotten, and the settle starts.
@@ -82,18 +106,38 @@ impl DebianEdge {
         self.holding.is_some()
     }
 
-    /// Looks at the tracker, whether or not a crossing could happen, so that a tracker gone silent
-    /// is noticed while the laptop has control or a game lock is on too.
-    pub fn look(&mut self, cfg: &SpatialConfig, now: Now, log: &mut impl EdgeLog) {
-        let (here, news) = self.track.locate(now.us, cfg.monitors(NodeId::Debian), self.edge.along_x());
-        if let Some(news) = news {
-            log.tracker(news, here.age_ms);
+    /// True once, when the tracker has been silent often enough to start it again.
+    pub fn take_respawn(&mut self) -> bool {
+        std::mem::take(&mut self.respawn_due)
+    }
+
+    /// Decides a held push again, as time passes with no movement and no position: it is how one
+    /// waiting on a silent tracker gets across.
+    pub fn look(&mut self, cfg: &SpatialConfig, buttons_held: bool, now: Now, router: &mut impl Router, log: &mut impl EdgeLog) {
+        if let Some(held) = self.holding {
+            self.push(cfg, (0, 0), held.from_peer, buttons_held, now, router, log);
         }
+    }
+
+    /// A held push has had no position for `HELD_SILENT_MS`.
+    fn silent(&self, now: Now) -> bool {
+        self.holding.is_some_and(|h| now.us - self.track.heard_at_us().max(h.since_us) > HELD_SILENT_MS as i64 * 1000)
+    }
+
+    fn note_silence(&mut self, now: Now, log: &mut impl EdgeLog) {
+        let Some(held) = self.holding.as_mut().filter(|h| !h.silent) else { return };
+        held.silent = true;
+        if !self.said_silent {
+            self.said_silent = true;
+            log.tracker(TrackerNews::Silent, u64::try_from(now.us - self.track.heard_at_us()).unwrap_or(0) / 1000);
+        }
+        self.respawn_due |= self.respawn.silenced(now.ms);
     }
 
     /// Counts movement of the Debian cursor by `delta` against the shared edge, from either
     /// device's mouse, and crosses to the laptop when the push completes on a position that can be
-    /// trusted. Otherwise the push waits, complete, for the next position or movement.
+    /// trusted. Otherwise the push waits, complete, for the next position or a silent tracker.
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
         cfg: &SpatialConfig,
@@ -109,10 +153,7 @@ impl DebianEdge {
             return;
         }
         let monitors = cfg.monitors(NodeId::Debian);
-        let (here, news) = self.track.locate(now.us, monitors, self.edge.along_x());
-        if let Some(news) = news {
-            log.tracker(news, here.age_ms);
-        }
+        let mut here = self.track.locate(now.us, monitors, self.edge.along_x());
         if !self.edge.press(monitors, here.sample, delta, buttons_held) {
             self.holding = None;
             self.refusals.cleared();
@@ -125,6 +166,10 @@ impl DebianEdge {
             }
             self.refusals.cleared();
             return;
+        }
+        if self.silent(now) {
+            self.note_silence(now, log);
+            here.trust = Trust::TrackerSilent;
         }
         let edge = &self.edge;
         let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
@@ -143,7 +188,7 @@ impl DebianEdge {
             }
             Gate::Hold(reason) => {
                 if self.holding.is_none() {
-                    self.holding = Some(Held { from_peer, since_ms: now.ms });
+                    self.holding = Some(Held { from_peer, since_ms: now.ms, since_us: now.us, silent: false });
                 }
                 if let Some(line) = self.refusals.refused(reason, now.ms) {
                     log.refused(line);
@@ -165,8 +210,9 @@ impl DebianEdge {
         if !self.track.is_new(&sample) {
             return;
         }
-        if let Some(news) = self.track.heard(sample) {
-            log.tracker(news, 0);
+        self.track.heard(sample);
+        if std::mem::take(&mut self.said_silent) {
+            log.tracker(TrackerNews::Back, 0);
         }
         if let Some(held) = self.holding {
             self.push(cfg, (0, 0), held.from_peer, buttons_held, now, router, log);
@@ -285,16 +331,113 @@ mod tests {
         assert_eq!(router.crossings.len(), 1);
     }
 
+    /// Pushes from 1990 on the edge while moving right along it, KWin a position behind, so the
+    /// reach takes in the guard strip and the push waits.
+    fn held_near_the_strip(x: i32) -> (SpatialConfig, DebianEdge, FakeRouter, FakeLog) {
+        let (cfg, mut d, mut router, mut log) = setup();
+        d.hear(&cfg, sample(x, 2, 2, 3), false, at(3), &mut router, &mut log);
+        for t in [10, 20] {
+            d.track.moved(t * MS, 5, 30);
+            d.push(&cfg, (5, 30), false, false, at(t + 5), &mut router, &mut log);
+        }
+        assert!(d.holding(), "{:?}", log.0);
+        (cfg, d, router, log)
+    }
+
     #[test]
-    fn a_tracker_gone_silent_is_noticed_while_crossing_is_off() {
+    fn a_push_held_with_the_mouse_at_rest_crosses_on_the_next_heartbeat() {
+        let (cfg, mut d, mut router, mut log) = held_near_the_strip(1990);
+        // Still, pushing nothing more. KWin's heartbeat brings the position 16 ms on.
+        d.look(&cfg, false, at(40), &mut router, &mut log);
+        assert!(router.crossings.is_empty());
+        d.hear(&cfg, sample(2000, 3, 41, 42), false, at(42), &mut router, &mut log);
+        assert_eq!(router.crossings, vec![((80, SHARED_EDGE_INSET), false)]);
+        assert!(!log.0.iter().any(|l| l.starts_with("cursor_tracker")), "{:?}", log.0);
+    }
+
+    #[test]
+    fn with_no_heartbeat_a_held_push_falls_back_after_150_ms_and_is_never_stranded() {
+        let (cfg, mut d, mut router, mut log) = held_near_the_strip(1990);
+        for t in (40..=160).step_by(40) {
+            d.look(&cfg, false, at(t), &mut router, &mut log);
+        }
+        assert!(router.crossings.is_empty(), "held at 25 ms, so silent only past 175");
+        d.look(&cfg, false, at(200), &mut router, &mut log);
+        assert_eq!(router.crossings, vec![((70, SHARED_EDGE_INSET), false)], "at the last position");
+        assert_eq!(log.0.iter().filter(|l| *l == "cursor_tracker Silent").count(), 1);
+        // The positions come back.
+        d.hear(&cfg, sample(2100, 9, 300, 301), false, at(301), &mut router, &mut log);
+        assert_eq!(log.0.last().map(String::as_str), Some("cursor_tracker Back"));
+    }
+
+    #[test]
+    fn a_silent_tracker_still_keeps_out_of_the_guard_strip() {
+        let (cfg, mut d, mut router, mut log) = held_near_the_strip(1950);
+        for t in (40..=400).step_by(40) {
+            d.look(&cfg, false, at(t), &mut router, &mut log);
+        }
+        assert!(router.crossings.is_empty());
+        assert!(log.0.contains(&"cursor_tracker Silent".to_string()));
+    }
+
+    #[test]
+    fn an_old_stale_position_mid_span_waits_for_the_heartbeat_then_crosses() {
+        let (cfg, mut d, mut router, mut log) = setup();
+        d.hear(&cfg, sample(3000, 2, 2, 3), false, at(3), &mut router, &mut log);
+        d.track.moved(60 * MS, 2, 30);
+        d.push(&cfg, (2, 30), false, false, at(60), &mut router, &mut log);
+        d.track.moved(130 * MS, -1, 30);
+        d.push(&cfg, (-1, 30), false, false, at(130), &mut router, &mut log);
+        assert!(d.holding() && router.crossings.is_empty(), "130 ms old: no crossing without a fresh one");
+        d.hear(&cfg, sample(3001, 3, 132, 133), false, at(133), &mut router, &mut log);
+        assert_eq!(router.crossings, vec![((1081, SHARED_EDGE_INSET), false)]);
+    }
+
+    #[test]
+    fn no_silence_while_a_game_holds_the_pointer_or_the_laptop_has_control() {
         let (cfg, mut d, _, mut log) = setup();
         let mut router = FakeRouter { blocked: true, ..Default::default() };
-        for ms in 2..=1700 {
-            d.track.moved(ms * MS, 1, 0);
-            d.push(&cfg, (1, 0), false, false, at(ms), &mut router, &mut log);
+        for ms in 2..=10_000 {
+            d.track.moved(ms * MS, 1, 1);
+            d.push(&cfg, (1, 1), false, false, at(ms), &mut router, &mut log);
+            if ms % 40 == 0 {
+                d.look(&cfg, false, at(ms), &mut router, &mut log);
+            }
         }
-        assert!(log.0.is_empty(), "pushes when crossing is off look at nothing");
-        d.look(&cfg, at(1700), &mut log);
-        assert_eq!(log.0, vec!["cursor_tracker Silent"]);
+        assert!(log.0.is_empty(), "{:?}", log.0);
+        assert!(!d.take_respawn());
+        assert!(router.crossings.is_empty());
+    }
+
+    #[test]
+    fn bursts_of_use_after_the_tracker_died_fall_back_each_time_and_three_start_it_again() {
+        let (cfg, mut d, mut router, mut log) = setup();
+        d.hear(&cfg, sample(3000, 2, 2, 3), false, at(3), &mut router, &mut log);
+        let mut t = 10;
+        let mut respawned = false;
+        for round in 0..3 {
+            // 200 ms of moving along the bottom, 400 ms of rest, then a push down.
+            for _ in 0..20 {
+                d.track.moved(t * MS, 1, 0);
+                d.push(&cfg, (1, 0), false, false, at(t), &mut router, &mut log);
+                t += 10;
+            }
+            t += 400;
+            d.arrived(0);
+            let crossings = router.crossings.len();
+            d.track.moved(t * MS, 0, 30);
+            d.push(&cfg, (0, 30), false, false, at(t), &mut router, &mut log);
+            d.push(&cfg, (0, 30), false, false, at(t + 1), &mut router, &mut log);
+            assert!(d.holding(), "round {round}: {:?}", log.0);
+            let held_at = t + 1;
+            while router.crossings.len() == crossings {
+                t += 40;
+                d.look(&cfg, false, at(t), &mut router, &mut log);
+            }
+            assert!(t - held_at <= HELD_SILENT_MS as i64 + 40, "round {round}: crossed {} ms after held", t - held_at);
+            respawned |= d.take_respawn();
+            assert_eq!(respawned, round == 2, "round {round}");
+        }
+        assert_eq!(log.0.iter().filter(|l| *l == "cursor_tracker Silent").count(), 1, "said once until it's back");
     }
 }

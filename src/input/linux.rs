@@ -13,7 +13,7 @@ use crate::protocol::{
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
 use super::debian_edge::{self, DebianEdge, LinkLog, Now};
-use crate::crossing::{taken_at, Respawn, Sample, SampleSlot, RESPAWN_GAP_MS};
+use crate::crossing::{taken_at, Sample, SampleSlot, RESPAWN_GAP_MS};
 use crate::spatial::{take_studio_requests, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -1191,6 +1191,13 @@ fn run_kwin_tracker(
     });
     let Ok(mut child) = child else { return false };
     control.monitor_pid.store(child.id() as i32, Ordering::SeqCst);
+    // A stop that came between the start and the pid being kept found no pid to end.
+    if control.stopping() {
+        control.monitor_pid.store(0, Ordering::SeqCst);
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
 
     std::thread::sleep(Duration::from_millis(80));
 
@@ -1557,6 +1564,14 @@ impl Core<'_> {
         self.after_routing(before);
     }
 
+    /// Decides a held push again as time passes: see `DebianEdge::look`.
+    fn look_at_edge(&mut self, cfg: &SpatialConfig) {
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.look(cfg, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
+    }
+
     /// Takes KWin's newest position, and decides a push that was waiting on it.
     fn hear_position(&mut self, cfg: &SpatialConfig, sample: Sample) {
         let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
@@ -1590,7 +1605,6 @@ pub fn run_debian_node(
     let kwin_game_active = Arc::new(AtomicBool::new(false));
     let tracker = Arc::new(TrackerControl::default());
     spawn_kwin_cursor_tracker(Arc::clone(&positions), Arc::clone(&kwin_game_active), Arc::clone(&tracker));
-    let mut respawn = Respawn::default();
 
     let (mice, keyboards) = discover_devices(explicit_mouse.as_deref());
     if mice.is_empty() {
@@ -1957,11 +1971,10 @@ pub fn run_debian_node(
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
             last_telemetry_sync = Instant::now();
-            // Silent for long while the mouse moves, as after KWin restarted: start it again. Looked
-            // at whether or not a crossing could happen, as with the laptop in control.
-            let now = core.now();
-            core.edge.look(&cfg_snapshot, now, &mut LinkLog);
-            if respawn.due(core.edge.track.silent_for_ms(now.us), now.ms) {
+            // A held push is decided again as time passes, so one waiting on a silent tracker gets
+            // across; found silent often, as after KWin restarted, the tracker starts again.
+            core.look_at_edge(&cfg_snapshot);
+            if core.edge.take_respawn() {
                 note_lost("silent");
                 // A game the old script saw is no game until the new one says so.
                 kwin_game_active.store(false, Ordering::Relaxed);

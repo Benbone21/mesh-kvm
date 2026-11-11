@@ -2751,7 +2751,7 @@ mod tests {
         let mut track = CursorTrack::new(0, (3200, 720));
         track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0, received_us: 0 });
         let decide = |edge: &EdgeWatch, track: &mut CursorTrack, now_us| {
-            let (here, _) = track.locate(now_us, monitors, edge.along_x());
+            let here = track.locate(now_us, monitors, edge.along_x());
             let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
             (here, judge(&here, edge.along_x(), spot))
         };
