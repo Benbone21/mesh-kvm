@@ -78,6 +78,10 @@ pub fn module_args(kind: Kind, peer: &str) -> Vec<String> {
     }
 }
 
+/// How long the devices stay after the link drops, so that a short drop doesn't send apps back to
+/// the real mic and speakers, where they often stay.
+pub const DROP_GRACE: Duration = Duration::from_secs(30);
+
 /// The name the devices should go by, while they should exist at all: paired and linked.
 pub fn wanted(paired: bool, online: bool, peer: Option<&str>) -> Option<String> {
     (paired && online).then(|| clean_name(peer.unwrap_or("")))
@@ -94,6 +98,8 @@ pub struct VirtualDevices {
     loaded: Option<Loaded>,
     failed_at: Option<Instant>,
     error: Option<String>,
+    /// When the link went while the devices were there.
+    dropped_at: Option<Instant>,
 }
 
 fn unload(ids: &[u32], run: &mut dyn FnMut(&[String]) -> Option<String>) {
@@ -103,6 +109,18 @@ fn unload(ids: &[u32], run: &mut dyn FnMut(&[String]) -> Option<String>) {
 }
 
 impl VirtualDevices {
+    /// What `step` should be given now. Like `wanted`, but devices already there stay for
+    /// `DROP_GRACE` after the link drops, under the other device's current name. Unpairing takes
+    /// them at once, and they are only ever made while linked.
+    pub fn wanted_now(&mut self, paired: bool, online: bool, peer: Option<&str>, now: Instant) -> Option<String> {
+        if !paired || online || self.loaded.is_none() {
+            self.dropped_at = None;
+            return wanted(paired, online, peer);
+        }
+        let dropped = *self.dropped_at.get_or_insert(now);
+        (now.duration_since(dropped) < DROP_GRACE).then(|| clean_name(peer.unwrap_or("")))
+    }
+
     /// Brings the devices in line with `wanted`. `run` runs `pactl` with these arguments and gives
     /// back what it printed, or None if it failed.
     pub fn step(&mut self, wanted: Option<String>, run: &mut dyn FnMut(&[String]) -> Option<String>) {
@@ -260,15 +278,22 @@ fn publish(state: Option<&VirtualDevices>) {
     *LAST_ERROR.lock().unwrap_or_else(PoisonError::into_inner) = state.and_then(VirtualDevices::error).map(String::from);
 }
 
-/// Runs one step of the service's devices, and publishes the result.
-fn step_service(wanted: Option<String>, graph: Option<(bool, bool)>) {
+/// What the devices are for: whether paired, whether linked, and the other device's name.
+type Link<'a> = (bool, bool, Option<&'a str>);
+
+/// Runs one step of the service's devices, and publishes the result. With no `link` they go.
+fn step_service(link: Option<Link>, graph: Option<(bool, bool)>) {
     let mut devices = DEVICES.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = devices.as_mut() else { return };
     if let Some((mic_there, speakers_there)) = graph {
         state.notice_graph(mic_there, speakers_there, &mut pactl);
     }
     let stopped = STOPPED.load(Ordering::SeqCst);
-    state.step(if stopped { None } else { wanted }, &mut pactl);
+    let wanted = match link {
+        Some((paired, online, peer)) if !stopped => state.wanted_now(paired, online, peer, Instant::now()),
+        _ => None,
+    };
+    state.step(wanted, &mut pactl);
     publish(Some(state));
     if stopped {
         *devices = None;
@@ -288,10 +313,11 @@ pub fn start() {
     }
 }
 
-/// On every look: the devices exist while paired and linked. `graph` says whether the mic and the
-/// speakers are in the sound server's graph, when it could be read.
+/// On every look: the devices exist while paired and linked, and for `DROP_GRACE` after a drop.
+/// `graph` says whether the mic and the speakers are in the sound server's graph, when it could be
+/// read.
 pub fn look(paired: bool, online: bool, peer: Option<&str>, graph: Option<(bool, bool)>) {
-    step_service(wanted(paired, online, peer), graph);
+    step_service(Some((paired, online, peer)), graph);
 }
 
 /// Whether `work`, run on a thread of its own, is done within `limit`. If not, it carries on alone.
@@ -455,6 +481,80 @@ mod tests {
         unloaded.sort();
         assert_eq!(unloaded, fake.ever_loaded, "every id loaded was unloaded, once");
         assert_eq!(fake.ever_loaded.len(), 8, "loaded four times, a rename included");
+    }
+
+    /// One look as the engine makes it, `at` seconds in.
+    fn look_at(devices: &mut VirtualDevices, fake: &mut FakePactl, start: Instant, at: f64, paired: bool, online: bool, peer: &str) {
+        let now = start + Duration::from_secs_f64(at);
+        let wanted = devices.wanted_now(paired, online, Some(peer), now);
+        devices.step_at(wanted, &mut |args| fake.run(args), now);
+    }
+
+    #[test]
+    fn a_short_drop_leaves_the_devices_alone() {
+        let (mut fake, mut devices, t) = (FakePactl::default(), VirtualDevices::default(), Instant::now());
+        look_at(&mut devices, &mut fake, t, 0.0, true, true, "Laptop");
+        let ids: Vec<u32> = fake.loaded.keys().copied().collect();
+        for at in [1.0, 1.5, 2.0] {
+            look_at(&mut devices, &mut fake, t, at, true, false, "Laptop");
+            assert_eq!(devices.present(), Some("Laptop"), "kept through the drop");
+        }
+        look_at(&mut devices, &mut fake, t, 2.1, true, true, "Laptop");
+        assert!(fake.unloaded.is_empty(), "nothing unloaded");
+        assert_eq!(fake.loads, 2, "nothing loaded again");
+        assert_eq!(fake.loaded.keys().copied().collect::<Vec<_>>(), ids, "the same modules");
+    }
+
+    #[test]
+    fn a_drop_past_the_grace_takes_the_devices_away() {
+        let (mut fake, mut devices, t) = (FakePactl::default(), VirtualDevices::default(), Instant::now());
+        look_at(&mut devices, &mut fake, t, 0.0, true, true, "Laptop");
+        look_at(&mut devices, &mut fake, t, 10.0, true, false, "Laptop");
+        look_at(&mut devices, &mut fake, t, 39.9, true, false, "Laptop");
+        assert_eq!(devices.present(), Some("Laptop"));
+        look_at(&mut devices, &mut fake, t, 41.0, true, false, "Laptop");
+        assert_eq!(devices.present(), None);
+        assert!(fake.loaded.is_empty());
+        look_at(&mut devices, &mut fake, t, 60.0, true, false, "Laptop");
+        assert_eq!(fake.loads, 2, "not made again while the link is down");
+        look_at(&mut devices, &mut fake, t, 61.0, true, true, "Laptop");
+        assert_eq!(devices.present(), Some("Laptop"), "made again once linked");
+    }
+
+    #[test]
+    fn each_drop_gets_a_grace_of_its_own() {
+        let (mut fake, mut devices, t) = (FakePactl::default(), VirtualDevices::default(), Instant::now());
+        look_at(&mut devices, &mut fake, t, 0.0, true, true, "Laptop");
+        look_at(&mut devices, &mut fake, t, 1.0, true, false, "Laptop");
+        look_at(&mut devices, &mut fake, t, 25.0, true, true, "Laptop");
+        look_at(&mut devices, &mut fake, t, 26.0, true, false, "Laptop");
+        look_at(&mut devices, &mut fake, t, 50.0, true, false, "Laptop");
+        assert_eq!(devices.present(), Some("Laptop"), "24 s into the second drop");
+        assert_eq!(fake.loads, 2);
+    }
+
+    #[test]
+    fn unpairing_or_never_linking_gets_no_grace() {
+        let (mut fake, mut devices, t) = (FakePactl::default(), VirtualDevices::default(), Instant::now());
+        look_at(&mut devices, &mut fake, t, 0.0, true, false, "Laptop");
+        assert_eq!(devices.present(), None, "only made once linked");
+        assert_eq!(fake.loads, 0);
+        look_at(&mut devices, &mut fake, t, 1.0, true, true, "Laptop");
+        look_at(&mut devices, &mut fake, t, 2.0, true, false, "Laptop");
+        look_at(&mut devices, &mut fake, t, 3.0, false, false, "Laptop");
+        assert_eq!(devices.present(), None, "unpaired: gone at once");
+        assert!(fake.loaded.is_empty());
+    }
+
+    #[test]
+    fn a_rename_during_the_grace_makes_them_again() {
+        let (mut fake, mut devices, t) = (FakePactl::default(), VirtualDevices::default(), Instant::now());
+        look_at(&mut devices, &mut fake, t, 0.0, true, true, "Laptop");
+        look_at(&mut devices, &mut fake, t, 1.0, true, false, "Laptop");
+        look_at(&mut devices, &mut fake, t, 2.0, true, false, "Renamed");
+        assert_eq!(devices.present(), Some("Renamed"));
+        assert_eq!(fake.loaded.len(), 2);
+        assert_eq!(fake.loads, 4);
     }
 
     #[test]
