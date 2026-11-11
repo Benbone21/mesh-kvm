@@ -1329,12 +1329,21 @@ fn apply_layout_action(state: &Arc<RwLock<SharedSpatialState>>, platform: &dyn P
     }
 }
 
+/// Layouts other modules' tests use.
+#[cfg(test)]
+pub mod test_layouts {
+    /// The owner's layout as it was saved: the laptop 5 px off DP-2.
+    pub fn real() -> super::SpatialConfig {
+        super::parse_layout(super::tests::OLD_LAYOUT).unwrap().config
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crossing::SETTLE_CLEAR;
 
-    const OLD_LAYOUT: &str = r#"{
+    pub(crate) const OLD_LAYOUT: &str = r#"{
         "debian_monitors": [
             {"name": "DP-3 (240Hz Native)", "x": 0, "y": 360, "w": 1920, "h": 1080},
             {"name": "DP-2 (360Hz Native)", "x": 1920, "y": 0, "w": 2560, "h": 1440}

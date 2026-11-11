@@ -12,11 +12,9 @@ use crate::protocol::{
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
-use crate::crossing::{
-    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Respawn, Sample, SampleSlot, Spot,
-    TrackerNews, RESPAWN_GAP_MS,
-};
-use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
+use super::debian_edge::{self, DebianEdge, LinkLog, Now};
+use crate::crossing::{taken_at, Respawn, Sample, SampleSlot, RESPAWN_GAP_MS};
+use crate::spatial::{take_studio_requests, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -1031,10 +1029,22 @@ fn wall_ms() -> i64 {
 #[derive(Default)]
 struct TrackerControl {
     restart: AtomicBool,
+    /// The service is stopping: the tracker mustn't start again behind the script's unload.
+    stopping: AtomicBool,
     monitor_pid: std::sync::atomic::AtomicI32,
 }
 
 impl TrackerControl {
+    /// Ends dbus-monitor for good, as the service stops.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.restart();
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || crate::settings::restart_requested()
+    }
+
     fn restart(&self) {
         self.restart.store(true, Ordering::SeqCst);
         let pid = self.monitor_pid.load(Ordering::SeqCst);
@@ -1043,6 +1053,19 @@ impl TrackerControl {
                 libc::kill(pid, libc::SIGTERM);
             }
         }
+    }
+}
+
+/// How long a call to KWin may take. A KWin that hangs mustn't hold up the tracker for good.
+const QDBUS_LIMIT: Duration = Duration::from_secs(3);
+
+/// Calls KWin through qdbus6, for at most `QDBUS_LIMIT`. Its output, if it finished.
+fn qdbus(args: &[&str]) -> Option<String> {
+    let mut command = Command::new("qdbus6");
+    command.args(args);
+    match crate::platform::limited::run_limited(command, QDBUS_LIMIT, crate::platform::limited::OnExpiry::Kill) {
+        crate::platform::limited::Ran::Finished(out) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
     }
 }
 
@@ -1062,14 +1085,22 @@ fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<A
             let mut last_start: Option<Instant> = None;
             let mut said_exit = false;
             loop {
-                if let Some(started) = last_start {
-                    std::thread::sleep(Duration::from_millis(RESPAWN_GAP_MS).saturating_sub(started.elapsed()));
+                // Waits out the gap since the last start, looking for the service stopping meanwhile.
+                while last_start.is_some_and(|started| started.elapsed() < Duration::from_millis(RESPAWN_GAP_MS))
+                    && !control.stopping()
+                {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                if control.stopping() {
                     return;
                 }
                 last_start = Some(Instant::now());
                 let heard = run_kwin_tracker(&positions, &kwin_game_active, &control, &mut said_bad_stamp);
+                // A game the script saw is no game once it has gone, until a new one says so.
+                kwin_game_active.store(false, Ordering::Relaxed);
+                if control.stopping() {
+                    return;
+                }
                 let asked = control.restart.swap(false, Ordering::SeqCst);
                 // Asked for, the input loop said why. A dbus-monitor that never works is said once.
                 if !asked && (heard || !said_exit) {
@@ -1110,17 +1141,17 @@ fn run_kwin_tracker(
 
     std::thread::sleep(Duration::from_millis(80));
 
-    let _ = Command::new("qdbus6")
-        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"])
-        .output();
-    if let Ok(out) = Command::new("qdbus6")
-        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script_path, "mesh_kvm_cursor_watch"])
-        .output()
-    {
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let _ = Command::new("qdbus6")
-            .args(["org.kde.KWin", &format!("/Scripting/Script{}", id), "org.kde.kwin.Script.run"])
-            .output();
+    // The service may have stopped meanwhile, and unloaded the script: it mustn't come back.
+    if !control.stopping() {
+        qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
+        let loaded = qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script_path, "mesh_kvm_cursor_watch"]);
+        if let Some(id) = loaded {
+            qdbus(&["org.kde.KWin", &format!("/Scripting/Script{}", id.trim()), "org.kde.kwin.Script.run"]);
+        }
+        // Stopped while loading it: take it away again, whichever unload came first.
+        if control.stopping() {
+            qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
+        }
     }
 
     let mut heard = false;
@@ -1227,8 +1258,8 @@ struct LinuxBackend {
     keyboards: Vec<EvdevDevice>,
     block_mice: bool,
     block_keyboards: bool,
-    /// Where the Debian cursor is, from KWin's positions and the movement since.
-    track: CursorTrack,
+    /// The last warp, for the cursor's track: when, and to where.
+    warped: Option<(i64, i32, i32)>,
     /// What the router has forwarded and not released, as of the last read of the devices.
     forwarded: HeldInput,
     grab_ops: Arc<dyn GrabOps<EvdevHandle>>,
@@ -1355,7 +1386,7 @@ impl InputBackend for LinuxBackend {
     fn warp_cursor(&mut self, x: i32, y: i32) {
         self.vmouse.warp_abs(x, y);
         // Where KWin really put it comes with its next position.
-        self.track.warped(mono_us(), x, y);
+        self.warped = Some((mono_us(), x, y));
     }
 
     fn release_held(&mut self) {
@@ -1414,10 +1445,27 @@ struct Core<'a> {
     router: Router,
     backend: LinuxBackend,
     peer: UdpPeer<'a>,
-    edge: EdgeWatch,
-    /// A push that completed and waits for a position to confirm it.
-    holding: Option<Held>,
-    refusals: RefusalLog,
+    /// The shared edge: the push, where the cursor is, and a push held for a better position.
+    edge: DebianEdge,
+}
+
+/// The router and what its actions touch, as the edge's decision sees them.
+struct Io<'x, 'a> {
+    router: &'x mut Router,
+    backend: &'x mut LinuxBackend,
+    peer: &'x mut UdpPeer<'a>,
+}
+
+impl debian_edge::Router for Io<'_, '_> {
+    fn may_cross(&self) -> bool {
+        self.router.online() && !self.router.panicked() && !self.router.captive() && self.router.active() == DEBIAN
+    }
+
+    fn cross(&mut self, (x, y): (i32, i32), from_peer: bool) -> bool {
+        let actions = self.router.handle(Event::EdgeCrossed { x, y, from_peer }).actions;
+        apply(&actions, self.backend, self.peer);
+        actions.iter().any(|a| matches!(a, Action::SendFocus { .. }))
+    }
 }
 
 impl Core<'_> {
@@ -1426,103 +1474,43 @@ impl Core<'_> {
         let before = self.router.active();
         let actions = self.router.handle(event).actions;
         apply(&actions, &mut self.backend, &mut self.peer);
-        let after = self.router.active();
-        if after != before {
-            self.edge.arrived(self.peer.now_ms());
-            self.holding = None;
-            let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
-            println!("[Debian] Focus switched to {name}");
-        }
+        self.after_routing(before);
         actions
     }
 
+    /// Passes a warp on to the cursor's track, and starts the settle when control changed hands.
+    fn after_routing(&mut self, before: DeviceId) {
+        if let Some((at, x, y)) = self.backend.warped.take() {
+            self.edge.track.warped(at, x, y);
+        }
+        let after = self.router.active();
+        if after != before {
+            self.edge.arrived(self.peer.now_ms());
+            let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
+            println!("[Debian] Focus switched to {name}");
+        }
+    }
+
+    fn now(&self) -> Now {
+        Now { us: mono_us(), ms: self.peer.now_ms() }
+    }
+
     /// Counts movement of the Debian cursor by `(dx, dy)` against the shared edge, from either
-    /// device's mouse, and crosses to the laptop when the push completes on a position that can be
-    /// trusted. Otherwise the push waits, complete, for the next position or movement.
+    /// device's mouse: see `DebianEdge::push`.
     fn push_edge(&mut self, cfg: &SpatialConfig, dx: i32, dy: i32, from_peer: bool) {
-        let can_cross = self.router.online()
-            && !self.router.panicked()
-            && !self.router.captive()
-            && self.router.active() == DEBIAN;
-        if !can_cross {
-            self.holding = None;
-            return;
-        }
-        let monitors = cfg.monitors(NodeId::Debian);
-        let (here, news) = self.backend.track.locate(mono_us(), monitors, self.edge.along_x());
-        if let Some(news) = news {
-            note_tracker(news, here.age_ms);
-        }
-        let held = self.backend.any_button_held();
-        let now_ms = self.peer.now_ms();
-        if !self.edge.press(monitors, here.sample, (dx, dy), held) {
-            self.holding = None;
-            self.refusals.cleared();
-            return;
-        }
-        if self.edge.too_soon(now_ms) {
-            self.holding = None;
-            if let Some(line) = self.refusals.refused(Refusal::Settle, now_ms) {
-                record_refusal(line);
-            }
-            self.refusals.cleared();
-            return;
-        }
-        let edge = &self.edge;
-        let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
-        match judge(&here, edge.along_x(), spot) {
-            Gate::Cross { at } => {
-                self.edge.clear();
-                self.refusals.cleared();
-                let held_ms = self.holding.take().map_or(0, |h| now_ms.saturating_sub(h.since_ms));
-                let settle_left_ms = self.edge.settle_full_left_ms(now_ms);
-                let entry = cfg.entry_on_peer(NodeId::Debian, at.0, at.1);
-                let actions = self.route(Event::EdgeCrossed { x: entry.0, y: entry.1, from_peer });
-                if actions.iter().any(|a| matches!(a, Action::SendFocus { .. })) {
-                    let est = here.moved;
-                    CrossLine { to_laptop: true, at, entry, sample_age_ms: here.age_ms, est, held_ms, settle_left_ms }.record();
-                }
-            }
-            Gate::Hold(reason) => {
-                if self.holding.is_none() {
-                    self.holding = Some(Held { from_peer, since_ms: now_ms });
-                }
-                if let Some(line) = self.refusals.refused(reason, now_ms) {
-                    record_refusal(line);
-                }
-            }
-        }
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.push(cfg, (dx, dy), from_peer, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
     }
 
     /// Takes KWin's newest position, and decides a push that was waiting on it.
     fn hear_position(&mut self, cfg: &SpatialConfig, sample: Sample) {
-        if !self.backend.track.is_new(&sample) {
-            return;
-        }
-        if let Some(news) = self.backend.track.heard(sample) {
-            note_tracker(news, 0);
-        }
-        if let Some(held) = self.holding {
-            self.push_edge(cfg, 0, 0, held.from_peer);
-        }
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.hear(cfg, sample, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
     }
-}
-
-/// A completed push waiting on a position it can trust.
-#[derive(Clone, Copy)]
-struct Held {
-    from_peer: bool,
-    since_ms: u64,
-}
-
-/// Says in the link log that KWin's positions stopped coming, or came back.
-fn note_tracker(news: TrackerNews, age_ms: u64) {
-    let details = crate::linklog::Details::new();
-    let details = match news {
-        TrackerNews::Silent => details.text("state", "silent").num("last_position_ms", age_ms),
-        TrackerNews::Back => details.text("state", "back"),
-    };
-    crate::linklog::record("cursor_tracker", details);
 }
 
 pub fn run_debian_node(
@@ -1597,7 +1585,7 @@ pub fn run_debian_node(
             keyboards,
             block_mice: false,
             block_keyboards: false,
-            track: CursorTrack::new(mono_us(), (3200, 720)),
+            warped: None,
             forwarded: HeldInput::default(),
             grab_ops: Arc::new(EvdevGrab),
         },
@@ -1608,9 +1596,7 @@ pub fn run_debian_node(
             motion: MotionBatch::default(),
             clock,
         },
-        edge: EdgeWatch::new(),
-        holding: None,
-        refusals: RefusalLog::new(),
+        edge: DebianEdge::new(mono_us(), (3200, 720)),
     };
 
     let mut hotkeys = HotkeyFilter::default();
@@ -1645,14 +1631,9 @@ pub fn run_debian_node(
             core.backend.finish_releases(Duration::from_secs(1));
             core.backend.release_held();
             crate::mute::shutdown();
-            let _ = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.unloadScript",
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output();
+            // dbus-monitor first, so that the tracker can't load the script again behind this.
+            tracker.stop();
+            qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
             break Ok(());
         }
 
@@ -1718,7 +1699,7 @@ pub fn run_debian_node(
                 Payload::MouseMoveDelta { dx, dy } => {
                     let actions = core.route(Event::PeerMove { dx, dy });
                     if actions.iter().any(|a| matches!(a, Action::InjectMove { .. })) {
-                        core.backend.track.moved(mono_us(), dx, dy);
+                        core.edge.track.moved(mono_us(), dx, dy);
                         core.push_edge(&cfg_snapshot, dx, dy, true);
                     }
                 }
@@ -1743,7 +1724,7 @@ pub fn run_debian_node(
                     crate::spatial::note_peer_displays(&spatial_state, &name, monitors);
                 }
                 Payload::EdgeMap { edge, start, end, resistance } => {
-                    core.edge.set_span(EdgeSpan { edge, start, end }, resistance);
+                    core.edge.edge.set_span(EdgeSpan { edge, start, end }, resistance);
                 }
                 Payload::GameLock { locked } => {
                     core.route(Event::PeerGameLock(locked));
@@ -1887,7 +1868,7 @@ pub fn run_debian_node(
                                 // Movement the laptop got didn't move this cursor.
                                 if !forwarded {
                                     let at = motion_time_us(core.backend.mice[i].clock, event_time_us(ev), mono_us());
-                                    core.backend.track.moved(at, acc_dx, acc_dy);
+                                    core.edge.track.moved(at, acc_dx, acc_dy);
                                 }
                                 core.push_edge(&cfg_snapshot, acc_dx, acc_dy, false);
                                 acc_dx = 0;
@@ -1923,9 +1904,14 @@ pub fn run_debian_node(
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
             last_telemetry_sync = Instant::now();
-            // Silent for long while the mouse moves, as after KWin restarted: start it again.
-            if respawn.due(core.backend.track.silent_for_ms(mono_us()), now_ms()) {
+            // Silent for long while the mouse moves, as after KWin restarted: start it again. Looked
+            // at whether or not a crossing could happen, as with the laptop in control.
+            let now = core.now();
+            core.edge.look(&cfg_snapshot, now, &mut LinkLog);
+            if respawn.due(core.edge.track.silent_for_ms(now.us), now.ms) {
                 note_lost("silent");
+                // A game the old script saw is no game until the new one says so.
+                kwin_game_active.store(false, Ordering::Relaxed);
                 tracker.restart();
             }
             if let Ok(mut guard) = spatial_state.write() {
@@ -1935,7 +1921,7 @@ pub fn run_debian_node(
                     "Debian".to_string()
                 };
                 guard.telemetry.panic_mode = core.router.panicked();
-                (guard.telemetry.cursor_x, guard.telemetry.cursor_y) = core.backend.track.shown();
+                (guard.telemetry.cursor_x, guard.telemetry.cursor_y) = core.edge.track.shown();
                 guard.telemetry.game_captive_active = is_game_captive;
                 guard.telemetry.game_reason = if cfg_snapshot.manual_game_lock {
                     "Manual Lock (Ctrl+Alt+G)".to_string()
@@ -1954,7 +1940,7 @@ pub fn run_debian_node(
 
         // Heartbeat, with what the other device needs to check its own edges (every 400ms)
         if heartbeat.due(now_ms()) {
-            core.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
+            core.edge.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);
             }
