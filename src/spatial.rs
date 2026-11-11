@@ -699,28 +699,66 @@ impl EdgeWatch {
         self.tracker.push(span, 0, 0, 1, 1, 0, 0, true);
     }
 
-    /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge.
+    /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge. The
+    /// count then starts again. The laptop's cursor position is never late, so it decides at once.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn push(&mut self, monitors: &[MonitorRect], at: (i32, i32), delta: (i32, i32), buttons_held: bool) -> bool {
+        let done = self.press(monitors, at, delta, buttons_held);
+        if done {
+            self.tracker.clear();
+        }
+        done
+    }
+
+    /// As `push`, but a completed push stays complete until `clear`, as long as the cursor stays
+    /// on the span and doesn't move in: it can wait there for a newer position to confirm it.
     ///
     /// The tracker works on one rectangle, so it is given the monitor under the cursor, and a
     /// point that isn't on an outer edge of the desktop doesn't count: the cursor there just
     /// carries on to the next monitor.
-    pub fn push(&mut self, monitors: &[MonitorRect], (x, y): (i32, i32), (dx, dy): (i32, i32), buttons_held: bool) -> bool {
+    pub fn press(&mut self, monitors: &[MonitorRect], (x, y): (i32, i32), (dx, dy): (i32, i32), buttons_held: bool) -> bool {
         let Some(span) = self.span else { return false };
-        let beyond = match span.edge {
-            SwitchEdge::Left => (x - 1, y),
-            SwitchEdge::Right => (x + 1, y),
-            SwitchEdge::Top => (x, y - 1),
-            SwitchEdge::Bottom => (x, y + 1),
-        };
-        let monitor = monitors.iter().find(|m| contains(m, (x, y)));
-        let (Some(m), false) = (monitor, monitors.iter().any(|m| contains(m, beyond))) else {
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else {
             self.reset();
             return false;
         };
         let shift = if matches!(span.edge, SwitchEdge::Top | SwitchEdge::Bottom) { m.x } else { m.y };
         let local = EdgeSpan { edge: span.edge, start: span.start - shift, end: span.end - shift };
-        self.tracker.push(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
+        self.tracker.press(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
     }
+
+    /// Starts the count again, as after a crossing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn clear(&mut self) {
+        self.tracker.clear();
+    }
+
+    /// True if `(x, y)` is on the shared edge's span: on the outer edge of a monitor, alongside the
+    /// other device.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn on_span(&self, monitors: &[MonitorRect], (x, y): (i32, i32)) -> bool {
+        let Some(span) = self.span else { return false };
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else { return false };
+        let (on_edge, along) = match span.edge {
+            SwitchEdge::Left => (x == m.x, y),
+            SwitchEdge::Right => (x == m.x + m.w - 1, y),
+            SwitchEdge::Top => (y == m.y, x),
+            SwitchEdge::Bottom => (y == m.y + m.h - 1, x),
+        };
+        on_edge && (span.start..=span.end).contains(&along)
+    }
+}
+
+/// The monitor under `(x, y)`, if the point is on the outer edge of the desktop facing `edge`.
+fn outer_monitor(monitors: &[MonitorRect], edge: SwitchEdge, (x, y): (i32, i32)) -> Option<&MonitorRect> {
+    let beyond = match edge {
+        SwitchEdge::Left => (x - 1, y),
+        SwitchEdge::Right => (x + 1, y),
+        SwitchEdge::Top => (x, y - 1),
+        SwitchEdge::Bottom => (x, y + 1),
+    };
+    let monitor = monitors.iter().find(|m| contains(m, (x, y)))?;
+    (!monitors.iter().any(|m| contains(m, beyond))).then_some(monitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2312,6 +2350,42 @@ mod tests {
         edge.push(monitors, (2340, 1439), (0, 30), false);
         assert!(!edge.push(monitors, (100, 100), (0, 30), false));
         assert!(!edge.push(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn a_completed_push_is_held_until_it_crosses_or_leaves_the_edge() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+        assert!(edge.press(monitors, (2340, 1439), (0, 30), false));
+        // Waiting on a newer position, it stays complete, with or without more push.
+        assert!(edge.press(monitors, (2340, 1439), (0, 0), false));
+        assert!(edge.press(monitors, (2350, 1439), (10, 0), false));
+        // Crossing starts the count again.
+        edge.clear();
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+        // And so does leaving the edge.
+        assert!(edge.press(monitors, (2340, 1439), (0, 30), false));
+        assert!(!edge.press(monitors, (2340, 1400), (0, -5), false));
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn a_point_is_on_the_span_only_on_the_outer_edge_beside_the_other_device() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(edge.on_span(monitors, (2340, 1439)));
+        assert!(edge.on_span(monitors, (2240, 1439)) && edge.on_span(monitors, (4159, 1439)));
+        assert!(!edge.on_span(monitors, (2239, 1439)), "the bottom of DP-2 beside the laptop only");
+        assert!(!edge.on_span(monitors, (500, 1439)), "DP-3 leads nowhere");
+        assert!(!edge.on_span(monitors, (2340, 1438)));
+        assert!(!EdgeWatch::new().on_span(monitors, (2340, 1439)), "nothing to cross to yet");
+        let c = layout(TouchSide::Right, 4480, 360);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(!edge.on_span(c.monitors(NodeId::Debian), (1919, 700)), "between two of its own monitors");
+        assert!(edge.on_span(c.monitors(NodeId::Debian), (4479, 700)));
     }
 
     #[test]

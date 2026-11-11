@@ -171,6 +171,7 @@ Each device keeps a record of what the link did, so that a drop can be looked in
 - `asleep` when the device slept, and on Windows `suspend` and `resume`.
 - `wifi_mode` on Windows when Low-latency Wi-Fi changes the Wi-Fi: `streaming=on ifaces=1 bgscan=off`, `streaming=off reason=link_down`, `reason=setting` or `reason=stop`, or `streaming=unavailable error="…"` when it can't, as with no Wi-Fi, Ethernet only or the WLAN service off. `bgscan=on` means background scans couldn't be paused, though streaming mode is on.
 - `qos` when the marking of a socket that sends input or sound changes (`socket=input`, `audio_tx`, `audio_rx`), with how its packets are marked, such as `dscp=46 applied=ip_tos` on Debian or `dscp=56 applied=qwave traffic=voice dest=… flow=1` on Windows, `applied=none error="…"` when they can't be (tried again after a network change, a wake and every minute, and logged again only for a new error), and `applied=off reason=setting` with the setting off. On Windows the listening audio socket says it once sound arrives, as qWAVE needs to know where its replies go.
+- `cursor_tracker state=silent last_position_ms=…` on Debian when KWin's positions stopped coming while the mouse moved, so crossings go by the last one, and `cursor_tracker state=back` when they come again.
 - `peer_addr`, and `start`, `restarting`, `restart_failed` and `stop`. A `start` with no `stop` or `restarting` before it means the service was killed.
 
 Both directions going at once with the Wi-Fi changing points to the network. A `one_way` points to a firewall or one side, a `stall` to this device being too busy, and an `asleep` or `roam` just before a `down` explains it. `mesh-kvm --link-log` prints the last 500 lines of this device's log, then the other device's, and says so if either can't be reached. The app's API serves them at `/api/local/linklog?lines=N`, up to 2000, including what the service before a restart wrote.
@@ -184,6 +185,12 @@ Drag any screen in the layout to arrange the devices. The whole device moves tog
 An arrangement you change on either device is saved there and passed to the other one. If the other device is away, your change is kept and reaches it when it comes back. Changes to different things on the two devices are both kept, such as moving a device on one and changing the push needed to cross on the other. If both devices changed the same thing, the newer change wins, and on a tie the second device's does.
 
 The layout is saved as `layout.json` beside the settings: `~/.config/mesh-kvm` on Debian and `%LOCALAPPDATA%\mesh-kvm` on Windows. Pointer speed and the game lock settings belong to each device and aren't shared.
+
+### Crossing
+
+Push the pointer against the bright edge and it crosses once it has pushed as far as the push needed to cross, in mouse counts. A button held down stops it, so a drag never carries a window across.
+
+On Debian, where the pointer is comes from a small KWin script, through D-Bus, a moment after the pointer got there. Each position carries a number and the time KWin took it, only the newest is kept, and the script sends at most one every 2 ms, always the latest, so nothing queues behind a fast mouse. The mouse movement since that position is added on to estimate where the pointer is now. A push crosses only on a position younger than 30 ms, or one that nothing has moved since, as when you push straight against the edge, and only with both the position and the estimate on the bright edge. Otherwise it waits for the next position, which comes within a few milliseconds of any movement, so a real crossing is late by one position at most and a late one can't carry the pointer across from a screen beside the bright edge. The pointer lands on the other device where the estimate says it was along the edge. After the pointer comes back to Debian, nothing counts until KWin says where it really is. If KWin's positions stop coming while the mouse moves, Debian goes by the last one, as before, and the link log says so.
 
 ## Resolution and refresh rate
 
