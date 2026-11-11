@@ -43,12 +43,17 @@ pub trait Marker {
     /// Marks the socket's packets. Gives back what was done, for the log, and a token for undoing it.
     fn mark(&mut self, target: &Target) -> Result<(Pairs, u32), String>;
     fn unmark(&mut self, target: &Target, token: u32);
+    /// Goes up whenever the marker starts over, as qWAVE does with a new handle: marks made
+    /// before then are gone, and their tokens mean nothing to it now.
+    fn generation(&self) -> u32 {
+        0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Unmarked,
-    Marked { dest: Option<SocketAddr>, token: u32 },
+    Marked { dest: Option<SocketAddr>, token: u32, generation: u32 },
     Failed { dest: Option<SocketAddr> },
 }
 
@@ -72,6 +77,10 @@ impl Entry {
     /// `retry` tries a failed mark again: marking can fail until the Wi-Fi is up, as at login.
     pub fn sync(&mut self, on: bool, retry: bool, marker: &mut dyn Marker) -> Option<Pairs> {
         let name = ("socket", self.target.name.to_string());
+        // A mark from before the marker started over is gone, and isn't undone with its old token.
+        if matches!(self.state, State::Marked { generation, .. } if generation != marker.generation()) {
+            self.state = State::Unmarked;
+        }
         if !on {
             let was_marked = matches!(self.state, State::Marked { .. });
             if let State::Marked { token, .. } = self.state {
@@ -98,7 +107,7 @@ impl Entry {
         self.said = true;
         match marker.mark(&self.target) {
             Ok((what, token)) => {
-                self.state = State::Marked { dest, token };
+                self.state = State::Marked { dest, token, generation: marker.generation() };
                 self.last_error = None;
                 let mut pairs = vec![name];
                 pairs.extend(what);
@@ -225,6 +234,7 @@ mod tests {
         fail: Option<String>,
         marks: Vec<Option<SocketAddr>>,
         unmarks: Vec<u32>,
+        generation: u32,
     }
 
     impl Marker for FakeMarker {
@@ -240,6 +250,9 @@ mod tests {
         }
         fn unmark(&mut self, _target: &Target, token: u32) {
             self.unmarks.push(token);
+        }
+        fn generation(&self) -> u32 {
+            self.generation
         }
     }
 
@@ -269,6 +282,39 @@ mod tests {
         assert_eq!(text(e.sync(false, false, &mut m)).as_deref(), Some("socket=input applied=off reason=setting"));
         assert_eq!(e.sync(false, false, &mut m), None);
         assert!(m.marks.is_empty() && m.unmarks.is_empty());
+    }
+
+    #[test]
+    fn a_new_handle_has_every_socket_added_again_once_without_undoing_stale_flows() {
+        let mut m = FakeMarker { needs_dest: true, ..Default::default() };
+        let dest: SocketAddr = "192.168.8.241:24850".parse().unwrap();
+        let mut sockets: Vec<Entry> = ["input", "audio_tx", "audio_rx"]
+            .into_iter()
+            .map(|name| Entry::new(Target { name, class: Class::Input, raw: 3, dest: Some(dest) }))
+            .collect();
+        for e in &mut sockets {
+            assert!(e.sync(true, false, &mut m).is_some());
+        }
+        assert_eq!(m.marks.len(), 3);
+        // One socket's add hit ERROR_DEVICE_REINITIALIZATION_NEEDED and the handle was made again.
+        m.generation += 1;
+        for e in &mut sockets {
+            assert!(e.sync(true, false, &mut m).is_some(), "added again under the new handle");
+        }
+        assert_eq!(m.marks.len(), 6);
+        for e in &mut sockets {
+            assert_eq!(e.sync(true, false, &mut m), None, "once");
+        }
+        assert_eq!(m.marks.len(), 6);
+        assert!(m.unmarks.is_empty(), "no stale token goes to the new handle");
+        // Off after a restart over: nothing stale is undone either.
+        m.generation += 1;
+        sockets[0].sync(false, false, &mut m);
+        assert!(m.unmarks.is_empty());
+        // A current mark is undone as usual.
+        sockets[1].sync(true, false, &mut m);
+        sockets[1].sync(false, false, &mut m);
+        assert_eq!(m.unmarks.len(), 1);
     }
 
     #[test]

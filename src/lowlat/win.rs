@@ -261,6 +261,8 @@ impl RawAddr {
 /// One qWAVE handle for the service, and a non-adaptive flow per socket and destination.
 pub struct QwaveMarker {
     handle: HANDLE,
+    /// How many handles have been made: flows from an older one are gone.
+    generation: u32,
 }
 
 // SAFETY: as for `NativeWifi`.
@@ -268,7 +270,7 @@ unsafe impl Send for QwaveMarker {}
 
 impl QwaveMarker {
     pub fn new() -> QwaveMarker {
-        QwaveMarker { handle: null_mut() }
+        QwaveMarker { handle: null_mut(), generation: 0 }
     }
 
     fn handle(&mut self, api: &QosApi) -> Result<HANDLE, String> {
@@ -281,6 +283,7 @@ impl QwaveMarker {
                 return Err(last_error("QOSCreateHandle"));
             }
             self.handle = handle;
+            self.generation += 1;
         }
         Ok(self.handle)
     }
@@ -327,6 +330,10 @@ impl Marker for QwaveMarker {
             ("flow", flow.to_string()),
         ];
         Ok((pairs, flow))
+    }
+
+    fn generation(&self) -> u32 {
+        self.generation
     }
 
     fn unmark(&mut self, target: &Target, token: u32) {
