@@ -4,6 +4,7 @@ use crate::keymap::{
     KEY_F11, KEY_F12, KEY_G, KEY_LEFTALT, KEY_LEFTCTRL, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_SCROLLLOCK,
 };
 use super::link::{press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
+use super::grab::{hand_back_press, wait_for_releases, GrabNews, GrabOps, GrabSlot};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::protocol::{
     HeldInput, NodeId, Packet, Payload, PressEvent, MAX_DATAGRAM, MOUSE_BTN_EXTRA, MOUSE_BTN_LEFT,
@@ -17,6 +18,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -59,6 +61,7 @@ const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
 
 // evdev ioctl constants (x86_64 Linux)
 const EVIOCGRAB: libc::c_ulong = 0x40044590;
+const EVIOCSCLOCKID: libc::c_ulong = 0x400445a0;
 
 #[inline]
 const fn eviocgname(len: usize) -> libc::c_ulong {
@@ -552,12 +555,54 @@ fn test_bit(bits: &[u8], bit: usize) -> bool {
 pub struct EvdevDevice {
     pub path: String,
     pub name: String,
-    pub fd: RawFd,
-    pub grabbed: bool,
+    /// Shared with a release under way on its own thread, so it stays open until that's done.
+    fd: Arc<OwnedFd>,
+    /// The clock the kernel stamps this device's events with.
+    clock: libc::clockid_t,
     /// Keys and buttons physically down on this device.
     pub held: HashSet<u16>,
-    /// The last `EVIOCGRAB` failed and was logged; sync retries it every loop.
-    pub grab_failed: bool,
+    grab: GrabSlot,
+    /// Keys and buttons put on the desktop through the virtual devices while focus came back.
+    handed_back: HashSet<u16>,
+}
+
+/// An evdev device as a release thread needs it.
+#[derive(Clone)]
+struct EvdevHandle {
+    fd: Arc<OwnedFd>,
+    clock: libc::clockid_t,
+}
+
+/// The real `EVIOCGRAB`.
+struct EvdevGrab;
+
+fn clock_now_us(clock: libc::clockid_t) -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
+}
+
+fn event_time_us(ev: &InputEvent) -> i64 {
+    ev.tv_sec as i64 * 1_000_000 + ev.tv_usec as i64
+}
+
+fn evdev_grab(fd: RawFd, enable: bool) -> std::io::Result<()> {
+    let arg: libc::c_int = enable as libc::c_int;
+    if unsafe { libc::ioctl(fd, EVIOCGRAB, arg) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+impl GrabOps<EvdevHandle> for EvdevGrab {
+    fn grab(&self, device: &EvdevHandle) -> std::io::Result<()> {
+        evdev_grab(device.fd.as_raw_fd(), true)
+    }
+    fn release(&self, device: &EvdevHandle, started: &dyn Fn(i64)) -> std::io::Result<()> {
+        started(clock_now_us(device.clock));
+        evdev_grab(device.fd.as_raw_fd(), false)
+    }
 }
 
 /// Updates `held` from one event read off a device.
@@ -602,7 +647,7 @@ impl EvdevDevice {
     fn read_events(&self, buf: &mut [InputEvent]) -> usize {
         let n = unsafe {
             libc::read(
-                self.fd,
+                self.fd.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 std::mem::size_of_val(buf),
             )
@@ -610,41 +655,72 @@ impl EvdevDevice {
         n.max(0) as usize / std::mem::size_of::<InputEvent>()
     }
 
-    pub fn set_grab(&mut self, enable: bool) {
-        if self.grabbed == enable {
-            return;
+    /// Takes over a freshly opened evdev fd. Its events are stamped on the monotonic clock if the
+    /// kernel allows, so a clock change can't confuse which came before a release.
+    fn new(path: String, name: String, fd: RawFd) -> EvdevDevice {
+        let monotonic: libc::c_int = libc::CLOCK_MONOTONIC;
+        let clock = if unsafe { libc::ioctl(fd, EVIOCSCLOCKID, &monotonic) } == 0 {
+            libc::CLOCK_MONOTONIC
+        } else {
+            libc::CLOCK_REALTIME
+        };
+        EvdevDevice {
+            path,
+            name,
+            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
+            clock,
+            held: HashSet::new(),
+            grab: GrabSlot::default(),
+            handed_back: HashSet::new(),
         }
-        let arg: libc::c_int = if enable { 1 } else { 0 };
-        let res = unsafe { libc::ioctl(self.fd, EVIOCGRAB, arg) };
-        if res == 0 {
-            self.grabbed = enable;
-            self.grab_failed = false;
-            println!(
+    }
+
+    fn handle(&self) -> EvdevHandle {
+        EvdevHandle { fd: Arc::clone(&self.fd), clock: self.clock }
+    }
+
+    /// Grabbed and staying so: what it reads goes to this process alone.
+    pub fn grabbed(&self) -> bool {
+        self.grab.held()
+    }
+
+    /// Whether an event read off the device reached this process alone, as the desktop won't see
+    /// it, and should get it if it was meant for here.
+    fn only_here(&self, ev: &InputEvent) -> bool {
+        self.grab.delivered_only_here(event_time_us(ev))
+    }
+
+    fn log(&self, news: GrabNews) {
+        match news {
+            GrabNews::Enabled | GrabNews::Released => println!(
                 "[Debian] EVIOCGRAB {} on '{}' ({})",
-                if enable { "ENABLED" } else { "RELEASED" },
+                if news == GrabNews::Enabled { "ENABLED" } else { "RELEASED" },
                 self.name,
                 self.path
-            );
-        } else if !self.grab_failed {
-            self.grab_failed = true;
-            eprintln!(
+            ),
+            GrabNews::Failed { grab, error } => eprintln!(
                 "[Debian] EVIOCGRAB {} failed on '{}' ({}): {}",
-                if enable { "grab" } else { "release" },
+                if grab { "grab" } else { "release" },
                 self.name,
                 self.path,
-                std::io::Error::last_os_error()
-            );
+                error
+            ),
+        }
+    }
+
+    fn drive_grab(&mut self, want: bool, ops: &Arc<dyn GrabOps<EvdevHandle>>) {
+        let handle = self.handle();
+        for news in self.grab.drive(want, &handle, ops, Instant::now()) {
+            self.log(news);
         }
     }
 }
 
 impl Drop for EvdevDevice {
     fn drop(&mut self) {
-        if self.grabbed {
-            let _ = unsafe { libc::ioctl(self.fd, EVIOCGRAB, 0 as libc::c_int) };
-        }
-        unsafe {
-            libc::close(self.fd);
+        // A release still under way holds the fd and finishes by itself; closing lets go too.
+        if self.grab.held() {
+            let _ = evdev_grab(self.fd.as_raw_fd(), false);
         }
     }
 }
@@ -662,14 +738,7 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
             let fd = unsafe { libc::open(cpath.as_ptr(), EVDEV_OPEN_FLAGS) };
             if fd >= 0 {
                 let name = get_device_name(fd);
-                mice.push(EvdevDevice {
-                    path: mouse_path.to_string(),
-                    name,
-                    fd,
-                    grabbed: false,
-                    held: HashSet::new(),
-                    grab_failed: false,
-                });
+                mice.push(EvdevDevice::new(mouse_path.to_string(), name, fd));
             }
         }
     }
@@ -725,23 +794,9 @@ fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<Evde
 
         if explicit_mouse.is_none() && has_rel && has_btn_left {
             println!("[Debian] Auto-discovered physical mouse: '{}' ({})", name, path);
-            mice.push(EvdevDevice {
-                path,
-                name,
-                fd,
-                grabbed: false,
-                held: HashSet::new(),
-                grab_failed: false,
-            });
+            mice.push(EvdevDevice::new(path, name, fd));
         } else if has_kbd_keys {
-            keyboards.push(EvdevDevice {
-                path,
-                name,
-                fd,
-                grabbed: false,
-                held: HashSet::new(),
-                grab_failed: false,
-            });
+            keyboards.push(EvdevDevice::new(path, name, fd));
         } else {
             unsafe { libc::close(fd) };
         }
@@ -984,6 +1039,7 @@ struct LinuxBackend {
     kwin_y: Arc<AtomicI32>,
     /// What the router has forwarded and not released, as of the last read of the devices.
     forwarded: HeldInput,
+    grab_ops: Arc<dyn GrabOps<EvdevHandle>>,
 }
 
 impl LinuxBackend {
@@ -995,15 +1051,63 @@ impl LinuxBackend {
         self.update_grabs(true);
     }
 
+    /// Grabs happen here and now; releases start here and land on their own threads, keyboards
+    /// first, and a device on its way out isn't grabbed again until its release has landed.
     fn update_grabs(&mut self, may_start: bool) {
         for (devices, wanted) in [
-            (&mut self.mice, self.block_mice),
             (&mut self.keyboards, self.block_keyboards),
+            (&mut self.mice, self.block_mice),
         ] {
             for device in devices {
                 let idle = may_start && free_to_grab(&device.held, &self.forwarded);
-                device.set_grab(should_grab(wanted, device.grabbed, idle));
+                let want = should_grab(wanted, device.grabbed(), idle);
+                device.drive_grab(want, &self.grab_ops);
             }
+        }
+    }
+
+    /// Waits a little for releases under way, so a clean stop leaves nothing grabbed and says so.
+    fn finish_releases(&mut self, limit: Duration) {
+        let devices: Vec<&mut EvdevDevice> = self.keyboards.iter_mut().chain(self.mice.iter_mut()).collect();
+        let mut news = Vec::new();
+        let (slots, labels): (Vec<&mut GrabSlot>, Vec<(String, String)>) =
+            devices.into_iter().map(|d| (&mut d.grab, (d.name.clone(), d.path.clone()))).unzip();
+        let done = wait_for_releases(slots.into_iter(), limit, |i, n| news.push((i, n)));
+        for (i, n) in news {
+            let (name, path) = &labels[i];
+            if n == GrabNews::Released {
+                println!("[Debian] EVIOCGRAB RELEASED on '{name}' ({path})");
+            } else if let GrabNews::Failed { error, .. } = n {
+                eprintln!("[Debian] EVIOCGRAB release failed on '{name}' ({path}): {error}");
+            }
+        }
+        if !done {
+            eprintln!("[Debian] Some EVIOCGRAB releases were still going at exit; closing the devices lets go.");
+        }
+    }
+
+    /// Whether input read off mouse `i` should be put on the desktop if it isn't going to the
+    /// peer: it reached only this process, from a grab that is on its way out or no longer wanted.
+    /// Moving the pointer while focus comes back to Debian then isn't lost.
+    fn mouse_hand_back(&self, i: usize, ev: &InputEvent) -> bool {
+        let device = &self.mice[i];
+        device.only_here(ev) && !(self.block_mice && device.grabbed())
+    }
+
+    /// Puts a key read off keyboard `i` on the desktop if the grab kept it from there, once.
+    fn hand_back_key(&mut self, i: usize, ev: &InputEvent, forwarded: bool) {
+        let device = &mut self.keyboards[i];
+        let only_here = device.only_here(ev) && !(self.block_keyboards && device.grabbed());
+        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, only_here, forwarded) {
+            self.vkbd.inject_key(ev.code, pressed);
+        }
+    }
+
+    fn hand_back_button(&mut self, i: usize, ev: &InputEvent, button: u8, forwarded: bool) {
+        let only_here = self.mouse_hand_back(i, ev);
+        let device = &mut self.mice[i];
+        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, only_here, forwarded) {
+            self.vrel.button(button, pressed);
         }
     }
 
@@ -1216,6 +1320,7 @@ pub fn run_debian_node(
             kwin_x: Arc::clone(&kwin_x),
             kwin_y: Arc::clone(&kwin_y),
             forwarded: HeldInput::default(),
+            grab_ops: Arc::new(EvdevGrab),
         },
         peer: UdpPeer {
             socket: &peer_socket,
@@ -1257,6 +1362,7 @@ pub fn run_debian_node(
             // Input first: the D-Bus call below can hang if KWin does.
             println!("\n[Debian] Shutting down cleanly; releasing all EVIOCGRAB locks.");
             core.backend.set_blocking(false, false);
+            core.backend.finish_releases(Duration::from_secs(1));
             core.backend.release_held();
             crate::mute::shutdown();
             let _ = Command::new("qdbus6")
@@ -1411,9 +1517,12 @@ pub fn run_debian_node(
                         KeyRoute::Forward { scancode, pressed } => {
                             let keyboard = &core.backend.keyboards[i];
                             let blocking = core.backend.block_keyboards;
-                            if reaches_router(blocking, keyboard.grabbed, !pressed) {
-                                core.route(Event::LocalKey { scancode, pressed });
+                            let mut forwarded = false;
+                            if reaches_router(blocking, keyboard.grabbed(), !pressed) {
+                                let actions = core.route(Event::LocalKey { scancode, pressed });
+                                forwarded = actions.iter().any(|a| matches!(a, Action::ForwardKey { .. }));
                             }
+                            core.backend.hand_back_key(i, ev, forwarded);
                         }
                         KeyRoute::Consumed => {}
                         KeyRoute::Hotkey(Hotkey::Panic) => {
@@ -1465,29 +1574,43 @@ pub fn run_debian_node(
                         EV_KEY => {
                             if let Some(button) = button_id(ev.code) {
                                 let pressed = ev.value != 0;
-                                let grabbed = core.backend.mice[i].grabbed;
+                                let grabbed = core.backend.mice[i].grabbed();
+                                let mut forwarded = false;
                                 if reaches_router(core.backend.block_mice, grabbed, !pressed) {
-                                    core.route(Event::LocalButton { button, pressed });
+                                    let actions = core.route(Event::LocalButton { button, pressed });
+                                    forwarded = actions.iter().any(|a| matches!(a, Action::ForwardButton { .. }));
                                 }
+                                core.backend.hand_back_button(i, ev, button, forwarded);
                             }
                         }
                         EV_SYN if ev.code == SYN_REPORT => {
-                            let grabbed = core.backend.mice[i].grabbed;
+                            let grabbed = core.backend.mice[i].grabbed();
                             let to_router = reaches_router(core.backend.block_mice, grabbed, false);
+                            let hand_back = core.backend.mouse_hand_back(i, ev);
                             if acc_dx != 0 || acc_dy != 0 {
+                                let mut forwarded = false;
                                 if to_router {
-                                    core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
+                                    let actions = core.route(Event::LocalMove { dx: acc_dx, dy: acc_dy });
+                                    forwarded = actions.iter().any(|a| matches!(a, Action::ForwardMove { .. }));
+                                }
+                                if hand_back && !forwarded {
+                                    core.backend.vrel.move_rel(acc_dx, acc_dy);
                                 }
                                 core.push_edge(&cfg_snapshot, acc_dx, acc_dy, false);
                                 acc_dx = 0;
                                 acc_dy = 0;
                             }
                             if acc_wheel_x != 0 || acc_wheel_y != 0 {
+                                let mut forwarded = false;
                                 if to_router {
-                                    core.route(Event::LocalWheel {
+                                    let actions = core.route(Event::LocalWheel {
                                         dx: acc_wheel_x,
                                         dy: acc_wheel_y,
                                     });
+                                    forwarded = actions.iter().any(|a| matches!(a, Action::ForwardWheel { .. }));
+                                }
+                                if hand_back && !forwarded {
+                                    core.backend.vrel.wheel(acc_wheel_x, acc_wheel_y);
                                 }
                                 acc_wheel_x = 0;
                                 acc_wheel_y = 0;
@@ -1718,21 +1841,6 @@ mod tests {
         assert!(reaches_router(true, false, true));
         assert!(reaches_router(true, true, true));
         assert!(reaches_router(false, false, true));
-    }
-
-    #[test]
-    fn grab_failure_is_recorded_until_a_grab_succeeds() {
-        let mut device = EvdevDevice {
-            path: "test".to_string(),
-            name: "test".to_string(),
-            fd: -1, // EBADF: the ioctl fails without touching any device
-            grabbed: false,
-            held: HashSet::new(),
-            grab_failed: false,
-        };
-        device.set_grab(true);
-        assert!(!device.grabbed);
-        assert!(device.grab_failed);
     }
 
     #[test]

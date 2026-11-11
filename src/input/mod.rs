@@ -1,6 +1,8 @@
 //! Platform input backend layer: traits the OS code implements, and `apply`, which turns
 //! router `Action`s into backend calls and peer packets.
 
+#[cfg(target_os = "linux")]
+pub mod grab;
 pub mod link;
 #[cfg(test)]
 mod live;
