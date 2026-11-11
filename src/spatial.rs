@@ -2690,6 +2690,41 @@ mod tests {
         assert_eq!(edge.cross(&monitors, (1080, 0), (0, -50), false, 270), Push::Crossed);
     }
 
+    /// What Debian's input loop does with a push, step by step: count it at KWin's position, judge
+    /// it, hold it, and decide it again when the next position arrives. The loop itself needs uinput
+    /// and a socket, so this goes through the same calls without them.
+    #[test]
+    fn a_held_push_on_debian_crosses_when_the_next_position_arrives() {
+        use crate::crossing::{judge, CursorTrack, Gate, Sample, Spot};
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        let ms = 1000;
+        let mut track = CursorTrack::new(0, (3200, 720));
+        track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0 });
+        let decide = |edge: &EdgeWatch, track: &mut CursorTrack, now_us| {
+            let (here, _) = track.locate(now_us, monitors);
+            let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
+            (here, judge(&here, edge.along_x(), spot))
+        };
+        // Pushing down while drifting left towards DP-3, with KWin 60 ms behind.
+        track.moved(40 * ms, -15, 30);
+        let (here, _) = decide(&edge, &mut track, 40 * ms);
+        assert!(!edge.press(monitors, here.sample, (-15, 30), false));
+        track.moved(50 * ms, -15, 30);
+        let (here, gate) = decide(&edge, &mut track, 60 * ms);
+        assert!(edge.press(monitors, here.sample, (-15, 30), false));
+        assert_eq!(gate, Gate::Hold(Refusal::Stale), "within reach of the guard strip");
+        // KWin's position, taken after the last move, arrives: 1970, clear of the strip. The held push
+        // is looked at again.
+        track.heard(Sample { x: 1970, y: 1439, seq: 2, taken_us: 59 * ms });
+        let (here, gate) = decide(&edge, &mut track, 61 * ms);
+        assert!(edge.press(monitors, here.sample, (0, 0), false), "still complete");
+        let Gate::Cross { at } = gate else { panic!("{gate:?}") };
+        assert_eq!(at, (1970, 1439));
+        assert_eq!(c.entry_on_peer(NodeId::Debian, at.0, at.1), (50, SHARED_EDGE_INSET));
+    }
+
     #[test]
     fn a_held_button_stops_a_crossing() {
         let c = layout(TouchSide::Bottom, 2240, 1440);

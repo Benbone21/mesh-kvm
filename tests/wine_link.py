@@ -817,21 +817,27 @@ def input_checks(peer, inbox):
 
     # o. With Debian in control the laptop's cursor sits parked, hidden under a window of its own,
     # which goes with Release all input and while the laptop is in use.
-    # Wine makes no windows with no display to put them on, the session window included.
+    # Wine makes no windows with no display to put them on, the session window included, so without
+    # one these checks would pass whatever the cloak did.
     windows = bool(os.environ.get("WINE_LINK_DISPLAY"))
     if windows:
         hidden = wait_for(lambda s: s.get("cursor_hidden") is True, 2)
         check("while Debian has control, the laptop's parked cursor is hidden", (hidden or {}).get("cursor_hidden") is True,
               str((hidden or {}).get("cursor_hidden")))
-    else:
-        print("SKIP: hiding the parked cursor, as Wine makes no windows without WINE_LINK_DISPLAY", flush=True)
     call("/api/action", {"action": "panic"})
-    shown = wait_for(lambda s: s.get("cursor_hidden") is False, 2)
-    check("Release all input shows the cursor", (shown or {}).get("cursor_hidden") is False, str(shown))
+    if windows:
+        shown = wait_for(lambda s: s.get("cursor_hidden") is False, 2)
+        check("Release all input shows the cursor", (shown or {}).get("cursor_hidden") is False, str(shown))
     peer.give_focus_to_laptop(400, 300)
     st = wait_for(lambda s: not s["panic_mode"] and s["active_node"] == "Windows", 2)
-    check("and the laptop in use shows its own", bool(st) and st.get("cursor_hidden") is False and not st["game_lock"],
-          str(st and (st.get("cursor_hidden"), st["game_lock"], st["active_node"])))
+    if windows:
+        check("and the laptop in use shows its own", bool(st) and st.get("cursor_hidden") is False,
+              str(st and st.get("cursor_hidden")))
+    else:
+        print("SKIP: hiding the parked cursor and showing it again, as Wine makes no windows without WINE_LINK_DISPLAY",
+              flush=True)
+    check("a cursor parked while Debian had control leaves no game lock behind", bool(st) and not st["game_lock"],
+          str(st and (st["game_lock"], st["active_node"])))
     return crossing
 
 
