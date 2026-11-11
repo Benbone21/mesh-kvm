@@ -805,6 +805,12 @@ impl EdgeWatch {
         self.tracker.press(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
     }
 
+    /// True if the shared edge runs along x: the top or bottom.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn along_x(&self) -> bool {
+        self.span.is_some_and(|s| matches!(s.edge, SwitchEdge::Top | SwitchEdge::Bottom))
+    }
+
     /// Starts the count again, as after a crossing.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn clear(&mut self) {

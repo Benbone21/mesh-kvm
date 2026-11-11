@@ -178,13 +178,17 @@ mod position {
     use crate::protocol::MonitorRect;
     use std::collections::VecDeque;
 
-    /// A position older than this, with the mouse moving since, is not believed.
-    pub const FRESH_MS: u64 = 30;
+    /// A position older than this, with the mouse moving since, is believed only well inside the
+    /// span: see `judge`.
+    pub const FRESH_MS: u64 = 12;
+    /// How much further than the raw counts an older position's cursor may have gone, for pointer
+    /// acceleration, either way along the edge.
+    pub const STALE_REACH: i32 = 3;
     /// No position for this long while the mouse moves means the tracker has stopped. Crossing then
     /// goes by the last position, as it did before positions were checked, rather than not at all.
     pub const TRACKER_SILENT_MS: u64 = 1500;
-    /// Movement older than this is forgotten.
-    const MOTION_KEPT_US: i64 = 3_000_000;
+    /// Movement older than this is forgotten. Past it, an unanswered move is a silent tracker anyway.
+    const MOTION_KEPT_US: i64 = TRACKER_SILENT_MS as i64 * 1000;
     /// The longest the D-Bus path is believed to have taken. Beyond it, a timestamp is wrong.
     const MOST_LAG_MS: i64 = 5000;
     /// KWin stamps positions with `Date.now()` modulo this, so that it fits a D-Bus int32.
@@ -275,16 +279,49 @@ mod position {
         Hold(Refusal),
     }
 
-    /// Decides a completed push from where the cursor is. `estimate_on_span` says whether the estimate
-    /// is on the span too (the push itself was counted at `sample`), and `guarded` whether either is
-    /// in a guard strip. A silent tracker crosses at the last position, as before any of this.
-    pub fn judge(here: &Whereabouts, estimate_on_span: bool, guarded: bool) -> Gate {
+    /// What a point on the edge is: on the span, and in a guard strip.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Spot {
+        pub on_span: bool,
+        pub guarded: bool,
+    }
+
+    /// Decides a completed push from where the cursor is (the push itself was counted at `sample`).
+    /// `along_x` says the edge runs along x, and `spot` tells what a point is.
+    ///
+    /// A fresh or still position crosses at the estimate if that is on the span. An older one, with
+    /// movement since, crosses only if wherever the cursor could have got to is: `STALE_REACH` times
+    /// the movement along the edge, either way from the position, all on the span and out of the
+    /// guard strips. So a lagging D-Bus doesn't hold up a push deep inside the span, and still can't
+    /// let one through near its ends. A silent tracker crosses at the last position, as before any
+    /// of this.
+    pub fn judge(here: &Whereabouts, along_x: bool, spot: impl Fn((i32, i32)) -> Spot) -> Gate {
+        let (at_sample, at_estimate) = (spot(here.sample), spot(here.estimate));
+        if at_sample.guarded || at_estimate.guarded {
+            return Gate::Hold(Refusal::Guard);
+        }
         match here.trust {
-            _ if guarded => Gate::Hold(Refusal::Guard),
             Trust::TrackerSilent => Gate::Cross { at: here.sample },
-            Trust::Stale | Trust::Unverified => Gate::Hold(Refusal::Stale),
-            Trust::Fresh | Trust::Still if !estimate_on_span => Gate::Hold(Refusal::OffSpan),
+            Trust::Unverified => Gate::Hold(Refusal::Stale),
+            Trust::Fresh | Trust::Still if !at_estimate.on_span => Gate::Hold(Refusal::OffSpan),
             Trust::Fresh | Trust::Still => Gate::Cross { at: here.estimate },
+            Trust::Stale => {
+                let moved = if along_x { here.moved.0 } else { here.moved.1 };
+                let reach = moved.saturating_abs().saturating_mul(STALE_REACH);
+                let ends = [-reach, reach].map(|r| {
+                    if along_x {
+                        (here.sample.0.saturating_add(r), here.estimate.1)
+                    } else {
+                        (here.estimate.0, here.sample.1.saturating_add(r))
+                    }
+                });
+                let sure = at_estimate.on_span && ends.into_iter().map(&spot).all(|s| s.on_span && !s.guarded);
+                if sure {
+                    Gate::Cross { at: here.estimate }
+                } else {
+                    Gate::Hold(Refusal::Stale)
+                }
+            }
         }
     }
 
@@ -302,14 +339,24 @@ mod position {
         warp: (i64, i32, i32),
         /// Movement as it was read: when, and by how much.
         moves: VecDeque<(i64, i32, i32)>,
+        /// The first movement since the base position that no position has answered yet.
+        unanswered_us: Option<i64>,
+        /// Movement since the base position was forgotten, so the estimate is short of it.
+        forgot: bool,
         silent: bool,
-        started_us: i64,
     }
 
     impl CursorTrack {
         /// `start` stands for the cursor until the first position arrives, unverified.
         pub fn new(now_us: i64, start: (i32, i32)) -> Self {
-            Self { newest: None, warp: (now_us, start.0, start.1), moves: VecDeque::new(), silent: false, started_us: now_us }
+            Self {
+                newest: None,
+                warp: (now_us, start.0, start.1),
+                moves: VecDeque::new(),
+                unanswered_us: None,
+                forgot: false,
+                silent: false,
+            }
         }
 
         /// Takes the newest position from KWin. Returns news of the tracker coming back.
@@ -318,6 +365,9 @@ mod position {
                 return None;
             }
             self.newest = Some(sample);
+            let (_, since, _) = self.base();
+            self.unanswered_us = self.moves.iter().rev().take_while(|m| m.0 > since).last().map(|m| m.0);
+            self.forgot = false;
             std::mem::take(&mut self.silent).then_some(TrackerNews::Back)
         }
 
@@ -328,10 +378,16 @@ mod position {
 
         /// The mouse moved the cursor by `(dx, dy)` counts.
         pub fn moved(&mut self, now_us: i64, dx: i32, dy: i32) {
-            if dx != 0 || dy != 0 {
-                self.moves.push_back((now_us, dx, dy));
+            if dx == 0 && dy == 0 {
+                return;
             }
-            while self.moves.front().is_some_and(|m| now_us - m.0 > MOTION_KEPT_US) {
+            let (_, since, _) = self.base();
+            self.moves.push_back((now_us, dx, dy));
+            if now_us > since && self.unanswered_us.is_none() {
+                self.unanswered_us = Some(now_us);
+            }
+            while let Some(&(at, ..)) = self.moves.front().filter(|m| now_us - m.0 > MOTION_KEPT_US) {
+                self.forgot |= at > since;
                 self.moves.pop_front();
             }
         }
@@ -339,6 +395,16 @@ mod position {
         /// The cursor was put at `(x, y)`. Positions taken before now no longer count.
         pub fn warped(&mut self, now_us: i64, x: i32, y: i32) {
             self.warp = (now_us, x, y);
+            self.unanswered_us = None;
+            self.forgot = false;
+        }
+
+        /// How long the tracker has been silent while the mouse moved, or 0.
+        pub fn silent_for_ms(&self, now_us: i64) -> u64 {
+            match (self.silent, self.unanswered_us) {
+                (true, Some(since)) => u64::try_from(now_us - since).unwrap_or(0) / 1000,
+                _ => 0,
+            }
         }
 
         /// The position to show: the newest position, or the warp if that is newer.
@@ -358,17 +424,21 @@ mod position {
         /// Where the cursor is at `now_us`, on `monitors`. Returns news of the tracker going silent.
         pub fn locate(&mut self, now_us: i64, monitors: &[MonitorRect]) -> (Whereabouts, Option<TrackerNews>) {
             let (sample, since_us, confirmed) = self.base();
-            let moved = self.moves.iter().filter(|m| m.0 > since_us).fold((0i32, 0i32), |(x, y), m| {
+            // Newest first, and only back to the base: the work is the movement since the last position.
+            let moved = self.moves.iter().rev().take_while(|m| m.0 > since_us).fold((0i32, 0i32), |(x, y), m| {
                 (x.saturating_add(m.1), y.saturating_add(m.2))
             });
             let estimate = clamp_to(monitors, (sample.0.saturating_add(moved.0), sample.1.saturating_add(moved.1)));
             let age_ms = u64::try_from(now_us - since_us).unwrap_or(0) / 1000;
-            let still = estimate == clamp_to(monitors, sample);
-            // Silent: nothing from KWin for a long while, though the mouse has been moving it.
-            let heard_us = self.newest.map_or(self.started_us, |s| s.taken_us);
-            let quiet_ms = u64::try_from(now_us - heard_us).unwrap_or(0) / 1000;
-            let moving_lately = self.moves.back().is_some_and(|m| now_us - m.0 <= (TRACKER_SILENT_MS as i64) * 1000);
-            let silent = quiet_ms > TRACKER_SILENT_MS && moving_lately && !still;
+            let still = !self.forgot && estimate == clamp_to(monitors, sample);
+            if still {
+                // Movement that moved nothing, as against an edge, has nothing for KWin to answer.
+                self.unanswered_us = None;
+            }
+            // Silent: movement KWin hasn't answered for a long while, and the mouse still moving.
+            let unanswered_ms = self.unanswered_us.map_or(0, |at| u64::try_from(now_us - at).unwrap_or(0) / 1000);
+            let moving_lately = self.moves.back().is_some_and(|m| now_us - m.0 <= MOTION_KEPT_US);
+            let silent = unanswered_ms > TRACKER_SILENT_MS && moving_lately && !still;
             let mut news = None;
             if silent && !self.silent {
                 self.silent = true;
@@ -503,6 +573,20 @@ mod tests {
         assert!(slot.offer(sample(2, 2, 0, 0)));
     }
 
+    /// The owner's desk: the laptop under DP-2, the bright edge 1920..4479 along y = 1439, and the
+    /// guard strip beside DP-3 at 1920..1967.
+    fn spot((x, y): (i32, i32)) -> Spot {
+        Spot { on_span: y == 1439 && (1920..=4479).contains(&x), guarded: y == 1439 && (1920..1968).contains(&x) }
+    }
+
+    fn nowhere(_: (i32, i32)) -> Spot {
+        Spot { on_span: false, guarded: false }
+    }
+
+    fn all_guarded(_: (i32, i32)) -> Spot {
+        Spot { on_span: true, guarded: true }
+    }
+
     #[test]
     fn a_stale_position_and_a_long_move_left_along_the_bottom_does_not_cross_from_the_side_display() {
         // KWin last said 2500,1439, above the laptop, 100 ms ago. Since then the mouse has carried
@@ -515,8 +599,38 @@ mod tests {
         assert_eq!(here.trust, Trust::Stale);
         assert_eq!(here.estimate, (1700, 1439));
         assert_eq!(here.moved, (-800, 80));
-        assert_eq!(judge(&here, false, false), Gate::Hold(Refusal::Stale));
-        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale), "even if the estimate were on the span");
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Stale));
+    }
+
+    #[test]
+    fn a_stale_position_deep_in_the_span_with_a_jittering_hand_crosses() {
+        // D-Bus is 100 ms behind, and the hand wobbles a few px along the edge while pushing.
+        let mut t = track_with(sample(3000, 1439, 1, 0));
+        for (i, dx) in [3, -2, 4, -1].into_iter().enumerate() {
+            t.moved((20 + 20 * i as i64) * MS, dx, 15);
+        }
+        let (here, _) = t.locate(100 * MS, &desk());
+        assert_eq!(here.trust, Trust::Stale);
+        assert_eq!(judge(&here, true, spot), Gate::Cross { at: (3004, 1439) });
+    }
+
+    #[test]
+    fn a_stale_position_within_reach_of_the_end_or_the_guard_holds() {
+        // Three times the movement either way could be past the end of the span.
+        let mut t = track_with(sample(4450, 1439, 1, 0));
+        t.moved(50 * MS, 12, 30);
+        let (here, _) = t.locate(100 * MS, &desk());
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Stale));
+        // Or in the guard strip beside DP-3.
+        let mut t = track_with(sample(1990, 1439, 1, 0));
+        t.moved(50 * MS, -10, 30);
+        let (here, _) = t.locate(100 * MS, &desk());
+        assert_eq!(here.estimate, (1980, 1439));
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Stale));
+        // Fresh, the same place crosses.
+        let mut t = track_with(sample(1990, 1439, 1, 95));
+        t.moved(97 * MS, -10, 30);
+        assert_eq!(judge(&t.locate(100 * MS, &desk()).0, true, spot), Gate::Cross { at: (1980, 1439) });
     }
 
     #[test]
@@ -527,9 +641,13 @@ mod tests {
         assert_eq!(here.trust, Trust::Fresh);
         assert_eq!(here.age_ms, 5);
         assert_eq!(here.estimate, (2503, 1439), "down is held at the bottom edge");
-        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2503, 1439) });
-        assert_eq!(judge(&here, false, false), Gate::Hold(Refusal::OffSpan));
-        assert_eq!(judge(&here, true, true), Gate::Hold(Refusal::Guard));
+        assert_eq!(judge(&here, true, spot), Gate::Cross { at: (2503, 1439) });
+        assert_eq!(judge(&here, true, nowhere), Gate::Hold(Refusal::OffSpan));
+        assert_eq!(judge(&here, true, all_guarded), Gate::Hold(Refusal::Guard));
+        // Fresh means under FRESH_MS.
+        let mut t = track_with(sample(2500, 1439, 1, 80));
+        t.moved(97 * MS, 3, 30);
+        assert_eq!(t.locate(100 * MS, &desk()).0.trust, Trust::Stale);
     }
 
     #[test]
@@ -540,7 +658,7 @@ mod tests {
         }
         let (here, _) = t.locate(2000 * MS, &desk());
         assert_eq!(here.trust, Trust::TrackerSilent);
-        assert_eq!(judge(&here, true, true), Gate::Hold(Refusal::Guard));
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Guard));
     }
 
     #[test]
@@ -552,20 +670,21 @@ mod tests {
         }
         let (here, _) = t.locate(300 * MS, &desk());
         assert_eq!(here.trust, Trust::Still);
-        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2500, 1439) });
+        assert_eq!(judge(&here, true, spot), Gate::Cross { at: (2500, 1439) });
     }
 
     #[test]
     fn a_held_push_completes_when_a_fresh_position_confirms_it() {
-        let mut t = track_with(sample(2500, 1439, 1, 0));
+        // Stale near the guard strip, so it waits.
+        let mut t = track_with(sample(2000, 1439, 1, 0));
         t.moved(40 * MS, -30, 20);
         let (here, _) = t.locate(60 * MS, &desk());
-        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale));
-        // KWin's next position arrives: the cursor did move 30 px left, and is still over the laptop.
-        t.heard(sample(2470, 1439, 2, 58));
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Stale));
+        // KWin's next position arrives: the cursor did move 30 px left, and is clear of the strip.
+        t.heard(sample(1970, 1439, 2, 58));
         let (here, _) = t.locate(61 * MS, &desk());
         assert_eq!(here.trust, Trust::Fresh);
-        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2470, 1439) });
+        assert_eq!(judge(&here, true, spot), Gate::Cross { at: (1970, 1439) });
     }
 
     #[test]
@@ -577,12 +696,40 @@ mod tests {
         t.heard(sample(2500, 1439, 2, 99));
         let (here, _) = t.locate(110 * MS, &desk());
         assert_eq!((here.trust, here.sample), (Trust::Unverified, (2600, 1427)));
-        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale));
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::Stale));
         // KWin put it somewhere else after all, and says so.
         t.heard(sample(2610, 1430, 3, 105));
         let (here, _) = t.locate(110 * MS, &desk());
         assert_eq!((here.trust, here.sample), (Trust::Fresh, (2610, 1430)));
         assert_eq!(t.shown(), (2610, 1430));
+    }
+
+    #[test]
+    fn a_pause_of_the_mouse_is_no_silence_of_the_tracker() {
+        // Nothing for 2 s, as nothing moved, then one move that KWin hasn't answered yet.
+        let mut t = track_with(sample(2500, 700, 1, 0));
+        t.moved(2000 * MS, 5, 0);
+        let (here, news) = t.locate(2001 * MS, &desk());
+        assert_eq!((here.trust, news), (Trust::Stale, None));
+        assert_eq!(t.silent_for_ms(2001 * MS), 0);
+        // Pushing straight at the edge for 2 s, which KWin has nothing to say about, then along it.
+        let mut t = track_with(sample(2500, 1439, 1, 0));
+        for i in 1..=200 {
+            t.moved(i * 10 * MS, 0, 5);
+            t.locate(i * 10 * MS, &desk());
+        }
+        t.moved(2005 * MS, 4, 0);
+        assert_ne!(t.locate(2006 * MS, &desk()).0.trust, Trust::TrackerSilent);
+    }
+
+    #[test]
+    fn movement_too_old_to_add_on_leaves_the_position_untrusted() {
+        let mut t = track_with(sample(2500, 1439, 1, 0));
+        t.moved(100 * MS, -400, 0);
+        for i in 0..10 {
+            t.moved((1700 + 10 * i) * MS, 0, 5);
+        }
+        assert_ne!(t.locate(1800 * MS, &desk()).0.trust, Trust::Still, "the move left is forgotten, not undone");
     }
 
     #[test]
@@ -594,7 +741,8 @@ mod tests {
         let (here, news) = t.locate(2000 * MS, &desk());
         assert_eq!(news, Some(TrackerNews::Silent));
         assert_eq!(here.trust, Trust::TrackerSilent);
-        assert_eq!(judge(&here, false, false), Gate::Cross { at: (2500, 1439) });
+        assert_eq!(judge(&here, true, nowhere), Gate::Cross { at: (2500, 1439) });
+        assert!(t.silent_for_ms(2000 * MS) >= 1990);
         let (_, news) = t.locate(2001 * MS, &desk());
         assert_eq!(news, None, "once");
         assert_eq!(t.heard(sample(3000, 1439, 2, 2002)), Some(TrackerNews::Back));

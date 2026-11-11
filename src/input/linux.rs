@@ -13,7 +13,8 @@ use crate::protocol::{
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
 use crate::crossing::{
-    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Sample, SampleSlot, TrackerNews,
+    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Sample, SampleSlot, Spot,
+    TrackerNews,
 };
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
@@ -1400,8 +1401,9 @@ impl Core<'_> {
             self.refusals.cleared();
             return;
         }
-        let guarded = self.edge.guarded(monitors, here.sample) || self.edge.guarded(monitors, here.estimate);
-        match judge(&here, self.edge.on_span(monitors, here.estimate), guarded) {
+        let edge = &self.edge;
+        let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
+        match judge(&here, edge.along_x(), spot) {
             Gate::Cross { at } => {
                 self.edge.clear();
                 self.refusals.cleared();
