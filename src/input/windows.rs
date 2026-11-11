@@ -971,6 +971,7 @@ pub fn run_windows_node(
                     (router.online(), router.active(), router.panicked(), router.captive(), main)
                 };
                 crate::audio::set_peer_online(status.0);
+                crate::secure::control::set_peer_online(status.0);
                 link().set_online(status.0);
                 let version = link().peer_version(now_ms());
                 let mut log = presses();

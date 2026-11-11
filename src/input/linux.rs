@@ -1380,6 +1380,7 @@ pub fn run_debian_node(
         // Every switch is stamped with the newest time the router has seen.
         core.route(Event::Tick { now_ms: now_ms() });
         crate::audio::set_peer_online(core.router.online());
+        crate::secure::control::set_peer_online(core.router.online());
         link.set_online(core.router.online());
         core.peer.presses.set_reliable(link.peer_version(now_ms()) == PeerVersion::Same);
         if !core.router.online() {
