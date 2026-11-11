@@ -130,10 +130,8 @@ pub struct AudioStatus {
     /// Something is chosen to send.
     pub tx_enabled: bool,
     /// What's chosen: a device id, `default`, or empty for nothing.
-    pub input: String,
     pub output: String,
     pub play: String,
-    pub inputs: Vec<AudioDevice>,
     pub outputs: Vec<AudioDevice>,
     /// Anything the person should know about these choices right now.
     pub notes: Vec<String>,
@@ -164,41 +162,9 @@ pub struct AudioStatus {
     pub rx_buffer_ms: u32,
     /// Audio is arriving from a mesh-kvm of another version, and being ignored.
     pub rx_other_version: bool,
-    /// The other device says it would take a microphone stream.
-    pub tx_mic_ready: bool,
-    /// How this device shows the other one's mic. Missing from an older service.
-    #[serde(rename = "virtual")]
-    pub virtual_devices: Option<VirtualDevices>,
 }
 
-/// What kind of virtual mic this device has for the other one's microphone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VirtualKind {
-    /// Debian: a mic and speakers made while linked.
-    Linux,
-    /// Windows with VB-Cable installed.
-    Cable,
-    /// Windows without it.
-    NoCable,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct VirtualDevices {
-    pub kind: VirtualKind,
-    /// The devices (or the cable) are there to use right now.
-    #[serde(default)]
-    pub present: bool,
-    /// Why the devices couldn't be added.
-    #[serde(default)]
-    pub error: Option<String>,
-    /// The other device's name as the devices carry it in the sound settings, while they're there.
-    /// Missing from an older service.
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-/// A microphone, line-in or output, by the id it's saved under and the name it's shown by.
+/// An output, by the id it's saved under and the name it's shown by.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct AudioDevice {
@@ -209,7 +175,6 @@ pub struct AudioDevice {
 /// What a device dropdown chooses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceRole {
-    Input,
     Output,
     Play,
 }
@@ -221,7 +186,6 @@ impl DeviceRole {
     /// The name the service knows it by.
     pub fn name(self) -> &'static str {
         match self {
-            DeviceRole::Input => "input",
             DeviceRole::Output => "output",
             DeviceRole::Play => "play",
         }
@@ -230,7 +194,7 @@ impl DeviceRole {
     /// What's on offer ahead of the real devices. Received audio always plays somewhere.
     pub fn fixed_options(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            DeviceRole::Input | DeviceRole::Output => &[NOTHING, SYSTEM_DEFAULT],
+            DeviceRole::Output => &[NOTHING, SYSTEM_DEFAULT],
             DeviceRole::Play => &[SYSTEM_DEFAULT],
         }
     }
@@ -1479,7 +1443,7 @@ fn one_way_message(other: &str) -> String {
 }
 
 /// Both devices sending output sound only echoes if one can't keep what it plays out of what it
-/// sends. A microphone can't be helped from here: that's a room, not a loop in the software.
+/// sends.
 fn echo_message(local: &DeviceStatus, peer: &DeviceStatus) -> Option<String> {
     let sends_output = |d: &DeviceStatus| !d.audio.output.is_empty();
     (sends_output(local) && sends_output(peer) && !(local.audio.echo_safe && peer.audio.echo_safe)).then(|| {
@@ -2328,8 +2292,7 @@ mod tests {
         assert_eq!(status_message(&snap), None);
         snap.peer.as_mut().unwrap().audio.echo_safe = false;
         snap.peer.as_mut().unwrap().audio.output.clear();
-        snap.peer.as_mut().unwrap().audio.input = "mic".into();
-        assert_eq!(status_message(&snap), None, "a microphone isn't a loop");
+        assert_eq!(status_message(&snap), None, "only one sending");
     }
 
     #[test]
@@ -2374,7 +2337,6 @@ mod tests {
 
     #[test]
     fn received_audio_can_t_be_set_to_nowhere() {
-        assert!(DeviceRole::Input.fixed_options().iter().any(|(id, _)| id.is_empty()));
         assert!(DeviceRole::Output.fixed_options().iter().any(|(id, _)| id.is_empty()));
         assert!(!DeviceRole::Play.fixed_options().iter().any(|(id, _)| id.is_empty()));
     }

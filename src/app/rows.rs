@@ -1,7 +1,7 @@
 //! The settings table as plain values: each row's label and what each device's cell says and
 //! does. No egui types in here, only `Tone`.
 
-use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutState, Picks, Placement, Snapshot, VirtualKind};
+use super::model::{self, AudioDevice, Control, ControlsEnabled, Device, DeviceRole, DeviceStatus, Display, Edits, LayoutState, Picks, Placement, Snapshot};
 use super::theme::Tone;
 use super::ui::UI_SCALES;
 use crate::audio::BITRATES;
@@ -178,8 +178,6 @@ pub enum ActionKind {
     ResetSizes,
     CheckUpdate,
     ShowLicences,
-    /// Opens the VB-Cable page.
-    GetCable,
 }
 
 /// Everything the rows are worked out from.
@@ -368,14 +366,12 @@ impl Rows<'_, '_> {
         let volume = |control| move |d, s: &DeviceStatus| self.number(d, s, control, |v| format!("{v:.0}%"), VOLUME_RANGE, 5.0);
         let rows = vec![
             audio_row("Output to send", None, &|d, s| self.audio_device(d, DeviceRole::Output, &s.audio.outputs, &s.audio.output)),
-            audio_row("Microphone or line-in", None, &|d, s| self.microphone(d, s)),
             audio_row("Play only on the other device", Some(Control::PlayOnlyOnOther), &|d, s| self.toggle(d, s, Control::PlayOnlyOnOther)),
             audio_row("Send volume", Some(Control::SendVolume), &volume(Control::SendVolume)),
             audio_row("Audio quality", Some(Control::AudioBitrate), &|d, s| self.bitrate(d, s)),
             audio_row("Level sent", None, &|_, s| level(s.audio.tx_peak)),
             audio_row("Play audio from the other device", Some(Control::AudioPlay), &|d, s| self.toggle(d, s, Control::AudioPlay)),
             audio_row("Play received audio on", None, &|d, s| self.audio_device(d, DeviceRole::Play, &s.audio.outputs, &s.audio.play)),
-            audio_row("Virtual devices", None, &|d, s| self.virtual_devices(d, s)),
             audio_row("Playback volume", Some(Control::PlayVolume), &volume(Control::PlayVolume)),
             audio_row("Level received", None, &|_, s| level(s.audio.rx_peak)),
             self.row("Test sound", |d, _| self.test_sound(d)),
@@ -395,50 +391,6 @@ impl Rows<'_, '_> {
         let shown = model::device_label(&current, devices);
         let kind = CellKind::Dropdown { pick: Pick::Audio(role), options };
         Cell::new(format!("{shown}{DROPDOWN}"), Tone::Text, kind)
-    }
-
-    /// How this device offers the other one's mic and speakers. Blank from a service that doesn't say.
-    fn virtual_devices(&self, device: Device, status: &DeviceStatus) -> Cell {
-        let Some(virtual_devices) = &status.audio.virtual_devices else { return Cell::blank() };
-        let peer = self.input.snapshot.name(device.other());
-        match virtual_devices.kind {
-            VirtualKind::Linux => match (&virtual_devices.error, virtual_devices.present) {
-                (_, true) => {
-                    // As the sound settings list them, from a service that says; an older one doesn't.
-                    let shown = virtual_devices.name.as_deref().unwrap_or(&peer);
-                    Cell::new(format!("{shown} mic, {shown} speakers \u{2014} in sound settings"), Tone::Text, CellKind::Plain)
-                }
-                (Some(error), false) => Cell::new(format!("Couldn't add the devices: {error}"), Tone::Warn, CellKind::Plain),
-                (None, false) => Cell::new("Appears when linked".into(), Tone::Dim, CellKind::Plain),
-            },
-            VirtualKind::Cable => Cell {
-                tooltip: Some("You can rename it in Windows Sound settings.".into()),
-                ..Cell::new(format!("Pick CABLE Output as the mic for {peer}"), Tone::Text, CellKind::Plain)
-            },
-            VirtualKind::NoCable => Cell {
-                tooltip: Some(format!("Opens {CABLE_URL}")),
-                ..action(&format!("Install VB-Cable to get {peer}'s mic here"), Tone::Text, ActionKind::GetCable)
-            },
-        }
-    }
-
-    /// Says so on a sending device whose mic is going to a device with nowhere to put it.
-    fn no_virtual_mic(&self, device: Device, status: &DeviceStatus) -> Option<String> {
-        let other = self.status(device.other())?;
-        let lacks = other.audio.virtual_devices.as_ref().is_some_and(|v| v.kind == VirtualKind::NoCable && !v.present);
-        (lacks && !status.audio.input.is_empty())
-            .then(|| format!("{} has no virtual mic. Install VB-Cable there.", self.input.snapshot.name(device.other())))
-    }
-
-    /// A microphone is only ever switched on from its own device, as it could be listened in on.
-    fn microphone(&self, device: Device, status: &DeviceStatus) -> Cell {
-        let cell = self.audio_device(device, DeviceRole::Input, &status.audio.inputs, &status.audio.input);
-        let cell = Cell { tooltip: self.no_virtual_mic(device, status), ..cell };
-        if self.input.snapshot.is_here(device) {
-            cell
-        } else {
-            cell.read_only(format!("Only {} can choose its microphone.", self.input.snapshot.title(device)))
-        }
     }
 
     fn bitrate(&self, device: Device, status: &DeviceStatus) -> Cell {
@@ -480,9 +432,6 @@ impl Rows<'_, '_> {
             if audio.play_only_on_other.is_none() {
                 notes.push(self.note(device, "Update mesh-kvm on it before its audio can be changed here.", Tone::Dim));
                 continue;
-            }
-            if let Some(text) = self.no_virtual_mic(device, status) {
-                notes.push(self.note(device, &text, Tone::Warn));
             }
             if !audio.hint.is_empty() {
                 notes.push(self.note(device, &audio.hint, Tone::Dim));
@@ -698,9 +647,6 @@ impl Rows<'_, '_> {
 
 const ON: &str = "ON";
 
-/// Where the free virtual cable comes from.
-pub const CABLE_URL: &str = "https://vb-audio.com/Cable/";
-
 /// Which device this is, its network name and its address.
 pub fn device_details(status: &DeviceStatus, here: bool) -> String {
     let address = if status.ip == UNKNOWN_ADDRESS { String::new() } else { format!(", {}", status.ip) };
@@ -801,105 +747,12 @@ mod tests {
         assert_eq!(labels(&g, Group::Input), ["Share mouse", "Share keyboard", "Pointer speed on the other device"]);
         assert_eq!(labels(&g, Group::Clipboard), ["Send clipboard", "Receive clipboard"]);
         assert_eq!(labels(&g, Group::Audio), [
-            "Output to send", "Microphone or line-in", "Play only on the other device", "Send volume", "Audio quality",
-            "Level sent", "Play audio from the other device", "Play received audio on", "Virtual devices",
+            "Output to send", "Play only on the other device", "Send volume", "Audio quality",
+            "Level sent", "Play audio from the other device", "Play received audio on",
             "Playback volume", "Level received", "Test sound",
         ]);
         assert_eq!(labels(&g, Group::Games), ["Hold the mouse while a game runs", "Lock the mouse here now"]);
         assert_eq!(labels(&g, Group::Startup), ["Start when this device boots"]);
-    }
-
-    fn virtual_of(snapshot: &mut Snapshot, device: Device, kind: model::VirtualKind, present: bool, error: Option<&str>) {
-        let status = if device == Device::Debian { snapshot.local.as_mut() } else { snapshot.peer.as_mut() }.unwrap();
-        status.audio.virtual_devices = Some(model::VirtualDevices { kind, present, error: error.map(str::to_string), name: None });
-    }
-
-    #[test]
-    fn the_debian_cell_names_the_devices_as_the_sound_settings_do() {
-        let mut s = linked();
-        virtual_of(&mut s, Device::Debian, model::VirtualKind::Linux, true, None);
-        s.local.as_mut().unwrap().audio.virtual_devices.as_mut().unwrap().name = Some("Bobs PC".into());
-        let g = groups(&input(&s));
-        assert_eq!(row(&g, "Virtual devices").cells[0].value, "Bobs PC mic, Bobs PC speakers \u{2014} in sound settings");
-        let from_json: model::AudioStatus =
-            serde_json::from_str(r#"{"virtual":{"kind":"linux","present":true,"error":null,"name":"Bobs PC"}}"#).unwrap();
-        assert_eq!(from_json.virtual_devices.and_then(|v| v.name).as_deref(), Some("Bobs PC"));
-    }
-
-    #[test]
-    fn virtual_devices_row_says_what_is_in_sound_settings() {
-        use model::VirtualKind::*;
-        let mut s = linked();
-        virtual_of(&mut s, Device::Debian, Linux, true, None);
-        virtual_of(&mut s, Device::Windows, Cable, true, None);
-        let g = groups(&input(&s));
-        let r = row(&g, "Virtual devices");
-        assert_eq!(
-            values(r),
-            ["windows-host mic, windows-host speakers \u{2014} in sound settings", "Pick CABLE Output as the mic for debian-host"]
-        );
-        assert_eq!(r.cells[1].tooltip.as_deref(), Some("You can rename it in Windows Sound settings."));
-    }
-
-    #[test]
-    fn virtual_devices_row_without_link_or_cable() {
-        use model::VirtualKind::*;
-        let mut s = linked();
-        virtual_of(&mut s, Device::Debian, Linux, false, None);
-        virtual_of(&mut s, Device::Windows, NoCable, false, None);
-        let g = groups(&input(&s));
-        let r = row(&g, "Virtual devices");
-        assert_eq!(values(r), ["Appears when linked", "Install VB-Cable to get debian-host's mic here"]);
-        assert_eq!(r.cells[1].kind, CellKind::Action(ActionKind::GetCable));
-    }
-
-    #[test]
-    fn a_failed_device_load_is_shown() {
-        let mut s = linked();
-        virtual_of(&mut s, Device::Debian, model::VirtualKind::Linux, false, Some("No such module"));
-        let g = groups(&input(&s));
-        let cell = &row(&g, "Virtual devices").cells[0];
-        assert_eq!(cell.value, "Couldn't add the devices: No such module");
-        assert_eq!(cell.tone, Tone::Warn);
-    }
-
-    #[test]
-    fn a_mic_sent_to_a_device_without_a_cable_is_called_out() {
-        use model::VirtualKind::*;
-        let note = "windows-host has no virtual mic. Install VB-Cable there.";
-        let mut s = linked();
-        s.local.as_mut().unwrap().audio.input = "usb-mic".into();
-        virtual_of(&mut s, Device::Debian, Linux, true, None);
-        virtual_of(&mut s, Device::Windows, NoCable, false, None);
-        let g = groups(&input(&s));
-        assert_eq!(row(&g, "Microphone or line-in").cells[0].tooltip.as_deref(), Some(note));
-        assert!(notes(&g, Group::Audio).iter().any(|n| n.text.ends_with(note)));
-        // With the cable there, no note; with the mic off, none either.
-        virtual_of(&mut s, Device::Windows, Cable, true, None);
-        let g = groups(&input(&s));
-        assert_eq!(row(&g, "Microphone or line-in").cells[0].tooltip, None);
-        assert!(!notes(&g, Group::Audio).iter().any(|n| n.text.contains("no virtual mic")));
-        virtual_of(&mut s, Device::Windows, NoCable, false, None);
-        s.local.as_mut().unwrap().audio.input = String::new();
-        let g = groups(&input(&s));
-        assert!(!notes(&g, Group::Audio).iter().any(|n| n.text.contains("no virtual mic")));
-        // A Linux peer not linked yet is no reason to say so.
-        s.local.as_mut().unwrap().audio.input = "usb-mic".into();
-        virtual_of(&mut s, Device::Windows, Linux, false, None);
-        let g = groups(&input(&s));
-        assert!(!notes(&g, Group::Audio).iter().any(|n| n.text.contains("no virtual mic")));
-    }
-
-    #[test]
-    fn an_older_peer_shows_no_virtual_devices_row_cell_text() {
-        let mut s = linked();
-        s.peer.as_mut().unwrap().audio.virtual_devices = None;
-        let g = groups(&input(&s));
-        assert_eq!(row(&g, "Virtual devices").cells[1], Cell::blank());
-        let from_json: model::AudioStatus = serde_json::from_str(r#"{"virtual":{"kind":"no_cable","present":false,"error":null},"tx_mic_ready":true}"#).unwrap();
-        assert_eq!(from_json.virtual_devices.as_ref().map(|v| v.kind), Some(model::VirtualKind::NoCable));
-        assert_eq!(from_json.virtual_devices.and_then(|v| v.name), None, "an older service gives no name");
-        assert!(from_json.tx_mic_ready);
     }
 
     #[test]
@@ -965,12 +818,15 @@ mod tests {
     }
 
     #[test]
-    fn the_other_devices_microphone_is_read_only_and_says_why() {
-        let g = groups(&input(&linked()));
-        let mic = row(&g, "Microphone or line-in");
-        assert_eq!(mic.cells[0].read_only, None);
-        assert_eq!(mic.cells[1].read_only.as_deref(), Some("Only windows-host can choose its microphone."));
-        assert_eq!(mic.cells[1].tone, Tone::Dim);
+    fn a_0_9_1_peer_s_microphone_and_virtual_devices_are_ignored() {
+        let older = r#"{"input":"usb-mic","inputs":[{"id":"usb-mic","name":"USB mic"}],"output":"","outputs":[],
+            "virtual":{"kind":"no_cable","present":false,"error":null},"tx_mic_ready":true,"rx_mic_live":true,"play_only_on_other":true}"#;
+        let audio: model::AudioStatus = serde_json::from_str(older).unwrap();
+        let mut s = linked();
+        s.peer.as_mut().unwrap().audio = audio;
+        let g = groups(&input(&s));
+        assert!(!labels(&g, Group::Audio).iter().any(|label| label.contains("Microphone") || label.contains("Virtual")));
+        assert!(!notes(&g, Group::Audio).iter().any(|n| n.text.contains("mic")));
     }
 
     #[test]

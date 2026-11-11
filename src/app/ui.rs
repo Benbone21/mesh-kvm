@@ -936,7 +936,6 @@ impl Window {
             }
             ActionKind::CheckUpdate => self.client.local_action(device, json!({ "action": "check_update" })),
             ActionKind::ShowLicences => self.show_licences = true,
-            ActionKind::GetCable => ctx.open_url(egui::OpenUrl::new_tab(super::rows::CABLE_URL)),
         }
     }
 
