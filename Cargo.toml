@@ -76,6 +76,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_QoS",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
 ] }
 
 [profile.release]

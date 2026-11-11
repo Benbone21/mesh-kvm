@@ -8,6 +8,7 @@ mod keymap;
 mod input;
 mod licenses;
 mod linklog;
+mod lowlat;
 mod mute;
 mod platform;
 mod protocol;
@@ -657,6 +658,8 @@ fn run_service(cli: Cli) {
     };
 
     spatial::start_sync(state.clone(), platform);
+    // Wi-Fi streaming mode and packet priority, while there is someone to link with.
+    lowlat::start();
 
     // Phase 2: Bidirectional Audio Bus (UDP 24851)
     let audio_target_str = cli

@@ -73,6 +73,23 @@ static PEER_CLOCK_MS: AtomicI64 = AtomicI64::new(NO_CLOCK);
 static PEER_CLOCK_RTT_MS: AtomicU32 = AtomicU32::new(0);
 /// A `down` or a sleep asks for a look at the network straight away.
 static LOOK_NOW: AtomicBool = AtomicBool::new(false);
+/// How many times a look found the network changed, and how many sleeps were seen, for whatever
+/// has to be set again after either.
+static NET_CHANGES: AtomicU64 = AtomicU64::new(0);
+static SLEEPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn network_changes() -> u64 {
+    NET_CHANGES.load(Ordering::Relaxed)
+}
+
+pub fn sleeps() -> u64 {
+    SLEEPS.load(Ordering::Relaxed)
+}
+
+/// The device woke from sleep. Safe from anywhere: it only counts.
+pub fn note_sleep() {
+    SLEEPS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Starts the log for the service, with a `start` line. Until this runs, which it never does in
 /// tests, everything recorded is dropped.
@@ -103,6 +120,7 @@ static RESTARTING: AtomicBool = AtomicBool::new(false);
 /// A `restarting` line, waited for, the first time this is called. The new service's `start`
 /// follows it; if starting again fails, a `stop` with the reason does instead.
 pub fn restarting(reason: &str) {
+    crate::lowlat::stop();
     if !RESTARTING.swap(true, Ordering::Relaxed) {
         record_and_wait("restarting", Details::new().text("reason", reason));
     }
@@ -111,12 +129,14 @@ pub fn restarting(reason: &str) {
 /// Starting again failed, and this process carries on or stops with its own line.
 pub fn restart_failed(error: &str) {
     RESTARTING.store(false, Ordering::Relaxed);
+    crate::lowlat::resume();
     record("restart_failed", Details::new().text("error", error));
 }
 
 /// A `stop` line, waited for briefly so that it's written before the process goes. Once a
 /// restart is under way, only a failure is worth one.
 pub fn stop(reason: &str, error: Option<&str>) {
+    crate::lowlat::stop();
     if RESTARTING.load(Ordering::Relaxed) && error.is_none() {
         return;
     }
@@ -892,6 +912,7 @@ fn watch_clock() {
         let lost = asleep(wall_ms() - wall, awake_ms().saturating_sub(awake), CLOCK_EVERY.as_millis() as u64);
         if let Some((ms, how)) = lost {
             record("asleep", Details::new().num("ms", ms).num("how", how));
+            note_sleep();
             LOOK_NOW.store(true, Ordering::Relaxed);
         }
     }
@@ -1284,6 +1305,9 @@ fn watch_network() {
         };
         SIGNAL.store(signal, Ordering::Relaxed);
         let lines = net.look(addrs, wifi);
+        if !lines.is_empty() {
+            NET_CHANGES.fetch_add(1, Ordering::Relaxed);
+        }
         if asked || !lines.is_empty() {
             quick_until = Instant::now() + QUICK_FOR;
         }

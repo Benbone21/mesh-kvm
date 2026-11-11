@@ -778,6 +778,7 @@ unsafe extern "system" fn session_window_proc(
                     // Automatic comes with every wake, and the other once someone is there.
                     let how = if wparam as u32 == PBT_APMRESUMEAUTOMATIC { "automatic" } else { "user" };
                     crate::linklog::record("resume", crate::linklog::Details::new().num("how", how));
+                    crate::linklog::note_sleep();
                     crate::mute::after_sleep();
                 }
                 _ => {}
@@ -897,6 +898,9 @@ pub fn run_windows_node(
             .map_err(|e| format!("Failed to make UDP socket non-blocking: {}", e))?;
     }
 
+    // Both handles send: the hooks on one, handshakes and replies on the other.
+    crate::lowlat::mark(&socket, crate::lowlat::Class::Input, "input", Some(peer_addr));
+    crate::lowlat::mark(&rx_socket, crate::lowlat::Class::Input, "input_rx", Some(peer_addr));
     let _ = NET_STATE.set(PeerSocket::new(socket, peer_addr, Arc::clone(&channel)));
     let rx_peer = PeerSocket::new(rx_socket, peer_addr, channel);
 

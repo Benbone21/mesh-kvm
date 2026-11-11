@@ -82,6 +82,9 @@ pub struct LocalSettings {
     pub device_name: String,
     /// The side of this device the other one sits on, for a layout that doesn't exist yet.
     pub switch_edge: Option<SwitchEdge>,
+    /// Wi-Fi streaming mode on Windows and high-priority marks on input and sound. Missing from
+    /// settings older than 0.9.3, which get it on.
+    pub low_latency_wifi: bool,
 }
 
 impl Default for LocalSettings {
@@ -105,6 +108,7 @@ impl Default for LocalSettings {
             peer_ip: String::new(),
             device_name: String::new(),
             switch_edge: None,
+            low_latency_wifi: true,
         }
     }
 }
@@ -449,6 +453,7 @@ pub fn load_and_apply() {
     *peer_slot() = s.peer_ip;
     *DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner) = s.device_name;
     *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner) = s.switch_edge;
+    crate::lowlat::set_enabled(s.low_latency_wifi);
 }
 
 /// What to send and play. Older settings had one Send switch and, on Linux, a choice of source,
@@ -494,6 +499,7 @@ fn current_settings() -> LocalSettings {
         peer_ip: peer_slot().clone(),
         device_name: DEVICE_NAME.lock().unwrap_or_else(PoisonError::into_inner).clone(),
         switch_edge: switch_edge(),
+        low_latency_wifi: crate::lowlat::enabled(),
     }
 }
 
@@ -586,6 +592,7 @@ pub fn add_toggle_status(status: &mut serde_json::Value, main_conflict: bool) {
     status["pointer_speed"] = serde_json::json!(pointer_speed());
     status["main_device"] = serde_json::json!(main_device());
     status["main_conflict"] = serde_json::json!(main_conflict);
+    status["low_latency_wifi"] = serde_json::json!(crate::lowlat::enabled());
 }
 
 /// Applies a toggle action to the live atomics, without saving. A field left out keeps its value,
@@ -608,6 +615,11 @@ fn apply_toggle(act: &str, val: &serde_json::Value) -> bool {
             store(&CLIPBOARD_RECEIVE, "receive");
         }
         "set_play_only_on_other" => store(&AUDIO_PLAY_ONLY_ON_OTHER, "enabled"),
+        "set_low_latency_wifi" => {
+            if let Some(on) = flag("enabled") {
+                crate::lowlat::set_enabled(on);
+            }
+        }
         "set_pointer_speed" => {
             if let Some(speed) = requested_pointer_speed(val) {
                 POINTER_SPEED_BITS.store(speed.to_bits(), Ordering::SeqCst);
@@ -1118,6 +1130,36 @@ mod tests {
     }
 
     #[test]
+    fn low_latency_wifi_is_on_unless_a_file_says_otherwise() {
+        assert!(LocalSettings::default().low_latency_wifi);
+        assert!(parse_settings(r#"{"audio_tx_enabled":true,"mouse_sharing":false}"#).low_latency_wifi, "a 0.9.2 file");
+        assert!(!parse_settings(r#"{"low_latency_wifi":false}"#).low_latency_wifi);
+        let off = LocalSettings { low_latency_wifi: false, ..LocalSettings::default() };
+        let saved = serde_json::to_string(&off).unwrap();
+        assert!(saved.contains(r#""low_latency_wifi":false"#), "{saved}");
+        assert!(!parse_settings(&saved).low_latency_wifi);
+    }
+
+    #[test]
+    fn low_latency_wifi_is_a_saved_toggle_in_the_status() {
+        let _guard = live_toggles();
+        assert!(apply_toggle("set_low_latency_wifi", &json!({ "enabled": false })));
+        assert!(!crate::lowlat::enabled());
+        assert!(!current_settings().low_latency_wifi);
+        let mut status = json!({});
+        add_toggle_status(&mut status, false);
+        assert_eq!(status["low_latency_wifi"], false);
+        // Nothing usable leaves it alone.
+        apply_toggle("set_low_latency_wifi", &json!({ "enabled": "yes" }));
+        apply_toggle("set_low_latency_wifi", &json!({}));
+        assert!(!crate::lowlat::enabled());
+        apply_toggle("set_low_latency_wifi", &json!({ "enabled": true }));
+        assert!(current_settings().low_latency_wifi);
+        add_toggle_status(&mut status, false);
+        assert_eq!(status["low_latency_wifi"], true);
+    }
+
+    #[test]
     fn the_old_send_switch_becomes_a_device_choice() {
         let choice = |text: &str, linux: bool| audio_choice(&parse_settings(text), linux);
         let (off, default) = (devices::NONE.to_string(), devices::DEFAULT.to_string());
@@ -1259,5 +1301,6 @@ mod tests {
         assert!(status["pointer_speed"].is_number());
         assert_eq!(status["main_device"], 0);
         assert_eq!(status["main_conflict"], true);
+        assert_eq!(status["low_latency_wifi"], true);
     }
 }

@@ -1319,6 +1319,7 @@ pub fn run_debian_node(
     let socket = crate::app::launch::bind_patiently(|| UdpSocket::bind(bind_addr))
         .map_err(|e| format!("Failed to bind UDP {}: {}", bind_addr, e))?;
     crate::update::note_service_up();
+    crate::lowlat::mark(&socket, crate::lowlat::Class::Input, "input", Some(peer_addr));
     socket
         .set_nonblocking(true)
         .map_err(|e| format!("Failed to set UDP socket nonblocking: {}", e))?;

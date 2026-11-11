@@ -306,6 +306,16 @@ pub fn other_version_arriving(now: Instant) -> bool {
     seen_within(*OTHER_VERSION_AT.lock().unwrap_or_else(PoisonError::into_inner), now, OTHER_VERSION_FOR)
 }
 
+/// Notes where the sender is. Reports go back there, so they're marked for there too.
+fn heard_from(last_source: &mut Option<SocketAddr>, from: SocketAddr) {
+    if *last_source != Some(from) {
+        *last_source = Some(from);
+        if let Some(mark) = RX_MARK.get() {
+            mark.sends_to(from);
+        }
+    }
+}
+
 /// The listening end of the link.
 struct Receiver<'a> {
     socket: &'a UdpSocket,
@@ -334,7 +344,7 @@ impl<'a> Receiver<'a> {
         }
         match self.channel.open(datagram, now_ms, &mut self.opened) {
             Opened::Data(plain) => {
-                self.last_source = Some(from);
+                heard_from(&mut self.last_source, from);
                 match packet::parse(plain) {
                     Ok(packet) if !matches!(packet.body, Body::Report(_)) => match packet.stream {
                         packet::Stream::Sound => {
@@ -353,7 +363,7 @@ impl<'a> Receiver<'a> {
             }
             // A responder never has a handshake going, so here this is always a keepalive, and so
             // authentic. It says where the sender is and nothing about the stream.
-            Opened::Heard => self.last_source = Some(from),
+            Opened::Heard => heard_from(&mut self.last_source, from),
             Opened::Reply(reply) => {
                 let _ = self.socket.send_to(reply, from);
             }
@@ -409,6 +419,9 @@ fn receive_loop(socket: &UdpSocket, sound: &Mutex<RxStream>, peer: SocketAddr, c
     }
 }
 
+/// The listening socket's mark, for what it sends back to wherever the sound comes from.
+static RX_MARK: std::sync::OnceLock<crate::lowlat::Mark> = std::sync::OnceLock::new();
+
 pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) -> Result<(), String> {
     let sound = Arc::new(Mutex::new(RxStream::default()));
     platform::start_playback(Arc::clone(&sound));
@@ -424,6 +437,7 @@ pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) 
                 }
             };
             println!("[Audio-RX] Listening on UDP {}", bind_addr);
+            let _ = RX_MARK.set(crate::lowlat::mark(&socket, crate::lowlat::Class::Audio, "audio_rx", None));
             receive_loop(&socket, &sound, peer, &channel, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
@@ -443,6 +457,7 @@ pub fn start_audio_sender(target_addr: SocketAddr, channel: Arc<Channel>) -> Res
                 }
             };
             println!("[Audio-TX] Ready -> UDP {}", target_addr);
+            crate::lowlat::mark(&socket, crate::lowlat::Class::Audio, "audio_tx", Some(target_addr));
             sender::send_loop(&socket, target_addr, &channel, &HUB, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
