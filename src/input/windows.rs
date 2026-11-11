@@ -1,6 +1,6 @@
 #![cfg(target_os = "windows")]
 
-use super::win_logic::{self, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
+use super::win_logic::{self, CloakStep, GameLook, HookGate, Hotkey, HotkeyFilter, KeyRoute, OsModifiers, KEY_SLOTS};
 use super::link::{came_up, press_event, MotionBatch, PeerLink, PeerVersion, PressLog, REPORT_COPIES};
 use super::{apply, InputBackend, PeerSender, PeerSocket};
 use crate::keymap::{evdev_to_win_scan, win_vk_scan_to_evdev};
@@ -13,7 +13,8 @@ use crate::secure::datagram::Channel;
 use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, Push, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -29,10 +30,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CONTROL, VK_MENU,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorInfo, GetCursorPos,
-    GetMessageW, GetSystemMetrics, PostQuitMessage, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, CURSORINFO,
-    CURSOR_SHOWING, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    CallNextHookEx, CreateCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorInfo,
+    GetCursorPos, GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW, SetCursor,
+    SetCursorPos, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+    UnhookWindowsHookEx, CURSORINFO, HCURSOR, HC_ACTION, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_APP, WM_MOUSEACTIVATE, WM_SETCURSOR, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, SM_CXSCREEN,
     SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_CLOSE, WM_ENDSESSION, WM_KEYDOWN, WM_KEYUP,
     WM_MOUSEMOVE, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, XBUTTON1, XBUTTON2,
@@ -58,6 +60,15 @@ const _: () = {
     assert!(win_logic::KEYEVENTF_EXTENDEDKEY == kbm::KEYEVENTF_EXTENDEDKEY);
     assert!(win_logic::KEYEVENTF_KEYUP == kbm::KEYEVENTF_KEYUP);
     assert!(win_logic::KEYEVENTF_SCANCODE == kbm::KEYEVENTF_SCANCODE);
+    assert!(win_logic::WS_POPUP == wm::WS_POPUP);
+    assert!(win_logic::WS_EX_TOPMOST == wm::WS_EX_TOPMOST);
+    assert!(win_logic::WS_EX_TRANSPARENT == wm::WS_EX_TRANSPARENT);
+    assert!(win_logic::WS_EX_TOOLWINDOW == wm::WS_EX_TOOLWINDOW);
+    assert!(win_logic::WS_EX_APPWINDOW == wm::WS_EX_APPWINDOW);
+    assert!(win_logic::WS_EX_LAYERED == wm::WS_EX_LAYERED);
+    assert!(win_logic::WS_EX_NOACTIVATE == wm::WS_EX_NOACTIVATE);
+    assert!(win_logic::CURSOR_SHOWING == wm::CURSOR_SHOWING);
+    assert!(win_logic::CURSOR_SUPPRESSED == wm::CURSOR_SUPPRESSED);
 };
 
 const ME: DeviceId = NodeId::Windows as DeviceId;
@@ -108,6 +119,17 @@ static DESKTOP_W: AtomicI32 = AtomicI32::new(1920);
 static DESKTOP_H: AtomicI32 = AtomicI32::new(1080);
 /// The cursor is parked at `pin_position` while the trackpad drives the peer.
 static MOUSE_PINNED: AtomicBool = AtomicBool::new(false);
+/// When the cursor last came off the park.
+static UNPINNED_MS: AtomicU64 = AtomicU64::new(0);
+/// The hidden session window, on the thread with the message loop. The cloak is made and ended
+/// there, as a window belongs to the thread that made it, and asked for by a message, so no other
+/// thread ever waits on that one.
+static SESSION_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// The cloak over the parked cursor, while it is up.
+static CLOAK_WINDOW: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static BLANK_CURSOR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+/// Asks the session window to bring the cloak in line with the park.
+const WM_APP_CLOAK: u32 = WM_APP + 1;
 /// Last known cursor position, clamped to the screen.
 static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
@@ -253,7 +275,8 @@ fn settle_races() {
 }
 
 /// Returns true if a game on Windows is holding the mouse captive (either manual lock Ctrl+Alt+G
-/// or a 3D game hiding/locking the hardware cursor via CURSOR_SHOWING == 0).
+/// or a 3D game hiding the hardware cursor). The cursor's looks are only judged on the laptop in
+/// use: see `win_logic::game_holds_cursor`.
 #[inline]
 fn is_windows_game_captive() -> bool {
     if MANUAL_GAME_LOCK.load(Ordering::Relaxed) {
@@ -262,14 +285,118 @@ fn is_windows_game_captive() -> bool {
     if !AUTO_GAME_LOCK.load(Ordering::Relaxed) {
         return false;
     }
+    let look = GameLook {
+        active_here: router().active() == ME,
+        pinned: MOUSE_PINNED.load(Ordering::SeqCst),
+        cloaked: cursor_cloaked(),
+        since_unpinned_ms: now_ms().saturating_sub(UNPINNED_MS.load(Ordering::SeqCst)),
+    };
     unsafe {
         let mut ci: CURSORINFO = std::mem::zeroed();
         ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
-        if GetCursorInfo(&mut ci) != 0 && (ci.flags & CURSOR_SHOWING) == 0 {
-            return true;
+        GetCursorInfo(&mut ci) != 0 && win_logic::game_holds_cursor(ci.flags, look)
+    }
+}
+
+/// True while the cloak hides this laptop's parked cursor.
+pub fn cursor_cloaked() -> bool {
+    !CLOAK_WINDOW.load(Ordering::SeqCst).is_null()
+}
+
+/// Asks for the cloak to follow the park. Safe from any thread, and from a hook: it only posts.
+fn ask_for_cloak() {
+    let window = SESSION_WINDOW.load(Ordering::SeqCst);
+    if !window.is_null() {
+        unsafe {
+            PostMessageW(window, WM_APP_CLOAK, 0, 0);
         }
     }
-    false
+}
+
+/// A cursor with nothing in it.
+fn blank_cursor() -> HCURSOR {
+    let made = BLANK_CURSOR.load(Ordering::SeqCst);
+    if !made.is_null() {
+        return made;
+    }
+    // AND all ones keeps the screen, XOR all zeros changes nothing: 32 rows of 32 bits each.
+    let (and, xor) = ([0xFFu8; 128], [0u8; 128]);
+    let cursor = unsafe { CreateCursor(GetModuleHandleW(ptr::null()), 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast()) };
+    BLANK_CURSOR.store(cursor, Ordering::SeqCst);
+    cursor
+}
+
+unsafe extern "system" fn cloak_window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        WM_SETCURSOR => {
+            SetCursor(blank_cursor());
+            1
+        }
+        // A click that somehow got here must not bring it forward.
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        _ => DefWindowProcW(window, message, wparam, lparam),
+    }
+}
+
+/// Makes the cloak under the parked cursor, on the window thread.
+fn create_cloak() -> HWND {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    let name: Vec<u16> = "mesh-kvm-cloak\0".encode_utf16().collect();
+    let (x, y, w, h) = win_logic::cloak_rect(pin_position());
+    unsafe {
+        let instance = GetModuleHandleW(ptr::null());
+        REGISTERED.get_or_init(|| {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(cloak_window_proc),
+                hInstance: instance,
+                hCursor: blank_cursor(),
+                lpszClassName: name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            RegisterClassW(&class);
+        });
+        let window = CreateWindowExW(
+            win_logic::CLOAK_EX_STYLE,
+            name.as_ptr(),
+            name.as_ptr(),
+            win_logic::CLOAK_STYLE,
+            x,
+            y,
+            w,
+            h,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            instance,
+            ptr::null(),
+        );
+        if window.is_null() {
+            return window;
+        }
+        // Almost clear, and still there for the cursor.
+        SetLayeredWindowAttributes(window, 0, 1, LWA_ALPHA);
+        ShowWindow(window, SW_SHOWNOACTIVATE);
+        SetWindowPos(window, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // The cursor takes a window's own only as it moves over it.
+        let (px, py) = pin_position();
+        SetCursorPos(px, py);
+        SetCursor(blank_cursor());
+        window
+    }
+}
+
+/// Brings the cloak in line with the park. Runs on the window thread only.
+fn follow_cloak() {
+    let existing = CLOAK_WINDOW.load(Ordering::SeqCst);
+    match win_logic::cloak_step(MOUSE_PINNED.load(Ordering::SeqCst), !existing.is_null()) {
+        CloakStep::Create => CLOAK_WINDOW.store(create_cloak(), Ordering::SeqCst),
+        CloakStep::Destroy => {
+            CLOAK_WINDOW.store(ptr::null_mut(), Ordering::SeqCst);
+            unsafe {
+                DestroyWindow(existing);
+            }
+        }
+        CloakStep::Keep => {}
+    }
 }
 
 /// Safe from a hook: the socket is non-blocking, and a failed send is dropped.
@@ -384,7 +511,10 @@ impl InputBackend for WindowsBackend {
             unsafe {
                 SetCursorPos(x, y);
             }
+            ask_for_cloak();
         } else if !mouse && was_pinned {
+            UNPINNED_MS.store(now_ms(), Ordering::SeqCst);
+            ask_for_cloak();
             if let Some(pt) = cursor_pos() {
                 remember_cursor(pt);
             }
@@ -461,8 +591,8 @@ fn os_key_down(vk: u16) -> bool {
 /// True if the hook must hand this event straight to the OS, because the router is poisoned.
 fn hook_fails_open() -> bool {
     let open = win_logic::hook_gate(router_lock().is_poisoned()) == HookGate::PassToOs;
-    if open {
-        MOUSE_PINNED.store(false, Ordering::SeqCst);
+    if open && MOUSE_PINNED.swap(false, Ordering::SeqCst) {
+        ask_for_cloak();
     }
     open
 }
@@ -765,6 +895,10 @@ unsafe extern "system" fn session_window_proc(
             PostQuitMessage(0);
             0
         }
+        WM_APP_CLOAK => {
+            follow_cloak();
+            0
+        }
         WM_POWERBROADCAST => {
             match wparam as u32 {
                 PBT_APMSUSPEND => {
@@ -833,8 +967,12 @@ fn create_session_window() {
         )
     };
     if created.is_null() {
-        crate::settings::log_note("Couldn't create the session window, so logging off or sleeping won't unmute this device.");
+        crate::settings::log_note("Couldn't create the session window, so logging off or sleeping won't unmute this device, and the parked cursor isn't hidden.");
+        return;
     }
+    SESSION_WINDOW.store(created, Ordering::SeqCst);
+    // The cursor may already be parked.
+    follow_cloak();
 }
 
 pub fn run_windows_node(

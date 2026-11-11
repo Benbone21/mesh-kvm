@@ -149,6 +149,7 @@ impl Canvas {
             painter.line_segment([to_screen(start.0, start.1), to_screen(end.0, end.1)], line(CROSSING_EDGE, ACCENT));
         }
         if let Some((x, y)) = model::cursor_position(snapshot, cfg) {
+            // Last, over the bright edge it sits on when about to cross.
             paint_pointer(&painter, to_screen(x, y));
         }
         for (_, _, response) in &borders {
@@ -289,8 +290,35 @@ fn paint_tile_text(painter: &Painter, rect: Rect, title: &str, caption: &str) {
     painter.galley(Pos2::new(at.x, below), caption, TEXT_DIM);
 }
 
-/// A mouse pointer, where the real one is: a `text` arrow outlined in `bg`.
-fn paint_pointer(painter: &Painter, tip: Pos2) {
-    let shape = [(0.0, 0.0), (0.0, 15.0), (4.0, 11.5), (10.5, 11.0)].map(|(x, y)| tip + vec2(x, y));
-    painter.add(Shape::convex_polygon(shape.to_vec(), TEXT, line(1.5, BG)));
+/// Where the real cursor is: a dot in the accent colour with a ring round it. An arrow would look
+/// like a second cursor on the screen.
+fn paint_pointer(painter: &Painter, at: Pos2) {
+    for shape in pointer_marker(at) {
+        painter.add(shape);
+    }
 }
+
+fn pointer_marker(at: Pos2) -> Vec<Shape> {
+    vec![Shape::circle_stroke(at, 7.0, line(1.5, ACCENT)), Shape::circle_filled(at, 3.5, ACCENT), Shape::circle_stroke(at, 3.5, line(1.0, BG))]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_live_cursor_is_a_ring_in_the_accent_colour_and_no_arrow() {
+        let at = Pos2::new(100.0, 50.0);
+        let shapes = pointer_marker(at);
+        assert!(!shapes.is_empty());
+        for shape in &shapes {
+            let Shape::Circle(circle) = shape else { panic!("only circles, never an arrow: {shape:?}") };
+            assert_eq!(circle.center, at, "centred on the cursor, not hanging off a tip");
+            assert!(circle.radius <= 8.0, "small: {}", circle.radius);
+            let colours = [circle.fill, circle.stroke.color];
+            assert!(colours.iter().any(|c| *c == ACCENT || *c == BG), "{colours:?}");
+        }
+        assert!(shapes.iter().any(|s| matches!(s, Shape::Circle(c) if c.fill == ACCENT)), "a dot of accent");
+    }
+}
+

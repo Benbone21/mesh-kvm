@@ -1242,6 +1242,7 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "game_reason": g.telemetry.game_reason,
         "displays": g.config.monitors(g.me),
         "cursor": [g.telemetry.cursor_x, g.telemetry.cursor_y],
+        "cursor_hidden": crate::input::cursor_hidden(),
         "autostart": platform.autostart_enabled(),
         "input_devices": platform.input_devices(),
         "audio": crate::settings::audio_status_json(),
