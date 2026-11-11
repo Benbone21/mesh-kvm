@@ -1015,7 +1015,39 @@ def link_log_checks(logged_before):
     with urllib.request.urlopen(LOCAL + "/api/local/clock", timeout=3) as r:
         clock = json.load(r)
     check("the exe gives its clock for the other device's log", abs(clock["unix_ms"] / 1000 - time.time()) < 5, str(clock))
+    check("and which process it is, so the other device can tell a restart", isinstance(clock.get("pid"), int) and clock.get("version"), str(clock))
     low_latency_checks()
+    link_details_checks()
+
+
+def link_details_checks():
+    """The exe's connection details, as the app reads them: the dropouts just played, each with its
+    cause once the 3 s after it have passed."""
+    details, drop, end = {}, {}, time.time() + 8
+    while time.time() < end:
+        details = call("/api/local/link")
+        drop = (details.get("stability") or {}).get("last_drop") or {}
+        if drop.get("cause"):
+            break
+        time.sleep(0.3)
+    with urllib.request.urlopen(LOCAL + "/api/local/link", timeout=3) as r:
+        kind = r.headers.get("Content-Type", "")
+    check("the exe serves its connection details as JSON", kind.startswith("application/json"), kind)
+    causes = ("wifi", "asleep", "restart", "unreachable", "unknown")
+    check("with the last drop, how long it lasted and its cause",
+          drop.get("length_ms", 0) >= 1350 and drop.get("cause") in causes, json.dumps(drop))
+    print(f"    the last drop lasted {drop.get('length_ms')} ms, cause: {drop.get('cause')}", flush=True)
+    events = details.get("events") or []
+    drops = [e for e in events if e.get("kind") == "drop"]
+    check("and the drops in its history, each with its cause, and a return after each",
+          len(drops) >= 2 and all(e.get("cause") in causes for e in drops) and any(e.get("kind") == "return" for e in events),
+          json.dumps([(e.get("kind"), e.get("cause")) for e in events]))
+    check("drops today counts them", (details.get("stability") or {}).get("drops_today", 0) >= len(drops), json.dumps(details.get("stability")))
+    latest = details.get("latest") or {}
+    check("and the latest sample has the round trips and packets", "rtt" in latest and "in_per_s" in latest, json.dumps(latest))
+    check("Wi-Fi scans and marks say how they stand under Wine",
+          (details.get("scans") or {}).get("state") in ("unavailable", "not_yet", "paused", "not_paused", "off") and len(details.get("marks") or []) >= 2,
+          json.dumps([details.get("scans"), details.get("marks")]))
 
 
 def low_latency_checks():

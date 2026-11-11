@@ -20,6 +20,10 @@ hold a change to that device's first screen at applying or going_back, as a serv
 --secure picks how the link's encryption stands, for both devices: encrypted, connecting, unpaired or old-peer (an
 other device too old to pair). Leave it out for a service that doesn't encrypt. POST {"state": ...} to /fake/secure to
 change it while running.
+--details picks how each device's connection details (GET /api/local/link) look: healthy, wifi-drop (a drop a moment
+ago that this device's Wi-Fi caused, with a roam and a stall in the history), unreachable (the other device's details
+can't be reached) or older (the other device is too old to have them). POST {"state": ...} to /fake/details to change
+that too. GET /fake/requests also counts the asks for the details, so it shows they stop while the panel is closed.
 GET /api/pairing answers from a small pairing state machine: pair_show shows the code 482917 counting down from 120,
 pair_enter with 482917 pairs with the fingerprint 4F2A-91C3, any other code fails as a wrong code, pair_cancel goes
 back to idle, and unpair leaves both devices unpaired.
@@ -86,6 +90,9 @@ class World:
         self.old_peer = False
         self.pairing = {"state": "idle"}
         self.code_until = None
+        self.details = "healthy"
+        self.details_since = time.time()
+        self.details_asked = {"Debian": 0, "Windows": 0}
 
     def rects(self, node):
         if not self.screens[node]:
@@ -183,6 +190,52 @@ def link_states():
 
 def set_link_state(world, name):
     world.online, world.link = link_states()[name]
+
+
+def link_details(world, node):
+    """What `/api/local/link` says on `node`, as the real service builds it: (status, body)."""
+    state = world.details
+    if node == "Windows" and state == "unreachable":
+        return 502, None
+    if node == "Windows" and state == "older":
+        return 404, None
+    now = int(time.time() * 1000)
+    started = int(world.details_since * 1000) - (2 * 3600 + 12 * 60) * 1000
+    windows = node == "Windows"
+    rtt = {"min_ms": 3.0, "avg_ms": 5.6, "max_ms": 14.0 if windows else 11.0, "jitter_ms": 1.3, "answers": 40}
+    sound = {"loss_percent": 0.4, "buffer_ms": 34 if windows else 42, "buffer_peak_ms": 61, "received": 1000, "lost": 1, "repaired": 1, "late": 0}
+    latest = {"at_ms": now - 3000, "online": True, "rtt": rtt, "loss_in": 0.2, "loss_out": 0.0 if windows else 0.4,
+              "in_per_s": 62.0, "out_per_s": 60.4, "failed_sends": 0, "failed_last": None, "worst_freeze_ms": 3, "sound": sound}
+    ten_min = {"from_ms": now - 597_000, "samples": 60,
+               "rtt": {"min_ms": 2.0, "avg_ms": 6.1, "max_ms": 48.0, "jitter_ms": 2.1, "answers": 2400},
+               "failed_sends": 0, "worst_freeze_ms": 9, "sound": {"buffer_peak_ms": 88, "received": 60000, "lost": 14, "repaired": 9, "late": 2}}
+    events = [{"at_ms": started, "kind": "start", "fields": {"version": world.version, "os": "windows" if windows else "linux", "pid": 4120}},
+              {"at_ms": started + 900, "kind": "wifi", "fields": {"addrs": "wlan0=192.168.8.210/24", "ssid": "Bread's Wi-Fi", "signal": 74}},
+              {"at_ms": started + 2400, "kind": "linked", "fields": {"down_ms": 2400}}]
+    stability = {"drops_today": 0, "last_drop": None}
+    wifi = {"state": "connected", "ssid": "Bread's Wi-Fi", "band": "5 GHz", "channel": "36" if windows else "149",
+            "freq_mhz": None if windows else 5745, "signal": 81 if windows else 74}
+    if state == "wifi-drop":
+        dropped = int(world.details_since * 1000) - 22_000
+        drop = {"at_ms": dropped, "detected_ms": dropped + 1100, "back_ms": dropped + 2400, "length_ms": 2400,
+                "cause": "wifi" if not windows else "unknown", "restarted": None}
+        events += [
+            {"at_ms": dropped - 40_000, "kind": "stall", "fields": {"late_ms": 420, "loop": "input"}},
+            {"at_ms": dropped - 1500, "kind": "roam", "fields": {"from": "aa:bb:cc:00:00:01", "to": "aa:bb:cc:00:00:02", "ssid": "Bread's Wi-Fi", "signal": 41}},
+            {"at_ms": dropped + 1100, "kind": "drop", "fields": {"silent_ms": 1100, "rtt_ms": 6, "signal": 41, "length_ms": 2400}, "cause": drop["cause"]},
+            {"at_ms": dropped + 2400, "kind": "return", "fields": {"down_ms": 1300, "length_ms": 2400}},
+            {"at_ms": dropped + 9000, "kind": "gap", "fields": {"silent_ms": 640, "while_busy": True}},
+        ]
+        stability = {"drops_today": 3, "last_drop": drop}
+        latest["loss_in"], latest["rtt"] = 6.3, rtt | {"max_ms": 212.0, "avg_ms": 31.0, "jitter_ms": 18.4}
+        ten_min["worst_freeze_ms"] = 420
+        wifi["signal"] = 41
+    scans = {"state": "paused"} if windows else {"state": "not_here"}
+    marks = ([{"socket": s, "applied": "qwave", "dscp": "56" if s == "input" else "40", "error": None} for s in ("audio_rx", "audio_tx", "input")]
+             if windows else [{"socket": s, "applied": "ip_tos", "dscp": "46" if s == "input" else "34", "error": None} for s in ("audio_rx", "audio_tx", "input")])
+    return 200, {"version": world.version, "pid": 4120, "now_ms": now, "started_ms": started, "online": True, "since_ms": started + 2400,
+                 "latest": latest, "ten_min": ten_min, "stability": stability, "wifi": wifi, "scans": scans, "marks": marks,
+                 "control": {"state": "up", "error": None}, "events": events[-20:]}
 
 
 def default_settings():
@@ -302,7 +355,14 @@ def serve(world):
                 elif path == "/api/local":
                     self.reply(world.local(self.node()))
                 elif path == "/fake/requests":
-                    self.reply(world.requests)
+                    self.reply(world.requests + [{"details_asked": world.details_asked}])
+                elif path == "/api/local/link":
+                    world.details_asked[self.node()] += 1
+                    status, body = link_details(world, self.node())
+                    if status == 200:
+                        self.reply(body)
+                    else:
+                        self.send_error(status)
                 elif path == "/api/state":
                     self.reply(world.state())
                 elif self.path == "/api/pairing":
@@ -327,6 +387,8 @@ def serve(world):
                     world.update = update_states()[body["state"]]
                 elif self.path == "/fake/secure":
                     set_secure_state(world, body["state"])
+                elif self.path == "/fake/details":
+                    world.details, world.details_since = body["state"], time.time()
                 elif self.path == "/fake/version":
                     world.version = body["version"]
                 elif self.path == "/fake/mode":
@@ -419,6 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("--update", default="none", choices=list(update_states()))
     parser.add_argument("--version", default="0.3.0")
     parser.add_argument("--secure", choices=["encrypted", "connecting", "unpaired", "old-peer"])
+    parser.add_argument("--details", default="healthy", choices=["healthy", "wifi-drop", "unreachable", "older"])
     options = parser.parse_args()
     world = World(options.monitors, options.name_style == "long", options.no_modes)
     set_audio_state(world, options.audio)
@@ -427,4 +490,5 @@ if __name__ == "__main__":
     world.version = options.version
     if options.secure:
         set_secure_state(world, options.secure)
+    world.details = options.details
     serve(world)
