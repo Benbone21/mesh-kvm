@@ -20,6 +20,8 @@ const MAIN_TIP: &str = "It takes the keyboard and mouse when the devices link up
 const MAIN_NEEDS_LINK: &str = "The main device can be chosen while the devices are linked and on the same version.";
 const ADDRESS_PINNED: &str = "How mesh-kvm starts on this device sets the address, so it can't be changed here.";
 const NO_LAYOUT: &str = "The layout shows up once mesh-kvm is running on this device.";
+pub const LOW_LATENCY_TIP: &str =
+    "Pauses background Wi-Fi scans on Windows and marks input and sound as high priority. Turn off if this device has trouble moving between Wi-Fi access points.";
 /// What a dropdown's value ends with.
 pub const DROPDOWN: &str = " \u{25be}";
 
@@ -285,10 +287,16 @@ impl Rows<'_, '_> {
             let range = MIN_POINTER_SPEED..=MAX_POINTER_SPEED;
             self.unless_older(d, s, self.number(d, s, Control::PointerSpeed, |v| format!("{v:.2}\u{d7}"), range, 0.05))
         };
+        // A service from before 0.9.3 has no such setting, so its cell is blank.
+        let low_latency = |d, s: &DeviceStatus| match s.low_latency_wifi {
+            Some(_) => Cell { tooltip: Some(LOW_LATENCY_TIP.into()), ..self.unless_older(d, s, self.toggle(d, s, Control::LowLatencyWifi)) },
+            None => Cell::blank(),
+        };
         let rows = vec![
             self.control_row("Share mouse", Control::MouseSharing, toggle(Control::MouseSharing)),
             self.control_row("Share keyboard", Control::KeyboardSharing, toggle(Control::KeyboardSharing)),
             self.control_row("Pointer speed on the other device", Control::PointerSpeed, speed),
+            self.control_row("Low-latency Wi-Fi", Control::LowLatencyWifi, low_latency),
         ];
         GroupRows { group: Group::Input, rows, notes: Vec::new() }
     }
@@ -744,7 +752,7 @@ mod tests {
     fn every_device_setting_has_a_row_in_the_boards_order() {
         let g = groups(&input(&linked()));
         assert_eq!(g.iter().map(|g| g.group).collect::<Vec<_>>(), ORDER);
-        assert_eq!(labels(&g, Group::Input), ["Share mouse", "Share keyboard", "Pointer speed on the other device"]);
+        assert_eq!(labels(&g, Group::Input), ["Share mouse", "Share keyboard", "Pointer speed on the other device", "Low-latency Wi-Fi"]);
         assert_eq!(labels(&g, Group::Clipboard), ["Send clipboard", "Receive clipboard"]);
         assert_eq!(labels(&g, Group::Audio), [
             "Output to send", "Play only on the other device", "Send volume", "Audio quality",
@@ -753,6 +761,26 @@ mod tests {
         ]);
         assert_eq!(labels(&g, Group::Games), ["Hold the mouse while a game runs", "Lock the mouse here now"]);
         assert_eq!(labels(&g, Group::Startup), ["Start when this device boots"]);
+    }
+
+    #[test]
+    fn low_latency_wifi_is_a_toggle_that_says_what_it_does_and_is_blank_for_an_older_peer() {
+        let mut s = linked();
+        s.peer.as_mut().unwrap().low_latency_wifi = Some(false);
+        let g = groups(&input(&s));
+        let r = row(&g, "Low-latency Wi-Fi");
+        assert_eq!(values(r), ["ON", "OFF"]);
+        assert_eq!(r.cells[0].kind, CellKind::Toggle(Setting::Device(Control::LowLatencyWifi)));
+        for cell in &r.cells {
+            assert_eq!(cell.tooltip.as_deref(), Some(LOW_LATENCY_TIP));
+            assert_eq!(cell.read_only, None);
+        }
+        assert!(LOW_LATENCY_TIP.starts_with("Pauses background Wi-Fi scans on Windows"));
+        s.peer.as_mut().unwrap().low_latency_wifi = None;
+        let g = groups(&input(&s));
+        let r = row(&g, "Low-latency Wi-Fi");
+        assert_eq!(r.cells[1].kind, CellKind::Blank, "a peer from before 0.9.3");
+        assert_eq!(r.cells[0].value, "ON");
     }
 
     #[test]

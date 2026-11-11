@@ -18,6 +18,7 @@ pub fn device(node: &str, tx_source: Option<u32>) -> DeviceStatus {
     d.audio.rx_volume = 100;
     d.audio.tx_peak = 60;
     d.audio.play_only_on_other = Some(true);
+    d.low_latency_wifi = Some(true);
     d
 }
 
@@ -41,6 +42,7 @@ pub fn states() -> Vec<Snapshot> {
     let mut older = linked();
     older.peer.as_mut().unwrap().sharing = None;
     older.peer.as_mut().unwrap().audio.play_only_on_other = None;
+    older.peer.as_mut().unwrap().low_latency_wifi = None;
     let mut with_modes = linked();
     with_modes.local_displays = vec![display("DP-3"), display("DP-2")];
     with_modes.peer_displays = vec![display("Display 1")];

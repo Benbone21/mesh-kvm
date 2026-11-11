@@ -190,6 +190,7 @@ def default_settings():
         "sharing": {"mouse": True, "keyboard": True},
         "clipboard": {"send": True, "receive": True, "note": "Copied 12 characters from the other device."},
         "pointer_speed": 0.75,
+        "low_latency_wifi": True,
         "audio": audio_idle(),
     }
 
@@ -383,6 +384,8 @@ def act(world, node, body):
         audio["tx_enabled"] = audio["output"] != ""
     elif action == "set_audio_bitrate":
         world.settings[node]["audio"]["bitrate"] = body["kbps"]
+    elif action == "set_low_latency_wifi":
+        world.settings[node]["low_latency_wifi"] = body["enabled"]
     elif action == "set_play_only_on_other":
         world.settings[node]["audio"]["play_only_on_other"] = body["enabled"]
     elif action == "set_audio_rx_muted":

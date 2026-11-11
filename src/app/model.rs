@@ -325,6 +325,8 @@ pub struct DeviceStatus {
     /// 0 is Debian, 1 is the laptop.
     pub main_device: u8,
     pub main_conflict: bool,
+    /// Wi-Fi streaming mode and high-priority packets. Missing from a service older than 0.9.3.
+    pub low_latency_wifi: Option<bool>,
     /// What the person calls this device: its given name, or else its hostname.
     pub device_name: String,
     pub display_change: DisplayChanges,
@@ -770,6 +772,7 @@ pub enum Control {
     MouseSharing,
     KeyboardSharing,
     PointerSpeed,
+    LowLatencyWifi,
     PlayOnlyOnOther,
     AudioBitrate,
     SendVolume,
@@ -791,6 +794,7 @@ impl Control {
             Control::MouseSharing => flag(d.sharing.as_ref().is_none_or(|s| s.mouse)),
             Control::KeyboardSharing => flag(d.sharing.as_ref().is_none_or(|s| s.keyboard)),
             Control::PointerSpeed => d.pointer_speed as f64,
+            Control::LowLatencyWifi => flag(d.low_latency_wifi.unwrap_or(false)),
             Control::PlayOnlyOnOther => flag(d.audio.play_only_on_other.unwrap_or(false)),
             Control::AudioBitrate => d.audio.bitrate as f64,
             Control::SendVolume => d.audio.tx_volume as f64,
@@ -811,6 +815,7 @@ impl Control {
             Control::PointerSpeed => {
                 json!({ "action": "set_pointer_speed", "speed": (value * 100.0).round() / 100.0 })
             }
+            Control::LowLatencyWifi => json!({ "action": "set_low_latency_wifi", "enabled": on }),
             Control::PlayOnlyOnOther => json!({ "action": "set_play_only_on_other", "enabled": on }),
             Control::AudioBitrate => json!({ "action": "set_audio_bitrate", "kbps": value as u32 }),
             Control::SendVolume => json!({ "action": "set_audio_tx_volume", "volume": value as u32 }),
@@ -2309,6 +2314,18 @@ mod tests {
         let newer = LOCAL_JSON.replace(r#""tx_source":0,"#, r#""play_only_on_other":false,"#);
         let d: DeviceStatus = serde_json::from_str(&newer).unwrap();
         assert_eq!(d.audio.play_only_on_other, Some(false));
+    }
+
+    #[test]
+    fn low_latency_wifi_reads_and_writes_the_service_field() {
+        let d: DeviceStatus = serde_json::from_str(LOCAL_JSON).unwrap();
+        assert_eq!(d.low_latency_wifi, None, "an older service has no such field");
+        assert_eq!(Control::LowLatencyWifi.read(&d), 0.0);
+        let newer = LOCAL_JSON.replace(r#""main_conflict":false"#, r#""main_conflict":false,"low_latency_wifi":true"#);
+        let d: DeviceStatus = serde_json::from_str(&newer).unwrap();
+        assert_eq!(d.low_latency_wifi, Some(true));
+        assert_eq!(Control::LowLatencyWifi.read(&d), 1.0);
+        assert_eq!(Control::LowLatencyWifi.action(0.0), json!({"action": "set_low_latency_wifi", "enabled": false}));
     }
 
     #[test]
