@@ -915,6 +915,21 @@ def dropout_checks(peer, inbox):
     check("with the link gone the laptop has its own input, and says control is going back",
           view(st) == (False, "Windows") and st["link"]["returning"] is True, str(st and st["link"]))
     check("and it shows no figures", st["link"]["measured"] is False and st["link"]["round_trip_ms"] is None, str(st["link"]))
+    started = time.time()
+    reply = call("/api/peer/api/state")
+    took = time.time() - started
+    check("while the link is down a call to the other device fails at once, saying why",
+          "offline" in str(reply.get("error", "")) and took < 0.3, f"{reply} in {took * 1000:.0f} ms")
+    # The link comes back: how long until the other device's API answers again.
+    came_back, answered = time.time(), None
+    while time.time() < came_back + 4 and answered is None:
+        beats.send()
+        if "error" not in call("/api/peer/api/state"):
+            answered = time.time() - came_back
+        else:
+            time.sleep(0.1)
+    print(f"    the other device's API answered {answered and round(answered * 1000)} ms after the link came back", flush=True)
+    check("after a dropout the other device's API answers again within 2 s", answered is not None and answered < 2, str(answered))
     end = time.time() + 2
     while time.time() < end and view(local())[1] != "Debian":
         beats.send()
