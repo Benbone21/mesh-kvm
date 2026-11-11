@@ -332,6 +332,29 @@ mod position {
         Back,
     }
 
+    /// Silent this long while the mouse moves, the tracker is taken for lost and started again.
+    pub const TRACKER_LOST_MS: u64 = 5000;
+    /// And no more often than this.
+    pub const RESPAWN_GAP_MS: u64 = 30_000;
+
+    /// When to start the tracker again: lost, and not too soon after the last time.
+    #[derive(Default)]
+    pub struct Respawn {
+        last_ms: Option<u64>,
+    }
+
+    impl Respawn {
+        /// True if the tracker, silent for `silent_ms` while the mouse moved, should start again now.
+        pub fn due(&mut self, silent_ms: u64, now_ms: u64) -> bool {
+            let rested = self.last_ms.is_none_or(|last| now_ms.saturating_sub(last) >= RESPAWN_GAP_MS);
+            let due = silent_ms > TRACKER_LOST_MS && rested;
+            if due {
+                self.last_ms = Some(now_ms);
+            }
+            due
+        }
+    }
+
     /// The cursor's position and the movement since, on Debian.
     pub struct CursorTrack {
         newest: Option<Sample>,
@@ -702,6 +725,16 @@ mod tests {
         let (here, _) = t.locate(110 * MS, &desk());
         assert_eq!((here.trust, here.sample), (Trust::Fresh, (2610, 1430)));
         assert_eq!(t.shown(), (2610, 1430));
+    }
+
+    #[test]
+    fn a_lost_tracker_is_started_again_at_most_every_30_s() {
+        let mut respawn = Respawn::default();
+        assert!(!respawn.due(TRACKER_LOST_MS, 1000), "silent, but not long enough");
+        assert!(respawn.due(TRACKER_LOST_MS + 1, 1000));
+        assert!(!respawn.due(60_000, 1000 + RESPAWN_GAP_MS - 1));
+        assert!(respawn.due(60_000, 1000 + RESPAWN_GAP_MS));
+        assert!(!respawn.due(0, 100_000), "heard from again");
     }
 
     #[test]

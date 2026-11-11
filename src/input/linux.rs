@@ -13,8 +13,8 @@ use crate::protocol::{
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
 use crate::crossing::{
-    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Sample, SampleSlot, Spot,
-    TrackerNews,
+    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Respawn, Sample, SampleSlot, Spot,
+    TrackerNews, RESPAWN_GAP_MS,
 };
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
@@ -1026,86 +1026,127 @@ fn wall_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Lets the input loop start the tracker again: it ends the running dbus-monitor, and the tracker's
+/// thread then starts dbus-monitor and the script afresh.
+#[derive(Default)]
+struct TrackerControl {
+    restart: AtomicBool,
+    monitor_pid: std::sync::atomic::AtomicI32,
+}
+
+impl TrackerControl {
+    fn restart(&self) {
+        self.restart.store(true, Ordering::SeqCst);
+        let pid = self.monitor_pid.load(Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+    }
+}
+
+fn note_lost(reason: &str) {
+    crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "lost").text("reason", reason));
+}
+
 /// Spawns a KWin Scripting bridge that tracks the TRUE KDE Plasma 6 Wayland cursor (x, y)
 /// AND active fullscreen/game windows in real time via `workspace.cursorPosChanged` over session D-Bus.
-/// Only the newest position is kept, with when KWin took it.
-fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<AtomicBool>) {
+/// Only the newest position is kept, with when KWin took it. If dbus-monitor ends, or the input
+/// loop finds the tracker lost, it starts again, no more often than every `RESPAWN_GAP_MS`.
+fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<AtomicBool>, control: Arc<TrackerControl>) {
     std::thread::Builder::new()
         .name("mesh-kvm-kwin-cursor".to_string())
         .spawn(move || {
-            let script_path = "/tmp/mesh_kvm_kwin_cursor.js";
-            let _ = fs::write(script_path, KWIN_SCRIPT);
-
-            // Start dbus-monitor BEFORE running the KWin script so we catch the initial emitPos(true).
-            // Line by line, so a position is never left sitting in its buffer.
-            let monitor_args = ["--session", "interface='org.meshkvm.Cursor'"];
-            let line_buffered = Command::new("stdbuf")
-                .arg("-oL")
-                .arg("dbus-monitor")
-                .args(monitor_args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-            let child_opt = line_buffered
-                .or_else(|_| {
-                    Command::new("dbus-monitor").args(monitor_args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-                })
-                .ok();
-
-            std::thread::sleep(Duration::from_millis(80));
-
-            let _ = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.unloadScript",
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output();
-
-            if let Ok(out) = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.loadScript",
-                    script_path,
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output()
-            {
-                let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let _ = Command::new("qdbus6")
-                    .args([
-                        "org.kde.KWin",
-                        &format!("/Scripting/Script{}", id),
-                        "org.kde.kwin.Script.run",
-                    ])
-                    .output();
-            }
-
-            if let Some(mut child) = child_opt {
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = MonitorReader::default();
-                    let mut unnumbered = 0u32;
-                    let mut said_bad_stamp = false;
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                        let Some(reading) = reader.feed(&line) else { continue };
-                        if reading.bad_stamp && !said_bad_stamp {
-                            said_bad_stamp = true;
-                            crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "bad_stamp"));
-                        }
-                        kwin_game_active.store(reading.game, Ordering::Relaxed);
-                        let seq = reading.seq.unwrap_or_else(|| {
-                            unnumbered = unnumbered.wrapping_add(1);
-                            unnumbered
-                        });
-                        let taken_us = taken_at(reading.kwin_ms, wall_ms(), mono_us());
-                        positions.offer(Sample { x: reading.x, y: reading.y, seq, taken_us });
-                    }
+            let mut said_bad_stamp = false;
+            let mut last_start: Option<Instant> = None;
+            let mut said_exit = false;
+            loop {
+                if let Some(started) = last_start {
+                    std::thread::sleep(Duration::from_millis(RESPAWN_GAP_MS).saturating_sub(started.elapsed()));
+                }
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    return;
+                }
+                last_start = Some(Instant::now());
+                let heard = run_kwin_tracker(&positions, &kwin_game_active, &control, &mut said_bad_stamp);
+                let asked = control.restart.swap(false, Ordering::SeqCst);
+                // Asked for, the input loop said why. A dbus-monitor that never works is said once.
+                if !asked && (heard || !said_exit) {
+                    said_exit = true;
+                    note_lost("dbus_monitor_exited");
                 }
             }
         })
         .ok();
+}
+
+/// One run of the tracker: dbus-monitor, then the script, then positions until dbus-monitor ends.
+/// True if it heard any.
+fn run_kwin_tracker(
+    positions: &SampleSlot,
+    kwin_game_active: &AtomicBool,
+    control: &TrackerControl,
+    said_bad_stamp: &mut bool,
+) -> bool {
+    let script_path = "/tmp/mesh_kvm_kwin_cursor.js";
+    let _ = fs::write(script_path, KWIN_SCRIPT);
+
+    // Start dbus-monitor BEFORE running the KWin script so we catch the initial emitPos(true).
+    // Line by line, so a position is never left sitting in its buffer.
+    let monitor_args = ["--session", "interface='org.meshkvm.Cursor'"];
+    let line_buffered = Command::new("stdbuf")
+        .arg("-oL")
+        .arg("dbus-monitor")
+        .args(monitor_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let child = line_buffered.or_else(|_| {
+        Command::new("dbus-monitor").args(monitor_args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    });
+    let Ok(mut child) = child else { return false };
+    control.monitor_pid.store(child.id() as i32, Ordering::SeqCst);
+
+    std::thread::sleep(Duration::from_millis(80));
+
+    let _ = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"])
+        .output();
+    if let Ok(out) = Command::new("qdbus6")
+        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script_path, "mesh_kvm_cursor_watch"])
+        .output()
+    {
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let _ = Command::new("qdbus6")
+            .args(["org.kde.KWin", &format!("/Scripting/Script{}", id), "org.kde.kwin.Script.run"])
+            .output();
+    }
+
+    let mut heard = false;
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = MonitorReader::default();
+        let mut unnumbered = 0u32;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Some(reading) = reader.feed(&line) else { continue };
+            heard = true;
+            if reading.bad_stamp && !*said_bad_stamp {
+                *said_bad_stamp = true;
+                crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "bad_stamp"));
+            }
+            kwin_game_active.store(reading.game, Ordering::Relaxed);
+            let seq = reading.seq.unwrap_or_else(|| {
+                unnumbered = unnumbered.wrapping_add(1);
+                unnumbered
+            });
+            let taken_us = taken_at(reading.kwin_ms, wall_ms(), mono_us());
+            positions.offer(Sample { x: reading.x, y: reading.y, seq, taken_us });
+        }
+    }
+    control.monitor_pid.store(0, Ordering::SeqCst);
+    let _ = child.kill();
+    let _ = child.wait();
+    heard
 }
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -1505,7 +1546,9 @@ pub fn run_debian_node(
 
     let positions = Arc::new(SampleSlot::default());
     let kwin_game_active = Arc::new(AtomicBool::new(false));
-    spawn_kwin_cursor_tracker(Arc::clone(&positions), Arc::clone(&kwin_game_active));
+    let tracker = Arc::new(TrackerControl::default());
+    spawn_kwin_cursor_tracker(Arc::clone(&positions), Arc::clone(&kwin_game_active), Arc::clone(&tracker));
+    let mut respawn = Respawn::default();
 
     let (mice, keyboards) = discover_devices(explicit_mouse.as_deref());
     if mice.is_empty() {
@@ -1879,6 +1922,11 @@ pub fn run_debian_node(
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
             last_telemetry_sync = Instant::now();
+            // Silent for long while the mouse moves, as after KWin restarted: start it again.
+            if respawn.due(core.backend.track.silent_for_ms(mono_us()), now_ms()) {
+                note_lost("silent");
+                tracker.restart();
+            }
             if let Ok(mut guard) = spatial_state.write() {
                 guard.telemetry.active_node = if core.router.active() == WINDOWS {
                     "Windows".to_string()
