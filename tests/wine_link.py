@@ -1015,6 +1015,28 @@ def link_log_checks(logged_before):
     with urllib.request.urlopen(LOCAL + "/api/local/clock", timeout=3) as r:
         clock = json.load(r)
     check("the exe gives its clock for the other device's log", abs(clock["unix_ms"] / 1000 - time.time()) < 5, str(clock))
+    low_latency_checks()
+
+
+def low_latency_checks():
+    """Low-latency Wi-Fi under Wine, which has neither a working wlanapi nor a working qWAVE: the
+    exe says so in its link log and carries on."""
+    lines = link_log_lines()
+    modes = [line for line in lines if line.split(" ")[1] == "wifi_mode"]
+    check("the link log says what became of Wi-Fi streaming mode, unavailable under Wine",
+          bool(modes) and all(re.search(r" streaming=(unavailable error=|on ifaces=)", line) for line in modes), "\n".join(modes) or "\n".join(lines[-5:]))
+    qos = {}
+    for line in lines:
+        m = re.search(r" qos socket=(\w+) (.*)", line)
+        if m:
+            qos.setdefault(m.group(1), m.group(2))
+    check("each socket that sends says once how its packets are marked, or why not",
+          all(name in qos for name in ("input", "input_rx", "audio_tx")) and all(" applied=" in " " + v for v in qos.values()), str(qos))
+    check("Low-latency Wi-Fi is on by default", local().get("low_latency_wifi") is True, str(local().get("low_latency_wifi")))
+    call("/api/local/action", {"action": "set_low_latency_wifi", "enabled": False})
+    check("and can be turned off", local().get("low_latency_wifi") is False, str(local().get("low_latency_wifi")))
+    call("/api/local/action", {"action": "set_low_latency_wifi", "enabled": True})
+    check("and on again", local().get("low_latency_wifi") is True, str(local().get("low_latency_wifi")))
 
 
 def api_checks(peer, inbox):
