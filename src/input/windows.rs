@@ -9,6 +9,7 @@ use crate::protocol::{
     MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT, MOUSE_BTN_SIDE,
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
+use crate::crossing::{CrossLine, Refusal, RefusalLog};
 use crate::secure::datagram::Channel;
 use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, Push, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
@@ -89,6 +90,10 @@ static SPATIAL: OnceLock<Arc<RwLock<SharedSpatialState>>> = OnceLock::new();
 /// A copy of this laptop's monitors, for the hooks.
 static MONITORS: Mutex<Vec<MonitorRect>> = Mutex::new(Vec::new());
 static HOTKEYS: Mutex<HotkeyFilter> = Mutex::new(HotkeyFilter::new());
+/// Crossings refused, for the link log.
+static REFUSALS: Mutex<RefusalLog> = Mutex::new(RefusalLog::new());
+/// When a completed push started waiting in a guard strip, or 0.
+static HELD_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// A copy of the layout's manual game lock, for the hooks.
 static MANUAL_GAME_LOCK: AtomicBool = AtomicBool::new(false);
 /// A copy of the layout's automatic game lock, for the hooks.
@@ -178,6 +183,10 @@ fn motion() -> MutexGuard<'static, MotionBatch> {
 
 fn edge_state() -> MutexGuard<'static, EdgeWatch> {
     EDGE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn refusals() -> MutexGuard<'static, RefusalLog> {
+    REFUSALS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn monitors() -> MutexGuard<'static, Vec<MonitorRect>> {
@@ -670,25 +679,57 @@ fn push_edge(x: i32, y: i32, dx: i32, dy: i32, from_peer: bool) -> bool {
     }
     let buttons_held = BUTTONS_HELD_MASK.load(Ordering::SeqCst) != 0
         || LOCAL_BUTTONS_MASK.load(Ordering::SeqCst) != 0;
-    let push = {
+    let now = now_ms();
+    let (push, settle_left_ms) = {
         let monitors = monitors();
-        edge_state().cross(&monitors, (x, y), (dx, dy), buttons_held, now_ms())
+        let mut edge = edge_state();
+        (edge.cross(&monitors, (x, y), (dx, dy), buttons_held, now), edge.settle_full_left_ms(now))
     };
-    if push != Push::Crossed {
-        return false;
-    }
+    let held_ms = {
+        let mut log = refusals();
+        match push {
+            Push::Refused(reason) => {
+                if let Some(line) = log.refused(reason, now) {
+                    crate::crossing::record_refusal(line);
+                }
+                // A push held in the guard strip waits; one refused for the settle starts again.
+                if reason == Refusal::Guard && HELD_SINCE_MS.load(Ordering::SeqCst) == 0 {
+                    HELD_SINCE_MS.store(now, Ordering::SeqCst);
+                } else if reason != Refusal::Guard {
+                    log.cleared();
+                }
+                return false;
+            }
+            Push::Pushing => {
+                log.cleared();
+                HELD_SINCE_MS.store(0, Ordering::SeqCst);
+                return false;
+            }
+            Push::Crossed => {
+                log.cleared();
+                let since = HELD_SINCE_MS.swap(0, Ordering::SeqCst);
+                if since == 0 { 0 } else { now.saturating_sub(since) }
+            }
+        }
+    };
     // Where the cursor lands. If the layout is busy, the next push crosses instead.
     let entry = SPATIAL.get().and_then(|state| {
         let state = state.try_read().ok()?;
         Some(state.config.entry_on_peer(NodeId::Windows, x, y))
     });
-    let Some((x, y)) = entry else {
+    let Some(entry) = entry else {
         return false;
     };
-    route(Event::EdgeCrossed { x, y, from_peer })
+    let crossed = route(Event::EdgeCrossed { x: entry.0, y: entry.1, from_peer })
         .actions
         .iter()
-        .any(|a| matches!(a, Action::SendFocus { .. }))
+        .any(|a| matches!(a, Action::SendFocus { .. }));
+    if crossed {
+        // The laptop's position is the cursor's own, never late.
+        let line = CrossLine { to_laptop: false, at: (x, y), entry, sample_age_ms: 0, est: (0, 0), held_ms, settle_left_ms };
+        line.record();
+    }
+    crossed
 }
 
 /// Handles physical pointer movement to `pt`. Returns true to keep it from the OS.

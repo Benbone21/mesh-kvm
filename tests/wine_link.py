@@ -332,6 +332,18 @@ def link_log_lines():
     return link_log(2000)[0].splitlines()
 
 
+def wait_for_lines(cond, timeout):
+    """The link log's lines once cond holds for them, as the log is written a moment after."""
+    deadline = time.time() + timeout
+    lines = []
+    while time.time() < deadline:
+        lines = link_log_lines()
+        if cond(lines):
+            break
+        time.sleep(0.2)
+    return lines
+
+
 def bincode_text(text):
     raw = text.encode()
     return struct.pack("<Q", len(raw)) + raw
@@ -794,6 +806,14 @@ def input_checks(peer, inbox):
     check("pushed straight back at the edge it came in by, the cursor doesn't bounce back", bounced is None)
     quick = arrive_then([(0.03, 30)] + [(0.08 + 0.02 * i, -100) for i in range(4)])
     check("a quick return 30 px in and back crosses inside the 250 ms settle", quick is not None)
+    # Each crossing has its line in the link log, and the refused push before it one too.
+    lines = wait_for_lines(lambda ls: any(" cross dir=to_debian " in l for l in ls), 3)
+    crossed = [l for l in lines if " cross dir=to_debian " in l]
+    check("a crossing writes a cross line with where it went and how early the settle ended",
+          bool(crossed) and all(k in crossed[-1] for k in ("at=0,", "entry=", "sample_age_ms=0", "held_ms=", "settle_left_ms=")),
+          str(crossed[-1:]))
+    check("the push refused for the settle writes a cross_refused line",
+          any(" cross_refused reason=settle count=" in l for l in lines), str([l for l in lines if "cross_refused" in l][-2:]))
 
     # o. With Debian in control the laptop's cursor sits parked, hidden under a window of its own,
     # which goes with Release all input and while the laptop is in use.

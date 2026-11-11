@@ -12,7 +12,9 @@ use crate::protocol::{
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
-use crate::crossing::{judge, taken_at, CursorTrack, Gate, Sample, SampleSlot, TrackerNews};
+use crate::crossing::{
+    judge, record_refusal, taken_at, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Sample, SampleSlot, TrackerNews,
+};
 use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -1347,6 +1349,7 @@ struct Core<'a> {
     edge: EdgeWatch,
     /// A push that completed and waits for a position to confirm it.
     holding: Option<Held>,
+    refusals: RefusalLog,
 }
 
 impl Core<'_> {
@@ -1383,25 +1386,40 @@ impl Core<'_> {
             note_tracker(news, here.age_ms);
         }
         let held = self.backend.any_button_held();
+        let now_ms = self.peer.now_ms();
         if !self.edge.press(monitors, here.sample, (dx, dy), held) {
             self.holding = None;
+            self.refusals.cleared();
             return;
         }
-        if self.edge.too_soon(self.peer.now_ms()) {
+        if self.edge.too_soon(now_ms) {
             self.holding = None;
+            if let Some(line) = self.refusals.refused(Refusal::Settle, now_ms) {
+                record_refusal(line);
+            }
+            self.refusals.cleared();
             return;
         }
         let guarded = self.edge.guarded(monitors, here.sample) || self.edge.guarded(monitors, here.estimate);
         match judge(&here, self.edge.on_span(monitors, here.estimate), guarded) {
             Gate::Cross { at } => {
                 self.edge.clear();
-                self.holding = None;
-                let (x, y) = cfg.entry_on_peer(NodeId::Debian, at.0, at.1);
-                self.route(Event::EdgeCrossed { x, y, from_peer });
+                self.refusals.cleared();
+                let held_ms = self.holding.take().map_or(0, |h| now_ms.saturating_sub(h.since_ms));
+                let settle_left_ms = self.edge.settle_full_left_ms(now_ms);
+                let entry = cfg.entry_on_peer(NodeId::Debian, at.0, at.1);
+                let actions = self.route(Event::EdgeCrossed { x: entry.0, y: entry.1, from_peer });
+                if actions.iter().any(|a| matches!(a, Action::SendFocus { .. })) {
+                    let est = here.moved;
+                    CrossLine { to_laptop: true, at, entry, sample_age_ms: here.age_ms, est, held_ms, settle_left_ms }.record();
+                }
             }
-            Gate::Hold(_) => {
+            Gate::Hold(reason) => {
                 if self.holding.is_none() {
-                    self.holding = Some(Held { from_peer });
+                    self.holding = Some(Held { from_peer, since_ms: now_ms });
+                }
+                if let Some(line) = self.refusals.refused(reason, now_ms) {
+                    record_refusal(line);
                 }
             }
         }
@@ -1425,6 +1443,7 @@ impl Core<'_> {
 #[derive(Clone, Copy)]
 struct Held {
     from_peer: bool,
+    since_ms: u64,
 }
 
 /// Says in the link log that KWin's positions stopped coming, or came back.
@@ -1520,6 +1539,7 @@ pub fn run_debian_node(
         },
         edge: EdgeWatch::new(),
         holding: None,
+        refusals: RefusalLog::new(),
     };
 
     let mut hotkeys = HotkeyFilter::default();

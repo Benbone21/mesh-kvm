@@ -32,6 +32,94 @@ pub enum Refusal {
     OffSpan,
 }
 
+impl Refusal {
+    pub fn word(self) -> &'static str {
+        match self {
+            Refusal::Stale => "stale",
+            Refusal::Guard => "guard",
+            Refusal::Settle => "settle",
+            Refusal::OffSpan => "off_span",
+        }
+    }
+}
+
+/// Refusals for the link log: one line a second at most, with how many there were. A push held
+/// for one reason counts once, however many times it is looked at again.
+#[derive(Default)]
+pub struct RefusalLog {
+    last_line_ms: Option<u64>,
+    since_line: u32,
+    ongoing: Option<Refusal>,
+}
+
+impl RefusalLog {
+    pub const fn new() -> Self {
+        Self { last_line_ms: None, since_line: 0, ongoing: None }
+    }
+
+    /// A completed push was refused. Returns the reason and the count for a line, when one is due.
+    pub fn refused(&mut self, reason: Refusal, now_ms: u64) -> Option<(Refusal, u32)> {
+        if self.ongoing == Some(reason) {
+            return None;
+        }
+        self.ongoing = Some(reason);
+        self.since_line += 1;
+        if self.last_line_ms.is_some_and(|last| now_ms.saturating_sub(last) < 1000) {
+            return None;
+        }
+        self.last_line_ms = Some(now_ms);
+        Some((reason, std::mem::take(&mut self.since_line)))
+    }
+
+    /// The push crossed, or isn't a completed one any more.
+    pub fn cleared(&mut self) {
+        self.ongoing = None;
+    }
+}
+
+/// What a crossing's line in the link log says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrossLine {
+    pub to_laptop: bool,
+    /// Where the push crossed, on this device.
+    pub at: (i32, i32),
+    /// Where the cursor goes on the other device.
+    pub entry: (i32, i32),
+    pub sample_age_ms: u64,
+    /// Mouse movement since the position, added on for the estimate.
+    pub est: (i32, i32),
+    /// How long the completed push waited.
+    pub held_ms: u64,
+    /// See `Settle::full_left_ms`.
+    pub settle_left_ms: u64,
+}
+
+impl CrossLine {
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("dir", if self.to_laptop { "to_laptop" } else { "to_debian" }.to_string()),
+            ("at", format!("{},{}", self.at.0, self.at.1)),
+            ("entry", format!("{},{}", self.entry.0, self.entry.1)),
+            ("sample_age_ms", self.sample_age_ms.to_string()),
+            ("est_dx", self.est.0.to_string()),
+            ("est_dy", self.est.1.to_string()),
+            ("held_ms", self.held_ms.to_string()),
+            ("settle_left_ms", self.settle_left_ms.to_string()),
+        ]
+    }
+
+    /// Writes the line.
+    pub fn record(&self) {
+        let details = self.fields().into_iter().fold(crate::linklog::Details::new(), |d, (k, v)| d.num(k, v));
+        crate::linklog::record("cross", details);
+    }
+}
+
+/// Writes a `cross_refused` line.
+pub fn record_refusal((reason, count): (Refusal, u32)) {
+    crate::linklog::record("cross_refused", crate::linklog::Details::new().num("reason", reason.word()).num("count", count));
+}
+
 /// How long after control arrives a push can't cross back, at most.
 pub const SETTLE_MS: u64 = 250;
 /// And at least, once the cursor has been well away from the edge.
@@ -66,6 +154,12 @@ impl Settle {
         if distance.is_some_and(|d| d >= SHARED_EDGE_INSET + SETTLE_CLEAR) {
             self.cleared = true;
         }
+    }
+
+    /// How much of the full `SETTLE_MS` was still to go, for the log: more than 0 on a crossing
+    /// means a quick return went through early.
+    pub fn full_left_ms(&self, now_ms: u64) -> u64 {
+        self.since_ms.map_or(0, |since| SETTLE_MS.saturating_sub(now_ms.saturating_sub(since)))
     }
 
     /// How much longer a push has to wait, or 0.
@@ -353,6 +447,30 @@ mod tests {
         assert_eq!(settle.left_ms(3100), 150);
         settle.observe(None);
         assert_eq!(settle.left_ms(3100), 150);
+    }
+
+    #[test]
+    fn refusals_make_a_line_a_second_at_most_with_their_count() {
+        let mut log = RefusalLog::new();
+        assert_eq!(log.refused(Refusal::Guard, 0), Some((Refusal::Guard, 1)));
+        assert_eq!(log.refused(Refusal::Guard, 10), None, "the same push held again is the same refusal");
+        log.cleared();
+        assert_eq!(log.refused(Refusal::Guard, 20), None);
+        assert_eq!(log.refused(Refusal::Stale, 30), None, "a new reason counts too");
+        log.cleared();
+        assert_eq!(log.refused(Refusal::Settle, 1000), Some((Refusal::Settle, 3)));
+        assert_eq!(Refusal::OffSpan.word(), "off_span");
+    }
+
+    #[test]
+    fn a_crossing_line_has_every_field() {
+        let line = CrossLine { to_laptop: true, at: (2500, 1439), entry: (580, 12), sample_age_ms: 4, est: (-3, 20), held_ms: 2, settle_left_ms: 0 };
+        let text: Vec<String> = line.fields().iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(text.join(" "), "dir=to_laptop at=2500,1439 entry=580,12 sample_age_ms=4 est_dx=-3 est_dy=20 held_ms=2 settle_left_ms=0");
+        let mut settle = Settle::new();
+        settle.arrived(0);
+        assert_eq!(settle.full_left_ms(90), 160);
+        assert_eq!(settle.full_left_ms(400), 0);
     }
 
     #[test]

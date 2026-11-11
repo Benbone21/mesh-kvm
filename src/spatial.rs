@@ -706,6 +706,11 @@ impl EdgeWatch {
         self.settle.arrived(now_ms);
     }
 
+    /// How much of the full settle was still to go: see `Settle::full_left_ms`.
+    pub fn settle_full_left_ms(&self, now_ms: u64) -> u64 {
+        self.settle.full_left_ms(now_ms)
+    }
+
     /// For a completed push: true if it is too soon after control arrived. The count then starts
     /// again, as a push during the settle never counted.
     pub fn too_soon(&mut self, now_ms: u64) -> bool {
