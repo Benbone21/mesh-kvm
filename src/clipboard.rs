@@ -769,9 +769,25 @@ fn write_clipboard(tracker: &Mutex<Tracker>, fingerprint: u64, set: impl FnOnce(
     written
 }
 
+/// Whether an image's sizes match its pixels, as RGBA. arboard trusts them and panics when they
+/// don't, which ends the whole service, so nothing reaches it unchecked.
+fn image_fits(width: usize, height: usize, len: usize) -> Result<(), String> {
+    let expected = width.checked_mul(height).and_then(|pixels| pixels.checked_mul(4));
+    match expected {
+        _ if width == 0 || height == 0 => Err(format!("an image of {width}\u{d7}{height} pixels")),
+        None => Err(format!("an image of {width}\u{d7}{height} pixels, too large to be one")),
+        Some(n) if n > MAX_FRAME_BYTES => Err(format!("an image of {width}\u{d7}{height} pixels, over the size limit")),
+        Some(n) if n != len => Err(format!("an image of {width}\u{d7}{height} pixels with {len} bytes, not {n}")),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Takes in one copy, and returns the answer to give.
 fn take_copy<R: Read>(stream: &mut R, tracker: &Mutex<Tracker>, inbox: &Path) -> Result<u8, String> {
     let (age, payload) = read_copy(stream)?;
+    if let ClipboardPayload::Image { width, height, bytes } = &payload {
+        image_fits(*width, *height, bytes.len()).map_err(|e| format!("The image that came was damaged ({e}), so the clipboard was left as it was."))?;
+    }
     let newest = tracker.lock().map(|mut t| t.take_from_peer(made_at(Instant::now(), age))).unwrap_or(true);
     if !newest {
         return Ok(ANSWER_NEWER_HERE);
@@ -1061,6 +1077,8 @@ fn send_whole(target_addr: SocketAddr, snapshot: Snapshot, copied_at: Instant, t
     match snapshot {
         Snapshot::Text(_) => Ok(()),
         Snapshot::Image(image) => {
+            // The other device would refuse it, as it can't be put on a clipboard.
+            image_fits(image.width, image.height, image.bytes.len()).map_err(|e| unsent("the image", &format!("It was damaged: {e}.")))?;
             let size = image.bytes.len() as u64;
             let payload = ClipboardPayload::Image {
                 width: image.width,
@@ -1123,6 +1141,30 @@ mod tests {
         assert!(!tracker.is_new(1, Instant::now()));
         assert!(!tracker.is_new(1, Instant::now()));
         assert!(tracker.is_new(2, Instant::now()));
+    }
+
+    #[test]
+    fn only_an_image_whose_sizes_match_its_bytes_fits() {
+        assert!(image_fits(2, 3, 24).is_ok());
+        assert!(image_fits(0, 0, 0).is_err(), "0\u{d7}0");
+        assert!(image_fits(0, 5, 0).is_err());
+        assert!(image_fits(usize::MAX, 2, 8).is_err(), "overflows");
+        assert!(image_fits(1 << 31, 1 << 31, 0).is_err(), "overflows times 4");
+        assert!(image_fits(2, 3, 23).is_err(), "short");
+        assert!(image_fits(2, 3, 25).is_err(), "long");
+        assert!(image_fits(8192, 8192, 8192 * 8192 * 4).is_err(), "past the cap");
+    }
+
+    #[test]
+    fn a_damaged_image_is_refused_before_the_clipboard_sees_it() {
+        let tracker = Mutex::new(Tracker::default());
+        for (width, height, len) in [(0, 0, 0), (usize::MAX, usize::MAX, 4), (4, 4, 63), (4, 4, 65)] {
+            let mut wire = Vec::new();
+            write_frame(&mut wire, &ClipboardPayload::Stamp { age_ms: 0 }).unwrap();
+            write_frame(&mut wire, &ClipboardPayload::Image { width, height, bytes: vec![0; len] }).unwrap();
+            let err = take_copy(&mut Cursor::new(wire), &tracker, Path::new("unused")).unwrap_err();
+            assert!(err.starts_with("The image that came was damaged"), "{err}");
+        }
     }
 
     #[test]
