@@ -291,20 +291,6 @@ pub fn enter(code: &str, me: &Pairing, my_name: &str, target: SocketAddr) -> Res
     Ok(PeerKey { public, name, paired_at: now_secs() })
 }
 
-/// The paired device's name, as the pairing status gives it, for the rest of the service. None
-/// while unpaired. The service keeps it up to date as it pairs and unpairs.
-static PEER_NAME: Mutex<Option<String>> = Mutex::new(None);
-
-/// The name of the device this one is paired with, if it is.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn peer_name() -> Option<String> {
-    PEER_NAME.lock().unwrap_or_else(PoisonError::into_inner).clone()
-}
-
-fn note_peer(me: &Pairing) {
-    *PEER_NAME.lock().unwrap_or_else(PoisonError::into_inner) = me.peer.as_ref().map(|peer| peer.name.clone());
-}
-
 /// What the service uses of the rest of the program, so that it can be tried on its own.
 pub struct Hooks {
     /// This device's name, sent to the other.
@@ -381,10 +367,8 @@ impl PairingService {
     /// `pairing` is None when the file at `path` can't be used, and `problem` says why. The file
     /// is then left alone until a pairing finishes.
     pub fn new(path: PathBuf, pairing: Option<Pairing>, problem: Option<String>, port: u16, hooks: Hooks) -> PairingService {
-        let me = pairing.unwrap_or_else(Pairing::fresh);
-        note_peer(&me);
         let shared = Shared {
-            me,
+            me: pairing.unwrap_or_else(Pairing::fresh),
             problem,
             phase: Phase::Idle,
             error: None,
@@ -566,7 +550,6 @@ impl PairingService {
         next.save_to(&core.path)?;
         {
             let mut g = core.lock();
-            note_peer(&next);
             g.me = next;
             g.phase = Phase::Idle;
             g.error = None;
@@ -683,7 +666,6 @@ impl Core {
             g.port = None;
             match saved {
                 Ok(()) => {
-                    note_peer(&next);
                     g.me = next;
                     g.problem = None;
                     g.repaired = true;

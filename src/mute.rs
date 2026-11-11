@@ -97,8 +97,7 @@ pub trait MuteBackend {
 #[derive(Debug, Clone, Copy)]
 pub struct MuteInputs {
     pub setting: bool,
-    /// An output is chosen to send. A microphone doesn't play through the speakers, so sending
-    /// one is no reason to silence them.
+    /// An output is chosen to send.
     pub send_on: bool,
     /// The capture is running.
     pub tx_active: bool,
@@ -640,8 +639,6 @@ fn wait_until(done: &AtomicBool, limit: Duration) {
 /// It gives up after a while so that a stuck sound server can't hold up an exit; the record then
 /// clears the mute at the next start.
 pub fn shutdown() {
-    // Every way out of the service comes through here, so the other device's mic and speakers go too.
-    crate::audio::shut_down();
     if STARTED.load(Ordering::SeqCst) {
         STOP.store(true, Ordering::SeqCst);
         wait_until(&STOPPED, SHUTDOWN_WAIT);

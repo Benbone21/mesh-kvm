@@ -9,10 +9,7 @@
 use super::devices::{self, CaptureHealth, Device, InUse, Lists, Resolved};
 use super::jitter::RxStream;
 use super::mix::{Signal, Source};
-use super::virtual_linux::{self, SPEAKERS_NAME};
-#[cfg(test)]
-use super::virtual_linux::MIC_NAME;
-use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PEER_ONLINE, AUDIO_SPEAKERS_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB};
+use super::{drain_received, finish_received, AUDIO_OUTPUT_CAPTURE_LIVE, AUDIO_PLAYER_LIVE, AUDIO_RX_MUTED, AUDIO_RX_PEAK_PCT, CHANNELS, HUB};
 use crate::mute::platform::run_with_deadline;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -29,7 +26,6 @@ const PREFIX: &str = "mesh-kvm-";
 const PLAY_NODE: &str = "mesh-kvm-play";
 const CHIME_NODE: &str = "mesh-kvm-chime";
 const CAPTURE_NODE: &str = "mesh-kvm-capture";
-const MIC_NODE: &str = "mesh-kvm-mic";
 const TOOL_DEADLINE: Duration = Duration::from_secs(2);
 /// How often the devices are looked at when nothing has said they changed.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
@@ -132,7 +128,6 @@ struct Graph {
     ports: Vec<Port>,
     links: Vec<Link>,
     default_sink: Option<String>,
-    default_source: Option<String>,
 }
 
 fn as_id(value: &Value) -> Option<u32> {
@@ -186,10 +181,8 @@ fn parse_graph(dump: &str) -> Option<Graph> {
             ("PipeWire:Interface:Metadata", _) if text_of(object, "metadata.name") == Some("default") => {
                 for entry in object.get("metadata").and_then(Value::as_array).into_iter().flatten() {
                     let value = entry.get("value");
-                    match entry.get("key").and_then(Value::as_str) {
-                        Some("default.audio.sink") => graph.default_sink = value.and_then(metadata_name),
-                        Some("default.audio.source") => graph.default_source = value.and_then(metadata_name),
-                        _ => {}
+                    if entry.get("key").and_then(Value::as_str) == Some("default.audio.sink") {
+                        graph.default_sink = value.and_then(metadata_name);
                     }
                 }
             }
@@ -220,12 +213,7 @@ impl Graph {
             devices.sort_by(|a, b| a.name.cmp(&b.name));
             devices
         };
-        Lists {
-            inputs: listed(&["Audio/Source", "Audio/Source/Virtual", "Audio/Duplex"]),
-            outputs: listed(&["Audio/Sink", "Audio/Duplex"]),
-            default_input: self.default_source.clone(),
-            default_output: self.default_sink.clone(),
-        }
+        Lists { outputs: listed(&["Audio/Sink", "Audio/Duplex"]), default_output: self.default_sink.clone() }
     }
 
     fn node(&self, id: u32) -> Option<&Node> {
@@ -458,7 +446,7 @@ impl Capture {
     }
 
     /// How it's doing, given whether anything should be coming out of it now.
-    fn health(&mut self, expected: bool, microphone: bool, now: Instant) -> CaptureHealth {
+    fn health(&mut self, expected: bool, now: Instant) -> CaptureHealth {
         let running = self.alive();
         if !(running && expected) {
             self.expected_since = None;
@@ -469,7 +457,6 @@ impl Capture {
             failed: self.failed_at.is_some_and(|at| now.duration_since(at) < FAILURE_SHOWS_FOR),
             expected_for: self.expected_since.map(|since| now.duration_since(since)),
             activity: self.source.activity(),
-            microphone,
         }
     }
 
@@ -512,89 +499,9 @@ impl Capture {
     }
 }
 
-/// The arguments for capturing from a microphone.
-fn mic_args(target: Option<String>) -> Vec<String> {
-    target.map(|name| vec!["--target".to_string(), name]).unwrap_or_default()
-}
-
 /// The arguments for a capture that connects to nothing by itself.
 fn unconnected_args() -> Vec<String> {
     ["--target", "0", "-P", "node.autoconnect=false"].map(String::from).to_vec()
-}
-
-/// The sinks whose apps are sent: the chosen one, and the other device's speakers while they're here.
-fn sinks_to_send(chosen: Option<&str>, speakers_present: bool) -> Vec<&str> {
-    let mut sinks: Vec<&str> = chosen.into_iter().collect();
-    if speakers_present && !sinks.contains(&SPEAKERS_NAME) {
-        sinks.push(SPEAKERS_NAME);
-    }
-    sinks
-}
-
-/// Whether the other device is paired, and what it's called.
-fn pairing_now() -> (bool, Option<String>) {
-    pairing_with(crate::secure::pairing::peer_name(), crate::spatial::peer_name_now())
-}
-
-/// Whether the other device is paired, and what it's called now: the name it last reported, which
-/// follows a rename, or else the one it had when paired.
-fn pairing_with(paired_as: Option<String>, live: Option<String>) -> (bool, Option<String>) {
-    let paired = paired_as.is_some();
-    let live = live.filter(|name| !name.trim().is_empty());
-    (paired, if paired { live.or(paired_as) } else { None })
-}
-
-/// Brings the other device's mic and speakers in line with the pairing and the link.
-fn look_at_virtual_devices(graph: Option<&Graph>) {
-    let (paired, peer) = pairing_now();
-    virtual_linux::look(paired, AUDIO_PEER_ONLINE.load(Ordering::Relaxed), peer.as_deref(), graph.map(virtual_devices_in));
-}
-
-/// Whether the other device's mic and speakers are in the graph.
-fn virtual_devices_in(graph: &Graph) -> (bool, bool) {
-    let has = |name: &str| graph.nodes.iter().any(|node| node.name == name);
-    (has(virtual_linux::MIC_NAME), has(SPEAKERS_NAME))
-}
-
-/// As the engine sees them, for the live test.
-#[cfg(test)]
-pub(super) fn virtual_devices_in_graph_now() -> Option<(bool, bool)> {
-    read_graph().as_ref().map(virtual_devices_in)
-}
-
-/// The input and the output to play on, once kept off our own devices.
-#[derive(Debug)]
-struct Steered {
-    input: Resolved,
-    play: Resolved,
-    notes: Vec<String>,
-}
-
-/// Whether a choice follows the system default, and the default is one of ours.
-fn follows_us(resolved: &Resolved, default: Option<&String>) -> bool {
-    matches!(resolved, Resolved::Default | Resolved::Missing) && default.is_some_and(|name| name.starts_with(PREFIX))
-}
-
-/// Choices that follow the system default don't follow it onto our own devices, which someone may
-/// well make the default so that apps use them. Our mic as the default would send the other
-/// device's own mic back to it, so nothing is captured. Our speakers as the default would swallow
-/// what's received, so it plays on the first real output instead, if there is one.
-fn steer_clear_of_ours(input: Resolved, play: Resolved, lists: &Lists) -> Steered {
-    let mut notes = Vec::new();
-    let input = if follows_us(&input, lists.default_input.as_ref()) {
-        notes.push("No mic is sent: Debian's default microphone is set to the other device's mic. Make your own microphone the default in the sound settings, or choose one here.".to_string());
-        Resolved::Off
-    } else {
-        input
-    };
-    let play = match lists.outputs.first() {
-        Some(real) if follows_us(&play, lists.default_output.as_ref()) => {
-            notes.push(format!("The system's default output is the other device's speakers, so received audio plays on {}.", real.name));
-            Resolved::Device(real.id.clone())
-        }
-        _ => play,
-    };
-    Steered { input, play, notes }
 }
 
 /// How long to wait before looking at the graph.
@@ -604,59 +511,41 @@ fn look_wait(last_look: Option<Instant>, now: Instant) -> Duration {
 }
 
 fn engine() {
-    let mut mic = Capture::new(MIC_NODE, &HUB.mic);
     let mut output = Capture::new(CAPTURE_NODE, &HUB.output);
     let mut last_look = None;
-    virtual_linux::start();
     loop {
         WAKE.wait(LOOK_EVERY);
         std::thread::sleep(look_wait(last_look, Instant::now()));
         let now = Instant::now();
         last_look = Some(now);
-        let graph = read_graph();
-        // Whatever the graph is up to, so that the devices go when the link does.
-        look_at_virtual_devices(graph.as_ref());
-        let Some(graph) = graph else {
+        let Some(graph) = read_graph() else {
             // No sound server yet. The captures stay as they are: it may just be restarting.
             AUDIO_OUTPUT_CAPTURE_LIVE.store(false, Ordering::Relaxed);
-            AUDIO_SPEAKERS_CAPTURE_LIVE.store(false, Ordering::Relaxed);
             continue;
         };
         let lists = graph.lists();
         let choice = devices::choice();
-        let input = devices::resolve(&choice.input, &lists.inputs);
         let sent = devices::resolve(&choice.output, &lists.outputs);
         let play = match devices::resolve(&choice.play, &lists.outputs) {
             Resolved::Off => Resolved::Default,
             other => other,
         };
-        // The notes about a missing choice are about the choice, so they're worked out before this.
-        let (input_missing, play_missing) = (input.missing_note("microphone or line-in"), play.missing_note("output to play on"));
-        let Steered { input, play, notes: steered_notes } = steer_clear_of_ours(input, play, &lists);
 
         let sink = sent.id(lists.default_output.as_ref());
-        // What apps play on the other device's speakers is sent whatever output is chosen to send.
-        let speakers_present = virtual_linux::present().is_some();
-        let speakers_playing = speakers_present && graph.apps_running_on(SPEAKERS_NAME);
-        mic.ensure((input != Resolved::Off).then(|| mic_args(input.target())), now);
-        output.ensure((sent != Resolved::Off || speakers_playing).then(unconnected_args), now);
+        output.ensure((sent != Resolved::Off).then(unconnected_args), now);
         *PLAY_TARGET.lock().unwrap_or_else(PoisonError::into_inner) = play.target();
 
-        let chosen = (sent != Resolved::Off).then_some(sink.as_deref()).flatten();
+        let chosen: Vec<&str> = (sent != Resolved::Off).then_some(sink.as_deref()).flatten().into_iter().collect();
         if output.alive() {
-            apply_links(&plan_links(&graph, &sinks_to_send(chosen, speakers_present)));
+            apply_links(&plan_links(&graph, &chosen));
         }
         AUDIO_OUTPUT_CAPTURE_LIVE.store(output.alive(), Ordering::Relaxed);
-        AUDIO_SPEAKERS_CAPTURE_LIVE.store(output.alive() && speakers_playing, Ordering::Relaxed);
 
-        let mic_health = mic.health(input != Resolved::Off, true, now);
         let apps_running = sink.as_deref().is_some_and(|sink| graph.apps_running_on(sink));
-        let output_health = output.health(sent != Resolved::Off && apps_running, false, now);
+        let output_health = output.health(sent != Resolved::Off && apps_running, now);
         let notes = [
-            input_missing,
             sent.missing_note("output to send"),
-            play_missing,
-            (input != Resolved::Off).then(|| mic_health.note("microphone or line-in", "", now)).flatten(),
+            play.missing_note("output to play on"),
             (sent != Resolved::Off).then(|| output_health.note("output to send", "", now)).flatten(),
         ];
         devices::set_in_use(InUse {
@@ -665,7 +554,7 @@ fn engine() {
             play: play.id(lists.default_output.as_ref()),
             echo_safe: true,
             hint: String::new(),
-            notes: notes.into_iter().flatten().chain(steered_notes).collect(),
+            notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);
     }
@@ -874,142 +763,6 @@ pub fn start_playback(stream: Arc<Mutex<RxStream>>) {
     }
 }
 
-/// How often a mic with nowhere to play is drained.
-const MIC_DRAIN_TICK: Duration = Duration::from_millis(20);
-/// The most one drain takes, after the thread was held up.
-const MIC_DRAIN_MOST: Duration = Duration::from_millis(200);
-/// One frame of the mic feed: 10 ms.
-const MIC_FEED_FRAMES: usize = 480;
-const MIC_FEED_EVERY: Duration = Duration::from_millis(10);
-/// Further behind than this, the feed starts again from now rather than catching up in a burst.
-const MIC_FEED_MOST_BEHIND: Duration = Duration::from_millis(100);
-/// The FIFO holds this much, about 40 ms, so that a feed a little ahead of the source can't build up
-/// more delay than that. Frames that don't fit are dropped.
-const MIC_FIFO_BYTES: usize = 16384;
-
-/// Says how many frames are due, one every `MIC_FEED_EVERY` by the clock.
-struct FeedClock {
-    next: Instant,
-}
-
-impl FeedClock {
-    fn new(now: Instant) -> Self {
-        Self { next: now }
-    }
-
-    fn due(&mut self, now: Instant) -> usize {
-        if now.saturating_duration_since(self.next) > MIC_FEED_MOST_BEHIND {
-            self.next = now;
-        }
-        let mut due = 0;
-        while self.next <= now {
-            self.next += MIC_FEED_EVERY;
-            due += 1;
-        }
-        due
-    }
-
-    fn until_next(&self, now: Instant) -> Duration {
-        self.next.saturating_duration_since(now)
-    }
-}
-
-/// How much went by since the last drain.
-struct DrainClock {
-    last: Instant,
-}
-
-impl DrainClock {
-    fn new(now: Instant) -> Self {
-        Self { last: now }
-    }
-
-    fn elapsed(&mut self, now: Instant) -> Duration {
-        let elapsed = now.saturating_duration_since(self.last).min(MIC_DRAIN_MOST);
-        self.last = now;
-        elapsed
-    }
-}
-
-/// Opens the mic source's FIFO for writing, without waiting for a reader.
-pub(super) fn open_mic_fifo() -> Option<std::fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-    let path = virtual_linux::fifo_path();
-    // Only ever a FIFO: never a file someone put there.
-    if !std::fs::metadata(&path).is_ok_and(|meta| meta.file_type().is_fifo()) {
-        return None;
-    }
-    let fifo = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&path).ok()?;
-    unsafe { libc::fcntl(fifo.as_raw_fd(), libc::F_SETPIPE_SZ, MIC_FIFO_BYTES as libc::c_int) };
-    Some(fifo)
-}
-
-/// Writes one frame. A full FIFO drops it. Returns false if the FIFO is no use any more.
-pub(super) fn write_mic_frame(fifo: &mut std::fs::File, bytes: &[u8]) -> bool {
-    use std::io::{ErrorKind, Write};
-    // A frame is less than PIPE_BUF, so it goes in whole or not at all.
-    match fifo.write(bytes) {
-        Ok(_) => true,
-        Err(e) => e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted,
-    }
-}
-
-/// Plays the other device's mic into the virtual microphone while there is one, and drains it
-/// otherwise. It is never played on the speakers.
-fn mic_feed(stream: &Mutex<RxStream>) {
-    let mut fifo = None;
-    let mut samples = vec![0.0f32; MIC_FEED_FRAMES * CHANNELS];
-    let mut bytes = Vec::with_capacity(samples.len() * 4);
-    let mut drain = DrainClock::new(Instant::now());
-    let mut clock = FeedClock::new(Instant::now());
-    loop {
-        let now = Instant::now();
-        if virtual_linux::present().is_some() && fifo.is_none() {
-            fifo = open_mic_fifo();
-        }
-        let Some(open) = fifo.as_mut().filter(|_| virtual_linux::present().is_some()) else {
-            fifo = None;
-            super::drain_mic(stream, drain.elapsed(now), now);
-            clock = FeedClock::new(now);
-            std::thread::sleep(MIC_DRAIN_TICK);
-            continue;
-        };
-        let mut usable = true;
-        for _ in 0..clock.due(now) {
-            stream.lock().unwrap_or_else(PoisonError::into_inner).fill(&mut samples, Instant::now());
-            bytes.clear();
-            bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
-            usable = write_mic_frame(open, &bytes);
-            if !usable {
-                break;
-            }
-        }
-        if !usable {
-            fifo = None;
-        }
-        drain = DrainClock::new(now);
-        std::thread::sleep(clock.until_next(Instant::now()).max(Duration::from_millis(1)));
-    }
-}
-
-pub fn start_mic_playback(stream: Arc<Mutex<RxStream>>) {
-    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-mic".to_string()).spawn(move || mic_feed(&stream));
-    if let Err(e) = spawned {
-        crate::settings::log_note(&format!("Couldn't start the mic feed: {e}"));
-    }
-}
-
-/// Whether the peer's mic has a virtual microphone to go to here.
-pub fn virtual_mic_ready() -> bool {
-    virtual_linux::present().is_some()
-}
-
-/// Takes the other device's mic and speakers away, at service stop.
-pub fn shut_down() {
-    virtual_linux::shut_down();
-}
-
 /// Plays the test chime here, on the output chosen for received audio.
 pub fn play_chime(pcm: &[f32]) {
     use std::io::Write;
@@ -1076,10 +829,13 @@ mod tests {
         let lists = graph().lists();
         let outputs: Vec<(&str, &str)> = lists.outputs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
         assert_eq!(outputs, [("headset", "Headset"), ("speakers", "USB speakers")]);
-        let inputs: Vec<&str> = lists.inputs.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(inputs, ["USB microphone"]);
         assert_eq!(lists.default_output.as_deref(), Some("speakers"));
-        assert_eq!(lists.default_input.as_deref(), Some("mic"), "written as text or as an object");
+    }
+
+    #[test]
+    fn the_default_sink_is_read_whether_written_as_text_or_as_an_object() {
+        let dump = DUMP.replace(r#""value":{"name":"speakers"}"#, r#""value":"{\"name\":\"headset\"}""#);
+        assert_eq!(parse_graph(&dump).unwrap().lists().default_output.as_deref(), Some("headset"));
     }
 
     #[test]
@@ -1185,129 +941,6 @@ mod tests {
         let mut graph = graph();
         graph.nodes.retain(|node| node.name != CAPTURE_NODE);
         assert_eq!(plan_links(&graph, &["speakers"]), LinkPlan::default());
-    }
-
-    /// The graph with the virtual speaker in it, and an app playing on it.
-    fn graph_with_virtual_speaker() -> Graph {
-        let mut graph = graph();
-        let node = |id, name: &str, class: &str| Node { id, name: name.into(), description: name.into(), class: class.into(), running: true };
-        graph.nodes.push(node(40, SPEAKERS_NAME, "Audio/Sink"));
-        graph.nodes.push(node(41, "game", "Stream/Output/Audio"));
-        graph.ports.push(Port { id: 400, node: 40, output: false, channel: "FL".into() });
-        graph.ports.push(Port { id: 401, node: 40, output: false, channel: "FR".into() });
-        graph.ports.push(Port { id: 410, node: 41, output: true, channel: "FL".into() });
-        graph.ports.push(Port { id: 411, node: 41, output: true, channel: "FR".into() });
-        graph.links.push(Link { id: 500, from_node: 41, from_port: 410, to_node: 40, to_port: 400 });
-        graph.links.push(Link { id: 501, from_node: 41, from_port: 411, to_node: 40, to_port: 401 });
-        graph
-    }
-
-    #[test]
-    fn an_app_on_the_virtual_speaker_is_captured_once_even_if_it_is_the_default_too() {
-        let graph = graph_with_virtual_speaker();
-        let plan = plan_links(&graph, &[SPEAKERS_NAME, SPEAKERS_NAME]);
-        assert_eq!(plan.add, vec![(410, 220), (411, 221)]);
-        assert!(graph.apps_running_on(SPEAKERS_NAME));
-        assert!(graph.lists().outputs.iter().all(|device| device.id != SPEAKERS_NAME), "not one of ours to choose");
-    }
-
-    #[test]
-    fn the_virtual_speaker_is_sent_beside_the_chosen_output() {
-        let plan = plan_links(&graph_with_virtual_speaker(), &["speakers", SPEAKERS_NAME]);
-        assert_eq!(plan.add, vec![(200, 220), (201, 221), (230, 220), (230, 221), (410, 220), (411, 221)]);
-        assert!(plan.remove.is_empty());
-    }
-
-    #[test]
-    fn the_sinks_to_send_are_the_chosen_one_and_the_virtual_speaker_once() {
-        assert_eq!(sinks_to_send(Some("speakers"), true), ["speakers", SPEAKERS_NAME]);
-        assert_eq!(sinks_to_send(Some(SPEAKERS_NAME), true), [SPEAKERS_NAME]);
-        assert_eq!(sinks_to_send(None, true), [SPEAKERS_NAME]);
-        assert_eq!(sinks_to_send(Some("speakers"), false), ["speakers"]);
-        assert!(sinks_to_send(None, false).is_empty());
-    }
-
-    fn lists_with_defaults(input: &str, output: &str) -> Lists {
-        let mut lists = graph().lists();
-        lists.default_input = Some(input.to_string());
-        lists.default_output = Some(output.to_string());
-        lists
-    }
-
-    #[test]
-    fn the_devices_take_the_peer_s_name_as_it_is_now() {
-        let paired = Some("OLDNAME".to_string());
-        assert_eq!(pairing_with(paired.clone(), Some("NEWNAME".into())), (true, Some("NEWNAME".into())), "a rename follows");
-        assert_eq!(pairing_with(paired.clone(), None), (true, Some("OLDNAME".into())), "before any heartbeat");
-        assert_eq!(pairing_with(paired, Some("  ".into())), (true, Some("OLDNAME".into())), "a blank name isn't a name");
-        assert_eq!(pairing_with(None, Some("NEWNAME".into())), (false, None), "unpaired, nothing");
-    }
-
-    #[test]
-    fn the_peer_s_mic_as_the_system_default_is_never_sent_back() {
-        let lists = lists_with_defaults(MIC_NAME, "speakers");
-        for input in [Resolved::Default, Resolved::Missing] {
-            let steered = steer_clear_of_ours(input, Resolved::Default, &lists);
-            assert_eq!(steered.input, Resolved::Off);
-            assert_eq!(steered.play, Resolved::Default);
-            assert_eq!(steered.notes.len(), 1);
-        }
-        let chosen = steer_clear_of_ours(Resolved::Device("mic".into()), Resolved::Default, &lists);
-        assert_eq!(chosen.input, Resolved::Device("mic".into()), "a chosen mic is the one used");
-        assert!(chosen.notes.is_empty());
-    }
-
-    #[test]
-    fn the_peer_s_speakers_as_the_system_default_don_t_take_what_is_received() {
-        let lists = lists_with_defaults("mic", SPEAKERS_NAME);
-        let steered = steer_clear_of_ours(Resolved::Default, Resolved::Default, &lists);
-        assert_eq!(steered.input, Resolved::Default);
-        assert_eq!(steered.play, Resolved::Device("headset".into()), "the first real output");
-        assert_eq!(steered.notes.len(), 1);
-        let nowhere = Lists { outputs: Vec::new(), ..lists.clone() };
-        assert_eq!(steer_clear_of_ours(Resolved::Default, Resolved::Default, &nowhere).play, Resolved::Default, "with no other, as before");
-        let real = lists_with_defaults("mic", "speakers");
-        let steered = steer_clear_of_ours(Resolved::Default, Resolved::Default, &real);
-        assert_eq!((steered.input, steered.play), (Resolved::Default, Resolved::Default));
-        assert!(steered.notes.is_empty());
-    }
-
-    #[test]
-    fn the_mic_feed_is_never_captured() {
-        let mut graph = graph();
-        let node = |id, name: &str, class: &str| Node { id, name: name.into(), description: name.into(), class: class.into(), running: true };
-        // The pipe source, and a stream of the same name playing on the speakers.
-        graph.nodes.push(node(50, MIC_NAME, "Audio/Source"));
-        graph.nodes.push(node(51, MIC_NAME, "Stream/Output/Audio"));
-        graph.ports.push(Port { id: 500, node: 50, output: true, channel: "FL".into() });
-        graph.ports.push(Port { id: 510, node: 51, output: true, channel: "FL".into() });
-        graph.links.push(Link { id: 600, from_node: 50, from_port: 500, to_node: 10, to_port: 100 });
-        graph.links.push(Link { id: 601, from_node: 51, from_port: 510, to_node: 10, to_port: 100 });
-        assert!(!graph.apps_on(10).contains(&50) && !graph.apps_on(10).contains(&51));
-        assert!(graph.lists().inputs.iter().all(|device| device.id != MIC_NAME));
-        assert!(!plan_links(&graph, &["speakers"]).add.iter().any(|(from, _)| *from == 500 || *from == 510));
-    }
-
-    #[test]
-    fn the_mic_is_fed_by_the_clock_not_by_how_long_a_turn_took() {
-        let t = Instant::now();
-        let mut clock = FeedClock::new(t);
-        assert_eq!(clock.due(t), 1, "the first frame at once");
-        assert_eq!(clock.due(t + Duration::from_millis(5)), 0);
-        assert_eq!(clock.due(t + Duration::from_millis(31)), 3, "late turns catch up");
-        assert_eq!(clock.due(t + Duration::from_millis(40)), 1);
-        // A long stall starts again from now rather than bursting.
-        assert_eq!(clock.due(t + Duration::from_secs(5)), 1);
-        assert_eq!(clock.due(t + Duration::from_secs(5) + Duration::from_millis(10)), 1);
-    }
-
-    #[test]
-    fn a_drain_takes_what_the_clock_says_went_by() {
-        let t = Instant::now();
-        let mut drain = DrainClock::new(t);
-        assert_eq!(drain.elapsed(t + Duration::from_millis(23)), Duration::from_millis(23));
-        assert_eq!(drain.elapsed(t + Duration::from_millis(50)), Duration::from_millis(27));
-        assert_eq!(drain.elapsed(t + Duration::from_secs(9)), MIC_DRAIN_MOST, "a stall isn't all drained at once");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::router::{EdgeSpan, EdgeTracker, KEEP_CURSOR};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, RwLock};
 
 /// How far in from a screen edge a cursor enters, on both machines.
 const ENTRY_INSET: i32 = 28;
@@ -344,11 +344,6 @@ impl SpatialConfig {
 
     pub fn device(&self, node: NodeId) -> Option<&DeviceLayout> {
         self.devices.iter().find(|d| d.node == node)
-    }
-
-    /// `node`'s name, as it last reported it, if it has.
-    pub fn name_of(&self, node: NodeId) -> Option<String> {
-        self.device(node).map(|d| d.name.trim()).filter(|name| !name.is_empty()).map(String::from)
     }
 
     fn device_mut(&mut self, node: NodeId) -> Option<&mut DeviceLayout> {
@@ -801,8 +796,6 @@ impl SharedSpatialState {
 
     pub fn save(&self) {
         let Some(path) = &self.file else { return };
-        // Every change to the layout is saved, so this is where the service hears of a rename.
-        *PEER_NAME_NOW.lock().unwrap_or_else(PoisonError::into_inner) = self.config.name_of(self.me.other());
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
@@ -833,16 +826,6 @@ pub fn heartbeat_payloads(config: &SpatialConfig, me: NodeId) -> Vec<Payload> {
         Payload::GameLock { locked: config.manual_game_lock },
         Payload::LayoutRevision { revision: config.revision, editor: config.editor },
     ]
-}
-
-/// The other device's name as the service's layout has it now. Set as the layout is saved: only the
-/// service's own layout, which has a file, sets it.
-static PEER_NAME_NOW: Mutex<Option<String>> = Mutex::new(None);
-
-/// The other device's name as it last reported it, which follows a rename.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn peer_name_now() -> Option<String> {
-    PEER_NAME_NOW.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// Records what the other device reported about its screens. Never waits for the lock: a busy
@@ -996,7 +979,7 @@ pub fn studio_handler(
                     return Some(crate::quit::answer(req.from_app_here));
                 }
                 if act == "set_audio_device" {
-                    return Some(crate::settings::set_audio_device(&val, req.from_app_here));
+                    return Some(crate::settings::set_audio_device(&val));
                 }
                 if let Some(reply) = crate::update::handle_action(&val, req.from_app_here) {
                     return Some(reply);
@@ -1230,16 +1213,6 @@ mod tests {
     }
 
     // ---- Migration ----
-
-    #[test]
-    fn the_other_device_s_name_is_the_one_it_reported_last() {
-        let mut config = SpatialConfig::fresh(NodeId::Debian, crate::settings::switch_edge());
-        assert_eq!(config.name_of(NodeId::Windows), None, "nothing heard yet");
-        config.report_monitors(NodeId::Windows, "SACBOOKPRO", Vec::new());
-        assert_eq!(config.name_of(NodeId::Windows).as_deref(), Some("SACBOOKPRO"));
-        config.report_monitors(NodeId::Windows, "Renamed", Vec::new());
-        assert_eq!(config.name_of(NodeId::Windows).as_deref(), Some("Renamed"));
-    }
 
     #[test]
     fn old_field_names_become_the_device_list() {
@@ -1763,13 +1736,15 @@ mod tests {
     }
 
     #[test]
-    fn the_service_refuses_a_microphone_chosen_from_the_other_device() {
+    fn the_service_refuses_a_microphone_whoever_asks() {
         let state = Arc::new(shared_at(0, NodeId::Debian, None));
         let platform: Arc<dyn Platform> = Arc::new(NoScreens);
         let handler = studio_handler(state, platform, DisplayManager::for_test_with_waiting_change(), test_pairing("mic"));
         let body = serde_json::json!({ "action": "set_audio_device", "role": "input", "id": "mic" }).to_string();
-        let from_peer = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, crate::webui::Source::Peer);
-        assert!(handler(&from_peer).unwrap().contains("device it belongs to"));
+        for source in [crate::webui::Source::Peer, crate::webui::Source::Local] {
+            let request = crate::webui::HttpRequest::for_test("POST", "/api/local/action", &body, source);
+            assert!(handler(&request).unwrap().contains("audio choices"));
+        }
     }
 
     #[test]

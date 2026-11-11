@@ -57,8 +57,9 @@ pub struct LocalSettings {
     pub audio_tx_enabled: bool,
     #[serde(skip_serializing)]
     pub audio_tx_source: u32,
-    /// What to send, as a device id, `default`, or empty for nothing. Missing from older settings.
-    pub audio_input: Option<String>,
+    /// The output to send, as a device id, `default`, or empty for nothing. Missing from older
+    /// settings. A microphone chosen by 0.9.1 or before, `audio_input`, is no longer read, and goes
+    /// at the next save.
     pub audio_output: Option<String>,
     /// Where received audio plays: a device id or `default`.
     pub audio_play: String,
@@ -88,7 +89,6 @@ impl Default for LocalSettings {
         Self {
             audio_tx_enabled: false,
             audio_tx_source: 0,
-            audio_input: None,
             audio_output: None,
             audio_play: devices::DEFAULT.to_string(),
             audio_bitrate: DEFAULT_BITRATE,
@@ -451,16 +451,16 @@ pub fn load_and_apply() {
     *SWITCH_EDGE.lock().unwrap_or_else(PoisonError::into_inner) = s.switch_edge;
 }
 
-/// What to send and play. Older settings had one Send switch and, on Linux, a choice of source.
-/// Windows only ever sent its system sound, whatever a settings file held.
+/// What to send and play. Older settings had one Send switch and, on Linux, a choice of source,
+/// where source 1 was the microphone, which isn't sent any more. Windows only ever sent its system
+/// sound, whatever a settings file held.
 fn audio_choice(s: &LocalSettings, mic_selectable: bool) -> Choice {
-    let from_old_switch = |wants_mic: bool| {
-        let selected = s.audio_tx_enabled && (s.audio_tx_source == 1 && mic_selectable) == wants_mic;
+    let from_old_switch = || {
+        let selected = s.audio_tx_enabled && !(s.audio_tx_source == 1 && mic_selectable);
         if selected { devices::DEFAULT } else { devices::NONE }.to_string()
     };
     Choice {
-        input: s.audio_input.clone().unwrap_or_else(|| from_old_switch(true)),
-        output: s.audio_output.clone().unwrap_or_else(|| from_old_switch(false)),
+        output: s.audio_output.clone().unwrap_or_else(from_old_switch),
         play: if s.audio_play.is_empty() { devices::DEFAULT.to_string() } else { s.audio_play.clone() },
     }
 }
@@ -476,7 +476,6 @@ fn usable_bitrate(kbps: u32) -> u32 {
 fn current_settings() -> LocalSettings {
     let choice = devices::choice();
     LocalSettings {
-        audio_input: Some(choice.input),
         audio_output: Some(choice.output),
         audio_play: choice.play,
         audio_bitrate: AUDIO_BITRATE_KBPS.load(Ordering::Relaxed),
@@ -534,10 +533,8 @@ pub fn audio_status_json() -> serde_json::Value {
     let now = std::time::Instant::now();
     serde_json::json!({
         "tx_enabled": devices::sending(),
-        "input": choice.input,
         "output": choice.output,
         "play": choice.play,
-        "inputs": lists.inputs,
         "outputs": lists.outputs,
         "hint": in_use.hint,
         "notes": audio_notes(in_use.notes),
@@ -559,10 +556,6 @@ pub fn audio_status_json() -> serde_json::Value {
         "rx_buffer_ms": AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed),
         "rx_live": AUDIO_RX_LIVE.load(Ordering::Relaxed),
         "rx_other_version": other_version_arriving(now),
-        "virtual": crate::audio::virtual_status()
-            .map(|v| serde_json::json!({ "kind": v.kind, "present": v.present, "error": v.error, "name": v.name })),
-        "tx_mic_ready": crate::audio::peer_mic_ready(now, std::time::Duration::from_secs(2)),
-        "rx_mic_live": crate::audio::AUDIO_RX_MIC_LIVE.load(Ordering::Relaxed),
     })
 }
 
@@ -648,13 +641,13 @@ fn change_main_device(val: &serde_json::Value, link_up: bool, save: impl FnOnce(
 /// Longer than any id PipeWire or Windows gives a device.
 const MAX_AUDIO_DEVICE_ID: usize = 512;
 
-/// Handles `set_audio_device` and returns the response body. Not a common action, as it has to
-/// know who is asking: the other device must not be able to switch on this one's microphone.
-pub fn set_audio_device(val: &serde_json::Value, from_this_device: bool) -> String {
-    change_audio_device(val, from_this_device, save_current)
+/// Handles `set_audio_device` and returns the response body. There is no microphone to choose: the
+/// `input` that 0.9.1 and before offered is refused like any unknown role.
+pub fn set_audio_device(val: &serde_json::Value) -> String {
+    change_audio_device(val, save_current)
 }
 
-fn change_audio_device(val: &serde_json::Value, from_this_device: bool, save: impl FnOnce()) -> String {
+fn change_audio_device(val: &serde_json::Value, save: impl FnOnce()) -> String {
     let refuse = |error: &str| serde_json::json!({ "ok": false, "error": error }).to_string();
     let Some(id) = val.get("id").and_then(|v| v.as_str()) else {
         return refuse("That isn't a device.");
@@ -664,10 +657,6 @@ fn change_audio_device(val: &serde_json::Value, from_this_device: bool, save: im
     }
     let mut choice = devices::choice();
     match val.get("role").and_then(|v| v.as_str()) {
-        Some("input") if id != devices::NONE && !from_this_device => {
-            return refuse("A microphone can only be chosen on the device it belongs to.");
-        }
-        Some("input") => choice.input = id.to_string(),
         Some("output") => choice.output = id.to_string(),
         Some("play") if id == devices::NONE => return refuse("Received audio has to play somewhere."),
         Some("play") => choice.play = id.to_string(),
@@ -1134,25 +1123,25 @@ mod tests {
         let (off, default) = (devices::NONE.to_string(), devices::DEFAULT.to_string());
 
         let system_sound = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":0}"#, true);
-        assert_eq!((system_sound.input, system_sound.output), (off.clone(), default.clone()));
+        assert_eq!(system_sound.output, default);
 
         let microphone = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":1}"#, true);
-        assert_eq!((microphone.input, microphone.output), (default.clone(), off.clone()));
+        assert_eq!(microphone.output, off, "it sent a microphone, which isn't sent any more");
 
         let windows = choice(r#"{"audio_tx_enabled":true,"audio_tx_source":1}"#, false);
-        assert_eq!((windows.input, windows.output), (off.clone(), default.clone()), "it only ever sent system sound");
+        assert_eq!(windows.output, default, "it only ever sent system sound");
 
         let not_sending = choice(r#"{"audio_tx_enabled":false,"audio_tx_source":1}"#, true);
-        assert_eq!((not_sending.input, not_sending.output), (off.clone(), off.clone()));
+        assert_eq!(not_sending.output, off);
         assert_eq!(not_sending.play, default);
     }
 
     #[test]
     fn a_saved_choice_wins_over_the_old_switch_and_the_old_switch_is_not_saved_again() {
-        let text = r#"{"audio_tx_enabled":true,"audio_input":"usb-mic","audio_output":"","audio_play":"headset"}"#;
+        let text = r#"{"audio_tx_enabled":true,"audio_output":"","audio_play":"headset"}"#;
         let s = parse_settings(text);
         let choice = audio_choice(&s, true);
-        assert_eq!((choice.input.as_str(), choice.output.as_str(), choice.play.as_str()), ("usb-mic", "", "headset"));
+        assert_eq!((choice.output.as_str(), choice.play.as_str()), ("", "headset"));
         let saved = serde_json::to_string(&s).unwrap();
         assert!(!saved.contains("audio_tx_enabled") && !saved.contains("audio_tx_source"), "{saved}");
         assert!(saved.contains("play_only_on_other") && !saved.contains("mute_while_sending"), "{saved}");
@@ -1172,21 +1161,18 @@ mod tests {
         let before = devices::choice();
         let set = |role: &str, id: &str| {
             let saves = std::cell::Cell::new(0);
-            let reply = change_audio_device(&json!({ "role": role, "id": id }), true, || saves.set(saves.get() + 1));
+            let reply = change_audio_device(&json!({ "role": role, "id": id }), || saves.set(saves.get() + 1));
             assert_eq!(saves.get(), u32::from(reply == OK_RESPONSE), "saved only if changed: {reply}");
             reply
         };
-        assert_eq!(set("input", "usb-mic"), OK_RESPONSE);
         assert_eq!(set("output", "speakers"), OK_RESPONSE);
         assert_eq!(set("play", "headset"), OK_RESPONSE);
-        assert_eq!(audio_status_json()["input"], "usb-mic");
-        assert_eq!(audio_status_json()["tx_enabled"], true, "choosing anything starts sending");
+        assert_eq!(audio_status_json()["output"], "speakers");
+        assert_eq!(audio_status_json()["tx_enabled"], true, "choosing an output starts sending");
         assert!(set("play", devices::NONE).contains("has to play somewhere"));
         assert_eq!(devices::choice().play, "headset");
         assert!(set("nonsense", "x").contains("audio choices"));
-        for role in ["input", "output"] {
-            set(role, devices::NONE);
-        }
+        set("output", devices::NONE);
         assert_eq!(audio_status_json()["tx_enabled"], false);
         devices::set_choice(before);
 
@@ -1202,7 +1188,7 @@ mod tests {
     fn a_device_id_has_to_be_one() {
         let _guard = live_toggles();
         let before = devices::choice();
-        let try_it = |val: serde_json::Value| change_audio_device(&val, true, || panic!("nothing to save"));
+        let try_it = |val: serde_json::Value| change_audio_device(&val, || panic!("nothing to save"));
         for refused in [
             json!({ "role": "output" }),
             json!({ "role": "output", "id": 5 }),
@@ -1218,43 +1204,40 @@ mod tests {
     }
 
     #[test]
-    fn the_other_device_can_t_switch_on_this_one_s_microphone() {
+    fn no_microphone_can_be_chosen_any_more() {
         let _guard = live_toggles();
         let before = devices::choice();
-        let asked = |role: &str, id: &str, here: bool| {
-            let val = json!({ "role": role, "id": id });
-            change_audio_device(&val, here, || {})
-        };
-        assert!(asked("input", "usb-mic", false).contains("device it belongs to"));
-        assert!(asked("input", devices::DEFAULT, false).contains("device it belongs to"));
+        for id in ["usb-mic", devices::DEFAULT, devices::NONE] {
+            let reply = change_audio_device(&json!({ "role": "input", "id": id }), || panic!("nothing to save"));
+            assert!(reply.contains("audio choices"), "{reply}");
+        }
         assert_eq!(devices::choice(), before);
-        assert_eq!(asked("output", "speakers", false), OK_RESPONSE, "an output is fair game");
-        assert_eq!(asked("input", "usb-mic", true), OK_RESPONSE);
-        assert_eq!(asked("input", devices::NONE, false), OK_RESPONSE, "and it can be switched off from there");
-        devices::set_choice(before);
+    }
+
+    #[test]
+    fn a_0_9_settings_file_with_a_microphone_loads_the_rest_and_drops_it_on_save() {
+        let text = r#"{"audio_input":"alsa_input.usb-mic","audio_output":"speakers","audio_play":"headset","audio_bitrate":128,
+            "audio_tx_volume":80,"audio_rx_volume":90,"play_only_on_other":false,"mouse_sharing":false,"peer_ip":"192.168.8.210",
+            "device_name":"Desk"}"#;
+        let s = parse_settings(text);
+        let choice = audio_choice(&s, true);
+        assert_eq!((choice.output.as_str(), choice.play.as_str()), ("speakers", "headset"));
+        assert_eq!((s.audio_bitrate, s.audio_tx_volume, s.audio_rx_volume), (128, 80, 90));
+        assert!(!s.play_only_on_other && !s.mouse_sharing);
+        assert_eq!((s.peer_ip.as_str(), s.device_name.as_str()), ("192.168.8.210", "Desk"));
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(!saved.contains("audio_input") && !saved.contains("usb-mic"), "{saved}");
     }
 
     #[test]
     fn status_says_what_the_app_needs_to_show() {
         let status = audio_status_json();
-        for field in ["rx_loss", "rx_unrepaired", "rx_buffer_ms", "tx_loss", "tx_reaching", "inputs", "outputs", "notes"] {
+        for field in ["rx_loss", "rx_unrepaired", "rx_buffer_ms", "tx_loss", "tx_reaching", "outputs", "notes"] {
             assert!(!status[field].is_null(), "{field}");
         }
-    }
-
-    #[test]
-    fn status_says_how_the_other_devices_mic_is_offered() {
-        let status = audio_status_json();
-        assert!(status["tx_mic_ready"].is_boolean() && status["rx_mic_live"].is_boolean());
-        #[cfg(target_os = "linux")]
-        assert_eq!(status["virtual"]["kind"], "linux");
-        #[cfg(target_os = "windows")]
-        assert!(matches!(status["virtual"]["kind"].as_str(), Some("cable" | "no_cable")));
-        assert!(status["virtual"]["present"].is_boolean());
-        assert!(status["virtual"]["error"].is_null() || status["virtual"]["error"].is_string());
-        let name = &status["virtual"]["name"];
-        assert!(status["virtual"].get("name").is_some(), "the name is always given, null when there's none");
-        assert_eq!(name.is_string(), status["virtual"]["kind"] == "linux" && status["virtual"]["present"] == true, "{name}");
+        for gone in ["input", "inputs", "virtual", "tx_mic_ready", "rx_mic_live"] {
+            assert!(status.get(gone).is_none(), "{gone}");
+        }
     }
 
     #[test]

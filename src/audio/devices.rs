@@ -23,15 +23,12 @@ pub struct Device {
 /// The devices of this machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lists {
-    pub inputs: Vec<Device>,
     pub outputs: Vec<Device>,
-    pub default_input: Option<String>,
     pub default_output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
-    pub input: String,
     pub output: String,
     pub play: String,
 }
@@ -53,7 +50,7 @@ pub struct InUse {
 }
 
 static CHOICE: Mutex<Choice> =
-    Mutex::new(Choice { input: String::new(), output: String::new(), play: String::new() });
+    Mutex::new(Choice { output: String::new(), play: String::new() });
 static LISTS: Mutex<Option<Lists>> = Mutex::new(None);
 static IN_USE: Mutex<Option<InUse>> = Mutex::new(None);
 
@@ -67,8 +64,7 @@ pub fn set_choice(choice: Choice) {
 
 /// True when something is chosen to send.
 pub fn sending() -> bool {
-    let choice = CHOICE.lock().unwrap_or_else(PoisonError::into_inner);
-    choice.input != NONE || choice.output != NONE
+    CHOICE.lock().unwrap_or_else(PoisonError::into_inner).output != NONE
 }
 
 pub fn lists() -> Lists {
@@ -134,9 +130,6 @@ impl Resolved {
 
 /// How long a capture gets to start delivering.
 const CAPTURE_GRACE: Duration = Duration::from_secs(4);
-/// How long a microphone can give nothing but silence before that's worth a mention. A real one
-/// picks up some noise, so this much digital silence is a blocked or switched-off one.
-const SILENT_MIC_FOR: Duration = Duration::from_secs(10);
 
 /// How a capture that's wanted is getting on.
 #[derive(Debug, Clone, Copy)]
@@ -146,8 +139,6 @@ pub struct CaptureHealth {
     /// How long it has been up, and been expected to deliver.
     pub expected_for: Option<Duration>,
     pub activity: Activity,
-    /// A microphone runs all the time, where an output capture only delivers while something plays.
-    pub microphone: bool,
 }
 
 impl CaptureHealth {
@@ -164,9 +155,6 @@ impl CaptureHealth {
         if longer_than(self.activity.data, CAPTURE_GRACE) {
             return finish(format!("The {what} isn't delivering any audio."));
         }
-        if self.microphone && longer_than(self.activity.sound, SILENT_MIC_FOR) {
-            return finish(format!("The {what} is delivering only silence."));
-        }
         None
     }
 }
@@ -179,45 +167,32 @@ mod tests {
         vec![Device { id: "usb".into(), name: "USB headset".into() }]
     }
 
-    fn health(failed: bool, up_for: Option<u64>, data: Option<Instant>, sound: Option<Instant>, microphone: bool) -> CaptureHealth {
-        CaptureHealth {
-            failed,
-            expected_for: up_for.map(Duration::from_secs),
-            activity: Activity { data, sound },
-            microphone,
-        }
+    fn health(failed: bool, up_for: Option<u64>, data: Option<Instant>, sound: Option<Instant>) -> CaptureHealth {
+        CaptureHealth { failed, expected_for: up_for.map(Duration::from_secs), activity: Activity { data, sound } }
     }
 
     #[test]
     fn a_capture_that_failed_or_delivers_nothing_is_called_out() {
         let t = Instant::now();
         let later = t + Duration::from_secs(60);
-        let note = |h: CaptureHealth| h.note("microphone", "Try this.", later);
-        assert_eq!(
-            note(health(true, None, None, None, true)).unwrap(),
-            "The microphone couldn't be opened. Try this."
-        );
-        assert_eq!(
-            note(health(false, Some(60), None, None, true)).unwrap(),
-            "The microphone isn't delivering any audio. Try this."
-        );
-        assert_eq!(note(health(false, Some(1), None, None, true)), None, "it has only just started");
-        assert_eq!(note(health(false, Some(60), Some(later), Some(later), true)), None, "all is well");
+        let note = |h: CaptureHealth| h.note("output to send", "Try this.", later);
+        assert_eq!(note(health(true, None, None, None)).unwrap(), "The output to send couldn't be opened. Try this.");
+        assert_eq!(note(health(false, Some(60), None, None)).unwrap(), "The output to send isn't delivering any audio. Try this.");
+        assert_eq!(note(health(false, Some(1), None, None)), None, "it has only just started");
+        assert_eq!(note(health(false, Some(60), Some(later), Some(later))), None, "all is well");
     }
 
     #[test]
-    fn a_microphone_giving_only_digital_silence_is_called_out_but_an_output_is_not() {
+    fn an_output_delivering_only_silence_is_not_called_out() {
         let t = Instant::now();
         let later = t + Duration::from_secs(60);
-        let blocked = health(false, Some(60), Some(later), None, true);
-        assert_eq!(blocked.note("microphone", "", later).unwrap(), "The microphone is delivering only silence.");
-        assert_eq!(health(false, Some(60), Some(later), None, false).note("output", "", later), None);
+        assert_eq!(health(false, Some(60), Some(later), None).note("output", "", later), None);
     }
 
     #[test]
     fn nothing_from_a_capture_that_isn_t_expected_to_deliver_says_nothing() {
         let t = Instant::now();
-        assert_eq!(health(false, None, None, None, false).note("output", "", t), None);
+        assert_eq!(health(false, None, None, None).note("output", "", t), None);
     }
 
     #[test]
@@ -235,13 +210,13 @@ mod tests {
         assert_eq!(gone.target(), None);
         assert_eq!(gone.id(Some(&default)), Some(default.clone()));
         assert_eq!(
-            gone.missing_note("microphone").unwrap(),
-            "The chosen microphone isn't connected, so the system default is being used."
+            gone.missing_note("output to send").unwrap(),
+            "The chosen output to send isn't connected, so the system default is being used."
         );
         let back = resolve("usb", &listed());
         assert_eq!(back.target().as_deref(), Some("usb"));
         assert_eq!(back.id(Some(&default)).as_deref(), Some("usb"));
-        assert_eq!(back.missing_note("microphone"), None);
+        assert_eq!(back.missing_note("output to send"), None);
         assert_eq!(resolve(NONE, &[]).id(Some(&default)), None);
     }
 }

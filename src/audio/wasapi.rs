@@ -23,7 +23,7 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{
-    eAll, eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
+    eAll, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
     IAudioClient, IMMDevice, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_SHAREMODE_SHARED,
@@ -60,8 +60,6 @@ const LONGEST_STOP_WAIT: Duration = Duration::from_millis(400);
 /// How long a stream failing stays in the notes.
 const FAILURE_SHOWS_FOR: Duration = Duration::from_secs(4);
 const ALL_SOUND_HINT: &str = "All of this device's sound is sent, from every app and output.";
-/// What to try when a microphone gives nothing. Windows can block one for every app.
-const MIC_HELP: &str = "Check that Microphone access is on in Windows privacy settings.";
 
 /// Wakes the engine when the choices change.
 static WAKE: LazyLock<Signal> = LazyLock::new(Signal::default);
@@ -72,10 +70,6 @@ static EXCLUSION: Mutex<Exclusion> =
     Mutex::new(Exclusion { unsupported: false, failing: false, next_try: None, backoff: None, started_at: None });
 /// The output to play on, with `None` meaning the default.
 static PLAY_DEVICE: Mutex<Option<Pick>> = Mutex::new(None);
-/// VB-Cable's endpoints as of the last look at the devices.
-static CABLE: Mutex<Cable> = Mutex::new(Cable { input: None, output: None });
-/// How to find the cable's render endpoint through `cpal`.
-static CABLE_PICK: Mutex<Option<Pick>> = Mutex::new(None);
 
 pub fn choices_changed() {
     WAKE.notify();
@@ -122,34 +116,7 @@ struct Endpoints {
     picks: HashMap<String, Pick>,
 }
 
-/// VB-Cable's two ends: "CABLE Input" is a render endpoint that mesh-kvm plays the other device's
-/// mic into, and "CABLE Output" is the capture endpoint that apps pick as their microphone.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct Cable {
-    input: Option<Device>,
-    output: Option<Device>,
-}
-
-const CABLE_INPUT: &str = "CABLE Input";
-const CABLE_OUTPUT: &str = "CABLE Output";
-
-fn is_cable(device: &Device) -> bool {
-    device.name.contains(CABLE_INPUT) || device.name.contains(CABLE_OUTPUT)
-}
-
-fn cable(found: &[Device]) -> Cable {
-    let by = |part: &str| found.iter().find(|device| device.name.contains(part)).cloned();
-    Cable { input: by(CABLE_INPUT), output: by(CABLE_OUTPUT) }
-}
-
-/// Whether the cable is installed, for the status JSON (which reads it once the app shows the
-/// cable line).
-pub fn cable_found() -> bool {
-    virtual_mic_ready()
-}
-
-/// Takes endpoints in enumeration order. The cable's two ends are left out of what's shown (they
-/// are not for choosing) but still counted, as `cpal` counts them, and can be found by id. Same-named ones get told apart in the dropdown too.
+/// Takes endpoints in enumeration order. Same-named ones get told apart in the dropdown too.
 fn sort_out(found: Vec<Device>) -> Endpoints {
     let mut totals: HashMap<&str, usize> = HashMap::new();
     for device in &found {
@@ -166,9 +133,7 @@ fn sort_out(found: Vec<Device>) -> Endpoints {
         } else {
             device.name.clone()
         };
-        if !is_cable(device) {
-            devices.push(Device { id: device.id.clone(), name });
-        }
+        devices.push(Device { id: device.id.clone(), name });
         *nth += 1;
     }
     devices.sort_by(|a, b| a.name.cmp(&b.name));
@@ -177,21 +142,21 @@ fn sort_out(found: Vec<Device>) -> Endpoints {
 
 /// Goes through endpoints the way `cpal` does, so that "the second one with this name" is the same
 /// device to both.
-fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> (Endpoints, Cable) {
+fn endpoints(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Endpoints {
     let Ok(collection) = (unsafe { all.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }) else {
-        return (Endpoints::default(), Cable::default());
+        return Endpoints::default();
     };
     let count = unsafe { collection.GetCount() }.unwrap_or(0);
     let flows_this_way = |device: &IMMDevice| {
         device.cast::<IMMEndpoint>().and_then(|endpoint| unsafe { endpoint.GetDataFlow() }).is_ok_and(|f| f == flow)
     };
-    let found: Vec<Device> = (0..count)
-        .filter_map(|index| unsafe { collection.Item(index) }.ok())
-        .filter(flows_this_way)
-        .filter_map(|device| describe(&device))
-        .collect();
-    let cable = cable(&found);
-    (sort_out(found), cable)
+    sort_out(
+        (0..count)
+            .filter_map(|index| unsafe { collection.Item(index) }.ok())
+            .filter(flows_this_way)
+            .filter_map(|device| describe(&device))
+            .collect(),
+    )
 }
 
 fn default_endpoint(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String> {
@@ -201,26 +166,14 @@ fn default_endpoint(all: &IMMDeviceEnumerator, flow: EDataFlow) -> Option<String
 /// The lists to show, and how to find what's on them.
 struct Found {
     lists: Lists,
-    inputs: HashMap<String, Pick>,
     outputs: HashMap<String, Pick>,
 }
 
 fn read_lists() -> Option<Found> {
     let all = enumerator().ok()?;
-    let ((inputs, capture_cable), (outputs, render_cable)) = (endpoints(&all, eCapture), endpoints(&all, eRender));
-    // CABLE Input is a render endpoint and CABLE Output a capture one.
-    let found = Cable { input: render_cable.input, output: capture_cable.output };
-    *CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner) =
-        found.input.as_ref().and_then(|device| outputs.picks.get(&device.id).cloned());
-    *CABLE.lock().unwrap_or_else(PoisonError::into_inner) = found;
+    let outputs = endpoints(&all, eRender);
     Some(Found {
-        lists: Lists {
-            inputs: inputs.devices,
-            outputs: outputs.devices,
-            default_input: default_endpoint(&all, eCapture),
-            default_output: default_endpoint(&all, eRender),
-        },
-        inputs: inputs.picks,
+        lists: Lists { outputs: outputs.devices, default_output: default_endpoint(&all, eRender) },
         outputs: outputs.picks,
     })
 }
@@ -274,13 +227,12 @@ impl<K: PartialEq> Worker<K> {
     }
 
     /// How a capture on this worker is doing.
-    fn health(&self, source: &Source, expected: bool, microphone: bool, now: Instant) -> CaptureHealth {
+    fn health(&self, source: &Source, expected: bool, now: Instant) -> CaptureHealth {
         let up_for = self.last_start.filter(|_| expected && self.alive()).map(|at| now.duration_since(at));
         CaptureHealth {
             failed: self.failed_at.is_some_and(|at| now.duration_since(at) < FAILURE_SHOWS_FOR),
             expected_for: up_for,
             activity: source.activity(),
-            microphone,
         }
     }
 
@@ -457,14 +409,6 @@ fn the_one(mut devices: impl Iterator<Item = cpal::Device>, pick: &Pick) -> Opti
             this_one.then_some(device)
         }
     })
-}
-
-fn find_input(pick: Option<&Pick>) -> Option<cpal::Device> {
-    let host = cpal::default_host();
-    match pick {
-        Some(pick) => the_one(host.input_devices().ok()?, pick),
-        None => host.default_input_device(),
-    }
 }
 
 fn find_output(pick: Option<&Pick>) -> Option<cpal::Device> {
@@ -828,91 +772,20 @@ fn echo_safe(sent: Option<&str>, play: Option<&str>, failing: bool) -> bool {
     sent != play || !failing
 }
 
-#[derive(Debug)]
-struct Steered {
-    input: Resolved,
-    sent: Resolved,
-    play: Resolved,
-    notes: Vec<String>,
-}
-
-/// Whether a choice follows the Windows default, and the default is this end of the cable.
-fn follows_cable(resolved: &Resolved, default: Option<&String>, end: Option<&Device>) -> bool {
-    matches!(resolved, Resolved::Default | Resolved::Missing) && end.is_some_and(|end| default == Some(&end.id))
-}
-
-/// Choices that follow the Windows default don't follow it onto VB-Cable, which often makes itself
-/// the default when it's installed. CABLE Output as the default microphone would send the other
-/// device's own mic back to it, so nothing is captured. CABLE Input as the default output carries
-/// what's played into the other device's mic: received sound would go into that mic, and sending it
-/// would send that mic back as sound. So both use the first real output instead, if there is one,
-/// and with none, nothing is sent.
-fn steer_clear_of_cable(input: Resolved, sent: Resolved, play: Resolved, lists: &Lists, cable: &Cable) -> Steered {
-    let mut notes = Vec::new();
-    let input = if follows_cable(&input, lists.default_input.as_ref(), cable.output.as_ref()) {
-        notes.push("The Windows default microphone is CABLE Output, which carries the other device's mic, so nothing is sent from it. Choose a microphone or line-in.".to_string());
-        Resolved::Off
-    } else {
-        input
-    };
-    let on_cable = |resolved: &Resolved| follows_cable(resolved, lists.default_output.as_ref(), cable.input.as_ref());
-    let real = lists.outputs.first();
-    let sent = match real {
-        _ if !on_cable(&sent) => sent,
-        Some(real) => {
-            notes.push(format!("The Windows default output is CABLE Input, which carries the other device's mic, so {} is sent instead.", real.name));
-            Resolved::Device(real.id.clone())
-        }
-        None => {
-            notes.push("The Windows default output is CABLE Input, which carries the other device's mic, so nothing is sent from it. Choose an output to send.".to_string());
-            Resolved::Off
-        }
-    };
-    let play = match real {
-        Some(real) if on_cable(&play) => {
-            notes.push(format!("The Windows default output is CABLE Input, which carries the other device's mic, so received audio plays on {}.", real.name));
-            Resolved::Device(real.id.clone())
-        }
-        _ => play,
-    };
-    Steered { input, sent, play, notes }
-}
-
-/// What else to mute, never the cable: muting it would silence the other device's mic.
-fn also_mute_but_the_cable(sent: Option<&str>, default: Option<&str>, play_only: bool, cable: &Cable) -> Option<String> {
-    also_mute(sent, default, play_only).filter(|id| cable.input.as_ref().is_none_or(|end| &end.id != id))
-}
-
-/// The cable to play the other device's mic into, while it's there and the mic is arriving. Held open
-/// with nothing arriving, the stream would keep Windows from sleeping by itself.
-fn mic_player_wanted(cable: Option<Pick>, last_alive: Option<Instant>, now: Instant) -> Option<Pick> {
-    cable.filter(|_| last_alive.is_some_and(|at| now.duration_since(at) < PLAYER_IDLE_CLOSE))
-}
-
 fn engine() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let mut mic = Worker::<Option<Pick>>::default();
     let mut output = Worker::<OutputCapture>::default();
     let mut wrong_output = WrongOutput::default();
     loop {
         WAKE.wait(LOOK_EVERY);
         let now = Instant::now();
-        let Some(Found { lists, inputs, outputs }) = read_lists() else { continue };
+        let Some(Found { lists, outputs }) = read_lists() else { continue };
         let choice = devices::choice();
-        let input = devices::resolve(&choice.input, &lists.inputs);
         let sent = devices::resolve(&choice.output, &lists.outputs);
         let play = match devices::resolve(&choice.play, &lists.outputs) {
             Resolved::Off => Resolved::Default,
             other => other,
         };
-        // The notes about a missing choice are about the choice, so they're worked out before this.
-        let missing = [
-            input.missing_note("microphone or line-in"),
-            sent.missing_note("output to send"),
-            play.missing_note("output to play on"),
-        ];
-        let cable = CABLE.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let Steered { input, sent, play, notes: steered_notes } = steer_clear_of_cable(input, sent, play, &lists, &cable);
         let sent_id = sent.id(lists.default_output.as_ref());
         let play_id = play.id(lists.default_output.as_ref());
         let (may_try, failing) = {
@@ -923,12 +796,6 @@ fn engine() {
         let receiving = RECEIVING.load(Ordering::SeqCst);
         let play_only = AUDIO_PLAY_ONLY_ON_OTHER.load(Ordering::Relaxed);
         let excluding = needs_exclusion(sent_id.as_deref(), play_id.as_deref(), receiving, may_try, play_only);
-
-        // By the device, even for the default, so that a change of default restarts the capture.
-        let mic_pick = input.id(lists.default_input.as_ref()).and_then(|id| inputs.get(&id).cloned());
-        mic.ensure((input != Resolved::Off).then_some(mic_pick), now, |pick, stop| {
-            capture_device(find_input(pick.as_ref()), false, &HUB.mic, &stop);
-        });
 
         let sent_pick = sent_id.as_ref().and_then(|id| outputs.get(id).cloned());
         let how = if excluding { OutputCapture::Excluding } else { OutputCapture::Endpoint(sent_pick) };
@@ -944,23 +811,22 @@ fn engine() {
         let peaks = if compare { read_peaks(sent_id.as_deref(), default_id) } else { None };
         let on_wrong_output = wrong_output.note(peaks, now);
         let notes = [
+            sent.missing_note("output to send"),
+            play.missing_note("output to play on"),
             no_mute_note(play_only, sent != Resolved::Off, failing),
             on_wrong_output.then(|| wrong_output_note(sent_id.as_deref(), default_id, &lists)).flatten(),
-            (input != Resolved::Off)
-                .then(|| mic.health(&HUB.mic, true, true, now).note("microphone or line-in", MIC_HELP, now))
-                .flatten(),
             // Loopback delivers nothing while nothing plays, so only a failure says anything here.
             (sent != Resolved::Off)
-                .then(|| output.health(&HUB.output, false, false, now).note("output to send", "", now))
+                .then(|| output.health(&HUB.output, false, now).note("output to send", "", now))
                 .flatten(),
         ];
         devices::set_in_use(InUse {
             output: sent_id.clone(),
-            also_mute: also_mute_but_the_cable(sent_id.as_deref(), lists.default_output.as_deref(), play_only, &cable),
+            also_mute: also_mute(sent_id.as_deref(), lists.default_output.as_deref(), play_only),
             play: play_id.clone(),
             echo_safe: echo_safe(sent_id.as_deref(), play_id.as_deref(), failing),
             hint: if excluding { ALL_SOUND_HINT.to_string() } else { String::new() },
-            notes: missing.into_iter().flatten().chain(steered_notes).chain(notes.into_iter().flatten()).collect(),
+            notes: notes.into_iter().flatten().collect(),
         });
         devices::set_lists(lists);
     }
@@ -1055,9 +921,7 @@ where
     )
 }
 
-/// Plays `stream` on an output until told to stop. `live` is the flag that says a player is
-/// running, for the sound stream.
-fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool, live: Option<&AtomicBool>) {
+fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool) {
     let Some(device) = find_output(pick) else { return };
     let Ok(supported) = device.default_output_config() else { return };
     let format = supported.sample_format();
@@ -1074,16 +938,12 @@ fn play_on(pick: Option<&Pick>, stream: Arc<Mutex<RxStream>>, stop: &AtomicBool,
     };
     match built {
         Ok(stream) => {
-            if let Some(live) = live {
-                live.store(true, Ordering::Relaxed);
-            }
+            AUDIO_PLAYER_LIVE.store(true, Ordering::Relaxed);
             hold(stream, stop, &failed);
         }
         Err(e) => eprintln!("[Audio] Couldn't open the output: {e}"),
     }
-    if let Some(live) = live {
-        live.store(false, Ordering::Relaxed);
-    }
+    AUDIO_PLAYER_LIVE.store(false, Ordering::Relaxed);
 }
 
 fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
@@ -1102,7 +962,7 @@ fn supervise_playback(stream: Arc<Mutex<RxStream>>) {
         let idle = last_alive.is_none_or(|at| now.duration_since(at) >= PLAYER_IDLE_CLOSE);
         let wanted = (!muted && !idle).then(|| PLAY_DEVICE.lock().unwrap_or_else(PoisonError::into_inner).clone());
         let for_player = Arc::clone(&stream);
-        player.ensure(wanted, now, move |pick, stop| play_on(pick.as_ref(), for_player, &stop, Some(&AUDIO_PLAYER_LIVE)));
+        player.ensure(wanted, now, move |pick, stop| play_on(pick.as_ref(), for_player, &stop));
         if muted && alive {
             drain_received(&stream, PLAYER_OFF_TICK, now);
         } else if muted || idle {
@@ -1120,68 +980,6 @@ pub fn start_playback(stream: Arc<Mutex<RxStream>>) {
     if let Err(e) = spawned {
         crate::settings::log_note(&format!("Couldn't start audio playback: {e}"));
     }
-}
-
-/// How often a mic with nowhere to play is drained.
-const MIC_DRAIN_TICK: Duration = Duration::from_millis(20);
-/// The most one drain takes, after the thread was held up.
-const MIC_DRAIN_MOST: Duration = Duration::from_millis(200);
-
-/// How much went by since the last drain.
-struct DrainClock {
-    last: Instant,
-}
-
-impl DrainClock {
-    fn new(now: Instant) -> Self {
-        Self { last: now }
-    }
-
-    fn elapsed(&mut self, now: Instant) -> Duration {
-        let elapsed = now.saturating_duration_since(self.last).min(MIC_DRAIN_MOST);
-        self.last = now;
-        elapsed
-    }
-}
-
-fn supervise_mic(stream: Arc<Mutex<RxStream>>) {
-    let mut player = Worker::<Pick>::default();
-    let mut drain = DrainClock::new(Instant::now());
-    let mut last_alive = None;
-    loop {
-        let now = Instant::now();
-        if stream.lock().unwrap_or_else(PoisonError::into_inner).alive(now) {
-            last_alive = Some(now);
-        }
-        // Only ever the cable: with none, the mic is dropped rather than played on the speakers.
-        // It can't come back as sound sent to the other device: the cable is never sent, as it's
-        // left out of the lists and a default on it is steered to a real output, so ordinary
-        // loopback never records it, and process-exclusion loopback leaves this process out, which
-        // takes this feed with it.
-        let cable = CABLE_PICK.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let wanted = mic_player_wanted(cable, last_alive, now);
-        let for_player = Arc::clone(&stream);
-        player.ensure(wanted, now, move |pick, stop| play_on(Some(pick), for_player, &stop, None));
-        let elapsed = drain.elapsed(now);
-        if !player.alive() {
-            super::drain_mic(&stream, elapsed, now);
-        }
-        std::thread::sleep(MIC_DRAIN_TICK);
-    }
-}
-
-/// Plays the peer's mic into VB-Cable's "CABLE Input" while it exists, and drains it by the clock
-/// otherwise. It is never played on the speakers.
-pub fn start_mic_playback(stream: Arc<Mutex<RxStream>>) {
-    let spawned = std::thread::Builder::new().name("mesh-kvm-audio-mic".to_string()).spawn(move || supervise_mic(stream));
-    if let Err(e) = spawned {
-        crate::settings::log_note(&format!("Couldn't start the mic playback: {e}"));
-    }
-}
-
-/// Whether the peer's mic has a virtual microphone to go to here.
-pub fn virtual_mic_ready() -> bool {
-    CABLE.lock().unwrap_or_else(PoisonError::into_inner).input.is_some()
 }
 
 /// Windows has no way to play the test sound on its own speakers from here.
@@ -1372,114 +1170,6 @@ mod tests {
         Device { id: id.into(), name: name.into() }
     }
 
-    fn dev(id: &str, name: &str) -> Device {
-        device(id, name)
-    }
-
-    impl Endpoints {
-        fn all_names(&self) -> Vec<String> {
-            self.devices.iter().map(|d| d.name.clone()).collect()
-        }
-    }
-
-    #[test]
-    fn the_cable_is_found_by_name_and_kept_out_of_the_lists() {
-        let found = vec![
-            dev("{a}", "Speakers (Realtek)"),
-            dev("{b}", "CABLE Input (VB-Audio Virtual Cable)"),
-            dev("{c}", "CABLE Output (VB-Audio Virtual Cable)"),
-        ];
-        let cable = cable(&found);
-        assert_eq!(cable.input.unwrap().id, "{b}");
-        assert_eq!(cable.output.unwrap().id, "{c}");
-        let kept = sort_out(found);
-        assert!(kept.all_names().iter().all(|n| !n.contains("CABLE")));
-        assert_eq!(kept.all_names(), ["Speakers (Realtek)"]);
-        assert_eq!(kept.picks["{b}"], Pick { name: "CABLE Input (VB-Audio Virtual Cable)".into(), nth: 0 });
-    }
-
-    fn lists_with_defaults(input: &str, output: &str) -> (Lists, Cable) {
-        let lists = Lists {
-            inputs: vec![dev("{mic}", "Microphone (Realtek)")],
-            outputs: vec![dev("{headset}", "Headset"), dev("{speakers}", "Speakers (Realtek)")],
-            default_input: Some(input.to_string()),
-            default_output: Some(output.to_string()),
-        };
-        let cable = Cable {
-            input: Some(dev("{cable-in}", "CABLE Input (VB-Audio Virtual Cable)")),
-            output: Some(dev("{cable-out}", "CABLE Output (VB-Audio Virtual Cable)")),
-        };
-        (lists, cable)
-    }
-
-    #[test]
-    fn the_peer_s_mic_as_the_system_default_is_never_sent_back() {
-        let (lists, cable) = lists_with_defaults("{cable-out}", "{speakers}");
-        for input in [Resolved::Default, Resolved::Missing] {
-            let steered = steer_clear_of_cable(input, Resolved::Default, Resolved::Default, &lists, &cable);
-            assert_eq!(steered.input, Resolved::Off);
-            assert_eq!((steered.sent, steered.play), (Resolved::Default, Resolved::Default));
-            assert_eq!(steered.notes.len(), 1);
-        }
-        let chosen = steer_clear_of_cable(Resolved::Device("{mic}".into()), Resolved::Default, Resolved::Default, &lists, &cable);
-        assert_eq!(chosen.input, Resolved::Device("{mic}".into()), "a chosen mic is the one used");
-        assert!(chosen.notes.is_empty());
-    }
-
-    #[test]
-    fn the_peer_s_speakers_as_the_system_default_don_t_take_what_is_received() {
-        let (lists, cable) = lists_with_defaults("{mic}", "{cable-in}");
-        let steered = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Missing, &lists, &cable);
-        assert_eq!(steered.input, Resolved::Default);
-        assert_eq!(steered.play, Resolved::Device("{headset}".into()), "received sound plays on the first real output");
-        assert_eq!(steered.sent, Resolved::Device("{headset}".into()), "and the cable, which carries the other mic, isn't sent");
-        assert_eq!(steered.notes.len(), 2, "{:?}", steered.notes);
-        let chosen = steer_clear_of_cable(
-            Resolved::Default,
-            Resolved::Device("{speakers}".into()),
-            Resolved::Off,
-            &lists,
-            &cable,
-        );
-        assert_eq!((chosen.sent, chosen.play), (Resolved::Device("{speakers}".into()), Resolved::Off), "choices are kept");
-        assert!(chosen.notes.is_empty());
-        let none_real = Lists { outputs: Vec::new(), ..lists.clone() };
-        let stuck = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Default, &none_real, &cable);
-        assert_eq!(stuck.sent, Resolved::Off, "nothing else to send: the cable isn't sent");
-        let without = steer_clear_of_cable(Resolved::Default, Resolved::Default, Resolved::Default, &lists, &Cable::default());
-        assert!(without.notes.is_empty(), "no cable, nothing to steer clear of");
-    }
-
-    #[test]
-    fn the_cable_is_never_muted_as_the_windows_default() {
-        let (_, cable) = lists_with_defaults("{mic}", "{cable-in}");
-        assert_eq!(also_mute_but_the_cable(Some("{headset}"), Some("{cable-in}"), true, &cable), None);
-        assert_eq!(also_mute_but_the_cable(Some("{headset}"), Some("{speakers}"), true, &cable).as_deref(), Some("{speakers}"));
-    }
-
-    #[test]
-    fn the_mic_player_lets_the_cable_go_when_nothing_arrives() {
-        let pick = Some(Pick { name: "CABLE Input (VB-Audio Virtual Cable)".into(), nth: 0 });
-        let t = Instant::now();
-        assert_eq!(mic_player_wanted(pick.clone(), None, t), None, "nothing ever arrived");
-        assert_eq!(mic_player_wanted(pick.clone(), Some(t), t + Duration::from_millis(500)), pick, "arriving");
-        assert_eq!(mic_player_wanted(pick.clone(), Some(t), t + PLAYER_IDLE_CLOSE), None, "quiet for long enough");
-        assert_eq!(mic_player_wanted(None, Some(t), t), None, "no cable");
-    }
-
-    #[test]
-    fn no_cable_means_no_virtual_mic() {
-        assert!(cable(&[dev("{a}", "Speakers (Realtek)")]).input.is_none());
-    }
-
-    #[test]
-    fn a_mic_drain_never_takes_more_than_a_stall_s_worth() {
-        let t = Instant::now();
-        let mut clock = DrainClock::new(t);
-        assert_eq!(clock.elapsed(t + Duration::from_millis(30)), Duration::from_millis(30));
-        assert_eq!(clock.elapsed(t + Duration::from_secs(9)), MIC_DRAIN_MOST);
-    }
-
     #[test]
     fn same_named_devices_stay_apart() {
         let found = sort_out(vec![device("{1}", "Speakers"), device("{2}", "Headset"), device("{3}", "Speakers")]);
@@ -1607,12 +1297,12 @@ mod tests {
 
     #[test]
     fn mono_and_surround_devices_map_to_stereo() {
-        let mut intake = Intake::new(&HUB.mic, 1, RATE);
+        let source: &'static Source = Box::leak(Box::default());
+        let mut intake = Intake::new(source, 1, RATE);
         intake.take(&[0.5f32, 0.25], |s| s);
         assert_eq!(intake.stereo, [0.5, 0.5, 0.25, 0.25]);
-        let mut intake = Intake::new(&HUB.mic, 6, RATE);
+        let mut intake = Intake::new(source, 6, RATE);
         intake.take(&[0.1f32, 0.2, 0.0, 9.0, 0.0, 0.0], |s| s);
         assert_eq!(intake.stereo, [0.1, 0.2], "bass doesn't go into the mix");
-        HUB.mic.clear();
     }
 }

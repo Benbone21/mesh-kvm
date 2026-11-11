@@ -1,7 +1,6 @@
 //! The audio bus (UDP 24851), the same in both directions on every device.
 //!
-//! Each device can send a microphone or line-in, the sound of an output, or both mixed. It can play
-//! what it receives on an output of its own. On the wire: Opus in 10 ms frames, or plain PCM in 5 ms
+//! Each device can send the sound of an output, and play what it receives on an output of its own. On the wire: Opus in 10 ms frames, or plain PCM in 5 ms
 //! frames, in the format `packet` describes. `jitter` turns packets back into steady audio.
 //!
 //! Linux uses PipeWire through its command line tools, Windows uses WASAPI, and each lives in a
@@ -21,8 +20,6 @@ pub mod sender;
 mod live;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-mod virtual_linux;
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "windows")]
@@ -95,25 +92,20 @@ impl StreamTally {
     }
 }
 
-/// The sound stream's tally, and the mic stream's.
+/// The sound stream's tally.
 pub static AUDIO_RX_TALLY: StreamTally = StreamTally::new();
-pub static AUDIO_RX_MIC_TALLY: StreamTally = StreamTally::new();
-/// A mic stream from the other device is alive.
-pub static AUDIO_RX_MIC_LIVE: AtomicBool = AtomicBool::new(false);
 /// The output is open and not switched off, so what's received can be heard.
 pub static AUDIO_PLAYER_LIVE: AtomicBool = AtomicBool::new(false);
 
 pub static AUDIO_TX_VOLUME_PCT: AtomicU32 = AtomicU32::new(100);
 pub static AUDIO_TX_PACKETS: AtomicU64 = AtomicU64::new(0);
 /// Of those, the ones with real sound from the output's capture in them, not silence, word that the
-/// stream is alive, or a microphone alone.
+/// stream is alive, or the chime alone.
 pub static AUDIO_TX_SOUND_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub static AUDIO_TX_PEAK_PCT: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_BITRATE_KBPS: AtomicU32 = AtomicU32::new(DEFAULT_BITRATE);
 /// What the other device says it is losing of what's sent, in percent.
 pub static AUDIO_TX_LOSS: AtomicU32 = AtomicU32::new(0);
-/// Apps playing on the other device's speakers here are being captured, to be sent.
-pub static AUDIO_SPEAKERS_CAPTURE_LIVE: AtomicBool = AtomicBool::new(false);
 /// The capture of an output is running.
 pub static AUDIO_OUTPUT_CAPTURE_LIVE: AtomicBool = AtomicBool::new(false);
 /// Muting the output won't silence what's captured from it. On Linux that's always so, as capture
@@ -147,23 +139,8 @@ fn note_heard_back(report: packet::Report, now: Instant) {
     AUDIO_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
 }
 
-/// What the sender last heard back about the microphone stream.
-static MIC_HEARD_BACK: Mutex<HeardBack> = Mutex::new(HeardBack { at: None, playing: false, sounding: false, ready: false });
-/// What the other device says it is losing of the microphone stream, in percent.
-pub static AUDIO_MIC_TX_LOSS: AtomicU32 = AtomicU32::new(0);
-
-fn note_mic_heard_back(report: packet::Report, now: Instant) {
-    *MIC_HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner) =
-        HeardBack { at: Some(now), playing: report.playing, sounding: report.sounding, ready: report.ready };
-    AUDIO_MIC_TX_LOSS.store(u32::from(report.loss_percent), Ordering::Relaxed);
-}
-
 fn heard_back(now: Instant, within: Duration) -> HeardBack {
-    heard_within(&HEARD_BACK, now, within)
-}
-
-fn heard_within(heard: &Mutex<HeardBack>, now: Instant, within: Duration) -> HeardBack {
-    let heard = *heard.lock().unwrap_or_else(PoisonError::into_inner);
+    let heard = *HEARD_BACK.lock().unwrap_or_else(PoisonError::into_inner);
     if heard.at.is_some_and(|at| now.duration_since(at) < within) {
         heard
     } else {
@@ -187,37 +164,6 @@ pub fn peer_ready(now: Instant, within: Duration) -> bool {
     heard_back(now, within).ready
 }
 
-/// True while the other device says it would take a microphone stream: it has somewhere to put it.
-pub fn peer_mic_ready(now: Instant, within: Duration) -> bool {
-    heard_within(&MIC_HEARD_BACK, now, within).ready
-}
-
-/// How this device offers the other one's microphone, for the status. None where no kind applies.
-pub struct VirtualStatus {
-    pub kind: &'static str,
-    /// There to use now.
-    pub present: bool,
-    /// Why not, if adding them failed.
-    pub error: Option<String>,
-    /// The other device's name as the devices carry it, while they're there.
-    pub name: Option<String>,
-}
-
-pub fn virtual_status() -> Option<VirtualStatus> {
-    #[cfg(target_os = "linux")]
-    return Some({
-        let name = virtual_linux::present();
-        VirtualStatus { kind: "linux", present: name.is_some(), error: virtual_linux::last_error(), name }
-    });
-    #[cfg(target_os = "windows")]
-    return Some({
-        let found = wasapi::cable_found();
-        VirtualStatus { kind: if found { "cable" } else { "no_cable" }, present: found, error: None, name: None }
-    });
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    None
-}
-
 /// True while reports are coming from the other device at all.
 pub fn peer_reporting(now: Instant, within: Duration) -> bool {
     heard_back(now, within).at.is_some()
@@ -226,7 +172,6 @@ pub fn peer_reporting(now: Instant, within: Duration) -> bool {
 /// What is being sent out, ready for the sender.
 #[derive(Default)]
 pub struct Hub {
-    pub mic: mix::Source,
     pub output: mix::Source,
     pub chime: mix::Source,
     pub signal: mix::Signal,
@@ -237,8 +182,7 @@ pub static HUB: LazyLock<Hub> = LazyLock::new(Hub::default);
 impl Hub {
     /// Hands over captured audio, at the volume chosen for sending.
     pub fn capture(&self, source: &mix::Source, samples: &mut [f32]) {
-        // The send volume is for what's played here; a microphone has its own level.
-        let volume = if std::ptr::eq(source, &self.mic) { 100 } else { AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed) };
+        let volume = AUDIO_TX_VOLUME_PCT.load(Ordering::Relaxed);
         if volume != 100 {
             let gain = volume as f32 / 100.0;
             samples.iter_mut().for_each(|sample| *sample *= gain);
@@ -275,23 +219,10 @@ fn finish_received(samples: &mut [f32]) {
 /// Runs received audio through the buffer with nothing to play it on, to keep the meter and the
 /// counts honest while Play is off. Call about every `elapsed`.
 fn drain_received(stream: &Mutex<RxStream>, elapsed: Duration, now: Instant) {
-    let samples = drain_stream(stream, elapsed, now);
-    AUDIO_RX_PEAK_PCT.store(peak_pct(&samples), Ordering::Relaxed);
-}
-
-/// Takes `elapsed` worth of audio out of the buffer and hands it back, to be dropped. The meter is
-/// the sound stream's, so this leaves it alone: a mic with nowhere to play drains through here.
-fn drain_stream(stream: &Mutex<RxStream>, elapsed: Duration, now: Instant) -> Vec<f32> {
     let frames = (elapsed.as_secs_f64() * f64::from(RATE)) as usize;
     let mut samples = vec![0.0f32; frames * CHANNELS];
     stream.lock().unwrap_or_else(PoisonError::into_inner).fill(&mut samples, now);
-    samples
-}
-
-/// Drains a mic stream that has no virtual microphone to go to, so that it never grows. Call about
-/// every `elapsed`.
-fn drain_mic(stream: &Mutex<RxStream>, elapsed: Duration, now: Instant) {
-    drop(drain_stream(stream, elapsed, now));
+    AUDIO_RX_PEAK_PCT.store(peak_pct(&samples), Ordering::Relaxed);
 }
 
 /// How long the test sound lasts, in ms.
@@ -326,19 +257,9 @@ pub fn trigger_test_chime(play_local: bool, send_to_peer: bool) {
     });
 }
 
-/// Notes whether the link to the other device is up, and tells the engine at once when that changes,
-/// as the other device's mic and speakers come and go with it.
+/// Notes whether the link to the other device is up, for the mute thread.
 pub fn set_peer_online(online: bool) {
-    if AUDIO_PEER_ONLINE.swap(online, Ordering::Relaxed) != online {
-        platform::choices_changed();
-    }
-}
-
-/// Takes away what the audio engine added to this device's sound settings. Every way the service
-/// stops runs this, through `mute::shutdown`.
-pub fn shut_down() {
-    #[cfg(target_os = "linux")]
-    platform::shut_down();
+    AUDIO_PEER_ONLINE.store(online, Ordering::Relaxed);
 }
 
 /// Tells the audio engine to look at the choices now.
@@ -366,22 +287,6 @@ fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
     report
 }
 
-/// Reads the mic stream's state and returns what to tell the sender. It never sounds on speakers, so
-/// `playing` is whether the virtual microphone is there to take it.
-fn publish_mic(stream: &mut RxStream, now: Instant) -> packet::Report {
-    let alive = stream.alive(now);
-    if !alive {
-        stream.forget_quality();
-    }
-    let ready = platform::virtual_mic_ready();
-    let mut report = stream.report(ready);
-    report.sounding = false;
-    report.ready = ready;
-    AUDIO_RX_MIC_LIVE.store(alive, Ordering::Relaxed);
-    AUDIO_RX_MIC_TALLY.publish(stream.counts(), stream.take_peak_ms());
-    report
-}
-
 /// When audio of another version last came from the other device. A plain packet sets this and
 /// needs no key, so anyone can forge one: this is for a note in the app, and must do nothing else.
 static OTHER_VERSION_AT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -405,23 +310,21 @@ pub fn other_version_arriving(now: Instant) -> bool {
 struct Receiver<'a> {
     socket: &'a UdpSocket,
     sound: &'a Mutex<RxStream>,
-    mic: &'a Mutex<RxStream>,
     peer: SocketAddr,
     channel: &'a Channel,
     /// Where the sender is. Its port can be anything, so this comes from what arrives, and only
     /// from what checked out: anyone can forge a source address.
     last_source: Option<SocketAddr>,
-    /// The sender's run, from its audio, for each stream.
+    /// The sender's run, from its sound stream.
     sound_epoch: Option<u16>,
-    mic_epoch: Option<u16>,
     opened: Vec<u8>,
     report: Vec<u8>,
     sealed: Vec<u8>,
 }
 
 impl<'a> Receiver<'a> {
-    fn new(socket: &'a UdpSocket, sound: &'a Mutex<RxStream>, mic: &'a Mutex<RxStream>, peer: SocketAddr, channel: &'a Channel) -> Self {
-        Self { socket, sound, mic, peer, channel, last_source: None, sound_epoch: None, mic_epoch: None, opened: Vec::new(), report: Vec::with_capacity(32), sealed: Vec::new() }
+    fn new(socket: &'a UdpSocket, sound: &'a Mutex<RxStream>, peer: SocketAddr, channel: &'a Channel) -> Self {
+        Self { socket, sound, peer, channel, last_source: None, sound_epoch: None, opened: Vec::new(), report: Vec::with_capacity(32), sealed: Vec::new() }
     }
 
     /// Anyone can send to a UDP port, so what comes from elsewhere is dropped before it's looked at.
@@ -433,14 +336,17 @@ impl<'a> Receiver<'a> {
             Opened::Data(plain) => {
                 self.last_source = Some(from);
                 match packet::parse(plain) {
-                    Ok(packet) if !matches!(packet.body, Body::Report(_)) => {
-                        let (stream, epoch) = match packet.stream {
-                            packet::Stream::Sound => (self.sound, &mut self.sound_epoch),
-                            packet::Stream::Mic => (self.mic, &mut self.mic_epoch),
-                        };
-                        *epoch = Some(packet.epoch);
-                        stream.lock().unwrap_or_else(PoisonError::into_inner).push(&packet, now);
-                    }
+                    Ok(packet) if !matches!(packet.body, Body::Report(_)) => match packet.stream {
+                        packet::Stream::Sound => {
+                            self.sound_epoch = Some(packet.epoch);
+                            self.sound.lock().unwrap_or_else(PoisonError::into_inner).push(&packet, now);
+                        }
+                        // A 0.9.0 or 0.9.1 peer with a microphone chosen still sends it. This
+                        // version has nowhere to put it: it is dropped here, never buffered or
+                        // counted, and no report goes back for it, so the sender shows it as not
+                        // ready.
+                        packet::Stream::Mic => {}
+                    },
                     Err(Refused::OtherVersion) => note_other_version(now),
                     _ => {}
                 }
@@ -465,24 +371,15 @@ impl<'a> Receiver<'a> {
         });
     }
 
-    /// Publishes each stream's figures and tells the sender how each is going.
+    /// Publishes the stream's figures and tells the sender how it's going.
     fn report(&mut self, now: Instant) {
-        // The socket waits for no lock: playback takes these on every buffer.
-        let (sound, sound_alive) = {
+        // The socket waits for no lock: playback takes this one on every buffer.
+        let (report, alive) = {
             let mut stream = self.sound.lock().unwrap_or_else(PoisonError::into_inner);
             (publish_received(&mut stream, now), stream.alive(now))
         };
-        let (mic, mic_alive) = {
-            let mut stream = self.mic.lock().unwrap_or_else(PoisonError::into_inner);
-            (publish_mic(&mut stream, now), stream.alive(now))
-        };
-        self.send_report(packet::Stream::Sound, self.sound_epoch, sound, sound_alive);
-        self.send_report(packet::Stream::Mic, self.mic_epoch, mic, mic_alive);
-    }
-
-    fn send_report(&mut self, stream: packet::Stream, epoch: Option<u16>, report: packet::Report, alive: bool) {
-        if let (Some(to), Some(epoch), true) = (self.last_source, epoch, alive) {
-            packet::write_report(&mut self.report, stream, epoch, report);
+        if let (Some(to), Some(epoch), true) = (self.last_source, self.sound_epoch, alive) {
+            packet::write_report(&mut self.report, packet::Stream::Sound, epoch, report);
             if self.channel.seal(&self.report, &mut self.sealed) {
                 let _ = self.socket.send_to(&self.sealed, to);
             }
@@ -491,10 +388,10 @@ impl<'a> Receiver<'a> {
 }
 
 /// Takes the other device's packets off the socket until `stop`, and tells it how it's going.
-fn receive_loop(socket: &UdpSocket, sound: &Mutex<RxStream>, mic: &Mutex<RxStream>, peer: SocketAddr, channel: &Channel, stop: &AtomicBool) {
+fn receive_loop(socket: &UdpSocket, sound: &Mutex<RxStream>, peer: SocketAddr, channel: &Channel, stop: &AtomicBool) {
     let _ = socket.set_read_timeout(Some(RECEIVE_WAIT));
     let clock = Instant::now();
-    let mut receiver = Receiver::new(socket, sound, mic, peer, channel);
+    let mut receiver = Receiver::new(socket, sound, peer, channel);
     let mut buf = [0u8; 2048];
     let mut next_report = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -514,9 +411,7 @@ fn receive_loop(socket: &UdpSocket, sound: &Mutex<RxStream>, mic: &Mutex<RxStrea
 
 pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) -> Result<(), String> {
     let sound = Arc::new(Mutex::new(RxStream::default()));
-    let mic = Arc::new(Mutex::new(RxStream::default()));
     platform::start_playback(Arc::clone(&sound));
-    platform::start_mic_playback(Arc::clone(&mic));
     std::thread::Builder::new()
         .name("mesh-kvm-audio-rx".to_string())
         .spawn(move || {
@@ -529,7 +424,7 @@ pub fn start_audio_listener(port: u16, peer: SocketAddr, channel: Arc<Channel>) 
                 }
             };
             println!("[Audio-RX] Listening on UDP {}", bind_addr);
-            receive_loop(&socket, &sound, &mic, peer, &channel, &AtomicBool::new(false));
+            receive_loop(&socket, &sound, peer, &channel, &AtomicBool::new(false));
         })
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -610,28 +505,20 @@ pub(crate) mod tests {
 
     /// Runs the receive loop for a moment on a socket of its own, with `127.0.0.1` as the peer.
     fn received_from(source: &str, channel: &Channel, data: &[u8]) -> (u64, Option<Instant>) {
-        let (sound, _, note) = received_on_both(source, channel, data);
-        (sound, note)
-    }
-
-    /// As `received_from`, with the count for the mic stream too.
-    fn received_on_both(source: &str, channel: &Channel, data: &[u8]) -> (u64, u64, Option<Instant>) {
         let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
         let to = listen.local_addr().unwrap();
         let stream = Mutex::new(RxStream::default());
-        let mic = Mutex::new(RxStream::default());
         let stop = AtomicBool::new(false);
         *OTHER_VERSION_AT.lock().unwrap() = None;
         std::thread::scope(|scope| {
-            scope.spawn(|| receive_loop(&listen, &stream, &mic, SocketAddr::from(([127, 0, 0, 1], 24851)), channel, &stop));
+            scope.spawn(|| receive_loop(&listen, &stream, SocketAddr::from(([127, 0, 0, 1], 24851)), channel, &stop));
             let sender = UdpSocket::bind((source, 0)).unwrap();
             sender.send_to(data, to).unwrap();
             std::thread::sleep(Duration::from_millis(30));
             stop.store(true, Ordering::SeqCst);
         });
         let received = stream.lock().unwrap().counts().received;
-        let mic_received = mic.lock().unwrap().counts().received;
-        (received, mic_received, *OTHER_VERSION_AT.lock().unwrap())
+        (received, *OTHER_VERSION_AT.lock().unwrap())
     }
 
     fn audio_packet() -> Vec<u8> {
@@ -692,18 +579,17 @@ pub(crate) mod tests {
     struct Far {
         socket: UdpSocket,
         stream: Mutex<RxStream>,
-        mic: Mutex<RxStream>,
         one: UdpSocket,
         other: UdpSocket,
     }
 
     impl Far {
         fn new() -> Far {
-            Far { socket: bound(), stream: Mutex::default(), mic: Mutex::default(), one: bound(), other: bound() }
+            Far { socket: bound(), stream: Mutex::default(), one: bound(), other: bound() }
         }
 
         fn receiver<'a>(&'a self, channel: &'a Channel) -> Receiver<'a> {
-            Receiver::new(&self.socket, &self.stream, &self.mic, SocketAddr::from(([127, 0, 0, 1], 24851)), channel)
+            Receiver::new(&self.socket, &self.stream, SocketAddr::from(([127, 0, 0, 1], 24851)), channel)
         }
     }
 
@@ -782,9 +668,9 @@ pub(crate) mod tests {
         let (out, channel) = paired_channels();
         let (listen, socket) = (bound(), bound());
         let target = listen.local_addr().unwrap();
-        let (stream, mic, hub, stop) = (Mutex::default(), Mutex::default(), Hub::default(), AtomicBool::new(false));
+        let (stream, hub, stop) = (Mutex::default(), Hub::default(), AtomicBool::new(false));
         std::thread::scope(|scope| {
-            scope.spawn(|| receive_loop(&listen, &stream, &mic, target, &channel, &stop));
+            scope.spawn(|| receive_loop(&listen, &stream, target, &channel, &stop));
             scope.spawn(|| sender::send_loop(&socket, target, &out, &hub, &stop));
             let end = Instant::now() + Duration::from_secs(3);
             let ready = || [&out, &channel].iter().all(|c| c.security() == LinkSecurity::Encrypted);
@@ -827,63 +713,50 @@ pub(crate) mod tests {
         out
     }
 
-    #[test]
-    fn mic_packets_never_reach_the_sound_stream() {
-        let _figures = figures_to_myself();
-        let far = Far::new();
-        let (sender, channel) = linked_channels();
-        let mut receiver = far.receiver(&channel);
-        let now = Instant::now();
-        for seq in 0..20 {
-            receiver.take(&sealed(&sender, &packet_on(packet::Stream::Mic, seq)), from(&far.one), 1, now);
-        }
-        assert_eq!(far.stream.lock().unwrap().counts().received, 0);
-        assert_eq!(far.mic.lock().unwrap().counts().received, 20);
-        // And the other way.
-        receiver.take(&sealed(&sender, &packet_on(packet::Stream::Sound, 0)), from(&far.one), 1, now);
-        assert_eq!(far.stream.lock().unwrap().counts().received, 1);
-        assert_eq!(far.mic.lock().unwrap().counts().received, 20);
-    }
-
-    #[test]
-    fn each_stream_reports_for_itself() {
-        let _figures = figures_to_myself();
-        let far = Far::new();
-        let (sender, channel) = linked_channels();
-        let mut receiver = far.receiver(&channel);
-        let now = Instant::now();
-        receiver.take(&sealed(&sender, &packet_on(packet::Stream::Sound, 0)), from(&far.one), 1, now);
-        receiver.take(&sealed(&sender, &packet_on(packet::Stream::Mic, 0)), from(&far.one), 1, now);
-        receiver.report(now);
+    /// What came back to the sender, as (stream, report), opened.
+    fn reports_at(sender: &Channel, socket: &UdpSocket) -> Vec<(packet::Stream, packet::Report)> {
         let mut seen = Vec::new();
-        while let Some(datagram) = next(&far.one) {
+        while let Some(datagram) = next(socket) {
             let mut plain = Vec::new();
             let Opened::Data(bytes) = sender.open(&datagram, 2, &mut plain) else { panic!("not from the session") };
             let Ok(packet::Packet { stream, body: Body::Report(report), .. }) = packet::parse(bytes) else { panic!("not a report") };
             seen.push((stream, report));
         }
-        assert_eq!(seen.len(), 2, "one report each");
-        let of = |which| seen.iter().find(|(stream, _)| *stream == which).map(|(_, report)| *report).expect("a report for the stream");
-        let mic = of(packet::Stream::Mic);
-        assert_eq!(mic.ready, platform::virtual_mic_ready());
-        assert_eq!(mic.playing, platform::virtual_mic_ready());
-        assert!(!mic.sounding);
-        assert_eq!(of(packet::Stream::Sound).ready, !AUDIO_RX_MUTED.load(Ordering::Relaxed));
-        assert!(AUDIO_RX_MIC_LIVE.load(Ordering::Relaxed));
+        seen
     }
 
     #[test]
-    fn a_mic_with_nowhere_to_play_is_drained_and_leaves_the_meter_alone() {
+    fn a_mic_stream_from_an_older_peer_is_dropped_and_gets_no_report() {
         let _figures = figures_to_myself();
-        let mic = Mutex::new(RxStream::default());
-        let t = Instant::now();
-        AUDIO_RX_PEAK_PCT.store(0, Ordering::Relaxed);
-        for seq in 0..20 {
-            mic.lock().unwrap().push(&packet::parse(&packet_on(packet::Stream::Mic, seq)).unwrap(), t);
+        *OTHER_VERSION_AT.lock().unwrap() = None;
+        let far = Far::new();
+        let (sender, channel) = linked_channels();
+        let mut receiver = far.receiver(&channel);
+        let now = Instant::now();
+        for seq in 0..200 {
+            receiver.take(&sealed(&sender, &packet_on(packet::Stream::Mic, seq)), from(&far.one), 1, now);
+            let mut quiet = Vec::new();
+            packet::write_quiet(&mut quiet, packet::Stream::Mic, 1, seq);
+            receiver.take(&sealed(&sender, &quiet), from(&far.one), 1, now);
         }
-        drain_mic(&mic, Duration::from_millis(200), t + Duration::from_millis(100));
-        assert_eq!(AUDIO_RX_PEAK_PCT.load(Ordering::Relaxed), 0, "the meter is the sound stream's");
-        assert!(mic.lock().unwrap().buffered_ms() < 1.0, "it never grows");
+        let sound = far.stream.lock().unwrap();
+        assert_eq!(sound.counts().received, 0, "never played");
+        assert!(!sound.alive(now), "and it doesn't make the sound stream look alive");
+        drop(sound);
+        assert!(OTHER_VERSION_AT.lock().unwrap().is_none(), "it is this version's format, not another version");
+        receiver.report(now);
+        assert!(reports_at(&sender, &far.one).is_empty(), "no report goes back for it");
+
+        // Sound from the same peer goes on as ever, and only it is reported on.
+        receiver.take(&sealed(&sender, &packet_on(packet::Stream::Sound, 0)), from(&far.one), 1, now);
+        receiver.take(&sealed(&sender, &packet_on(packet::Stream::Mic, 200)), from(&far.one), 1, now);
+        assert_eq!(far.stream.lock().unwrap().counts().received, 1);
+        receiver.report(now);
+        let seen = reports_at(&sender, &far.one);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, packet::Stream::Sound);
+        assert_eq!(seen[0].1.received, 1, "the mic packets aren't counted in it");
+        assert_eq!(seen[0].1.loss_percent, 0);
     }
 
     #[test]
@@ -892,8 +765,8 @@ pub(crate) mod tests {
         let (sender, receiver) = linked_channels();
         let mut older = packet_on(packet::Stream::Sound, 0);
         older[4] = 2;
-        let (sound, mic, note) = received_on_both("127.0.0.1", &receiver, &sealed(&sender, &older));
-        assert_eq!((sound, mic), (0, 0));
+        let (sound, note) = received_from("127.0.0.1", &receiver, &sealed(&sender, &older));
+        assert_eq!(sound, 0);
         assert!(note.is_some());
         assert!(other_version_arriving(Instant::now()));
     }
