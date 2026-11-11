@@ -7,7 +7,7 @@ When one device sends its microphone, the other should see it as a microphone in
 ### Decided with the user
 
 - A received mic goes **only** to the virtual mic. It isn't played on the speakers.
-- The virtual devices appear **while the devices are paired and linked**, and stay for 30 s after the link drops before they go away.
+- The virtual devices appear **while the devices are paired and linked**, and stay for about 30 s after the link drops before they go away.
 - On the laptop, a free VB-Cable carries **Debian's mic**. Sound from the laptop to Debian keeps using the existing "output to send" setting.
 - Renaming VB-Cable's devices from code is out of scope, because it needs admin rights. The app says which device to pick, and the user can rename it in Windows Sound settings.
 
@@ -44,7 +44,7 @@ The peer name is the other device's own name (its hostname, or the name set in m
   1. A pipe source fed directly by mesh-kvm.
   2. A source the playback stream links to with `pw-link`.
   3. The tested null sink and remap source, with the sink hidden.
-- **Taking devices away.** The devices are removed 30 s after the link drops (unless it returns first), at once when the peer is unpaired, and on Quit or service stop. Every module mesh-kvm loads carries a name with the `meshkvm_` prefix. At service start, any of those left by a crash are unloaded, because PipeWire keeps them after the process that made them is gone.
+- **Taking devices away.** The devices are removed about 30 s after the link drops (at the engine's next look, so up to 5 s later) (unless it returns first), at once when the peer is unpaired, and on Quit or service stop. Every module mesh-kvm loads carries a name with the `meshkvm_` prefix. At service start, any of those left by a crash are unloaded, because PipeWire keeps them after the process that made them is gone.
 - **Keeping streams apart.** The capture for the sound stream already leaves out mesh-kvm's own playback. It must leave out the mic feed too, so the laptop's mic never comes back to the laptop. The virtual speaker's monitor is captured on its own and mixed in, whatever output is chosen to send.
 
 ### 3. Windows: VB-Cable
@@ -69,7 +69,7 @@ The cells have accessible names like every other cell (see the redesign spec).
 
 ## Errors and edge cases
 
-- **The link drops mid-call:** both devices stay for 30 s (`DROP_GRACE`), the mic giving silence, so a short drop doesn't send apps back to their default mic, where they often stay. A link back within that keeps the same modules. After 30 s they go, and apps fall back to their default mic; when the link returns, they are created again with the same name, so apps that remember devices by name pick them up again. Unpairing and service stop still take them at once.
+- **The link drops mid-call:** both devices stay for about 30 s (`DROP_GRACE`, then the engine's next look, up to 5 s on), the mic giving silence, so a short drop doesn't send apps back to their default mic, where they often stay. A link back within that keeps the same modules. After that they go, and apps fall back to their default mic; when the link returns, they are created again with the same name, so apps that remember devices by name pick them up again. Unpairing and service stop still take them at once.
 - **Creating a device fails:** for example, `pactl` is missing or PipeWire is restarting. The row says so, and it's retried with the device lists. Nothing else in audio stops.
 - **The peer is renamed:** the devices are recreated with the new name.
 - **Both devices send their mics:** this is fine, because each goes to the other's virtual mic and neither is captured as output sound.
