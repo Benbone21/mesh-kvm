@@ -14,7 +14,7 @@ poor, measuring, returning, down, oneway or older. POST {"state": ...} to /fake/
 --update picks where an update has got to: none, both, offline, peer-downloading, here-downloading, updating-peer,
 waiting-peer, installing, view-only, peer-failed, apt-failed, restored, no-polkit or stale. POST {"state": ...} to
 /fake/update to change that too, and GET /fake/requests shows the update actions the app has sent.
---version says what version the service is, which POST {"version": ...} to /fake/version changes, as
+--version says what version the service is (Cargo.toml's by default), which POST {"version": ...} to /fake/version changes, as
 an update would, so the app can be seen starting again. POST {"device": "Windows", "stage": ...} to /fake/mode to
 hold a change to that device's first screen at applying or going_back, as a service waiting on a screen does.
 --secure picks how the link's encryption stands, for both devices: encrypted, connecting, unpaired or old-peer (an
@@ -203,12 +203,12 @@ def link_details(world, node):
     started = int(world.details_since * 1000) - (2 * 3600 + 12 * 60) * 1000
     windows = node == "Windows"
     rtt = {"min_ms": 3.0, "avg_ms": 5.6, "max_ms": 14.0 if windows else 11.0, "jitter_ms": 1.3, "answers": 40}
-    sound = {"loss_percent": 0.4, "buffer_ms": 34 if windows else 42, "buffer_peak_ms": 61, "received": 1000, "lost": 1, "repaired": 1, "late": 0}
+    sound = {"loss_percent": 0.4, "buffer_ms": 34 if windows else 42, "buffer_peak_ms": 61, "received": 1000, "missed": 1, "repaired": 1, "late": 0}
     latest = {"at_ms": now - 3000, "online": True, "rtt": rtt, "loss_in": 0.2, "loss_out": 0.0 if windows else 0.4,
               "in_per_s": 62.0, "out_per_s": 60.4, "failed_sends": 0, "failed_last": None, "worst_freeze_ms": 3, "sound": sound}
     ten_min = {"from_ms": now - 597_000, "samples": 60,
                "rtt": {"min_ms": 2.0, "avg_ms": 6.1, "max_ms": 48.0, "jitter_ms": 2.1, "answers": 2400},
-               "failed_sends": 0, "worst_freeze_ms": 9, "sound": {"buffer_peak_ms": 88, "received": 60000, "lost": 14, "repaired": 9, "late": 2}}
+               "failed_sends": 0, "worst_freeze_ms": 9, "sound": {"buffer_peak_ms": 88, "received": 60000, "missed": 14, "repaired": 9, "late": 2}}
     events = [{"at_ms": started, "kind": "start", "fields": {"version": world.version, "os": "windows" if windows else "linux", "pid": 4120}},
               {"at_ms": started + 900, "kind": "wifi", "fields": {"addrs": "wlan0=192.168.8.210/24", "ssid": "Bread's Wi-Fi", "signal": 74}},
               {"at_ms": started + 2400, "kind": "linked", "fields": {"down_ms": 2400}}]
@@ -471,6 +471,14 @@ def expire(world):
             world.change[node] = None
 
 
+def crate_version():
+    """The version in Cargo.toml, so the window shows what's being built."""
+    import pathlib
+    import re
+    text = (pathlib.Path(__file__).resolve().parent.parent / "Cargo.toml").read_text()
+    return re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--monitors", type=int, default=2, help="under 5 gives 3 screens, 5 or more gives 6")
@@ -479,7 +487,7 @@ if __name__ == "__main__":
     parser.add_argument("--audio", default="idle", choices=list(audio_states()))
     parser.add_argument("--link", default="good", choices=list(link_states()))
     parser.add_argument("--update", default="none", choices=list(update_states()))
-    parser.add_argument("--version", default="0.3.0")
+    parser.add_argument("--version", default=crate_version())
     parser.add_argument("--secure", choices=["encrypted", "connecting", "unpaired", "old-peer"])
     parser.add_argument("--details", default="healthy", choices=["healthy", "wifi-drop", "unreachable", "older"])
     options = parser.parse_args()
