@@ -831,6 +831,10 @@ mod tests {
         let manager = manager(&fake, SOON, None);
         ask_for(&manager, &mode(1920, 1080, 60));
         wait_until("the change", || fake.calls().len() == 1);
+        // The manager's own listing has seen the change before anything hangs: otherwise a
+        // listing from before it can pass for the screen being back, and nothing is owed.
+        let current_width = |m: &DisplayManager| serde_json::from_str::<Value>(&m.list_json()).ok().map(|v| v["displays"][0]["current"]["width"].clone());
+        wait_until("the change seen", || current_width(&manager) == Some(Value::from(1920)));
         // The change is made, and from here on no listing ever answers.
         fake.stuck.store(true, Ordering::SeqCst);
         wait_until("the revert", || fake.calls().len() == 2);
