@@ -764,6 +764,17 @@ def input_checks(peer, inbox):
               lambda: active_view(WINDOWS), lambda: mouse_move(-400, 0))
     crossing = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
     check("pushing at the edge in Debian's EdgeMap sends focus to Debian", crossing is not None)
+
+    # m. A guard strip is only where another of this device's monitors carries on the edge, so the
+    # laptop's one monitor has none: a push two pixels from the end of the span still crosses.
+    peer.give_focus_to_laptop(28, 2)
+    time.sleep(0.4)
+    inbox.clear()
+    peer.pump(0.8, heartbeat, lambda: edge_map(LEFT, 0, 5000, 30), lambda: active_view(WINDOWS),
+              lambda: mouse_move(-400, 0))
+    corner = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
+    check("one monitor has no guard strip: a push at the very end of the span crosses", corner is not None,
+          str(corner and corner[1]))
     return crossing
 
 

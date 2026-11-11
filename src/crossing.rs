@@ -115,6 +115,8 @@ mod position {
     pub enum Refusal {
         /// The position is too old to go by. The push waits for a newer one.
         Stale,
+        /// In the guard strip at the end of the span, beside a monitor that doesn't cross.
+        Guard,
         /// The estimate has left the span.
         OffSpan,
     }
@@ -127,10 +129,11 @@ mod position {
     }
 
     /// Decides a completed push from where the cursor is. `estimate_on_span` says whether the estimate
-    /// is on the span too (the push itself was counted at `sample`). A silent tracker crosses at the
-    /// last position, as before any of this.
-    pub fn judge(here: &Whereabouts, estimate_on_span: bool) -> Gate {
+    /// is on the span too (the push itself was counted at `sample`), and `guarded` whether either is
+    /// in a guard strip. A silent tracker crosses at the last position, as before any of this.
+    pub fn judge(here: &Whereabouts, estimate_on_span: bool, guarded: bool) -> Gate {
         match here.trust {
+            _ if guarded => Gate::Hold(Refusal::Guard),
             Trust::TrackerSilent => Gate::Cross { at: here.sample },
             Trust::Stale | Trust::Unverified => Gate::Hold(Refusal::Stale),
             Trust::Fresh | Trust::Still if !estimate_on_span => Gate::Hold(Refusal::OffSpan),
@@ -318,8 +321,8 @@ mod tests {
         assert_eq!(here.trust, Trust::Stale);
         assert_eq!(here.estimate, (1700, 1439));
         assert_eq!(here.moved, (-800, 80));
-        assert_eq!(judge(&here, false), Gate::Hold(Refusal::Stale));
-        assert_eq!(judge(&here, true), Gate::Hold(Refusal::Stale), "even if the estimate were on the span");
+        assert_eq!(judge(&here, false, false), Gate::Hold(Refusal::Stale));
+        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale), "even if the estimate were on the span");
     }
 
     #[test]
@@ -330,8 +333,20 @@ mod tests {
         assert_eq!(here.trust, Trust::Fresh);
         assert_eq!(here.age_ms, 5);
         assert_eq!(here.estimate, (2503, 1439), "down is held at the bottom edge");
-        assert_eq!(judge(&here, true), Gate::Cross { at: (2503, 1439) });
-        assert_eq!(judge(&here, false), Gate::Hold(Refusal::OffSpan));
+        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2503, 1439) });
+        assert_eq!(judge(&here, false, false), Gate::Hold(Refusal::OffSpan));
+        assert_eq!(judge(&here, true, true), Gate::Hold(Refusal::Guard));
+    }
+
+    #[test]
+    fn the_guard_strip_holds_even_a_silent_tracker() {
+        let mut t = track_with(sample(1930, 1439, 1, 0));
+        for i in 1..=200 {
+            t.moved(i * 10 * MS, 1, 0);
+        }
+        let (here, _) = t.locate(2000 * MS, &desk());
+        assert_eq!(here.trust, Trust::TrackerSilent);
+        assert_eq!(judge(&here, true, true), Gate::Hold(Refusal::Guard));
     }
 
     #[test]
@@ -343,7 +358,7 @@ mod tests {
         }
         let (here, _) = t.locate(300 * MS, &desk());
         assert_eq!(here.trust, Trust::Still);
-        assert_eq!(judge(&here, true), Gate::Cross { at: (2500, 1439) });
+        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2500, 1439) });
     }
 
     #[test]
@@ -351,12 +366,12 @@ mod tests {
         let mut t = track_with(sample(2500, 1439, 1, 0));
         t.moved(40 * MS, -30, 20);
         let (here, _) = t.locate(60 * MS, &desk());
-        assert_eq!(judge(&here, true), Gate::Hold(Refusal::Stale));
+        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale));
         // KWin's next position arrives: the cursor did move 30 px left, and is still over the laptop.
         t.heard(sample(2470, 1439, 2, 58));
         let (here, _) = t.locate(61 * MS, &desk());
         assert_eq!(here.trust, Trust::Fresh);
-        assert_eq!(judge(&here, true), Gate::Cross { at: (2470, 1439) });
+        assert_eq!(judge(&here, true, false), Gate::Cross { at: (2470, 1439) });
     }
 
     #[test]
@@ -368,7 +383,7 @@ mod tests {
         t.heard(sample(2500, 1439, 2, 99));
         let (here, _) = t.locate(110 * MS, &desk());
         assert_eq!((here.trust, here.sample), (Trust::Unverified, (2600, 1427)));
-        assert_eq!(judge(&here, true), Gate::Hold(Refusal::Stale));
+        assert_eq!(judge(&here, true, false), Gate::Hold(Refusal::Stale));
         // KWin put it somewhere else after all, and says so.
         t.heard(sample(2610, 1430, 3, 105));
         let (here, _) = t.locate(110 * MS, &desk());
@@ -385,7 +400,7 @@ mod tests {
         let (here, news) = t.locate(2000 * MS, &desk());
         assert_eq!(news, Some(TrackerNews::Silent));
         assert_eq!(here.trust, Trust::TrackerSilent);
-        assert_eq!(judge(&here, false), Gate::Cross { at: (2500, 1439) });
+        assert_eq!(judge(&here, false, false), Gate::Cross { at: (2500, 1439) });
         let (_, news) = t.locate(2001 * MS, &desk());
         assert_eq!(news, None, "once");
         assert_eq!(t.heard(sample(3000, 1439, 2, 2002)), Some(TrackerNews::Back));

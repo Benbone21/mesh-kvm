@@ -30,6 +30,9 @@ const MAX_EDGE_RESISTANCE: i32 = 400;
 /// A laptop this close to lining up with a monitor of its own size is lined up when the layout
 /// loads. Further off than this, it was put there on purpose.
 const ALIGN_SNAP: i32 = 8;
+/// How far along the edge from a monitor that doesn't cross a push can't cross either. See
+/// `EdgeWatch::guarded`.
+pub const GUARD: i32 = 48;
 /// How far ahead of this copy another copy's revision can be and still be believed. No one makes
 /// this many edits, so a bigger jump is a bad value, which would otherwise win every comparison
 /// from then on and leave no edit able to beat it.
@@ -700,14 +703,26 @@ impl EdgeWatch {
     }
 
     /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge. The
-    /// count then starts again. The laptop's cursor position is never late, so it decides at once.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    /// count then starts again.
+    #[cfg(test)]
     pub fn push(&mut self, monitors: &[MonitorRect], at: (i32, i32), delta: (i32, i32), buttons_held: bool) -> bool {
         let done = self.press(monitors, at, delta, buttons_held);
         if done {
             self.tracker.clear();
         }
         done
+    }
+
+    /// True when moving by `(dx, dy)` to `(x, y)` crosses: a completed push, outside the guard
+    /// strip. A push completed in the strip waits there, and crosses once the cursor moves out of
+    /// it along the edge. The laptop's cursor position is never late, so it decides at once.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn cross(&mut self, monitors: &[MonitorRect], at: (i32, i32), delta: (i32, i32), buttons_held: bool) -> bool {
+        if !self.press(monitors, at, delta, buttons_held) || self.guarded(monitors, at) {
+            return false;
+        }
+        self.tracker.clear();
+        true
     }
 
     /// As `push`, but a completed push stays complete until `clear`, as long as the cursor stays
@@ -746,6 +761,30 @@ impl EdgeWatch {
             SwitchEdge::Bottom => (y == m.y + m.h - 1, x),
         };
         on_edge && (span.start..=span.end).contains(&along)
+    }
+
+    /// True if `(x, y)` is in a guard strip: within `GUARD` pixels of the end of the span, where a
+    /// monitor that doesn't touch the other device carries on the same edge. Going along that edge
+    /// onto that monitor is no push across, so the last pixels before it don't cross. An end at the
+    /// desktop's own corner has nothing beside it, and no strip.
+    pub fn guarded(&self, monitors: &[MonitorRect], (x, y): (i32, i32)) -> bool {
+        let Some(span) = self.span else { return false };
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else { return false };
+        // A monitor's line on that edge, its pixels along it (end exclusive), and its last pixel on it.
+        let side = |m: &MonitorRect| match span.edge {
+            SwitchEdge::Left => (m.x, (m.y, m.y + m.h), (m.x, m.y + m.h - 1)),
+            SwitchEdge::Right => (m.x + m.w, (m.y, m.y + m.h), (m.x + m.w - 1, m.y + m.h - 1)),
+            SwitchEdge::Top => (m.y, (m.x, m.x + m.w), (m.x + m.w - 1, m.y)),
+            SwitchEdge::Bottom => (m.y + m.h, (m.x, m.x + m.w), (m.x + m.w - 1, m.y + m.h - 1)),
+        };
+        let along = if matches!(span.edge, SwitchEdge::Top | SwitchEdge::Bottom) { x } else { y };
+        let (line, ..) = side(m);
+        monitors.iter().filter(|o| *o != m).any(|o| {
+            let (o_line, (start, end), corner) = side(o);
+            let touches = start <= span.end && end > span.start;
+            let distance = if along >= end { along - end } else { start - 1 - along };
+            o_line == line && !touches && outer_monitor(monitors, span.edge, corner).is_some() && (0..GUARD).contains(&distance)
+        })
     }
 }
 
@@ -2386,6 +2425,84 @@ mod tests {
         let edge = watch(&c, NodeId::Debian);
         assert!(!edge.on_span(c.monitors(NodeId::Debian), (1919, 700)), "between two of its own monitors");
         assert!(edge.on_span(c.monitors(NodeId::Debian), (4479, 700)));
+    }
+
+    /// The owner's layout, lined up: the laptop under DP-2, from 1920 to 4479.
+    fn real_layout() -> SpatialConfig {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        c.align_exactly(NodeId::Debian);
+        c
+    }
+
+    #[test]
+    fn the_end_of_the_span_beside_the_side_display_is_guarded() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        let edge = watch(&c, NodeId::Debian);
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Bottom, 1920, 4479));
+        // DP-3's bottom carries on the line of DP-2's, left of where the laptop starts.
+        for x in [1920, 1940, 1967] {
+            assert!(edge.guarded(monitors, (x, 1439)), "{x}");
+        }
+        for x in [1968, 3000, 4432, 4479] {
+            assert!(!edge.guarded(monitors, (x, 1439)), "{x}: the far end is the desktop's own corner");
+        }
+    }
+
+    #[test]
+    fn a_push_in_the_guard_strip_does_not_cross_and_just_past_it_does() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        for x in [1920, 1967] {
+            let mut edge = watch(&c, NodeId::Debian);
+            assert!(!edge.cross(monitors, (x, 1439), (0, 99), false), "{x}");
+            // Held: moving out of the strip along the edge crosses without pushing all over again.
+            assert!(edge.cross(monitors, (1968, 1439), (1, 0), false), "{x} then out of the strip");
+        }
+        for x in [1968, 4479] {
+            let mut edge = watch(&c, NodeId::Debian);
+            assert!(edge.cross(monitors, (x, 1439), (0, 99), false), "{x}");
+        }
+    }
+
+    #[test]
+    fn a_single_monitor_has_no_guard() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        assert_eq!(monitors.len(), 1);
+        let mut edge = watch(&c, NodeId::Windows);
+        for x in [0, 1, 47, 2559] {
+            assert!(!edge.guarded(&monitors, (x, 0)), "{x}");
+        }
+        assert!(edge.cross(&monitors, (0, 0), (0, -99), false));
+    }
+
+    #[test]
+    fn a_monitor_that_touches_the_other_device_is_no_reason_for_a_guard() {
+        // Under both of Debian's monitors, the span runs across the join, and nothing is guarded.
+        let c = layout(TouchSide::Bottom, 1500, 1440);
+        let edge = watch(&c, NodeId::Debian);
+        for x in [1500, 1919, 1920, 1967, 3419] {
+            assert!(!edge.guarded(c.monitors(NodeId::Debian), (x, 1439)), "{x}");
+        }
+        // Beside the desktop, DP-3's right side isn't on DP-2's line, so it guards nothing either.
+        let c = layout(TouchSide::Right, 4480, 0);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(!edge.guarded(c.monitors(NodeId::Debian), (4479, 0)));
+    }
+
+    #[test]
+    fn a_guard_works_along_a_side_edge_too() {
+        // Two monitors stacked on the right, the laptop beside the lower one only.
+        let mut c = layout(TouchSide::Right, 1920, 1080);
+        debian_mut(&mut c).monitors = vec![rect("Top", 0, 0, 1920, 1080), rect("Bottom", 0, 1080, 1920, 1080)];
+        laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 1920, 1080)];
+        c.resnap();
+        let edge = watch(&c, NodeId::Debian);
+        let monitors = c.monitors(NodeId::Debian);
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Right, 1080, 2159));
+        assert!(edge.guarded(monitors, (1919, 1080)) && edge.guarded(monitors, (1919, 1127)));
+        assert!(!edge.guarded(monitors, (1919, 1128)) && !edge.guarded(monitors, (1919, 2159)));
     }
 
     #[test]

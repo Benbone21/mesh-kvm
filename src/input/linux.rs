@@ -1393,7 +1393,8 @@ impl Core<'_> {
             self.holding = None;
             return;
         }
-        match judge(&here, self.edge.on_span(monitors, here.estimate)) {
+        let guarded = self.edge.guarded(monitors, here.sample) || self.edge.guarded(monitors, here.estimate);
+        match judge(&here, self.edge.on_span(monitors, here.estimate), guarded) {
             Gate::Cross { at } => {
                 self.edge.clear();
                 self.holding = None;

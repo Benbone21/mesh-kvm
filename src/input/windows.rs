@@ -545,7 +545,7 @@ fn push_edge(x: i32, y: i32, dx: i32, dy: i32, from_peer: bool) -> bool {
         || LOCAL_BUTTONS_MASK.load(Ordering::SeqCst) != 0;
     let pushed_through = {
         let monitors = monitors();
-        edge_state().push(&monitors, (x, y), (dx, dy), buttons_held)
+        edge_state().cross(&monitors, (x, y), (dx, dy), buttons_held)
     };
     if !pushed_through {
         return false;
