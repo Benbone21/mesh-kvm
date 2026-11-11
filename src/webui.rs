@@ -274,11 +274,6 @@ pub fn http_call(host: &str, method: &str, path: &str, body: &str) -> Result<(u1
     http_call_port(host, UI_PORT, method, path, body)
 }
 
-/// `http_call` for a request that matters enough to wait out a slow link.
-pub fn http_call_patient(host: &str, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    http_call_within(host, UI_PORT, method, path, body, Duration::from_secs(3), Duration::from_secs(10))
-}
-
 /// `http_call` to a port other than the Studio's.
 pub fn http_call_port(
     host: &str,

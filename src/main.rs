@@ -377,7 +377,8 @@ fn pairing_service(secure: &secure::Services, pinned: bool) -> secure::pairing::
         pinned: Box::new(move || pinned),
         learn_address: Box::new(|ip| settings::learn_peer(&ip.to_string())),
         tell_peer: Box::new(|| {
-            secure::control::peer_call("POST", "/api/local/action", PEER_UNPAIRED_BODY).map(|_| ())
+            // Tried even with the input link down: the other device should hear it if it can.
+            secure::control::peer_call_any_link("POST", "/api/local/action", PEER_UNPAIRED_BODY).map(|_| ())
         }),
         restart: Box::new(settings::request_restart),
         security: Box::new(|| secure::services().input.security()),

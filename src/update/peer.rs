@@ -5,20 +5,18 @@ use super::both::{Asked, PeerLook};
 use super::trust::Version;
 use serde_json::{json, Value};
 
-/// One call to the other device's API, through this service's own proxy, which knows the way.
-/// Calling from here counts as the app on this device, as the proxy requires for a change.
+/// One call to the other device's API, straight over the control connection this service keeps.
+/// It's tried even while the input link is said to be down, unlike the app's calls through the
+/// proxy: an update can change how the input link works, and the pair must still reach each other
+/// to come back into step.
 fn peer_call(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    crate::webui::http_call("127.0.0.1", method, &proxied(path), body)
+    crate::secure::control::peer_call_any_link(method, path, body)
 }
 
 /// `peer_call`, for what can wait on a slow link. The swap to another way of reaching the other
 /// device goes here as well.
 fn peer_call_patiently(method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
-    crate::webui::http_call_patient("127.0.0.1", method, &proxied(path), body)
-}
-
-fn proxied(path: &str) -> String {
-    format!("/api/peer{path}")
+    crate::secure::control::peer_call_any_link_patiently(method, path, body)
 }
 
 /// Reaching the other device.
@@ -73,11 +71,6 @@ fn read_peer(status: &Value) -> PeerLook {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_call_goes_through_the_proxy_on_this_device() {
-        assert_eq!(proxied("/api/local/action"), "/api/peer/api/local/action");
-    }
 
     #[test]
     fn a_peer_reports_its_name_version_and_failure() {
