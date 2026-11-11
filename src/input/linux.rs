@@ -865,8 +865,9 @@ pub fn detect_screen_dimensions() -> (i32, i32) {
 /// mouse. Within `NEAR` px of an outer edge of the desktop (one with no screen beyond it) the
 /// position also goes out every `BEAT_MS` while the cursor stands still, as a push against the
 /// edge moves nothing and would otherwise wait for a wiggle. Away from the edges that heartbeat
-/// doesn't run. A KWin without `QTimer` gets the older way: every move near an edge, and every
-/// 12 ms elsewhere. `tests/kwin_script_sim.js` plays the script against stand-ins for KWin.
+/// doesn't run. Every `ALIVE_MS` an `Alive` call says the script still runs, whatever the cursor
+/// does. A KWin without `QTimer` gets the older way: every move near an edge, and every 12 ms
+/// elsewhere, and no `Alive`. `tests/kwin_script_sim.js` plays the script against stand-ins for KWin.
 const KWIN_SCRIPT: &str = r#"
 var SEND_GAP_MS = 2;
 var NEAR = 16;
@@ -876,9 +877,15 @@ var seq = 0;
 var waiting = false;
 var timer = null;
 var beat = null;
-function screenList() {
+var alive = null;
+var ALIVE_MS = 2000;
+var screens = [];
+function refreshScreens() {
     var list = workspace.screens;
-    return list ? list : [];
+    screens = list ? list : [];
+}
+function screenList() {
+    return screens;
 }
 function onScreen(x, y) {
     var list = screenList();
@@ -900,10 +907,27 @@ function nearOuterEdge(x, y) {
     }
     return false;
 }
+// The cursor's pixel. A position in the last half pixel of a screen would round onto no screen.
+function pixel() {
+    var p = workspace.cursorPos;
+    var x = Math.round(p.x);
+    var y = Math.round(p.y);
+    if (!onScreen(x, y)) {
+        if (onScreen(x - 1, y)) {
+            x -= 1;
+        } else if (onScreen(x, y - 1)) {
+            y -= 1;
+        } else if (onScreen(x - 1, y - 1)) {
+            x -= 1;
+            y -= 1;
+        }
+    }
+    return [x, y];
+}
 function followBeat() {
     if (beat === null) return;
-    var p = workspace.cursorPos;
-    var near = nearOuterEdge(Math.round(p.x), Math.round(p.y));
+    var at = pixel();
+    var near = nearOuterEdge(at[0], at[1]);
     if (near && !beat.active) {
         beat.start();
     } else if (!near && beat.active) {
@@ -929,13 +953,21 @@ function isGameWindow() {
     return 0;
 }
 function send() {
-    var p = workspace.cursorPos;
+    var at = pixel();
     var now = Date.now();
     lastEmit = now;
     seq = (seq % 2000000000) + 1;
     callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Update",
-             Math.round(p.x) | 0, Math.round(p.y) | 0, isGameWindow() | 0, seq | 0, (now % 1000000000) | 0);
+             at[0] | 0, at[1] | 0, isGameWindow() | 0, seq | 0, (now % 1000000000) | 0);
 }
+// Says the script is running, wherever the cursor is and whether or not it moves.
+function sendAlive() {
+    var now = Date.now();
+    seq = (seq % 2000000000) + 1;
+    callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Alive",
+             seq | 0, (now % 1000000000) | 0, isGameWindow() | 0);
+}
+refreshScreens();
 try {
     timer = new QTimer();
     timer.singleShot = true;
@@ -945,24 +977,33 @@ try {
     beat.singleShot = false;
     beat.interval = BEAT_MS;
     beat.timeout.connect(function() {
-        var p = workspace.cursorPos;
-        if (nearOuterEdge(Math.round(p.x), Math.round(p.y))) {
+        var at = pixel();
+        if (nearOuterEdge(at[0], at[1])) {
             send();
         } else {
             beat.stop();
         }
     });
+    alive = new QTimer();
+    alive.singleShot = false;
+    alive.interval = ALIVE_MS;
+    alive.timeout.connect(sendAlive);
+    alive.start();
 } catch (e) {
     timer = null;
     beat = null;
+    alive = null;
+}
+if (workspace.screensChanged) {
+    workspace.screensChanged.connect(function() { refreshScreens(); followBeat(); });
 }
 function emitPos(force) {
     followBeat();
     var now = Date.now();
     if (timer === null) {
-        var p = workspace.cursorPos;
-        var x = Math.round(p.x);
-        var y = Math.round(p.y);
+        var at = pixel();
+        var x = at[0];
+        var y = at[1];
         var nearEdge = (x <= 16 || x >= 4464 || (x >= 1904 && x <= 1936) ||
                         y <= 16 || y >= 1424 || (y >= 344 && y <= 376));
         if (force || nearEdge || (now - lastEmit) >= 12) {
@@ -2078,7 +2119,7 @@ mod tests {
 
     #[test]
     fn the_script_sends_whole_numbers() {
-        for arg in ["Math.round(p.x) | 0", "Math.round(p.y) | 0", "isGameWindow() | 0", "seq | 0", "(now % 1000000000) | 0"] {
+        for arg in ["at[0] | 0", "at[1] | 0", "isGameWindow() | 0", "seq | 0", "(now % 1000000000) | 0"] {
             assert!(KWIN_SCRIPT.contains(arg), "{arg}");
         }
     }

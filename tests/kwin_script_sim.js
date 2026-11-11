@@ -17,7 +17,7 @@ function check(name, ok, detail) {
 }
 
 function kwin({ withTimer = true } = {}) {
-  const k = { clock: 1000, sent: [], timers: [], moved: [] };
+  const k = { clock: 1000, sent: [], alive: [], timers: [], moved: [], screensChanged: [], screenReads: 0 };
   const pos = { x: 3000, y: 700 };
   class QTimer {
     constructor() { this.singleShot = false; this.interval = 0; this.active = false; const self = this; this.timeout = { connect(f) { self.f = f; } }; k.timers.push(this); }
@@ -25,15 +25,19 @@ function kwin({ withTimer = true } = {}) {
     stop() { this.active = false; }
   }
   const rect = (x, y, width, height) => ({ geometry: { x, y, width, height } });
+  let screens = [rect(0, 360, 1920, 1080), rect(1920, 0, 2560, 1440)];
   const workspace = {
     cursorPos: pos, activeWindow: null,
-    screens: [rect(0, 360, 1920, 1080), rect(1920, 0, 2560, 1440)],
+    get screens() { k.screenReads++; return screens; },
     cursorPosChanged: { connect(f) { k.moved.push(f); } },
     windowActivated: { connect() {} },
+    screensChanged: { connect(f) { k.screensChanged.push(f); } },
   };
+  k.setScreens = (list) => { screens = list.map((r) => rect(...r)); k.screensChanged.forEach((f) => f()); };
   const realNow = Date.now;
   Date.now = () => k.clock;
-  new Function('workspace', 'callDBus', 'QTimer', script)(workspace, (...a) => k.sent.push(a.slice(4)), withTimer ? QTimer : undefined);
+  const callDBus = (...a) => (a[3] === 'Alive' ? k.alive : k.sent).push(a.slice(4));
+  new Function('workspace', 'callDBus', 'QTimer', script)(workspace, callDBus, withTimer ? QTimer : undefined);
   k.restoreDate = () => { Date.now = realNow; };
   k.tick = (ms) => {
     for (let i = 0; i < ms; i++) {
@@ -48,7 +52,7 @@ function kwin({ withTimer = true } = {}) {
   };
   k.pos = pos;
   k.moveTo = (x, y) => { pos.x = x; pos.y = y; k.moved.forEach((f) => f()); };
-  k.beating = () => k.timers.some((t) => !t.singleShot && t.active);
+  k.beating = () => k.timers.some((t) => !t.singleShot && t.active && t.interval === 16);
   k.sentDuring = (ms) => { const before = k.sent.length; k.tick(ms); return k.sent.slice(before); };
   return k;
 }
@@ -114,7 +118,54 @@ function kwin({ withTimer = true } = {}) {
 {
   const k = kwin({ withTimer: false });
   k.moveTo(3000, 1430);
-  check('a KWin without QTimer sends no heartbeat', k.sentDuring(200).length === 0 && k.timers.length === 0);
+  check('a KWin without QTimer sends no heartbeat, and no Alive', k.sentDuring(200).length === 0 && k.timers.length === 0 && k.alive.length === 0);
+  k.restoreDate();
+}
+
+
+{
+  const k = kwin();
+  k.moveTo(3000, 700);
+  k.tick(10);
+  const before = k.alive.length;
+  k.tick(10_000);
+  const pings = k.alive.slice(before);
+  check('an Alive goes out every 2 s with the cursor mid-screen and still', pings.length === 5, pings.length);
+  check('each with a new number, a time and the game flag, as whole numbers',
+    pings.every((p) => p.length === 3 && p.every(Number.isInteger)) && new Set(pings.map((p) => p[0])).size === 5);
+  // A pointer lock stops the cursor, not the timer.
+  k.moveTo(2240, 720);
+  check('and on while the pointer is held still', k.alive.length - before === 5 && k.sentDuring(4000).length === 0 && k.alive.length - before === 7);
+  k.restoreDate();
+}
+
+{
+  const k = kwin();
+  k.moveTo(3000, 700);
+  const reads = k.screenReads;
+  for (let i = 0; i < 50; i++) { k.moveTo(3000 + i, 700); k.tick(1); }
+  check('the screens are read once, not with every move', k.screenReads === reads, k.screenReads - reads);
+  k.moveTo(3000, 1430);
+  check('in the band beside the laptop', k.beating());
+  // A third screen is plugged in below DP-2: the bottom of DP-2 is no outer edge any more.
+  k.setScreens([[0, 360, 1920, 1080], [1920, 0, 2560, 1440], [1920, 1440, 2560, 1440]]);
+  check('screensChanged takes the new list and looks at the band again', !k.beating());
+  k.setScreens([[0, 360, 1920, 1080], [1920, 0, 2560, 1440]]);
+  check('and back', k.beating());
+  k.restoreDate();
+}
+
+{
+  const k = kwin();
+  k.moveTo(4479.6, 1439.7);
+  k.tick(20);
+  const last = k.sent[k.sent.length - 1];
+  check('a cursor in the last half pixel is reported on the last pixel, not off every screen', last[0] === 4479 && last[1] === 1439, last);
+  check('and is in the band', k.beating());
+  k.moveTo(1919.6, 1000);
+  k.tick(20);
+  const mid = k.sent[k.sent.length - 1];
+  check('rounding up onto the next screen is fine where there is one', mid[0] === 1920, mid);
   k.restoreDate();
 }
 
