@@ -644,7 +644,11 @@ fn reaches_router(blocking: bool, grabbed: bool, release: bool) -> bool {
 
 impl EvdevDevice {
     /// Reads pending events into `buf` and returns how many; 0 when there are none.
-    fn read_events(&self, buf: &mut [InputEvent]) -> usize {
+    /// An unplugged device says so here, and is marked gone.
+    fn read_events(&mut self, buf: &mut [InputEvent]) -> usize {
+        if self.grab.gone() {
+            return 0;
+        }
         let n = unsafe {
             libc::read(
                 self.fd.as_raw_fd(),
@@ -652,6 +656,10 @@ impl EvdevDevice {
                 std::mem::size_of_val(buf),
             )
         };
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODEV) {
+            self.grab.mark_gone();
+            self.log(GrabNews::Gone);
+        }
         n.max(0) as usize / std::mem::size_of::<InputEvent>()
     }
 
@@ -698,6 +706,7 @@ impl EvdevDevice {
                 self.name,
                 self.path
             ),
+            GrabNews::Gone => eprintln!("[Debian] '{}' ({}) has gone; it's left alone until a restart.", self.name, self.path),
             GrabNews::Failed { grab, error } => eprintln!(
                 "[Debian] EVIOCGRAB {} failed on '{}' ({}): {}",
                 if grab { "grab" } else { "release" },
@@ -1062,6 +1071,22 @@ impl LinuxBackend {
                 let idle = may_start && free_to_grab(&device.held, &self.forwarded);
                 let want = should_grab(wanted, device.grabbed(), idle);
                 device.drive_grab(want, &self.grab_ops);
+            }
+        }
+        self.let_go_of_gone();
+    }
+
+    /// What was put on the desktop from a device that has gone is let go, as its releases never
+    /// will come.
+    fn let_go_of_gone(&mut self) {
+        for keyboard in self.keyboards.iter_mut().filter(|k| k.grab.gone()) {
+            for code in keyboard.handed_back.drain() {
+                self.vkbd.inject_key(code, false);
+            }
+        }
+        for mouse in self.mice.iter_mut().filter(|m| m.grab.gone()) {
+            for button in mouse.handed_back.drain().filter_map(button_id) {
+                self.vrel.button(button, false);
             }
         }
     }

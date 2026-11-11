@@ -34,6 +34,12 @@ enum Phase {
     Free,
     Held,
     Releasing(Arc<Job>),
+    /// Unplugged. Its grab went with it, and nothing more is tried.
+    Gone,
+}
+
+fn unplugged(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENODEV)
 }
 
 /// What happened to a grab, for the journal.
@@ -41,6 +47,8 @@ enum Phase {
 pub enum GrabNews {
     Enabled,
     Released,
+    /// The device is gone (unplugged), so there's nothing more to grab or let go.
+    Gone,
     /// The first failure since the last success; `grab` says which way.
     Failed { grab: bool, error: String },
 }
@@ -70,6 +78,16 @@ impl GrabSlot {
         matches!(self.phase, Phase::Releasing(_))
     }
 
+    pub fn gone(&self) -> bool {
+        matches!(self.phase, Phase::Gone)
+    }
+
+    /// Reading the device said it has gone. A release under way finishes by itself.
+    pub fn mark_gone(&mut self) {
+        self.phase = Phase::Gone;
+        self.released_at = None;
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn failed(&self) -> bool {
         self.failed
@@ -83,6 +101,7 @@ impl GrabSlot {
             Phase::Held => true,
             Phase::Releasing(job) => at_us < job.started_us.load(Ordering::SeqCst),
             Phase::Free => self.released_at.is_some_and(|start| at_us < start),
+            Phase::Gone => false,
         }
     }
 
@@ -100,6 +119,10 @@ impl GrabSlot {
                 self.retry_release_at = None;
                 self.released_at = Some(started);
                 Some(GrabNews::Released)
+            }
+            Err(error) if unplugged(&error) => {
+                self.mark_gone();
+                Some(GrabNews::Gone)
             }
             Err(error) => {
                 self.phase = Phase::Held;
@@ -127,8 +150,17 @@ impl GrabSlot {
                     self.released_at = None;
                     news.push(GrabNews::Enabled);
                 }
+                Err(error) if unplugged(&error) => {
+                    self.mark_gone();
+                    news.push(GrabNews::Gone);
+                }
                 Err(error) => news.extend(self.note_failure(true, error)),
             },
+            // Grabbed and wanted so: whatever failed before is over, and a new failure is news.
+            (Phase::Held, true) => {
+                self.failed = false;
+                self.retry_release_at = None;
+            }
             (Phase::Held, false) if self.retry_release_at.is_none_or(|at| now >= at) => {
                 let job = Arc::new(Job { started_us: AtomicI64::new(i64::MAX), done: Mutex::new(None) });
                 self.phase = Phase::Releasing(Arc::clone(&job));
@@ -225,6 +257,8 @@ mod tests {
         grabs: AtomicUsize,
         releases: AtomicUsize,
         clock: AtomicI64,
+        /// Unplugged: everything fails with ENODEV.
+        gone: AtomicBool,
     }
 
     impl Fake {
@@ -234,6 +268,9 @@ mod tests {
         fn shut() -> Arc<Fake> {
             Arc::new(Fake::default())
         }
+        fn pipe(self: Arc<Fake>) -> Arc<dyn GrabOps<usize>> {
+            self as Arc<dyn GrabOps<usize>>
+        }
         fn let_go(&self) {
             *self.gate.lock().unwrap() = true;
             self.opened.notify_all();
@@ -242,6 +279,9 @@ mod tests {
 
     impl GrabOps<usize> for Fake {
         fn grab(&self, _: &usize) -> io::Result<()> {
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(io::Error::from_raw_os_error(libc::ENODEV));
+            }
             if self.fail_grab.load(Ordering::SeqCst) {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
@@ -257,6 +297,9 @@ mod tests {
             started(self.clock.load(Ordering::SeqCst));
             std::thread::sleep(Duration::from_millis(self.release_ms));
             self.releases.fetch_add(1, Ordering::SeqCst);
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(io::Error::from_raw_os_error(libc::ENODEV));
+            }
             if self.fail_release.load(Ordering::SeqCst) {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));
             }
@@ -375,6 +418,57 @@ mod tests {
         assert!(slot.releasing());
         assert_eq!(settle(&mut slot), vec![GrabNews::Released]);
         assert!(!slot.failed());
+    }
+
+    #[test]
+    fn a_release_that_fails_again_after_the_device_was_wanted_back_is_logged_again() {
+        let fake = Fake::open(0);
+        fake.fail_release.store(true, Ordering::SeqCst);
+        let ops = ops(&fake);
+        let mut slot = GrabSlot::default();
+        slot.drive(true, &0, &ops, Instant::now());
+        slot.drive(false, &0, &ops, Instant::now());
+        assert!(matches!(settle(&mut slot).as_slice(), [GrabNews::Failed { grab: false, .. }]));
+        // Wanted grabbed again, which it still is: that episode is over.
+        assert!(slot.drive(true, &0, &ops, Instant::now()).is_empty());
+        assert!(!slot.failed());
+        slot.drive(false, &0, &ops, Instant::now());
+        assert!(matches!(settle(&mut slot).as_slice(), [GrabNews::Failed { grab: false, .. }]), "a new failure is news");
+    }
+
+    #[test]
+    fn a_device_that_went_away_mid_release_is_not_tried_again() {
+        let fake = Fake::open(0);
+        let ops = ops(&fake);
+        let mut slot = GrabSlot::default();
+        let t0 = Instant::now();
+        slot.drive(true, &0, &ops, t0);
+        fake.gone.store(true, Ordering::SeqCst);
+        slot.drive(false, &0, &ops, t0);
+        assert_eq!(settle(&mut slot), vec![GrabNews::Gone]);
+        assert!(slot.gone() && !slot.held() && !slot.releasing());
+        assert!(!slot.delivered_only_here(0), "nothing more comes from it");
+        for later in 1..5 {
+            assert!(slot.drive(false, &0, &ops, t0 + RELEASE_RETRY * later * 2).is_empty());
+            assert!(slot.drive(true, &0, &ops, t0 + RELEASE_RETRY * later * 2).is_empty());
+        }
+        assert_eq!(fake.releases.load(Ordering::SeqCst), 1, "no thread every 100 ms");
+        assert_eq!(fake.grabs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_device_that_went_away_before_a_grab_is_not_tried_again() {
+        let fake = Fake::open(0);
+        fake.gone.store(true, Ordering::SeqCst);
+        let ops = ops(&fake);
+        let mut slot = GrabSlot::default();
+        assert_eq!(slot.drive(true, &0, &ops, Instant::now()), vec![GrabNews::Gone]);
+        assert!(slot.drive(true, &0, &ops, Instant::now()).is_empty());
+        let mut read_gone = GrabSlot::default();
+        read_gone.drive(true, &0, &Fake::open(0).pipe(), Instant::now());
+        read_gone.mark_gone();
+        assert!(read_gone.gone() && !read_gone.held());
+        assert!(wait_for_releases(std::iter::once(&mut read_gone), Duration::from_millis(10), |_, _| {}));
     }
 
     #[test]
