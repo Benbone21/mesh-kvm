@@ -80,8 +80,10 @@ impl PeerSocket {
     pub fn send(&self, bytes: &[u8]) {
         let mut sealed = Vec::new();
         if self.channel.seal(bytes, &mut sealed) {
-            let _ = self.socket.send_to(&sealed, self.peer);
-            crate::linklog::packet_out();
+            match self.socket.send_to(&sealed, self.peer) {
+                Ok(_) => crate::linklog::packet_out(),
+                Err(e) => crate::linklog::send_error(&e),
+            }
         }
     }
 
@@ -103,7 +105,9 @@ impl PeerSocket {
                 packet.ok()
             }
             Opened::Reply(reply) => {
-                let _ = self.socket.send_to(reply, from);
+                if let Err(e) = self.socket.send_to(reply, from) {
+                    crate::linklog::send_error(&e);
+                }
                 None
             }
             Opened::OldPeer => {
@@ -117,7 +121,9 @@ impl PeerSocket {
     /// Sends what the channel has due. As with `open`, this is for the receive thread.
     pub fn tick(&self, now_ms: u64) {
         self.channel.tick(now_ms, &mut |packet| {
-            let _ = self.socket.send_to(packet, self.peer);
+            if let Err(e) = self.socket.send_to(packet, self.peer) {
+                crate::linklog::send_error(&e);
+            }
         });
     }
 

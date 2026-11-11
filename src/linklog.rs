@@ -17,7 +17,7 @@ use std::fmt::{Display, Write as _};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -151,6 +151,61 @@ pub fn packet_in() {
 pub fn packet_out() {
     PACKETS_OUT.fetch_add(1, Ordering::Relaxed);
 }
+
+/// What a failed send of the link's was, by kind, for the samples and each `down`.
+const SEND_KINDS: [&str; 7] = ["would_block", "no_buffer", "unreachable", "refused", "denied", "too_big", "other"];
+const NO_KIND: usize = usize::MAX;
+static SEND_ERRORS: [AtomicU64; SEND_KINDS.len()] = [const { AtomicU64::new(0) }; SEND_KINDS.len()];
+/// The counts as of the last sample, which reports what came since.
+static SEND_ERRORS_SAMPLED: [AtomicU64; SEND_KINDS.len()] = [const { AtomicU64::new(0) }; SEND_KINDS.len()];
+static SEND_ERROR_LAST: AtomicUsize = AtomicUsize::new(NO_KIND);
+
+/// Counts a send on the link that failed. Never logs on its own, so it's safe for every packet and
+/// from a hook.
+pub fn send_error(error: &std::io::Error) {
+    let kind = send_kind(error);
+    SEND_ERRORS[kind].fetch_add(1, Ordering::Relaxed);
+    SEND_ERROR_LAST.store(kind, Ordering::Relaxed);
+}
+
+fn send_kind(error: &std::io::Error) -> usize {
+    use std::io::ErrorKind;
+    // ENOBUFS, EMSGSIZE, ENETUNREACH and EHOSTUNREACH, as Linux and Winsock number them.
+    #[cfg(windows)]
+    const RAW: [i32; 4] = [10055, 10040, 10051, 10065];
+    #[cfg(not(windows))]
+    const RAW: [i32; 4] = [105, 90, 101, 113];
+    let raw = error.raw_os_error();
+    let kind = match (raw, error.kind()) {
+        (Some(n), _) if n == RAW[0] => "no_buffer",
+        (Some(n), _) if n == RAW[1] => "too_big",
+        (Some(n), _) if n == RAW[2] || n == RAW[3] => "unreachable",
+        (_, ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable) => "unreachable",
+        (_, ErrorKind::WouldBlock) => "would_block",
+        (_, ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset) => "refused",
+        (_, ErrorKind::PermissionDenied) => "denied",
+        _ => "other",
+    };
+    SEND_KINDS.iter().position(|k| *k == kind).unwrap_or(SEND_KINDS.len() - 1)
+}
+
+fn send_error_counts(from: &[AtomicU64; SEND_KINDS.len()]) -> [u64; SEND_KINDS.len()] {
+    std::array::from_fn(|i| from[i].load(Ordering::Relaxed))
+}
+
+/// `send_errors=` with how many sends failed since `was`, and when any did, the latest kind and
+/// how many of each: `send_error_last=no_buffer send_errors_by=no_buffer:3,unreachable:1`.
+fn send_errors(details: Details, now: [u64; SEND_KINDS.len()], was: [u64; SEND_KINDS.len()], last: usize) -> Details {
+    let since: Vec<u64> = now.iter().zip(was).map(|(n, w)| n.saturating_sub(w)).collect();
+    let total: u64 = since.iter().sum();
+    let details = details.num("send_errors", total);
+    if total == 0 {
+        return details;
+    }
+    let by: Vec<String> = since.iter().enumerate().filter(|(_, n)| **n > 0).map(|(i, n)| format!("{}:{n}", SEND_KINDS[i])).collect();
+    details.num("send_error_last", SEND_KINDS.get(last).copied().unwrap_or("-")).num("send_errors_by", by.join(","))
+}
+
 fn packets() -> (u64, u64) {
     (PACKETS_IN.load(Ordering::Relaxed), PACKETS_OUT.load(Ordering::Relaxed))
 }
@@ -695,6 +750,8 @@ pub fn note(events: Vec<LinkEvent>) {
                 if signal != NO_SIGNAL {
                     details = details.num("signal", signal);
                 }
+                let last = SEND_ERROR_LAST.load(Ordering::Relaxed);
+                details = send_errors(details, send_error_counts(&SEND_ERRORS), send_error_counts(&SEND_ERRORS_SAMPLED), last);
                 LOOK_NOW.store(true, Ordering::Relaxed);
             }
             LinkEvent::Sample { .. } => {
@@ -702,6 +759,11 @@ pub fn note(events: Vec<LinkEvent>) {
                 if AUDIO_RX_LIVE.load(Ordering::Relaxed) {
                     let loss = f64::from(AUDIO_RX_LOSS.load(Ordering::Relaxed)) / 10.0;
                     details = details.num("audio_loss", format!("{loss:.1}")).num("audio_buffer_ms", AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed));
+                }
+                let now = send_error_counts(&SEND_ERRORS);
+                details = send_errors(details, now, send_error_counts(&SEND_ERRORS_SAMPLED), SEND_ERROR_LAST.load(Ordering::Relaxed));
+                for (sampled, n) in SEND_ERRORS_SAMPLED.iter().zip(now) {
+                    sampled.store(n, Ordering::Relaxed);
                 }
                 details = details.num("control", crate::secure::control::control_state());
                 details = peer_clock(details, PEER_CLOCK_MS.load(Ordering::Relaxed), PEER_CLOCK_RTT_MS.load(Ordering::Relaxed));
@@ -1502,6 +1564,25 @@ mod tests {
         third.packets = (600, 350);
         let quiet = watch.look(third);
         assert!(matches!(quiet.last(), Some(LinkEvent::Sample { online: false, round_trips: None, loop_late_ms: 0, .. })), "{quiet:?}");
+    }
+
+    #[test]
+    fn send_errors_are_told_apart_by_kind() {
+        let kind = |raw| SEND_KINDS[send_kind(&std::io::Error::from_raw_os_error(raw))];
+        // ENOBUFS, ENETUNREACH, EHOSTUNREACH, EAGAIN, ECONNREFUSED, EACCES, EMSGSIZE, EIO.
+        #[cfg(not(windows))]
+        let raw = [105, 101, 113, 11, 111, 13, 90, 5];
+        #[cfg(windows)]
+        let raw = [10055, 10051, 10065, 10035, 10061, 10013, 10040, 10022];
+        assert_eq!(raw.map(kind), ["no_buffer", "unreachable", "unreachable", "would_block", "refused", "denied", "too_big", "other"]);
+    }
+
+    #[test]
+    fn send_errors_say_how_many_since_the_last_sample_and_which() {
+        let none = send_errors(Details::new(), [0; 7], [0; 7], NO_KIND);
+        assert_eq!(none.0, "send_errors=0");
+        let some = send_errors(Details::new(), [0, 5, 2, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0], 2);
+        assert_eq!(some.0, "send_errors=6 send_error_last=unreachable send_errors_by=no_buffer:4,unreachable:2");
     }
 
     #[test]
