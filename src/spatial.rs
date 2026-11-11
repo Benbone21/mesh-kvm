@@ -2701,9 +2701,9 @@ mod tests {
         let mut edge = watch(&c, NodeId::Debian);
         let ms = 1000;
         let mut track = CursorTrack::new(0, (3200, 720));
-        track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0 });
+        track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0, received_us: 0 });
         let decide = |edge: &EdgeWatch, track: &mut CursorTrack, now_us| {
-            let (here, _) = track.locate(now_us, monitors);
+            let (here, _) = track.locate(now_us, monitors, edge.along_x());
             let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
             (here, judge(&here, edge.along_x(), spot))
         };
@@ -2717,7 +2717,7 @@ mod tests {
         assert_eq!(gate, Gate::Hold(Refusal::Stale), "within reach of the guard strip");
         // KWin's position, taken after the last move, arrives: 1970, clear of the strip. The held push
         // is looked at again.
-        track.heard(Sample { x: 1970, y: 1439, seq: 2, taken_us: 59 * ms });
+        track.heard(Sample { x: 1970, y: 1439, seq: 2, taken_us: 59 * ms, received_us: 60 * ms });
         let (here, gate) = decide(&edge, &mut track, 61 * ms);
         assert!(edge.press(monitors, here.sample, (0, 0), false), "still complete");
         let Gate::Cross { at } = gate else { panic!("{gate:?}") };

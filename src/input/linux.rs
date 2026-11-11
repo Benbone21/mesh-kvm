@@ -1139,8 +1139,9 @@ fn run_kwin_tracker(
                 unnumbered = unnumbered.wrapping_add(1);
                 unnumbered
             });
-            let taken_us = taken_at(reading.kwin_ms, wall_ms(), mono_us());
-            positions.offer(Sample { x: reading.x, y: reading.y, seq, taken_us });
+            let received_us = mono_us();
+            let taken_us = taken_at(reading.kwin_ms, wall_ms(), received_us);
+            positions.offer(Sample { x: reading.x, y: reading.y, seq, taken_us, received_us });
         }
     }
     control.monitor_pid.store(0, Ordering::SeqCst);
@@ -1448,7 +1449,7 @@ impl Core<'_> {
             return;
         }
         let monitors = cfg.monitors(NodeId::Debian);
-        let (here, news) = self.backend.track.locate(mono_us(), monitors);
+        let (here, news) = self.backend.track.locate(mono_us(), monitors, self.edge.along_x());
         if let Some(news) = news {
             note_tracker(news, here.age_ms);
         }
