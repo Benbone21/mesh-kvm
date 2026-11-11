@@ -513,6 +513,11 @@ fn look_wait(last_look: Option<Instant>, now: Instant) -> Duration {
 fn engine() {
     let mut output = Capture::new(CAPTURE_NODE, &HUB.output);
     let mut last_look = None;
+    // Never from a test: it would take away the devices of a real service of 0.9.0 or 0.9.1.
+    #[cfg(not(test))]
+    for id in clear_0_9_peer_devices(&mut run_pactl, &peer_mic_fifo()) {
+        crate::settings::log_note(&format!("Took away a mic or speakers module left by mesh-kvm 0.9 ({id})."));
+    }
     loop {
         WAKE.wait(LOOK_EVERY);
         std::thread::sleep(look_wait(last_look, Instant::now()));
@@ -558,6 +563,60 @@ fn engine() {
         });
         devices::set_lists(lists);
     }
+}
+
+// ============================================================================================
+// What 0.9.0 and 0.9.1 left behind
+// ============================================================================================
+//
+// Those versions gave Debian a mic and speakers for the other device, as two `pactl` modules
+// whose arguments all hold `mesh-kvm-peer-`, with the mic fed through a FIFO. The sound server
+// keeps such modules after the service that loaded them has gone, so a device upgraded from one
+// of them may have them now, maybe as an app's device. They are taken away once, at start. This
+// can go after a few versions, once nobody upgrades from 0.9.0 or 0.9.1 any more.
+
+/// What every module those versions loaded has in its arguments.
+const PEER_DEVICE_MARK: &str = "mesh-kvm-peer-";
+
+/// The modules in `pactl list short modules` that those versions loaded, by id.
+fn peer_device_modules(listing: &str) -> Vec<u32> {
+    listing
+        .lines()
+        .filter(|line| line.contains(PEER_DEVICE_MARK))
+        .filter_map(|line| line.split('\t').next()?.trim().parse().ok())
+        .collect()
+}
+
+/// The FIFO their mic read from.
+#[cfg(not(test))]
+fn peer_mic_fifo() -> std::path::PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })));
+    dir.join("mesh-kvm-peer-mic.fifo")
+}
+
+/// Unloads those modules, picked by the name in their arguments and nothing else, through `run`,
+/// which runs `pactl` with these arguments and gives back what it printed. Then removes the FIFO,
+/// if a FIFO is what's there. Returns the ids it unloaded.
+fn clear_0_9_peer_devices(run: &mut dyn FnMut(&[&str]) -> Option<String>, fifo: &std::path::Path) -> Vec<u32> {
+    use std::os::unix::fs::FileTypeExt;
+    let listing = run(&["list", "short", "modules"]).unwrap_or_default();
+    let unloaded = peer_device_modules(&listing).into_iter().filter(|id| run(&["unload-module", &id.to_string()]).is_some()).collect();
+    if std::fs::symlink_metadata(fifo).is_ok_and(|meta| meta.file_type().is_fifo()) {
+        let _ = std::fs::remove_file(fifo);
+    }
+    unloaded
+}
+
+/// Runs `pactl` for at most `TOOL_DEADLINE`, giving back what it printed if it worked.
+#[cfg(not(test))]
+fn run_pactl(args: &[&str]) -> Option<String> {
+    let mut command = Command::new("pactl");
+    command.args(args);
+    let output = run_with_deadline(command, TOOL_DEADLINE)?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub fn start_engine() {
@@ -941,6 +1000,70 @@ mod tests {
         let mut graph = graph();
         graph.nodes.retain(|node| node.name != CAPTURE_NODE);
         assert_eq!(plan_links(&graph, &["speakers"]), LinkPlan::default());
+    }
+
+    /// `pactl list short modules` on a device that ran 0.9.0 or 0.9.1, with others of its own.
+    const MODULES_LEFT_BY_0_9: &str = concat!(
+        "536870913\tmodule-always-sink\t\t\n",
+        "41\tmodule-pipe-source\tsource_name=mesh-kvm-peer-mic file=/run/user/1000/mesh-kvm-peer-mic.fifo format=float32le rate=48000 channels=2 source_properties=\"device.description=\\\"SACBOOKPRO mic (mesh-kvm)\\\" priority.session=1 priority.driver=1\"\t\n",
+        "7\tmodule-null-sink\tsink_name=someone-else\t\n",
+        "8\tmodule-null-sink\tsink_name=mesh-kvm-capture-not-ours-to-touch\t\n",
+        "42\tmodule-null-sink\tsink_name=mesh-kvm-peer-speakers sink_properties=\"device.description=\\\"x\\\"\"\t\n",
+        "junk without an id mesh-kvm-peer-\n",
+    );
+
+    #[test]
+    fn only_the_modules_0_9_loaded_for_the_other_device_are_picked() {
+        assert_eq!(peer_device_modules(MODULES_LEFT_BY_0_9), [41, 42]);
+        assert!(peer_device_modules("").is_empty());
+        assert!(peer_device_modules("7\tmodule-null-sink\tsink_name=someone-else\t\n").is_empty());
+    }
+
+    /// A stand-in for `pactl`: what it was asked, and the listing it gives.
+    fn fake_pactl<'a>(asked: &'a mut Vec<String>, listing: Option<&'a str>) -> impl FnMut(&[&str]) -> Option<String> + 'a {
+        move |args: &[&str]| {
+            asked.push(args.join(" "));
+            match args {
+                ["list", "short", "modules"] => listing.map(String::from),
+                ["unload-module", _] => Some(String::new()),
+                _ => None,
+            }
+        }
+    }
+
+    fn private_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mesh-kvm-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn what_0_9_left_is_unloaded_by_name_and_its_fifo_removed() {
+        let dir = private_dir("fifo");
+        let fifo = dir.join("mesh-kvm-peer-mic.fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut asked = Vec::new();
+        assert_eq!(clear_0_9_peer_devices(&mut fake_pactl(&mut asked, Some(MODULES_LEFT_BY_0_9)), &fifo), [41, 42]);
+        assert_eq!(asked, ["list short modules", "unload-module 41", "unload-module 42"]);
+        assert!(std::fs::symlink_metadata(&fifo).is_err(), "the FIFO is gone");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn with_nothing_left_by_0_9_nothing_is_unloaded_and_no_file_is_touched() {
+        let dir = private_dir("plain");
+        let file = dir.join("mesh-kvm-peer-mic.fifo");
+        std::fs::write(&file, "not a FIFO").unwrap();
+        let mut asked = Vec::new();
+        assert!(clear_0_9_peer_devices(&mut fake_pactl(&mut asked, Some("7\tmodule-null-sink\tsink_name=someone-else\t\n")), &file).is_empty());
+        assert_eq!(asked, ["list short modules"]);
+        assert!(file.exists(), "only ever a FIFO is removed");
+        let mut asked = Vec::new();
+        assert!(clear_0_9_peer_devices(&mut fake_pactl(&mut asked, None), &dir.join("missing.fifo")).is_empty());
+        assert_eq!(asked, ["list short modules"], "no sound server: nothing more is tried");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
