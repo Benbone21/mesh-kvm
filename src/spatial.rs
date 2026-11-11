@@ -158,6 +158,9 @@ pub struct SpatialConfig {
     /// This device's own choice: it doesn't travel with the layout.
     #[serde(default)]
     pub manual_game_lock: bool,
+    /// `align_exactly` has had its one look at this layout. After that, an offset is a choice.
+    #[serde(default)]
+    pub aligned_once: bool,
 }
 
 /// Where one device goes in an edit.
@@ -247,6 +250,7 @@ impl LegacyLayout {
             edge_resistance: self.edge_resistance,
             auto_game_lock: self.auto_game_lock,
             manual_game_lock: self.manual_game_lock,
+            aligned_once: false,
         }
     }
 }
@@ -319,6 +323,7 @@ impl SpatialConfig {
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
+            aligned_once: false,
         };
         config.resnap();
         config
@@ -423,7 +428,12 @@ impl SpatialConfig {
     /// desktop) that the laptop touches, and starts within `ALIGN_SNAP` pixels of. Nothing ever made
     /// a few pixels off a choice, and they put the cursor a few pixels off on every crossing. True
     /// if it moved.
+    /// It does this once per layout: `aligned_once` is kept in the file, so an offset made on
+    /// purpose afterwards stays.
     pub fn align_exactly(&mut self, me: NodeId) -> bool {
+        if std::mem::replace(&mut self.aligned_once, true) {
+            return false;
+        }
         let Some((wl, wt, wr, wb)) = bounds(&self.rects(NodeId::Windows)) else { return false };
         let (ww, wh) = (wr - wl, wb - wt);
         let near = |offset: i32| offset != 0 && offset.abs() <= ALIGN_SNAP;
@@ -570,6 +580,8 @@ impl SpatialConfig {
         }
         self.revision = theirs.revision.saturating_add(u64::from(kept));
         self.editor = theirs.editor;
+        // Either copy having had its look is enough: an older device's copy has no marker.
+        self.aligned_once |= theirs.aligned_once;
         true
     }
 
@@ -1375,6 +1387,7 @@ mod tests {
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
+            aligned_once: false,
         }
     }
 
@@ -1428,6 +1441,48 @@ mod tests {
         assert_eq!(c.arrangement_stamp, c.stamp());
         assert!(!c.align_exactly(NodeId::Debian), "lined up, there's nothing more to do");
         assert_eq!(c.stamp(), (before.0 + 1, NodeId::Debian));
+    }
+
+    #[test]
+    fn a_layout_is_lined_up_once_and_a_deliberate_offset_after_that_stays() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        assert!(c.align_exactly(NodeId::Debian));
+        // Saved, and loaded at the next start.
+        let mut c = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert!(c.aligned_once);
+        // Moved off by 3 px on purpose.
+        let mut place = c.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| p.x = 1923);
+        c.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Windows);
+        let mut c = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert!(!c.align_exactly(NodeId::Debian), "never again");
+        assert_eq!(laptop_x(&c), 1923);
+        // A layout that was right already is marked too, so a later offset stays as well.
+        let mut fine = layout(TouchSide::Bottom, 2240, 1440);
+        assert!(!fine.align_exactly(NodeId::Debian));
+        assert!(fine.aligned_once);
+    }
+
+    #[test]
+    fn a_copy_from_a_device_that_never_lines_up_doesnt_undo_the_marker() {
+        // This device lined up; the other device runs an older version that has no marker.
+        let mut mine = parse_layout(OLD_LAYOUT).unwrap().config;
+        mine.align_exactly(NodeId::Debian);
+        let mut theirs_json = serde_json::to_value(&mine).unwrap();
+        theirs_json.as_object_mut().unwrap().remove("aligned_once");
+        let mut theirs = parse_layout(&theirs_json.to_string()).unwrap().config;
+        assert!(!theirs.aligned_once);
+        // The older device edits the arrangement and this one takes it.
+        let mut place = theirs.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| p.x = 1924);
+        theirs.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Windows);
+        assert!(mine.adopt(&theirs));
+        assert_eq!(laptop_x(&mine), 1924);
+        assert!(mine.aligned_once);
+        assert!(!mine.align_exactly(NodeId::Debian), "their 1924 stands");
+        // And the two copies agree on the arrangement after it.
+        assert_eq!(mine.arrangement(), theirs.arrangement());
+        assert!(!theirs.adopt(&mine));
     }
 
     #[test]
