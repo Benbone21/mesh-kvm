@@ -160,7 +160,7 @@ pub fn record_and_wait(word: &'static str, details: Details) {
 /// Puts one event in the queue. It never blocks: with the queue full, the event is lost.
 pub fn record(word: &'static str, details: Details) {
     if let Some(tx) = QUEUE_TX.get() {
-        let _ = tx.try_send(Msg::Line(Entry { at_ms: wall_ms(), word, details: details.0 }));
+        let _ = tx.try_send(Msg::Line(Entry { at_ms: wall_ms(), word, details }));
     }
 }
 
@@ -248,9 +248,18 @@ fn packets() -> (u64, u64) {
 /// device's clock.
 pub fn answer(path: &str) -> Option<String> {
     if path == CLOCK_PATH {
-        return Some(serde_json::json!({ "unix_ms": wall_ms() }).to_string());
+        return Some(clock_answer(wall_ms()));
+    }
+    if let Some(json) = crate::linkdetails::answer(path) {
+        return Some(json);
     }
     lines_asked(path).map(|lines| tail_of(&RING.lock().unwrap_or_else(PoisonError::into_inner), lines))
+}
+
+/// The clock, and which process is answering, so that the other device can tell a restart.
+fn clock_answer(unix_ms: i64) -> String {
+    let version = crate::update::trust::running_version().to_string();
+    serde_json::json!({ "unix_ms": unix_ms, "pid": std::process::id(), "version": version }).to_string()
 }
 
 pub fn is_log_path(path: &str) -> bool {
@@ -334,27 +343,44 @@ fn keep(ring: &mut VecDeque<String>, line: String) {
     ring.push_back(line);
 }
 
-fn wall_ms() -> i64 {
+pub(crate) fn wall_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 // ---- Lines ----
 
-/// The `key=value` part of a line.
+/// The `key=value` part of a line, and each pair as it was given, which the connection details
+/// are kept from so that they say what the line says.
 #[derive(Default)]
-pub struct Details(String);
+pub struct Details(String, Vec<(String, String, bool)>);
 
 impl Details {
     pub fn new() -> Details {
         Details::default()
     }
 
-    pub fn num(mut self, key: &str, value: impl Display) -> Details {
+    pub fn num(self, key: &str, value: impl Display) -> Details {
+        let value = value.to_string();
+        self.pair(key, value.clone(), value, false)
+    }
+
+    fn pair(mut self, key: &str, written: String, value: String, text: bool) -> Details {
         if !self.0.is_empty() {
             self.0.push(' ');
         }
-        let _ = write!(self.0, "{key}={value}");
+        let _ = write!(self.0, "{key}={written}");
+        self.1.push((key.to_string(), value, text));
         self
+    }
+
+    /// The value given last for `key`, unquoted.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.1.iter().rev().find(|(k, ..)| k == key).map(|(_, v, _)| v.as_str())
+    }
+
+    /// Every pair in order, and whether it was given as text rather than a figure.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.1.iter().map(|(k, v, text)| (k.as_str(), v.as_str(), *text))
     }
 
     /// Text in quotes when it has a space or a quote in it, or nothing at all. Lines are read by
@@ -362,7 +388,7 @@ impl Details {
     pub fn text(self, key: &str, value: &str) -> Details {
         let plain = !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c == '"');
         if plain {
-            return self.num(key, value);
+            return self.pair(key, value.to_string(), value.to_string(), true);
         }
         let mut quoted = String::from("\"");
         for c in value.chars() {
@@ -376,7 +402,7 @@ impl Details {
             }
         }
         quoted.push('"');
-        self.num(key, quoted)
+        self.pair(key, quoted, value.to_string(), true)
     }
 
     /// A figure that may not be known, shown as `-`.
@@ -391,13 +417,13 @@ impl Details {
 struct Entry {
     at_ms: i64,
     word: &'static str,
-    details: String,
+    details: Details,
 }
 
 impl Entry {
     fn line(&self, offset_s: i32) -> String {
-        let space = if self.details.is_empty() { "" } else { " " };
-        format!("{} {}{space}{}", time_text(self.at_ms, offset_s), self.word, self.details)
+        let space = if self.details.0.is_empty() { "" } else { " " };
+        format!("{} {}{space}{}", time_text(self.at_ms, offset_s), self.word, self.details.0)
     }
 }
 
@@ -420,7 +446,7 @@ fn time_text(unix_ms: i64, offset_s: i32) -> String {
 }
 
 /// The date of a day counted from 1970-01-01, proleptic Gregorian.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -446,7 +472,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 
 /// How far this device's clock is from UTC at `unix_ms`, in seconds.
 #[cfg(unix)]
-fn utc_offset_s(unix_ms: i64) -> i32 {
+pub(crate) fn utc_offset_s(unix_ms: i64) -> i32 {
     let now = unix_ms.div_euclid(1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
@@ -457,7 +483,7 @@ fn utc_offset_s(unix_ms: i64) -> i32 {
 
 /// Windows says local time and UTC apart, so the offset is their difference, to the quarter hour.
 #[cfg(windows)]
-fn utc_offset_s(_unix_ms: i64) -> i32 {
+pub(crate) fn utc_offset_s(_unix_ms: i64) -> i32 {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
     let (mut local, mut utc): (SYSTEMTIME, SYSTEMTIME) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
@@ -547,9 +573,11 @@ fn write_lines(rx: Receiver<Msg>, mut file: LogFile) {
     for msg in rx {
         match msg {
             Msg::Line(entry) => {
-                let line = entry.line(utc_offset_s(entry.at_ms));
+                let offset_s = utc_offset_s(entry.at_ms);
+                let line = entry.line(offset_s);
                 file.write(&line);
                 keep(&mut RING.lock().unwrap_or_else(PoisonError::into_inner), line);
+                crate::linkdetails::take(entry.at_ms, offset_s, entry.word, &entry.details);
             }
             Msg::Flush(done) => {
                 let _ = done.send(());
@@ -704,6 +732,8 @@ impl LinkWatch {
                     max_ms: was.max_ms.max(t.max_ms),
                     sum_ms: was.sum_ms + t.sum_ms,
                     count: was.count + t.count,
+                    steps_ms: was.steps_ms + t.steps_ms,
+                    steps: was.steps + t.steps,
                 },
                 None => t,
             });
@@ -856,6 +886,7 @@ fn describe(event: &LinkEvent, peer: &str) -> (&'static str, Details) {
                 .opt("rtt_min_ms", ms(|t| t.min_ms))
                 .opt("rtt_avg_ms", ms(RoundTrips::average_ms))
                 .opt("rtt_max_ms", ms(|t| t.max_ms))
+                .opt("rtt_jitter_ms", round_trips.as_ref().and_then(RoundTrips::jitter_ms).map(|j| format!("{j:.1}")))
                 .num("answers", round_trips.map_or(0, |t| t.count));
             let details = loss(details, f)
                 .num("one_way", f.one_way)
@@ -1281,14 +1312,35 @@ fn clock_offset(sent_ms: i64, back_ms: i64, peer_ms: i64) -> Option<(i64, u32)> 
 
 /// Asks the other device the time, on a connection of its own and within a short budget. A
 /// failure leaves the offset as it was, and is no news of the link.
-fn look_at_peer_clock() {
+/// The answer also names the other device's process, which the connection details compare across
+/// a drop. True when it answered.
+fn look_at_peer_clock() -> bool {
     let sent = wall_ms();
-    let Some(Ok((200, body))) = crate::secure::control::peer_clock_call(CLOCK_PATH) else { return };
+    let Some(Ok((200, body))) = crate::secure::control::peer_clock_call(CLOCK_PATH) else { return false };
     let back = wall_ms();
-    let said = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v["unix_ms"].as_i64());
-    if let Some((ahead, rtt)) = said.and_then(|peer| clock_offset(sent, back, peer)) {
+    let said = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+    if let Some((ahead, rtt)) = said["unix_ms"].as_i64().and_then(|peer| clock_offset(sent, back, peer)) {
         PEER_CLOCK_MS.store(ahead, Ordering::Relaxed);
         PEER_CLOCK_RTT_MS.store(rtt, Ordering::Relaxed);
+    }
+    crate::linkdetails::peer_seen(back, peer_identity(&said));
+    true
+}
+
+/// Which process a clock answer came from. An older service doesn't say.
+fn peer_identity(said: &serde_json::Value) -> Option<crate::linkdetails::Identity> {
+    let pid = said["pid"].as_u64()?;
+    Some(crate::linkdetails::Identity { pid, version: said["version"].as_str().unwrap_or_default().to_string() })
+}
+
+/// The Wi-Fi as the connection details show it. Nothing is said while it's changing.
+fn wifi_now(read: &WifiRead) -> Option<crate::linkdetails::WifiNow> {
+    use crate::linkdetails::WifiNow;
+    match read {
+        WifiRead::Connected(w) => Some(WifiNow::connected(&w.ssid, &w.channel, &w.freq, w.signal)),
+        WifiRead::NotConnected => Some(WifiNow::None),
+        WifiRead::Changing => None,
+        WifiRead::Unknown(error) => Some(WifiNow::Unknown { error: error.clone() }),
     }
 }
 
@@ -1296,6 +1348,7 @@ fn watch_network() {
     let mut net = NetWatch::default();
     let mut quick_until = Instant::now() + QUICK_FOR;
     let mut clock_due = Instant::now();
+    let mut asked_peer_at: Option<Instant> = None;
     loop {
         let asked = LOOK_NOW.swap(false, Ordering::Relaxed);
         let (addrs, wifi) = this_network();
@@ -1304,6 +1357,9 @@ fn watch_network() {
             _ => NO_SIGNAL,
         };
         SIGNAL.store(signal, Ordering::Relaxed);
+        if let Some(now) = wifi_now(&wifi) {
+            crate::linkdetails::wifi_now(now);
+        }
         let lines = net.look(addrs, wifi);
         if !lines.is_empty() {
             NET_CHANGES.fetch_add(1, Ordering::Relaxed);
@@ -1322,16 +1378,26 @@ fn watch_network() {
         let next = Instant::now() + every;
         while Instant::now() < next && !LOOK_NOW.load(Ordering::Relaxed) {
             std::thread::sleep(NET_WAKE);
+            // A drop that's back waits on which process the other device runs, so that is asked
+            // straight away, and again until it answers.
+            let wanted = crate::linkdetails::peer_wanted();
+            if wanted.is_some_and(|every| asked_peer_at.is_none_or(|at| at.elapsed() >= every)) {
+                asked_peer_at = Some(Instant::now());
+                if look_at_peer_clock() {
+                    clock_due = Instant::now() + PEER_CLOCK_EVERY;
+                }
+            }
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn line_of(word: &'static str, details: Details, at_ms: i64, offset_s: i32) -> String {
-        Entry { at_ms, word, details: details.0 }.line(offset_s)
+        Entry { at_ms, word, details }.line(offset_s)
     }
 
     #[test]
@@ -1395,6 +1461,27 @@ mod tests {
         let said: serde_json::Value = serde_json::from_str(&answer(CLOCK_PATH).unwrap()).unwrap();
         assert!((said["unix_ms"].as_i64().unwrap() - wall_ms()).abs() < 5000);
         assert!(!is_log_path(CLOCK_PATH), "it isn't plain text");
+        // With the process, so that the other device can tell a restart across a drop.
+        let identity = peer_identity(&said).unwrap();
+        assert_eq!((identity.pid, identity.version), (u64::from(std::process::id()), crate::update::trust::running_version().to_string()));
+        assert_eq!(peer_identity(&serde_json::json!({ "unix_ms": 5 })), None, "an older service doesn't say");
+    }
+
+    #[test]
+    fn the_connection_details_are_served_beside_the_log_as_json() {
+        let said: serde_json::Value = serde_json::from_str(&answer(crate::linkdetails::PATH).unwrap()).unwrap();
+        assert!(said["events"].is_array());
+        assert!(!is_log_path(crate::linkdetails::PATH), "it isn't plain text");
+        assert!(is_log_path(PATH) && answer(PATH).is_some_and(|text| !text.starts_with('{')));
+    }
+
+    #[test]
+    fn the_wifi_for_the_details_is_left_alone_while_it_changes() {
+        use crate::linkdetails::WifiNow;
+        let w = Wifi { ssid: "Home".into(), bssid: "aa".into(), signal: Some(70), channel: "36".into(), freq: "5180 MHz".into() };
+        assert_eq!(wifi_now(&WifiRead::Connected(w)), Some(WifiNow::connected("Home", "36", "5180 MHz", Some(70))));
+        assert_eq!(wifi_now(&WifiRead::Changing), None);
+        assert_eq!(wifi_now(&WifiRead::NotConnected), Some(WifiNow::None));
     }
 
     #[test]
@@ -1583,13 +1670,13 @@ mod tests {
     #[test]
     fn a_sample_every_ten_seconds_with_the_round_trips_packets_and_lateness_in_between() {
         let mut watch = LinkWatch::starting(0, (100, 50));
-        let trips = |min_ms, max_ms, sum_ms, count| Some(RoundTrips { min_ms, max_ms, sum_ms, count });
+        let trips = |min_ms, max_ms, sum_ms, count, steps_ms, steps| Some(RoundTrips { min_ms, max_ms, sum_ms, count, steps_ms, steps });
         let mut first = look(5000, true, 10, 5000, None);
-        first.round_trips = trips(8.0, 20.0, 28.0, 2);
+        first.round_trips = trips(8.0, 20.0, 28.0, 2, 12.0, 1);
         first.loop_late_ms = 40;
         watch.look(first);
         let mut second = look(10_000, true, 10, 10_000, None);
-        second.round_trips = trips(5.0, 9.0, 14.0, 2);
+        second.round_trips = trips(5.0, 9.0, 14.0, 2, 15.0, 2);
         second.packets = (600, 350);
         second.loop_late_ms = 7;
         let events = watch.look(second);
@@ -1603,7 +1690,7 @@ mod tests {
         assert_eq!(word, "sample");
         assert_eq!(
             details.0,
-            "link=up rtt_min_ms=5 rtt_avg_ms=10 rtt_max_ms=20 answers=4 loss_in=1.50 loss_out=0.00 one_way=false in_pps=50.0 out_pps=30.0 loop_late_ms=40"
+            "link=up rtt_min_ms=5 rtt_avg_ms=10 rtt_max_ms=20 rtt_jitter_ms=9.0 answers=4 loss_in=1.50 loss_out=0.00 one_way=false in_pps=50.0 out_pps=30.0 loop_late_ms=40"
         );
         let mut third = look(20_000, false, 10, 10_000, None);
         third.packets = (600, 350);

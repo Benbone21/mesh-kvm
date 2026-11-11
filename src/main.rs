@@ -7,6 +7,7 @@ mod displays;
 mod keymap;
 mod input;
 mod licenses;
+mod linkdetails;
 mod linklog;
 mod lowlat;
 mod mute;

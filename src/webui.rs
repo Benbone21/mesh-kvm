@@ -3,6 +3,7 @@
 //! Every node (Debian + Windows) exposes the following. Any other path, including `/`, is a 404:
 //!   GET  /api/local              -> this node's live status (node-specific handler)
 //!   GET  /api/local/linklog      -> the last lines of this node's link log, as plain text (?lines=N)
+//!   GET  /api/local/link         -> this node's connection details, as JSON
 //!   POST /api/local/action       -> this node's local actions (audio, autostart, focus, panic...)
 //!   ANY  /api/peer/<path>        -> sent to the other device over the encrypted control connection
 //!   GET  /api/state              -> this node's copy of the layout, and live telemetry
@@ -451,6 +452,24 @@ mod tests {
         assert_eq!(answer(&HttpRequest::from_peer("GET", path, ""), &handler).0, 200, "the handler needn't know it");
         assert_eq!(answer(&HttpRequest::from_peer("POST", path, ""), &handler).0, 404, "only read");
         assert_eq!(answer(&request("DELETE", path, Source::Browser), &handler).0, 403);
+    }
+
+    #[test]
+    fn the_connection_details_are_a_read_open_to_both_devices_and_through_the_proxy() {
+        let path = crate::linkdetails::PATH;
+        for source in [Source::Local, Source::Peer, Source::Browser] {
+            assert!(request("GET", path, source).may_change_state(), "{source:?}");
+        }
+        assert!(request("GET", "/api/peer/api/local/link", Source::Local).may_use_proxy());
+        assert!(!request("GET", "/api/peer/api/local/link", Source::Peer).may_use_proxy(), "never back to the asker");
+        let handler: Handler = Arc::new(|_| None);
+        let (status, body) = answer(&HttpRequest::from_peer("GET", path, ""), &handler);
+        assert_eq!(status, 200, "the handler needn't know it");
+        assert!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["events"].is_array());
+        assert_eq!(answer(&HttpRequest::from_peer("POST", path, ""), &handler).0, 404, "only read");
+        assert_eq!(answer(&request("DELETE", path, Source::Browser), &handler).0, 403);
+        let reply = exchange(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"));
+        assert!(reply.starts_with("HTTP/1.1 200") && reply.contains("Content-Type: application/json"), "{reply}");
     }
 
     #[test]

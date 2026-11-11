@@ -501,19 +501,32 @@ pub struct RoundTrips {
     pub max_ms: f32,
     pub sum_ms: f32,
     pub count: u32,
+    /// How far each round trip was from the one before, added up, and how many such steps.
+    pub steps_ms: f32,
+    pub steps: u32,
 }
 
 impl RoundTrips {
-    fn add(trips: &mut Option<RoundTrips>, ms: f32) {
-        let t = trips.get_or_insert(RoundTrips { min_ms: ms, max_ms: ms, sum_ms: 0.0, count: 0 });
+    /// One more answer, `ms` long, after one `previous` long, if there was one.
+    fn add(trips: &mut Option<RoundTrips>, ms: f32, previous: Option<f32>) {
+        let t = trips.get_or_insert(RoundTrips { min_ms: ms, max_ms: ms, sum_ms: 0.0, count: 0, steps_ms: 0.0, steps: 0 });
         t.min_ms = t.min_ms.min(ms);
         t.max_ms = t.max_ms.max(ms);
         t.sum_ms += ms;
         t.count += 1;
+        if let Some(previous) = previous {
+            t.steps_ms += (ms - previous).abs();
+            t.steps += 1;
+        }
     }
 
     pub fn average_ms(&self) -> f32 {
         self.sum_ms / self.count.max(1) as f32
+    }
+
+    /// The jitter: how far one round trip is from the next, on average. `None` with fewer than two.
+    pub fn jitter_ms(&self) -> Option<f32> {
+        (self.steps > 0).then(|| self.steps_ms / self.steps as f32)
     }
 }
 
@@ -540,6 +553,8 @@ pub struct PeerLink {
     handshake_at: Option<u64>,
     online: bool,
     round_trips: Option<RoundTrips>,
+    /// The last round trip measured, unsmoothed, for the jitter.
+    last_round_trip_ms: Option<f32>,
 }
 
 impl PeerLink {
@@ -617,7 +632,7 @@ impl PeerLink {
                 self.answer = Some((state.echo, now_ms));
                 let took = now_ms.saturating_sub(sent_ms).saturating_sub(u64::from(state.echo_age_ms)) as f32;
                 self.round_trip_ms = Some(self.round_trip_ms.map_or(took, |was| was + (took - was) * SMOOTHING));
-                RoundTrips::add(&mut self.round_trips, took);
+                RoundTrips::add(&mut self.round_trips, took, self.last_round_trip_ms.replace(took));
                 if state.main {
                     events.push(Event::MainAnswered);
                 }
@@ -672,6 +687,7 @@ impl PeerLink {
         self.loss = LossMeter::default();
         self.heard = None;
         self.round_trip_ms = None;
+        self.last_round_trip_ms = None;
         self.answer = None;
         self.loss_out = None;
         self.protocol = None;
@@ -1521,6 +1537,23 @@ mod tests {
         assert_eq!((trips.min_ms, trips.max_ms, trips.count), (10.0, 200.0, 3));
         assert!((trips.average_ms() - 90.0).abs() < 0.01, "{trips:?}");
         assert_eq!(a.take_round_trips(), None, "each window starts empty");
+    }
+
+    #[test]
+    fn the_jitter_is_how_far_each_round_trip_is_from_the_one_before() {
+        let (mut a, mut b) = (PeerLink::default(), PeerLink::default());
+        a.set_online(true);
+        answered(&mut a, &mut b, 1000, 30, 10);
+        assert_eq!(a.take_round_trips().unwrap().jitter_ms(), None, "one answer has nothing to compare");
+        answered(&mut a, &mut b, 1400, 5, 10);
+        answered(&mut a, &mut b, 1800, 100, 10);
+        // 60, then 10, then 200 ms: steps of 50 and 190, the first across the window before.
+        let trips = a.take_round_trips().unwrap();
+        assert_eq!((trips.steps, trips.jitter_ms()), (2, Some(120.0)));
+        a.set_online(false);
+        a.set_online(true);
+        answered(&mut a, &mut b, 3000, 20, 10);
+        assert_eq!(a.take_round_trips().unwrap().jitter_ms(), None, "nothing from before a dropout");
     }
 
     #[test]
