@@ -206,6 +206,20 @@ fn send_errors(details: Details, now: [u64; SEND_KINDS.len()], was: [u64; SEND_K
     details.num("send_error_last", SEND_KINDS.get(last).copied().unwrap_or("-")).num("send_errors_by", by.join(","))
 }
 
+/// The audio tallies as of the last sample, which reports what came since: sound, then mic.
+static AUDIO_SAMPLED: [[AtomicU64; crate::audio::TALLY_FIELDS]; 2] = [const { [const { AtomicU64::new(0) }; crate::audio::TALLY_FIELDS] }; 2];
+
+/// One received stream's figures since the last sample, each name after `prefix`, and the fullest
+/// its buffer got.
+fn audio_since(details: Details, prefix: &str, now: [u64; crate::audio::TALLY_FIELDS], was: [u64; crate::audio::TALLY_FIELDS], buffer_max_ms: u32) -> Details {
+    let mut details = details;
+    for ((name, n), w) in crate::audio::TALLY_NAMES.iter().zip(now).zip(was) {
+        // A stream that started again counts from nothing, so a drop in a total is all new.
+        details = details.num(&format!("{prefix}{name}"), if n >= w { n - w } else { n });
+    }
+    details.num(&format!("{prefix}buffer_max_ms"), buffer_max_ms)
+}
+
 fn packets() -> (u64, u64) {
     (PACKETS_IN.load(Ordering::Relaxed), PACKETS_OUT.load(Ordering::Relaxed))
 }
@@ -755,10 +769,22 @@ pub fn note(events: Vec<LinkEvent>) {
                 LOOK_NOW.store(true, Ordering::Relaxed);
             }
             LinkEvent::Sample { .. } => {
-                use crate::audio::{AUDIO_RX_BUFFER_MS, AUDIO_RX_LIVE, AUDIO_RX_LOSS};
-                if AUDIO_RX_LIVE.load(Ordering::Relaxed) {
+                use crate::audio::{AUDIO_RX_BUFFER_MS, AUDIO_RX_LIVE, AUDIO_RX_LOSS, AUDIO_RX_MIC_LIVE, AUDIO_RX_MIC_TALLY, AUDIO_RX_TALLY};
+                let streams = [
+                    (&AUDIO_RX_TALLY, AUDIO_RX_LIVE.load(Ordering::Relaxed), "audio_"),
+                    (&AUDIO_RX_MIC_TALLY, AUDIO_RX_MIC_LIVE.load(Ordering::Relaxed), "mic_"),
+                ];
+                if streams[0].1 {
                     let loss = f64::from(AUDIO_RX_LOSS.load(Ordering::Relaxed)) / 10.0;
                     details = details.num("audio_loss", format!("{loss:.1}")).num("audio_buffer_ms", AUDIO_RX_BUFFER_MS.load(Ordering::Relaxed));
+                }
+                for ((tally, live, prefix), sampled) in streams.into_iter().zip(&AUDIO_SAMPLED) {
+                    let now = tally.totals();
+                    let was: [u64; crate::audio::TALLY_FIELDS] = std::array::from_fn(|i| sampled[i].swap(now[i], Ordering::Relaxed));
+                    let buffer_max_ms = tally.take_buffer_max_ms();
+                    if live {
+                        details = audio_since(details, prefix, now, was, buffer_max_ms);
+                    }
                 }
                 let now = send_error_counts(&SEND_ERRORS);
                 details = send_errors(details, now, send_error_counts(&SEND_ERRORS_SAMPLED), SEND_ERROR_LAST.load(Ordering::Relaxed));
@@ -1564,6 +1590,17 @@ mod tests {
         third.packets = (600, 350);
         let quiet = watch.look(third);
         assert!(matches!(quiet.last(), Some(LinkEvent::Sample { online: false, round_trips: None, loop_late_ms: 0, .. })), "{quiet:?}");
+    }
+
+    #[test]
+    fn audio_figures_are_what_came_since_the_last_sample() {
+        let details = audio_since(Details::new(), "audio_", [500, 7, 3, 2, 1, 1], [300, 5, 3, 0, 0, 1], 80);
+        assert_eq!(
+            details.0,
+            "audio_received=200 audio_concealed=2 audio_repaired=0 audio_late=2 audio_trimmed=1 audio_restarts=0 audio_buffer_max_ms=80"
+        );
+        let mic = audio_since(Details::new(), "mic_", [10, 0, 0, 0, 0, 0], [900, 0, 0, 0, 0, 0], 20);
+        assert!(mic.0.starts_with("mic_received=10 "), "{}", mic.0);
     }
 
     #[test]

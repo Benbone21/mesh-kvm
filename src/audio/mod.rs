@@ -60,6 +60,44 @@ pub static AUDIO_RX_UNREPAIRED: AtomicU32 = AtomicU32::new(0);
 pub static AUDIO_RX_BUFFER_MS: AtomicU32 = AtomicU32::new(0);
 /// A stream from the other device is alive, so the figures above mean something.
 pub static AUDIO_RX_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// A received stream's counts, added up since the service started, and the fullest its buffer has
+/// been since the link log last looked, for the link log's samples.
+pub struct StreamTally {
+    totals: [AtomicU64; TALLY_FIELDS],
+    buffer_max_ms: AtomicU32,
+}
+
+/// What a `StreamTally` counts, in order.
+pub const TALLY_FIELDS: usize = 6;
+pub const TALLY_NAMES: [&str; TALLY_FIELDS] = ["received", "concealed", "repaired", "late", "trimmed", "restarts"];
+
+impl StreamTally {
+    const fn new() -> StreamTally {
+        StreamTally { totals: [const { AtomicU64::new(0) }; TALLY_FIELDS], buffer_max_ms: AtomicU32::new(0) }
+    }
+
+    fn publish(&self, counts: jitter::Counts, peak_ms: f64) {
+        let values = [counts.received, counts.concealed, counts.repaired, counts.late, counts.trimmed, counts.restarts];
+        for (total, value) in self.totals.iter().zip(values) {
+            total.store(value, Ordering::Relaxed);
+        }
+        self.buffer_max_ms.fetch_max(peak_ms as u32, Ordering::Relaxed);
+    }
+
+    pub fn totals(&self) -> [u64; TALLY_FIELDS] {
+        std::array::from_fn(|i| self.totals[i].load(Ordering::Relaxed))
+    }
+
+    /// The fullest since the last call.
+    pub fn take_buffer_max_ms(&self) -> u32 {
+        self.buffer_max_ms.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// The sound stream's tally, and the mic stream's.
+pub static AUDIO_RX_TALLY: StreamTally = StreamTally::new();
+pub static AUDIO_RX_MIC_TALLY: StreamTally = StreamTally::new();
 /// A mic stream from the other device is alive.
 pub static AUDIO_RX_MIC_LIVE: AtomicBool = AtomicBool::new(false);
 /// The output is open and not switched off, so what's received can be heard.
@@ -324,6 +362,7 @@ fn publish_received(stream: &mut RxStream, now: Instant) -> packet::Report {
     AUDIO_RX_LOSS.store((stream.loss_percent() * 10.0) as u32, Ordering::Relaxed);
     AUDIO_RX_UNREPAIRED.store((stream.unrepaired_percent() * 10.0) as u32, Ordering::Relaxed);
     AUDIO_RX_BUFFER_MS.store(if alive { stream.buffered_ms() as u32 } else { 0 }, Ordering::Relaxed);
+    AUDIO_RX_TALLY.publish(stream.counts(), stream.take_peak_ms());
     report
 }
 
@@ -339,6 +378,7 @@ fn publish_mic(stream: &mut RxStream, now: Instant) -> packet::Report {
     report.sounding = false;
     report.ready = ready;
     AUDIO_RX_MIC_LIVE.store(alive, Ordering::Relaxed);
+    AUDIO_RX_MIC_TALLY.publish(stream.counts(), stream.take_peak_ms());
     report
 }
 

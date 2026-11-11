@@ -69,6 +69,9 @@ pub struct Counts {
     pub late: u64,
     /// Frames dropped to bring the delay down.
     pub trimmed: u64,
+    /// Times the buffer started again because nothing came for too long, or the numbers jumped.
+    /// The sender going quiet isn't one.
+    pub restarts: u64,
 }
 
 pub struct JitterBuffer {
@@ -93,6 +96,8 @@ pub struct JitterBuffer {
     low_since: Option<Instant>,
     stalled_frames: u32,
     counts: Counts,
+    /// The most frames held since `take_peak_ms`.
+    peak_level: usize,
 }
 
 impl JitterBuffer {
@@ -120,6 +125,7 @@ impl JitterBuffer {
             low_since: None,
             stalled_frames: 0,
             counts: Counts::default(),
+            peak_level: 0,
         }
     }
 
@@ -144,6 +150,13 @@ impl JitterBuffer {
         }
     }
 
+    /// The most delay the buffer has held since the last time this was asked, in ms.
+    pub fn take_peak_ms(&mut self) -> f64 {
+        let level = self.level();
+        let peak = std::mem::replace(&mut self.peak_level, level).max(level);
+        peak as f64 * self.frame_ms
+    }
+
     /// The delay the buffer is holding now, in ms.
     pub fn buffered_ms(&self) -> f64 {
         self.level() as f64 * self.frame_ms
@@ -163,6 +176,7 @@ impl JitterBuffer {
     pub fn push(&mut self, seq: u32, payload: Vec<u8>, now: Instant) {
         let far_ahead = self.newest.is_some_and(|newest| seq.abs_diff(newest) > FURTHEST_JUMP);
         if far_ahead {
+            self.counts.restarts += 1;
             self.start_again();
         }
         if self.cursor.is_some_and(|cursor| seq < cursor) {
@@ -177,6 +191,7 @@ impl JitterBuffer {
         while self.packets.len() > MOST_HELD {
             self.packets.pop_first();
         }
+        self.peak_level = self.peak_level.max(self.level());
     }
 
     /// The sender has nothing to send. `seq` is the number its next packet will have, so a marker
@@ -302,6 +317,7 @@ impl JitterBuffer {
         }
         self.lost_one(now);
         if f64::from(self.stalled_frames) * self.frame_ms >= LONGEST_STALL_MS {
+            self.counts.restarts += 1;
             self.start_again();
             return Next::Idle;
         }
@@ -322,7 +338,6 @@ pub struct RxStream {
     /// Added up over the stream's restarts, for showing.
     earlier: Counts,
     reported_received: u64,
-    reported_late: u64,
     reported_newest: Option<u32>,
     loss_percent: f64,
     reported_concealed: u64,
@@ -344,7 +359,6 @@ impl Default for RxStream {
             last_heard: None,
             earlier: Counts::default(),
             reported_received: 0,
-            reported_late: 0,
             reported_newest: None,
             loss_percent: 0.0,
             reported_concealed: 0,
@@ -362,11 +376,11 @@ impl RxStream {
         self.earlier.concealed += counts.concealed;
         self.earlier.late += counts.late;
         self.earlier.trimmed += counts.trimmed;
+        self.earlier.restarts += counts.restarts;
         self.epoch = Some(epoch);
         self.jitter = JitterBuffer::new(format);
         self.decoder = Decoder::new(format).ok();
         self.reported_received = 0;
-        self.reported_late = 0;
         self.reported_newest = None;
         self.reported_concealed = 0;
     }
@@ -401,11 +415,17 @@ impl RxStream {
             concealed: a.concealed + b.concealed,
             late: a.late + b.late,
             trimmed: a.trimmed + b.trimmed,
+            restarts: a.restarts + b.restarts,
         }
     }
 
     pub fn buffered_ms(&self) -> f64 {
         self.jitter.buffered_ms()
+    }
+
+    /// The most delay held since this was last asked, in ms.
+    pub fn take_peak_ms(&mut self) -> f64 {
+        self.jitter.take_peak_ms()
     }
 
     /// The share of packets lately that didn't arrive in time, however they were made up for.
@@ -430,7 +450,8 @@ impl RxStream {
         let newest = self.jitter.newest();
         if let (Some(newest), Some(before)) = (newest, self.reported_newest) {
             let due = u64::from(newest.saturating_sub(before));
-            let came = (counts.received - self.reported_received).saturating_sub(counts.late - self.reported_late);
+            // A packet that came after its turn isn't in `received`: its turn is already short of one.
+            let came = counts.received - self.reported_received;
             if due == 0 {
                 // Nothing was due, so nothing was lost: a quiet spell lets the figures fall.
                 self.loss_percent *= 1.0 - LOSS_SMOOTHING;
@@ -445,7 +466,6 @@ impl RxStream {
         if newest.is_some() {
             self.reported_newest = newest;
             self.reported_received = counts.received;
-            self.reported_late = counts.late;
             self.reported_concealed = counts.concealed;
         }
         Report {
@@ -982,5 +1002,66 @@ mod tests {
             }
         }
         assert_eq!(stream.report(true).loss_percent, 0);
+    }
+
+    #[test]
+    fn a_packet_that_comes_late_counts_as_lost_once() {
+        let packets = opus_packets(1);
+        let mut stream = RxStream::default();
+        let t = Instant::now();
+        stream.push(&audio(1, 0, Format::Opus, &packets[0]), t);
+        let mut report = stream.report(true);
+        let mut out = vec![0.0; OPUS_FRAME * CHANNELS];
+        let mut at = t;
+        for round in 0..30u32 {
+            let base = 1 + round * 100;
+            for seq in 0..100 {
+                if seq % 10 != 0 {
+                    stream.push(&audio(1, base + seq, Format::Opus, &packets[0]), at);
+                }
+                at += FRAME;
+                stream.fill(&mut out, at);
+            }
+            // The missing ones turn up after their turn has gone.
+            for seq in (0..100).step_by(10) {
+                stream.push(&audio(1, base + seq, Format::Opus, &packets[0]), at);
+            }
+            report = stream.report(true);
+        }
+        assert!(stream.counts().late >= 200, "{:?}", stream.counts());
+        assert!((9..=11).contains(&report.loss_percent), "{}", report.loss_percent);
+    }
+
+    #[test]
+    fn a_stall_or_a_jump_counts_as_a_restart_but_the_sender_going_quiet_does_not() {
+        let mut buffer = opus();
+        let t = Instant::now();
+        steady(&mut buffer, t, 50);
+        // Nothing comes for longer than concealment carries on.
+        for i in 0..15 {
+            buffer.pull(t + FRAME * (50 + i));
+        }
+        assert_eq!(buffer.counts().restarts, 1);
+        buffer.push(10_000, vec![0], t + FRAME * 70);
+        buffer.push(20_000, vec![0], t + FRAME * 71);
+        assert_eq!(buffer.counts().restarts, 2, "a jump");
+        buffer.note_quiet(20_001);
+        buffer.pull(t + FRAME * 72);
+        buffer.pull(t + FRAME * 73);
+        assert_eq!(buffer.counts().restarts, 2, "quiet is no restart");
+    }
+
+    #[test]
+    fn the_fullest_the_buffer_got_is_kept_until_taken() {
+        let mut buffer = opus();
+        let t = Instant::now();
+        for seq in 0..12 {
+            buffer.push(seq, vec![0], t);
+        }
+        for i in 0..12 {
+            buffer.pull(t + FRAME * i);
+        }
+        assert_eq!(buffer.take_peak_ms(), 120.0);
+        assert!(buffer.take_peak_ms() <= 10.0, "taken, so only what's held now");
     }
 }
