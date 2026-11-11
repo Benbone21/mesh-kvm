@@ -24,6 +24,8 @@ const MOST_OF_MONITOR: f32 = 0.9;
 /// How far the snap keeps a device on the edge it's dragged along: enough of it to cross at.
 const MIN_TOUCH_ALONG_X: i32 = 280;
 const MIN_TOUCH_ALONG_Y: i32 = 240;
+/// A nudge that ends this close to lining up with a monitor lines up exactly.
+const NUDGE_SNAP: i32 = 4;
 
 fn yes() -> bool {
     true
@@ -1233,10 +1235,20 @@ pub fn tile_view(cfg: &LayoutConfig, width: f32, height: f32) -> (MapView, [f32;
     (view, content)
 }
 
-/// Moves a device by `(dx, dy)` layout units through the same snapping as a drag, with no magnet.
+/// Moves a device by `(dx, dy)` layout units through the same snapping as a drag. A nudge that ends
+/// within `NUDGE_SNAP` of lining up with a monitor lines up, as long as that is still the way it
+/// was going, so a device lined up can still be moved off a pixel at a time.
 pub fn nudge(cfg: &mut LayoutConfig, device: Device, dx: i32, dy: i32) {
     let (x, y, ..) = cfg.device_box(device);
-    drag_device(cfg, device, x + dx, y + dy, 0);
+    let moved = |magnet: i32| {
+        let mut c = cfg.clone();
+        drag_device(&mut c, device, x + dx, y + dy, magnet);
+        let (nx, ny, ..) = c.device_box(device);
+        (c, if dx != 0 { nx - x } else { ny - y })
+    };
+    let (plain, went) = moved(0);
+    let (snapped, would) = moved(NUDGE_SNAP);
+    *cfg = if would != 0 && would.signum() == went.signum() { snapped } else { plain };
 }
 
 /// What a screen's tile says under its device's name, like `DP-1 2560x1440` with a times sign.
@@ -1524,6 +1536,59 @@ mod tests {
         assert_eq!(cfg.device_box(Device::Windows).0, x + 10);
         nudge(&mut cfg, Device::Windows, 0, -1);
         assert_eq!(cfg.device_box(Device::Windows).1, y, "it can't move into the other device, so it stays on the edge");
+    }
+
+    /// The real layout: the 2560-wide laptop under the 2560-wide DP-2, its box starting at `x`.
+    fn laptop_under_dp2_at(x: i32) -> LayoutConfig {
+        let mut c = cfg();
+        apply_placement(&mut c, &Placement { label: "Custom".into(), x, y: 1440, side: "Bottom".into() });
+        c
+    }
+
+    #[test]
+    fn a_nudge_that_ends_a_few_pixels_from_lining_up_lines_up_exactly() {
+        // The owner's saved layout had the laptop 5 px to the right of DP-2.
+        let mut c = laptop_under_dp2_at(1925);
+        nudge(&mut c, Device::Windows, -1, 0);
+        assert_eq!(c.laptop_box().0, 1920, "1924 is within a few px of DP-2's x");
+        let mut c = laptop_under_dp2_at(1916);
+        nudge(&mut c, Device::Windows, 1, 0);
+        assert_eq!(c.laptop_box().0, 1920, "it jumps ahead onto the line it's moving towards");
+        let mut c = laptop_under_dp2_at(1930);
+        nudge(&mut c, Device::Windows, -10, 0);
+        assert_eq!(c.laptop_box().0, 1920);
+    }
+
+    #[test]
+    fn a_nudge_can_still_leave_an_aligned_place_a_pixel_at_a_time() {
+        let mut c = laptop_under_dp2_at(1920);
+        nudge(&mut c, Device::Windows, 1, 0);
+        assert_eq!(c.laptop_box().0, 1921, "it isn't pulled back to where it came from");
+        nudge(&mut c, Device::Windows, 1, 0);
+        assert_eq!(c.laptop_box().0, 1922, "nor back the other way it's moving");
+        let mut c = laptop_under_dp2_at(1920);
+        nudge(&mut c, Device::Windows, -1, 0);
+        assert_eq!(c.laptop_box().0, 1919);
+        let mut c = laptop_under_dp2_at(2000);
+        nudge(&mut c, Device::Windows, 10, 0);
+        assert_eq!(c.laptop_box().0, 2010, "far from any line, a nudge is just a nudge");
+    }
+
+    #[test]
+    fn a_drag_within_the_magnet_lines_up_exactly() {
+        let mut c = laptop_under_dp2_at(2240);
+        drag_device(&mut c, Device::Windows, 1925, 1440, 14);
+        assert_eq!(c.laptop_box().0, 1920);
+    }
+
+    #[test]
+    fn below_a_monitor_of_the_same_width_is_exactly_under_it() {
+        let mut c = laptop_under_dp2_at(1925);
+        let ps = placements(&c, &[]);
+        let below = ps.iter().find(|p| p.label == "Below DP-2").unwrap();
+        apply_placement(&mut c, below);
+        assert_eq!(c.laptop_box().0, 1920);
+        assert_eq!(position_label(&c, &placements(&c, &[])), "Below DP-2");
     }
 
     #[test]

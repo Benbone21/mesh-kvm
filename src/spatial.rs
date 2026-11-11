@@ -27,6 +27,9 @@ const MAX_MONITOR_SIZE: i32 = 1 << 16;
 const MAX_MONITORS: usize = 16;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_EDGE_RESISTANCE: i32 = 400;
+/// A laptop this close to lining up with a monitor of its own size is lined up when the layout
+/// loads. Further off than this, it was put there on purpose.
+const ALIGN_SNAP: i32 = 8;
 /// How far ahead of this copy another copy's revision can be and still be believed. No one makes
 /// this many edits, so a bigger jump is a bad value, which would otherwise win every comparison
 /// from then on and leave no edit able to beat it.
@@ -408,6 +411,39 @@ impl SpatialConfig {
         }
     }
 
+    /// Lines the laptop up exactly with the one monitor of the desktop it nearly lines up with, as
+    /// an edit made on `me`. That is a monitor of the same width (the same height beside the
+    /// desktop) that the laptop touches, and starts within `ALIGN_SNAP` pixels of. Nothing ever made
+    /// a few pixels off a choice, and they put the cursor a few pixels off on every crossing. True
+    /// if it moved.
+    pub fn align_exactly(&mut self, me: NodeId) -> bool {
+        let Some((wl, wt, wr, wb)) = bounds(&self.rects(NodeId::Windows)) else { return false };
+        let (ww, wh) = (wr - wl, wb - wt);
+        let near = |offset: i32| offset != 0 && offset.abs() <= ALIGN_SNAP;
+        let shifts: Vec<(i32, i32)> = self
+            .rects(NodeId::Debian)
+            .iter()
+            .filter_map(|m| {
+                let (dx, dy) = (m.x - wl, m.y - wt);
+                let fits = match self.attach_side {
+                    TouchSide::Bottom => wt == m.y + m.h && m.w == ww && near(dx),
+                    TouchSide::Top => wb == m.y && m.w == ww && near(dx),
+                    TouchSide::Right => wl == m.x + m.w && m.h == wh && near(dy),
+                    TouchSide::Left => wr == m.x && m.h == wh && near(dy),
+                };
+                let along_x = matches!(self.attach_side, TouchSide::Bottom | TouchSide::Top);
+                fits.then_some(if along_x { (dx, 0) } else { (0, dy) })
+            })
+            .collect();
+        let [(dx, dy)] = shifts[..] else { return false };
+        let mut arrangement = self.arrangement();
+        for place in arrangement.devices.iter_mut().filter(|p| p.node == NodeId::Windows) {
+            place.x += dx;
+            place.y += dy;
+        }
+        self.apply_edit(&LayoutEdit { arrangement: Some(arrangement), edge_resistance: None }, me)
+    }
+
     /// The edge of `node` that faces the other device.
     pub fn facing_edge(&self, node: NodeId) -> SwitchEdge {
         let debian_edge = match self.attach_side {
@@ -780,6 +816,9 @@ impl SharedSpatialState {
             crate::settings::adopt_pointer_speed(speed);
         }
         config.report_monitors(me, &crate::settings::device_name(), platform.monitors());
+        if config.align_exactly(me) {
+            crate::settings::log_note("Lined the laptop up exactly with the monitor it was a few pixels off.");
+        }
         let state = Self {
             me,
             peer_pinned,
@@ -1226,6 +1265,66 @@ mod tests {
         assert_eq!(laptop.custom_size, None);
         assert_eq!(c.attach_side, TouchSide::Bottom);
         assert_eq!(c.edge_resistance, 55);
+    }
+
+    #[test]
+    fn the_real_layout_is_lined_up_exactly_under_dp2_once() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        let before = c.stamp();
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 1920);
+        assert_eq!(c.device(NodeId::Windows).unwrap().y, 1440);
+        // The normal way of an edit: one past this copy, and the arrangement's stamp with it, so
+        // that the other device fetches it.
+        assert_eq!(c.stamp(), (before.0 + 1, NodeId::Debian));
+        assert_eq!(c.arrangement_stamp, c.stamp());
+        assert!(!c.align_exactly(NodeId::Debian), "lined up, there's nothing more to do");
+        assert_eq!(c.stamp(), (before.0 + 1, NodeId::Debian));
+    }
+
+    #[test]
+    fn only_a_near_miss_of_one_monitor_the_same_size_is_lined_up() {
+        let laptop_2560 = |x: i32| {
+            let mut c = layout(TouchSide::Bottom, x, 1440);
+            laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 2560, 1600)];
+            c
+        };
+        for x in [1912, 1928] {
+            let mut c = laptop_2560(x);
+            assert!(c.align_exactly(NodeId::Windows), "{x}");
+            assert_eq!(laptop_x(&c), 1920);
+        }
+        for x in [1911, 1929, 1920, 2240] {
+            let mut c = laptop_2560(x);
+            assert!(!c.align_exactly(NodeId::Windows), "{x}");
+            assert_eq!(laptop_x(&c), x);
+        }
+        // A narrower laptop near DP-2's start is a choice, not a near miss.
+        let mut c = layout(TouchSide::Bottom, 1925, 1440);
+        assert!(!c.align_exactly(NodeId::Debian));
+        // Beside the desktop it is the heights that have to match, and y that lines up.
+        let mut c = layout(TouchSide::Right, 4480, 4);
+        laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 1920, 1440)];
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(c.device(NodeId::Windows).unwrap().y, 0);
+        // And under DP-3, with its own width.
+        let mut c = layout(TouchSide::Bottom, 6, 1440);
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 0);
+    }
+
+    #[test]
+    fn down_and_back_up_again_lands_on_the_same_column() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        c.align_exactly(NodeId::Debian);
+        for k in (1..2559).step_by(7).chain([1, 2557, 2558]) {
+            let (lx, ly) = c.entry_on_peer(NodeId::Debian, 1920 + k, 1439);
+            assert_eq!(lx, k, "down at {k}");
+            assert!(ly > 0);
+            let (dx, dy) = c.entry_on_peer(NodeId::Windows, lx, 0);
+            assert_eq!(dx, 1920 + k, "back up at {k}");
+            assert!(dy < 1439);
+        }
     }
 
     #[test]
