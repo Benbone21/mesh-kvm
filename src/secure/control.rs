@@ -483,6 +483,10 @@ fn exchange(stream: &mut SecureStream, request: &ApiRequest, wait: Duration) -> 
 static TARGET: OnceLock<SocketAddr> = OnceLock::new();
 static PEER_LINK: Link = Link::new(HOUR);
 static CLOCK_LINK: Link = Link::unlogged(HOUR);
+/// The app's look at the other device's connection details, on a connection of its own, so that
+/// the panel being open neither waits behind other requests nor holds them up, and its failures
+/// are no `control_down`: having the panel open can't change what a drop is put down to.
+static DETAILS_LINK: Link = Link::unlogged(HOUR);
 /// The clock look's whole budget: an answer later than this says little about the clock anyway.
 const CLOCK_CONNECT_WAIT: Duration = Duration::from_millis(350);
 const CLOCK_ANSWER_WAIT: Duration = Duration::from_millis(1000);
@@ -503,6 +507,14 @@ pub fn set_peer_online(online: bool) {
     if changed(&CLOCK_LINK) {
         CLOCK_LINK.set_online(online, None);
     }
+    if changed(&DETAILS_LINK) {
+        DETAILS_LINK.set_online(online, None);
+    }
+}
+
+/// A read of the other device's connection details, on their own connection.
+pub fn peer_details_call(path: &str) -> Result<(u16, String), String> {
+    DETAILS_LINK.call(super::services().pairing.as_deref(), TARGET.get().copied(), "GET", path, "")
 }
 
 /// The connection to the peer's API as it last went: `up`, `down`, or `unused` while nothing has

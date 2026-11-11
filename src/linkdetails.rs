@@ -128,8 +128,9 @@ struct Sound {
     buffer_ms: Option<u32>,
     buffer_peak_ms: u32,
     received: u64,
-    /// Lost on the way, repaired or not.
-    lost: u64,
+    /// Frames whose packet wasn't there in time: filled in, or rebuilt from repair data. A packet
+    /// that came after its turn is one of these too, so `repaired` and `late` are parts of this.
+    missed: u64,
     repaired: u64,
     late: u64,
 }
@@ -169,7 +170,7 @@ impl Sample {
                 buffer_ms: figure(d, "audio_buffer_ms"),
                 buffer_peak_ms: figure(d, "audio_buffer_max_ms").unwrap_or(0),
                 received,
-                lost: concealed + repaired,
+                missed: concealed + repaired,
                 repaired,
                 late: figure(d, "audio_late").unwrap_or(0),
             }
@@ -286,6 +287,11 @@ struct Store {
     control: Control,
     peer: Option<Identity>,
     peer_answered: bool,
+    /// A drop settled before the other device said which process it runs, and the process it
+    /// ran before: a late answer can still show it restarted.
+    unchecked: Option<(u64, Identity)>,
+    /// The Wi-Fi network as the `net` lines last said, `None` until one has.
+    wifi_seen: Option<Option<String>>,
     next_id: u64,
 }
 
@@ -344,6 +350,8 @@ impl Store {
             control: Control { state: String::new(), error: None },
             peer: None,
             peer_answered: false,
+            unchecked: None,
+            wifi_seen: None,
             next_id: 0,
         }
     }
@@ -368,7 +376,7 @@ impl Store {
             }
             "net" => {
                 let wifi = d.get("ssid").is_some() || d.get("was_ssid").is_some() || d.get("wifi").is_some();
-                if wifi && d.get("wifi") != Some("unknown") {
+                if wifi && self.wifi_changed(d) {
                     self.clue(at_ms, at_ms, Clue::Wifi);
                 }
                 self.event(at_ms, if wifi { "wifi" } else { "network" }, d);
@@ -376,6 +384,10 @@ impl Store {
             "roam" => {
                 self.clue(at_ms, at_ms, Clue::Wifi);
                 self.event(at_ms, "roam", d);
+            }
+            // Time lost with the device awake is mesh-kvm held up, not sleep.
+            "asleep" if d.get("how") == Some("late") => {
+                self.event(at_ms, "held_up", d);
             }
             "asleep" => {
                 let lost: i64 = figure(d, "ms").unwrap_or(0);
@@ -500,8 +512,24 @@ impl Store {
         }
     }
 
+    /// Whether a Wi-Fi `net` line is a change of network, rather than the Wi-Fi being readable again,
+    /// or the first look at it.
+    fn wifi_changed(&mut self, d: &Details) -> bool {
+        if d.get("wifi") == Some("unknown") {
+            return false;
+        }
+        let now = d.get("ssid").map(str::to_string);
+        let was = self.wifi_seen.replace(now.clone());
+        d.get("was_ssid").is_some() || was.is_some_and(|was| was != now)
+    }
+
     fn peer_seen(&mut self, at_ms: i64, peer: Option<Identity>) {
         self.peer_answered = true;
+        if let Some((id, before)) = self.unchecked.take() {
+            if peer.as_ref().is_some_and(|after| *after != before) {
+                self.restarted_after_all(id);
+            }
+        }
         if let Some(drop) = self.pending.as_mut() {
             if drop.back_ms.is_some_and(|back| at_ms >= back) && !drop.peer_checked {
                 drop.peer_checked = true;
@@ -514,9 +542,26 @@ impl Store {
         self.decide(at_ms);
     }
 
+    /// A drop settled without the other device's answer, which has now come and names another
+    /// process: it restarted, unless sleep explains the drop.
+    fn restarted_after_all(&mut self, id: u64) {
+        let drops = self.last_drop.iter_mut().chain(self.pending.iter_mut()).filter(|d| d.id == id);
+        for drop in drops {
+            if drop.cause != Some(Cause::Asleep) {
+                drop.cause = Some(Cause::Restart);
+                drop.restarted = Some("other");
+            }
+        }
+        if let Some(event) = self.events.iter_mut().find(|e| e.id == id && e.cause != Some(Cause::Asleep)) {
+            event.cause = Some(Cause::Restart);
+            event.fields.insert("restarted".into(), Value::from("other"));
+        }
+    }
+
     fn peer_wanted(&self) -> Option<std::time::Duration> {
         use std::time::Duration;
-        if self.pending.as_ref().is_some_and(|p| p.back_ms.is_some() && !p.peer_checked && p.peer_before.is_some()) {
+        let waiting = self.pending.as_ref().is_some_and(|p| p.back_ms.is_some() && !p.peer_checked && p.peer_before.is_some());
+        if waiting || (self.unchecked.is_some() && self.online == Some(true)) {
             return Some(Duration::from_secs(1));
         }
         (self.online == Some(true) && !self.peer_answered).then_some(Duration::from_secs(10))
@@ -536,6 +581,14 @@ impl Store {
 
     fn settle(&mut self) {
         let Some(mut drop) = self.pending.take() else { return };
+        if !drop.peer_checked {
+            // Settled without hearing which process the other device runs now. A later answer is
+            // for this drop, and the next one mustn't be held against a process from before it.
+            if let Some(before) = drop.peer_before.clone() {
+                self.unchecked = Some((drop.id, before));
+            }
+            self.peer = None;
+        }
         let (cause, restarted) = self.cause_of(&drop);
         drop.cause = Some(cause);
         drop.restarted = restarted;
@@ -605,7 +658,7 @@ impl Store {
             json!({
                 "buffer_peak_ms": sounds.iter().map(|s| s.buffer_peak_ms).max().unwrap_or(0),
                 "received": sounds.iter().map(|s| s.received).sum::<u64>(),
-                "lost": sounds.iter().map(|s| s.lost).sum::<u64>(),
+                "missed": sounds.iter().map(|s| s.missed).sum::<u64>(),
                 "repaired": sounds.iter().map(|s| s.repaired).sum::<u64>(),
                 "late": sounds.iter().map(|s| s.late).sum::<u64>(),
             })
@@ -756,8 +809,8 @@ mod tests {
         assert_eq!(latest["worst_freeze_ms"], 4);
         let sound = &latest["sound"];
         assert_eq!((sound["buffer_ms"].as_u64(), sound["buffer_peak_ms"].as_u64()), (Some(42), Some(80)));
-        assert_eq!((sound["lost"].as_u64(), sound["repaired"].as_u64(), sound["late"].as_u64()), (Some(5), Some(3), Some(1)));
-        assert_eq!(json["ten_min"]["sound"]["lost"], 5);
+        assert_eq!((sound["missed"].as_u64(), sound["repaired"].as_u64(), sound["late"].as_u64()), (Some(5), Some(3), Some(1)));
+        assert_eq!(json["ten_min"]["sound"]["missed"], 5);
         assert_eq!(json["ten_min"]["failed_sends"], 3);
         assert_eq!(json["control"]["state"], "up");
     }
@@ -933,6 +986,67 @@ mod tests {
         assert_eq!(store.peer_wanted(), Some(std::time::Duration::from_secs(1)));
         store.peer_seen(T + 11_200, Some(identity(7, "0.9.4")));
         assert_eq!(store.peer_wanted(), None);
+    }
+
+    #[test]
+    fn a_late_answer_labels_the_drop_it_belongs_to_and_not_the_next() {
+        let mut store = Store::new();
+        store.peer_seen(T, Some(identity(100, "0.9.4")));
+        store.take(T + 10_000, 0, "down", &down("1000"));
+        store.take(T + 10_500, 0, "up", &up("500"));
+        // No answer within 5 s of the return: settled as unknown, and still asked about.
+        assert_eq!(drop_at(&mut store, 15_500)["cause"], "unknown");
+        assert_eq!(store.peer_wanted(), Some(std::time::Duration::from_secs(1)));
+        // A roam brings a second drop before the answer comes.
+        store.take(T + 19_000, 0, "roam", &d(&[]).text("from", "aa").text("to", "bb"));
+        store.take(T + 20_000, 0, "down", &down("500"));
+        store.take(T + 21_000, 0, "up", &up("1000"));
+        store.peer_seen(T + 21_200, Some(identity(200, "0.9.4")));
+        let json = store.json(T + 30_000, 0);
+        let causes: Vec<(&str, Option<&str>)> =
+            json["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "drop").map(|e| (e["cause"].as_str().unwrap(), e["fields"]["restarted"].as_str())).collect();
+        assert_eq!(causes, [("restart", Some("other")), ("wifi", None)]);
+        assert_eq!(json["stability"]["last_drop"]["cause"], "wifi");
+        assert_eq!(store.peer_wanted(), None);
+    }
+
+    #[test]
+    fn two_drops_in_quick_succession_never_compare_the_second_with_a_process_from_before_the_first() {
+        let mut store = Store::new();
+        store.peer_seen(T, Some(identity(100, "0.9.4")));
+        store.take(T + 10_000, 0, "down", &down("1000"));
+        store.take(T + 10_200, 0, "up", &up("200"));
+        store.take(T + 11_000, 0, "down", &down("500"));
+        store.take(T + 12_000, 0, "up", &up("1000"));
+        store.peer_seen(T + 12_100, Some(identity(200, "0.9.4")));
+        let json = store.json(T + 20_000, 0);
+        let causes: Vec<&str> = json["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "drop").map(|e| e["cause"].as_str().unwrap()).collect();
+        assert_eq!(causes, ["restart", "unknown"], "the change is put down to the first drop, once");
+        // The answer after the second drop is now what a third is compared with.
+        store.take(T + 30_000, 0, "down", &down("500"));
+        store.take(T + 30_500, 0, "up", &up("500"));
+        store.peer_seen(T + 30_600, Some(identity(200, "0.9.4")));
+        assert_eq!(drop_at(&mut store, 34_000)["cause"], "unknown");
+    }
+
+    #[test]
+    fn mesh_kvm_held_up_with_the_device_awake_is_not_sleep() {
+        let late = d(&[("ms", "6200"), ("how", "late")]);
+        let mut store = fed(&[(10_000, "down", down("1000")), (10_200, "asleep", late), (10_500, "up", up("500"))]);
+        assert_eq!(drop_at(&mut store, 20_000)["cause"], "unknown");
+        assert_eq!(store.json(T + 20_000, 0)["events"][1]["kind"], "held_up");
+    }
+
+    #[test]
+    fn wifi_readable_again_or_first_seen_is_no_change() {
+        let first = d(&[]).text("addrs", "wlan0=10.0.0.2/24").text("ssid", "Home");
+        let unreadable = d(&[("wifi", "unknown")]).text("error", "nmcli failed");
+        let again = d(&[]).text("ssid", "Home");
+        let mut store = fed(&[(0, "net", first), (9_000, "net", unreadable), (10_000, "down", down("1000")), (10_500, "net", again), (10_600, "up", up("600"))]);
+        assert_eq!(drop_at(&mut store, 20_000)["cause"], "unknown");
+        // Joining a network after none is a change, and so is another network.
+        let mut store = fed(&[(0, "net", d(&[("wifi", "none")])), (10_000, "down", down("1000")), (10_500, "net", d(&[]).text("ssid", "Home")), (10_600, "up", up("600"))]);
+        assert_eq!(drop_at(&mut store, 20_000)["cause"], "wifi");
     }
 
     #[test]

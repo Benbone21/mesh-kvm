@@ -203,6 +203,11 @@ pub fn answer(req: &HttpRequest, handler: &Handler) -> (u16, String) {
     (404, NOT_FOUND.to_string())
 }
 
+/// A read of the connection details, which goes to the other device on a connection of its own.
+fn is_details_read(method: &str, target: &str) -> bool {
+    method == "GET" && (target == crate::linkdetails::PATH || target.starts_with(&format!("{}?", crate::linkdetails::PATH)))
+}
+
 /// Everything is JSON but the link log.
 fn content_type(path: &str) -> &'static str {
     if crate::linklog::is_log_path(path) {
@@ -233,7 +238,12 @@ fn handle_conn(mut stream: TcpStream, peer_ip: &str, handler: Handler) {
         // The link log can be long, and is most wanted on a link that's slow.
         let patient = req.body.contains("install_update") || crate::linklog::is_log_path(target);
         let call = if patient { peer_call_patiently } else { peer_call };
-        match call(&req.method, target, &req.body) {
+        let reply = if is_details_read(&req.method, target) {
+            crate::secure::control::peer_details_call(target)
+        } else {
+            call(&req.method, target, &req.body)
+        };
+        match reply {
             Ok((status, body)) => {
                 let st = if status == 200 { "200 OK".to_string() } else { format!("{} Peer", status) };
                 let ctype = if status == 200 { content_type(target) } else { "application/json" };
@@ -470,6 +480,15 @@ mod tests {
         assert_eq!(answer(&request("DELETE", path, Source::Browser), &handler).0, 403);
         let reply = exchange(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"));
         assert!(reply.starts_with("HTTP/1.1 200") && reply.contains("Content-Type: application/json"), "{reply}");
+    }
+
+    #[test]
+    fn the_connection_details_go_to_the_other_device_on_a_connection_of_their_own() {
+        assert!(is_details_read("GET", "/api/local/link"));
+        assert!(is_details_read("GET", "/api/local/link?x=1"));
+        assert!(!is_details_read("GET", "/api/local/linklog"));
+        assert!(!is_details_read("POST", "/api/local/link"));
+        assert!(!is_details_read("GET", "/api/local"));
     }
 
     #[test]
