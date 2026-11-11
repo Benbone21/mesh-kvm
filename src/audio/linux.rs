@@ -582,7 +582,7 @@ fn follows_us(resolved: &Resolved, default: Option<&String>) -> bool {
 fn steer_clear_of_ours(input: Resolved, play: Resolved, lists: &Lists) -> Steered {
     let mut notes = Vec::new();
     let input = if follows_us(&input, lists.default_input.as_ref()) {
-        notes.push("The system's default microphone is the other device's mic, so nothing is sent from it. Choose a microphone or line-in.".to_string());
+        notes.push("No mic is sent: Debian's default microphone is set to the other device's mic. Make your own microphone the default in the sound settings, or choose one here.".to_string());
         Resolved::Off
     } else {
         input

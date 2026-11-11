@@ -48,6 +48,16 @@ pub enum Kind {
     Speakers,
 }
 
+/// The properties both devices are made with. The sound server would otherwise give a pipe source a
+/// driver priority of 50000, above any real microphone even with the user's own choice of default
+/// added, and make the other device's mic this one's default microphone. At 1 they are never the
+/// default unless chosen. The whole list is one quoted value, with the description's quotes
+/// escaped inside it: a comma-separated list isn't read as properties. `description` is clean, so
+/// it has no quote or backslash to break out with.
+fn properties(description: &str) -> String {
+    format!("\"device.description=\\\"{description}\\\" priority.session=1 priority.driver=1\"")
+}
+
 /// The arguments to `pactl load-module` for one of the devices. `peer` is already clean.
 pub fn module_args(kind: Kind, peer: &str) -> Vec<String> {
     match kind {
@@ -58,12 +68,12 @@ pub fn module_args(kind: Kind, peer: &str) -> Vec<String> {
             "format=float32le".to_string(),
             "rate=48000".to_string(),
             "channels=2".to_string(),
-            format!("source_properties=device.description=\"{peer} mic (mesh-kvm)\""),
+            format!("source_properties={}", properties(&format!("{peer} mic (mesh-kvm)"))),
         ],
         Kind::Speakers => vec![
             "module-null-sink".to_string(),
             format!("sink_name={SPEAKERS_NAME}"),
-            format!("sink_properties=device.description=\"{peer} speakers (mesh-kvm)\""),
+            format!("sink_properties={}", properties(&format!("{peer} speakers (mesh-kvm)"))),
         ],
     }
 }
@@ -324,7 +334,16 @@ mod tests {
     #[test]
     fn names_cannot_smuggle_arguments() {
         let args = module_args(Kind::Mic, &clean_name("Bob's \"PC\" a=b"));
-        assert_eq!(args.last().unwrap(), "source_properties=device.description=\"Bobs PC ab mic (mesh-kvm)\"");
+        assert_eq!(
+            args.last().unwrap(),
+            "source_properties=\"device.description=\\\"Bobs PC ab mic (mesh-kvm)\\\" priority.session=1 priority.driver=1\""
+        );
+        // Nothing in a name can close the description early and add a priority of its own.
+        let sly = module_args(Kind::Speakers, &clean_name("x\\\" priority.session=99999 \""));
+        assert_eq!(
+            sly.last().unwrap(),
+            "sink_properties=\"device.description=\\\"x priority.session99999 speakers (mesh-kvm)\\\" priority.session=1 priority.driver=1\""
+        );
         assert_eq!(clean_name("  \u{7}  "), "Other device");
     }
 
@@ -341,7 +360,8 @@ mod tests {
                 "format=float32le".into(),
                 "rate=48000".into(),
                 "channels=2".into(),
-                "source_properties=device.description=\"Laptop mic (mesh-kvm)\"".into(),
+                // Low priorities, so the sound server never makes it the default by itself.
+                r#"source_properties="device.description=\"Laptop mic (mesh-kvm)\" priority.session=1 priority.driver=1""#.into(),
             ]
         );
         assert_eq!(
@@ -349,7 +369,7 @@ mod tests {
             [
                 "module-null-sink",
                 "sink_name=mesh-kvm-peer-speakers",
-                "sink_properties=device.description=\"Laptop speakers (mesh-kvm)\"",
+                r#"sink_properties="device.description=\"Laptop speakers (mesh-kvm)\" priority.session=1 priority.driver=1""#,
             ]
         );
         assert_eq!(clean_name("  Café\\PC\n "), "CaféPC", "non-ASCII stays, the rest goes");
