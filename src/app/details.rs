@@ -38,7 +38,9 @@ pub struct Sound {
     pub buffer_ms: Option<u32>,
     pub buffer_peak_ms: u32,
     pub received: u64,
-    pub lost: u64,
+    /// Packets that weren't there in time for their turn: rebuilt from repair data or filled in.
+    /// `repaired` and `late` are parts of this.
+    pub missed: u64,
     pub repaired: u64,
     pub late: u64,
 }
@@ -160,6 +162,8 @@ pub enum Missing {
     OutOfReach,
     NotPaired,
     Unreadable,
+    /// The service turned the ask away.
+    Refused,
 }
 
 impl Missing {
@@ -170,6 +174,7 @@ impl Missing {
             Missing::OutOfReach => "Out of reach".into(),
             Missing::NotPaired => "Not paired".into(),
             Missing::Unreadable => "Answer couldn't be read".into(),
+            Missing::Refused => "Refused".into(),
         }
     }
 }
@@ -191,7 +196,8 @@ pub fn fetched(reply: Result<(u16, String), String>, at: Instant) -> Fetched {
             Err(_) => Fetched::Missing(Missing::Unreadable),
         },
         Ok((404, _)) => Fetched::Missing(Missing::NeedsUpdate),
-        Ok((502 | 403, _)) => Fetched::Missing(Missing::OutOfReach),
+        Ok((502, _)) => Fetched::Missing(Missing::OutOfReach),
+        Ok((403, _)) => Fetched::Missing(Missing::Refused),
         Ok(_) | Err(_) => Fetched::Missing(Missing::NotAnswering),
     }
 }
@@ -203,11 +209,24 @@ pub struct DetailCell {
     pub text: String,
     pub tone: Tone,
     pub tooltip: Option<String>,
+    /// What the copy says, when it says more than the panel: a relative time with its exact one.
+    pub copy: Option<String>,
 }
 
 impl DetailCell {
     fn new(text: impl Into<String>, tone: Tone) -> DetailCell {
-        DetailCell { text: text.into(), tone, tooltip: None }
+        DetailCell { text: text.into(), tone, tooltip: None, copy: None }
+    }
+
+    /// The exact time of what the text says relatively, for the copy.
+    fn at(mut self, exact: &str) -> DetailCell {
+        self.copy = Some(format!("{} ({exact})", self.text));
+        self
+    }
+
+    /// The text as the copy has it.
+    pub fn copied(&self) -> &str {
+        self.copy.as_deref().unwrap_or(&self.text)
     }
 
     fn text(text: impl Into<String>) -> DetailCell {
@@ -266,6 +285,8 @@ pub struct Column<'a> {
     pub name: String,
     pub other: String,
     pub fetched: &'a Fetched,
+    /// This device, whose clock the window's times are on.
+    pub here: bool,
 }
 
 /// A device's details and how far on its clock is now, from its answer and the time since.
@@ -274,6 +295,8 @@ struct Seen<'a> {
     now_ms: i64,
     name: &'a str,
     other: &'a str,
+    here: bool,
+    offset_s: i32,
 }
 
 fn whole(ms: f32) -> String {
@@ -418,7 +441,10 @@ impl Seen<'_> {
                 DetailCell::new(duration(since), if since < RECENT_DROP_MS { Tone::Warn } else { Tone::Text })
             }
             None => match self.d.started_ms {
-                Some(started) => DetailCell::text(format!("None since start, {}", ago(self.now_ms - started))),
+                Some(started) => {
+                    let exact = date_time(started, self.offset_s);
+                    DetailCell::text(format!("None since start, {}", ago(self.now_ms - started))).tip(format!("Started at {exact}.")).at(&exact)
+                }
                 None => DetailCell::text("None"),
             },
         }
@@ -441,7 +467,7 @@ impl Seen<'_> {
         if let Some(first) = cause_text.get(..1) {
             cause_text = first.to_uppercase() + &cause_text[1..];
         }
-        [DetailCell::new(text, tone).tip(format!("Last heard at {exact}.")), DetailCell::new(cause_text, cause_tone)]
+        [DetailCell::new(text, tone).tip(format!("Last heard at {exact}.")).at(&exact), DetailCell::new(cause_text, cause_tone)]
     }
 
     fn wifi(&self) -> [DetailCell; 3] {
@@ -539,9 +565,9 @@ impl Seen<'_> {
                 .tip("The delay sound waits in the buffer to even out the link. The peak is the most in the last 10 min."),
             None => DetailCell::none(),
         };
-        let counts = DetailCell::text(format!("{} / {} / {} packets", window.lost, window.repaired, window.late)).tip(format!(
-            "In the last 10 min: {} packets lost on the way, {} of them repaired, and {} too late to play, of {} received.",
-            window.lost, window.repaired, window.late, window.received
+        let counts = DetailCell::text(format!("{} ({} repaired, {} late)", window.missed, window.repaired, window.late)).tip(format!(
+            "In the last 10 min, of {} packets received, {} weren't there in time to play. {} of those were rebuilt from repair data and the rest filled in, and {} of them came later, after their turn had gone.",
+            window.received, window.missed, window.repaired, window.late
         ));
         [buffer, counts]
     }
@@ -615,9 +641,7 @@ impl Seen<'_> {
                 let on = text_field("ssid").map_or_else(String::new, |s| format!(" on {s}"));
                 (format!("Moved to another access point{on}"), Tone::Text)
             }
-            "asleep" if text_field("how").as_deref() == Some("late") => {
-                (format!("mesh-kvm didn't run for {}", duration(ms_field("ms").unwrap_or(0))), Tone::Warn)
-            }
+            "held_up" => (format!("mesh-kvm was held up on {name} for {}", duration(ms_field("ms").unwrap_or(0))), Tone::Warn),
             "asleep" => (format!("{name} was asleep for {}", duration(ms_field("ms").unwrap_or(0))), Tone::Text),
             "suspend" => (format!("{name} went to sleep"), Tone::Text),
             "resume" => (format!("{name} woke up"), Tone::Text),
@@ -636,6 +660,9 @@ impl Seen<'_> {
             other => format!("{k}={other}"),
         }).collect();
         let mut tooltip = format!("{}, {}", date_time(e.at_ms, offset_s), ago(self.now_ms - e.at_ms));
+        if !self.here {
+            tooltip.push_str(&format!(" on {name}'s own clock"));
+        }
         if !logged.is_empty() {
             tooltip.push('\n');
             tooltip.push_str(&logged.join(" "));
@@ -649,7 +676,7 @@ pub fn view(columns: [Column; 2], now: Instant, offset_s: i32) -> DetailsView {
     let seen: [Option<Seen>; 2] = std::array::from_fn(|i| match columns[i].fetched {
         Fetched::Got(d, at) => {
             let elapsed = now.saturating_duration_since(*at).as_millis() as i64;
-            Some(Seen { d, now_ms: d.now_ms + elapsed, name: &columns[i].name, other: &columns[i].other })
+            Some(Seen { d, now_ms: d.now_ms + elapsed, name: &columns[i].name, other: &columns[i].other, here: columns[i].here, offset_s })
         }
         _ => None,
     });
@@ -712,7 +739,7 @@ pub fn view(columns: [Column; 2], now: Instant, offset_s: i32) -> DetailsView {
             heading: "Sound",
             rows: vec![
                 row("Buffer", both(&|s| s.sound()[0].clone())),
-                row("Lost / repaired / late", both(&|s| s.sound()[1].clone())),
+                row("Missed in time", both(&|s| s.sound()[1].clone())),
             ],
         },
         DetailGroup {
@@ -736,7 +763,7 @@ pub fn copy_text(view: &DetailsView, names: [&str; 2], stamp: &str) -> String {
         .groups
         .iter()
         .flat_map(|g| &g.rows)
-        .map(|r| r.cells[0].text.chars().count())
+        .map(|r| r.cells[0].copied().chars().count())
         .chain([names[0].chars().count()])
         .max()
         .unwrap_or(0);
@@ -755,11 +782,12 @@ pub fn copy_text(view: &DetailsView, names: [&str; 2], stamp: &str) -> String {
         out.push_str(&group.heading.to_uppercase());
         out.push('\n');
         for row in &group.rows {
-            out.push_str(&line(row.label, &row.cells[0].text, &row.cells[1].text));
+            out.push_str(&line(row.label, row.cells[0].copied(), row.cells[1].copied()));
         }
     }
-    for (name, history) in names.iter().zip(&view.history) {
-        out.push_str(&format!("\nHISTORY, {}\n", name.to_uppercase()));
+    for (i, (name, history)) in names.iter().zip(&view.history).enumerate() {
+        let clock = if i == 0 { "" } else { ", times on its own clock" };
+        out.push_str(&format!("\nHISTORY, {}{clock}\n", name.to_uppercase()));
         if history.is_empty() {
             out.push_str("Nothing yet\n");
         }
@@ -788,10 +816,10 @@ mod tests {
             "latest": {"at_ms": T - 4000, "online": true, "rtt": {"min_ms": 3.0, "avg_ms": 5.4, "max_ms": 12.0, "jitter_ms": 1.24, "answers": 40},
                        "loss_in": 0.2, "loss_out": 0.0, "in_per_s": 61.0, "out_per_s": 59.6, "failed_sends": 0, "failed_last": null,
                        "worst_freeze_ms": 4,
-                       "sound": {"loss_percent": 0.4, "buffer_ms": 42, "buffer_peak_ms": 60, "received": 1000, "lost": 2, "repaired": 1, "late": 0}},
+                       "sound": {"loss_percent": 0.4, "buffer_ms": 42, "buffer_peak_ms": 60, "received": 1000, "missed": 2, "repaired": 1, "late": 0}},
             "ten_min": {"from_ms": T - 600_000, "samples": 60, "rtt": {"min_ms": 2.0, "avg_ms": 6.0, "max_ms": 48.0, "jitter_ms": 2.0, "answers": 2400},
                         "failed_sends": 3, "worst_freeze_ms": 12,
-                        "sound": {"buffer_peak_ms": 80, "received": 60000, "lost": 5, "repaired": 3, "late": 1}},
+                        "sound": {"buffer_peak_ms": 80, "received": 60000, "missed": 5, "repaired": 3, "late": 1}},
             "stability": {"drops_today": 0, "last_drop": null},
             "wifi": {"state": "connected", "ssid": "Home Net", "band": "5 GHz", "channel": "36", "freq_mhz": 5180, "signal": 78},
             "scans": {"state": "paused"},
@@ -809,8 +837,8 @@ mod tests {
 
     fn columns<'a>(a: &'a Fetched, b: &'a Fetched) -> [Column<'a>; 2] {
         [
-            Column { name: "Bread's desk".into(), other: "ThinkPad".into(), fetched: a },
-            Column { name: "ThinkPad".into(), other: "Bread's desk".into(), fetched: b },
+            Column { name: "Bread's desk".into(), other: "ThinkPad".into(), fetched: a, here: true },
+            Column { name: "ThinkPad".into(), other: "Bread's desk".into(), fetched: b, here: false },
         ]
     }
 
@@ -825,6 +853,8 @@ mod tests {
         assert!(matches!(fetched(Ok((200, healthy().to_string())), now), Fetched::Got(..)));
         assert_eq!(fetched(Ok((404, r#"{"error":"not found"}"#.into())), now), Fetched::Missing(Missing::NeedsUpdate));
         assert_eq!(fetched(Ok((502, "{}".into())), now), Fetched::Missing(Missing::OutOfReach));
+        assert_eq!(fetched(Ok((403, "{}".into())), now), Fetched::Missing(Missing::Refused));
+        assert_eq!(Missing::Refused.reason(), "Refused");
         assert_eq!(fetched(Err("refused".into()), now), Fetched::Missing(Missing::NotAnswering));
         assert_eq!(fetched(Ok((200, "not json".into())), now), Fetched::Missing(Missing::Unreadable));
         assert_eq!(Missing::NeedsUpdate.reason(), "Needs 0.9.4");
@@ -871,7 +901,9 @@ mod tests {
         assert_eq!(cell(&view, "Priority marks", 0).text, "On: input, sound in");
         assert_eq!(cell(&view, "Priority marks", 0).tooltip.as_deref(), Some("input: DSCP 56, qwave\nsound in: DSCP 56, qwave"));
         assert_eq!(cell(&view, "Buffer", 0).text, "42 ms now, 80 ms peak");
-        assert_eq!(cell(&view, "Lost / repaired / late", 0).text, "5 / 3 / 1 packets");
+        let missed = cell(&view, "Missed in time", 0);
+        assert_eq!(missed.text, "5 (3 repaired, 1 late)", "the repaired and the late are parts of the missed, not added to them");
+        assert!(missed.tooltip.as_deref().unwrap().starts_with("In the last 10 min, of 60000 packets received, 5 weren't there in time to play."));
         assert_eq!(cell(&view, "Own freezes", 0).text, "12 ms at worst");
         assert_eq!(cell(&view, "Control connection", 0).text, "Up");
         assert_eq!(cell(&view, "Version", 0).text, "0.9.4");
@@ -937,6 +969,7 @@ mod tests {
             [("11:59:31", "Link back after 1.5 s"), ("11:59:31", "Wi-Fi changed from Home Net to Office"), ("11:59:31", "Link dropped for 1.5 s \u{2014} Wi-Fi changed on Bread's desk")]
         );
         assert!(view.history[0][2].tooltip.starts_with("2025-11-11 11:59:31, 29 s ago\n"), "{}", view.history[0][2].tooltip);
+        assert!(view.history[1][0].tooltip.contains(" on ThinkPad's own clock"), "the other device's times are its own: {}", view.history[1][0].tooltip);
     }
 
     #[test]
@@ -1025,7 +1058,7 @@ mod tests {
         let (a, b) = (got(quiet, now), got(healthy(), now));
         let view = view(columns(&a, &b), now, 0);
         assert_eq!(cell(&view, "Buffer", 0).text, "No sound coming in");
-        assert_eq!(cell(&view, "Lost / repaired / late", 0).text, NONE);
+        assert_eq!(cell(&view, "Missed in time", 0).text, NONE);
     }
 
     #[test]
@@ -1046,6 +1079,7 @@ mod tests {
             ("one_way", serde_json::json!({"state": "on"}), "ThinkPad stopped hearing Bread's desk"),
             ("roam", serde_json::json!({"ssid": "Home Net", "from": "aa", "to": "bb"}), "Moved to another access point on Home Net"),
             ("asleep", serde_json::json!({"ms": 3_600_000, "how": "clock"}), "Bread's desk was asleep for 1 h"),
+            ("held_up", serde_json::json!({"ms": 6200, "how": "late"}), "mesh-kvm was held up on Bread's desk for 6.2 s"),
             ("suspend", serde_json::json!({}), "Bread's desk went to sleep"),
             ("resume", serde_json::json!({"how": "auto"}), "Bread's desk woke up"),
             ("restarting", serde_json::json!({"reason": "update"}), "mesh-kvm restarting to update"),
@@ -1078,7 +1112,9 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Needs 0.9.4")), "{text}");
         assert!(text.contains("HISTORY, BREAD'S DESK\n11:50:01  Link back after 1.0 s\n"), "{text}");
         assert!(text.contains("11:50:01  Link dropped for 1.0 s \u{2014} ThinkPad restarted"), "{text}");
-        assert!(text.contains("HISTORY, THINKPAD\nNothing yet\n"), "{text}");
+        assert!(text.contains("HISTORY, THINKPAD, times on its own clock\nNothing yet\n"), "{text}");
+        let last = lines.iter().find(|l| l.starts_with("Last drop ")).unwrap();
+        assert!(last.contains("10 min ago, for 1.0 s (2025-11-11 11:50:00)"), "the exact time goes with a relative one: {last}");
         assert!(lines.iter().all(|l| l.len() == l.trim_end().len()), "no trailing spaces");
     }
 }

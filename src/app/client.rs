@@ -32,8 +32,9 @@ const ONE_WAY_HOLD: Duration = Duration::from_secs(1);
 /// How long a setting's error stays under its row when no later change clears it.
 const ROW_ERROR_SHOWN: Duration = Duration::from_secs(10);
 const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
-/// The most often each device's connection details are asked for, while they're shown.
-pub const DETAILS_EVERY: Duration = Duration::from_secs(1);
+/// The most often this device's connection details are asked for while they're shown, and the
+/// other device's, which go over the link. Each ask waits for the one before it to come back.
+pub const DETAILS_EVERY: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 /// How often a details thread that isn't wanted looks whether the client has gone.
 const DETAILS_IDLE_CHECK: Duration = Duration::from_secs(1);
 
@@ -434,8 +435,9 @@ impl Drop for Client {
 }
 
 /// Asks for one device's connection details, here (`which` 0) or through the peer proxy, at most
-/// once each `DETAILS_EVERY` and only while they're wanted. The other device's thread can wait on
-/// a slow link without holding this device's up.
+/// once each `DETAILS_EVERY` and only while they're wanted. An ask that's slow to come back delays
+/// the next rather than adding to it, and the other device's thread can wait on a slow link
+/// without holding this device's up.
 fn poll_details(port: u16, which: usize, shared: &Shared, on_update: &dyn Fn()) {
     let path = if which == 0 { details::PATH.to_string() } else { format!("/api/peer{}", details::PATH) };
     loop {
@@ -457,12 +459,17 @@ fn poll_details(port: u16, which: usize, shared: &Shared, on_update: &dyn Fn()) 
         }
         let asked = Instant::now();
         let got = details::fetched(http_call_port(LOCALHOST, port, "GET", &path, ""), Instant::now());
-        // Hidden while this was asked: the answer isn't kept.
-        if *lock(&shared.details_wanted) {
+        // Hidden while this was asked: the answer isn't kept. The wish is held while the answer goes
+        // in, so a hide can't come between and leave it there to be shown stale.
+        let wanted = lock(&shared.details_wanted);
+        if *wanted {
             lock(&shared.details)[which] = got;
+            drop(wanted);
             on_update();
+        } else {
+            drop(wanted);
         }
-        let next = asked + DETAILS_EVERY;
+        let next = asked + DETAILS_EVERY[which];
         let wanted = lock(&shared.details_wanted);
         // Woken early only to be hidden, or to stop.
         let _ = shared.details_changed.wait_timeout_while(wanted, next.saturating_duration_since(Instant::now()), |w| {
@@ -1169,8 +1176,9 @@ mod tests {
         assert!(matches!(here, Fetched::Got(ref d, _) if d.version == "0.9.4"), "{here:?}");
         assert_eq!(peer, Fetched::Missing(details::Missing::NeedsUpdate), "an older device has no such path");
         std::thread::sleep(Duration::from_millis(1500));
-        let asked = asks_for_details(&log);
-        assert!(asked.iter().all(|n| (1..=2).contains(n)), "{asked:?} in 1.5 s");
+        let [here, peer] = asks_for_details(&log);
+        assert!((1..=2).contains(&here), "this device at most once a second: {here} in 1.5 s");
+        assert_eq!(peer, 1, "the other device at most once each 2 s");
         client.want_details(false);
         assert_eq!(client.details(), [Fetched::Waiting, Fetched::Waiting], "nothing is kept to show stale");
         std::thread::sleep(Duration::from_millis(100));

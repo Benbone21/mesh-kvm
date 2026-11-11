@@ -45,11 +45,12 @@ const UI_SCALE_KEY: &str = "ui_scale";
 const DETAILS_OPEN_KEY: &str = "details_open";
 /// How long Copy details says it copied.
 const COPIED_SHOWN: Duration = Duration::from_millis(1500);
-/// What the connection details may take of the height the window has left under the figures.
-const DETAILS_SHARE: f32 = 0.6;
 const DETAILS_MIN_HEIGHT: f32 = 120.0;
-/// What the connection details leave the settings and the layout at least.
-const BODY_KEPT: f32 = 80.0;
+/// What the connection details leave the settings and the layout at least, however far they
+/// are dragged: enough for several settings rows and the screens on the canvas.
+const BODY_KEPT: f32 = 260.0;
+/// The least height the details get in a panel of their own; with less room they go in the body.
+const DETAILS_PANEL_LEAST: f32 = 200.0;
 const DEFAULT_UI_SCALE: f32 = 1.0;
 /// How far the window's own zoom has to move before it changes, so a resize doesn't flicker.
 const ZOOM_SLACK: f32 = 0.04;
@@ -379,17 +380,25 @@ impl Window {
         let (view, names) = self.details_view(snapshot, now);
         let screen = ctx.screen_rect();
         let layout = view::frame_layout(screen.width(), screen.height());
-        let in_body = layout.stacked || layout.body_scrolls;
+        // A panel of their own has to leave the body its room and still be worth having; where
+        // it can't, the details go at the top of the body, which then scrolls as a whole.
+        let room = ctx.available_rect().height();
+        let in_body = layout.stacked || layout.body_scrolls || room - BODY_KEPT < DETAILS_PANEL_LEAST;
         if open && !in_body {
-            let room = ctx.available_rect().height();
             let most = (room - BODY_KEPT).max(DETAILS_MIN_HEIGHT);
             let frame = Frame::new().fill(SURFACE).inner_margin(Margin { left: SPACE_5 as i8, right: SPACE_5 as i8, top: SPACE_3 as i8, bottom: 0 });
+            // Its height can be dragged at its lower edge, and egui remembers it with the window.
             egui::TopBottomPanel::top("details")
                 .frame(frame)
-                .resizable(false)
-                .exact_height((room * DETAILS_SHARE).clamp(DETAILS_MIN_HEIGHT, most))
+                .resizable(true)
+                .default_height(most)
+                .height_range(DETAILS_MIN_HEIGHT..=most)
                 .show(ctx, |ui| {
-                    ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| details_panel::body(ui, &view, &names));
+                    let shape = details_panel::shape(ui.available_width());
+                    details_panel::header(ui, &view, &names, shape);
+                    ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
+                        details_panel::content(ui, &view, &names, shape, false)
+                    });
                 });
         }
         match asked {
@@ -417,8 +426,8 @@ impl Window {
         }
         let names = snapshot.in_order().map(|device| snapshot.title(device));
         let columns = [
-            Column { name: names[0].clone(), other: names[1].clone(), fetched: &fetched[0] },
-            Column { name: names[1].clone(), other: names[0].clone(), fetched: &fetched[1] },
+            Column { name: names[0].clone(), other: names[1].clone(), fetched: &fetched[0], here: true },
+            Column { name: names[1].clone(), other: names[0].clone(), fetched: &fetched[1], here: false },
         ];
         let offset = crate::linklog::utc_offset_s(crate::linklog::wall_ms());
         (details::view(columns, now, offset), names)
@@ -861,7 +870,7 @@ impl Window {
                     });
                 });
             });
-        } else if frame.body_scrolls {
+        } else if frame.body_scrolls || details.is_some() {
             // Too short for the table to scroll beside a squashed canvas, so both scroll together.
             // The canvas keeps the visible height, so its screens stay in view at the top.
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
@@ -1041,7 +1050,9 @@ fn details_in_body(ui: &mut Ui, details: Option<&(details::DetailsView, [String;
     let frame = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
     frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        details_panel::body(ui, view, names);
+        let shape = details_panel::shape(ui.available_width());
+        details_panel::header(ui, view, names, shape);
+        details_panel::content(ui, view, names, shape, true);
     });
     let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(rule, 0.0, LINE);
@@ -1216,6 +1227,76 @@ mod tests {
         let named = |label: &str| update.nodes.iter().find(|(_, n)| n.label() == Some(label)).map(|(_, n)| n.value().map(str::to_string));
         assert_eq!(named("Round trip, last 10 s, debian-host"), Some(Some(details::NONE.to_string())), "{:?}", update.nodes.len());
         assert!(named("Version, windows-host").is_some());
+    }
+
+    #[test]
+    fn open_details_leave_the_settings_and_the_screens_room() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        // The hint a Windows copy run from elsewhere shows would take the room this needs.
+        window.not_installed = false;
+        for _ in 0..4 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        }
+        let screen = ctx.screen_rect();
+        let first_row = ctx.read_response(cell_id("Share mouse", 0)).unwrap().rect;
+        assert!(screen.bottom() - first_row.top() >= 6.0 * 26.0, "room for six settings rows, from {first_row:?}");
+        for device in Device::BOTH {
+            let tile = ctx.read_response(monitor_id(device, 0)).unwrap().rect;
+            assert!(tile.bottom() <= screen.bottom() && tile.top() >= first_row.top() - 60.0, "{device:?} {tile:?}");
+        }
+        // Too short for both: the details go at the top of the body, and the screens keep about the
+        // size they have with the details closed (the body's scroll bar takes a little).
+        let tiles = |open: bool| {
+            let (ctx, mut window, s) = (context(), self::window(), linked());
+            window.details_open = open;
+            for _ in 0..4 {
+                frame(&ctx, &mut window, &s, [900.0, 600.0], vec![], Instant::now());
+            }
+            Device::BOTH.map(|device| ctx.read_response(monitor_id(device, 0)).unwrap().rect.size())
+        };
+        for (open, closed) in tiles(true).into_iter().zip(tiles(false)) {
+            assert!(open.x >= closed.x * 0.9 && open.y >= closed.y * 0.9, "{open:?} against {closed:?}");
+        }
+    }
+
+    #[test]
+    fn the_device_names_stay_put_while_the_details_scroll() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        // The hint a Windows copy run from elsewhere shows would take the room this needs.
+        window.not_installed = false;
+        for _ in 0..3 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        }
+        let name = |ctx: &egui::Context| ctx.read_response(egui::Id::new(("details header", 0usize, 0usize))).unwrap().rect;
+        let value = |ctx: &egui::Context| ctx.read_response(details_panel::cell_id("Round trip, last 10 s", 0)).unwrap().rect;
+        let (name_before, value_before) = (name(&ctx), value(&ctx));
+        let inside = value_before.center();
+        let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -120.0), modifiers: Modifiers::NONE };
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![Event::PointerMoved(inside), wheel], Instant::now());
+        for _ in 0..3 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        }
+        assert!(value(&ctx).top() < value_before.top() - 50.0, "it scrolled: {value_before:?} to {:?}", value(&ctx));
+        assert_eq!(name(&ctx), name_before);
+    }
+
+    #[test]
+    fn each_detail_can_take_the_keyboard_and_says_more_to_a_screen_reader() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        ctx.enable_accesskit();
+        for _ in 0..2 {
+            frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now());
+        }
+        let update = frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now()).platform_output.accesskit_update.unwrap();
+        let node = update.nodes.iter().find(|(_, n)| n.label() == Some("Varies by, last 10 s, debian-host")).map(|(_, n)| n.clone()).unwrap();
+        assert!(node.description().is_some_and(|d| d.contains("jitter")), "{:?}", node.description());
+        let id = details_panel::cell_id("Varies by, last 10 s", 0);
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now());
+        assert!(ctx.memory(|m| m.has_focus(id)), "a detail can hold the keyboard");
     }
 
     #[test]
