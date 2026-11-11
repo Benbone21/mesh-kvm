@@ -1011,6 +1011,17 @@ fn mono_us() -> i64 {
     clock_now_us(libc::CLOCK_MONOTONIC)
 }
 
+/// When the kernel says a movement happened, on the clock positions are timed by, so that a late
+/// read of the mouse doesn't make movement KWin already showed look newer than its position. A
+/// device that isn't on the monotonic clock, or a time from the future, goes by `now_us`.
+fn motion_time_us(clock: libc::clockid_t, event_us: i64, now_us: i64) -> i64 {
+    if clock == libc::CLOCK_MONOTONIC && event_us > 0 {
+        event_us.min(now_us)
+    } else {
+        now_us
+    }
+}
+
 fn wall_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1831,7 +1842,8 @@ pub fn run_debian_node(
                                 }
                                 // Movement the laptop got didn't move this cursor.
                                 if !forwarded {
-                                    core.backend.track.moved(mono_us(), acc_dx, acc_dy);
+                                    let at = motion_time_us(core.backend.mice[i].clock, event_time_us(ev), mono_us());
+                                    core.backend.track.moved(at, acc_dx, acc_dy);
                                 }
                                 core.push_edge(&cfg_snapshot, acc_dx, acc_dy, false);
                                 acc_dx = 0;
@@ -1952,6 +1964,15 @@ mod tests {
         assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: None, bad_stamp: true }]);
         let lines = [UPDATE, "   int32 1", "   int32 2", "   int32 0", "   int32 78", "   int32 734568123"];
         assert_eq!(lines.iter().filter_map(|l| r.feed(l)).next().map(|g| (g.kwin_ms, g.bad_stamp)), Some((Some(734_568_123), false)));
+    }
+
+    #[test]
+    fn movement_is_timed_when_the_kernel_saw_it() {
+        // Read 40 ms late after a stall, it is still 40 ms old.
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 1_000_000, 1_040_000), 1_000_000);
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 2_000_000, 1_040_000), 1_040_000, "never from the future");
+        assert_eq!(motion_time_us(libc::CLOCK_REALTIME, 1_000_000, 1_040_000), 1_040_000);
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 0, 1_040_000), 1_040_000);
     }
 
     #[test]
