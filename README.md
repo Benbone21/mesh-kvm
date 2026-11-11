@@ -108,7 +108,7 @@ Each device has its own audio controls, and sound can go both ways at once.
 
 ### Upgrading from 0.9.0 or 0.9.1
 
-Those versions could send a microphone, and gave each device a way to use the other one's: on Debian a mic and speakers in the sound settings, on the laptop a virtual cable you installed. That is gone. When mesh-kvm starts on Debian, it takes away any mic and speakers those versions left in the sound settings, and an app that was using them goes back to a real device. A virtual cable on the laptop is left installed, and is listed like any other device. A microphone chosen in those versions is forgotten, and the rest of the settings are kept. Audio packets are still version 3, so sound goes both ways with a device on 0.9.0 or 0.9.1 while the two are updated one at a time, and a microphone such a device still sends is ignored.
+Earlier versions could send a microphone, and 0.9.0 and 0.9.1 also gave each device a way to use the other one's: on Debian a mic and speakers in the sound settings, on the laptop a virtual cable you installed. That is gone. When mesh-kvm starts on Debian, it takes away any mic and speakers those versions left in the sound settings, and an app that was using them goes back to a real device. A virtual cable on the laptop is left installed, and is listed like any other device. A microphone chosen in those versions is forgotten, and the rest of the settings are kept. Audio packets are still version 3, so sound goes both ways with a device on 0.9.0 or 0.9.1 while the two are updated one at a time, and a microphone such a device still sends is ignored.
 
 ### Play only on the other device
 
