@@ -1,3 +1,5 @@
+Withdrawn in 0.9.2: microphone sharing and the virtual devices were removed.
+
 # Virtual mics and speakers for the other device
 
 ## What it's for

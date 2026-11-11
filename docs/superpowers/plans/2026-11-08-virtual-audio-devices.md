@@ -1,3 +1,5 @@
+Withdrawn in 0.9.2: microphone sharing and the virtual devices were removed.
+
 # Virtual Mics and Speakers Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
