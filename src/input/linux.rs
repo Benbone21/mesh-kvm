@@ -862,14 +862,54 @@ pub fn detect_screen_dimensions() -> (i32, i32) {
 /// The KWin script that reports the cursor. Each position goes out with a number and the time KWin
 /// took it, so the receiver can tell how old it is. They go out at most once every `SEND_GAP_MS`,
 /// the latest one always going out at the end of the gap, so that nothing queues up behind a fast
-/// mouse. A KWin without `QTimer` gets the older way: every move near an edge, and every 12 ms
-/// elsewhere.
+/// mouse. Within `NEAR` px of an outer edge of the desktop (one with no screen beyond it) the
+/// position also goes out every `BEAT_MS` while the cursor stands still, as a push against the
+/// edge moves nothing and would otherwise wait for a wiggle. Away from the edges that heartbeat
+/// doesn't run. A KWin without `QTimer` gets the older way: every move near an edge, and every
+/// 12 ms elsewhere. `tests/kwin_script_sim.js` plays the script against stand-ins for KWin.
 const KWIN_SCRIPT: &str = r#"
 var SEND_GAP_MS = 2;
+var NEAR = 16;
+var BEAT_MS = 16;
 var lastEmit = 0;
 var seq = 0;
 var waiting = false;
 var timer = null;
+var beat = null;
+function screenList() {
+    var list = workspace.screens;
+    return list ? list : [];
+}
+function onScreen(x, y) {
+    var list = screenList();
+    for (var i = 0; i < list.length; i++) {
+        var g = list[i].geometry;
+        if (x >= g.x && x < g.x + g.width && y >= g.y && y < g.y + g.height) return true;
+    }
+    return false;
+}
+function nearOuterEdge(x, y) {
+    var list = screenList();
+    for (var i = 0; i < list.length; i++) {
+        var g = list[i].geometry;
+        if (x < g.x || x >= g.x + g.width || y < g.y || y >= g.y + g.height) continue;
+        if (y - g.y < NEAR && !onScreen(x, g.y - 1)) return true;
+        if (g.y + g.height - 1 - y < NEAR && !onScreen(x, g.y + g.height)) return true;
+        if (x - g.x < NEAR && !onScreen(g.x - 1, y)) return true;
+        if (g.x + g.width - 1 - x < NEAR && !onScreen(g.x + g.width, y)) return true;
+    }
+    return false;
+}
+function followBeat() {
+    if (beat === null) return;
+    var p = workspace.cursorPos;
+    var near = nearOuterEdge(Math.round(p.x), Math.round(p.y));
+    if (near && !beat.active) {
+        beat.start();
+    } else if (!near && beat.active) {
+        beat.stop();
+    }
+}
 function isGameWindow() {
     var w = workspace.activeWindow;
     if (!w) return 0;
@@ -901,10 +941,23 @@ try {
     timer.singleShot = true;
     timer.interval = SEND_GAP_MS;
     timer.timeout.connect(function() { waiting = false; send(); });
+    beat = new QTimer();
+    beat.singleShot = false;
+    beat.interval = BEAT_MS;
+    beat.timeout.connect(function() {
+        var p = workspace.cursorPos;
+        if (nearOuterEdge(Math.round(p.x), Math.round(p.y))) {
+            send();
+        } else {
+            beat.stop();
+        }
+    });
 } catch (e) {
     timer = null;
+    beat = null;
 }
 function emitPos(force) {
+    followBeat();
     var now = Date.now();
     if (timer === null) {
         var p = workspace.cursorPos;
