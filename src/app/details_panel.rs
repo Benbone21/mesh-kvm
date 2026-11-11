@@ -271,10 +271,10 @@ fn more_about(cell: &DetailCell, cut: bool, hint: Option<&str>) -> Option<String
 }
 
 /// One value's place: named for a screen reader as its row and device, with what its tooltip says
-/// as its description, and reachable from the keyboard as the settings table's cells are. The
-/// tooltip shows while it has the keyboard, too.
+/// as its description, and reachable from the keyboard while a screen reader is on. The tooltip
+/// shows while it has the keyboard, too.
 fn value(ui: &mut Ui, cell: &DetailCell, cut: bool, rect: Rect, id: Id, spoken: &str, hint: Option<&str>) {
-    let response = ui.interact(rect, id, Sense::focusable_noninteractive());
+    let response = ui.interact(rect, id, reading_sense(ui, id));
     response.widget_info(|| WidgetInfo {
         label: Some(spoken.to_string()),
         current_text_value: Some(cell.text.clone()),
@@ -284,6 +284,17 @@ fn value(ui: &mut Ui, cell: &DetailCell, cut: bool, rect: Rect, id: Id, spoken: 
     focus_ring(ui, &response);
     if let Some(more) = more_about(cell, cut, hint) {
         describe(ui, &response, &more);
+    }
+}
+
+/// A value or a history line takes the keyboard only while a screen reader is reading the window,
+/// as egui's own labels do, so that the figures don't stand between Tab and the settings.
+fn reading_sense(ui: &Ui, id: Id) -> Sense {
+    let reading = ui.memory(|m| m.options.screen_reader) || ui.ctx().accesskit_node_builder(id, |_| ()).is_some();
+    if reading {
+        Sense::focusable_noninteractive()
+    } else {
+        Sense::hover()
     }
 }
 
@@ -343,7 +354,7 @@ fn history_line(ui: &mut Ui, entry: &HistoryLine, at: Pos2, column: f32, id: Id,
     let time_y = rect.top() + SPACE_1 + (first_line - time.size().y) / 2.0;
     ui.painter().galley(Pos2::new(rect.left(), time_y), time, TEXT_DIM);
     ui.painter().galley(Pos2::new(rect.left() + TIME_WIDTH, rect.top() + SPACE_1), words, tone(entry.tone));
-    let response = ui.interact(rect, id, Sense::focusable_noninteractive());
+    let response = ui.interact(rect, id, reading_sense(ui, id));
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, format!("{device}, {}, {}", entry.time, entry.text)));
     focus_ring(ui, &response);
     describe(ui, &response, &entry.tooltip);

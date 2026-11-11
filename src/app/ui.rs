@@ -49,8 +49,6 @@ const DETAILS_MIN_HEIGHT: f32 = 120.0;
 /// What the connection details leave the settings and the layout at least, however far they
 /// are dragged: enough for several settings rows and the screens on the canvas.
 const BODY_KEPT: f32 = 260.0;
-/// The least height the details get in a panel of their own; with less room they go in the body.
-const DETAILS_PANEL_LEAST: f32 = 200.0;
 const DEFAULT_UI_SCALE: f32 = 1.0;
 /// How far the window's own zoom has to move before it changes, so a resize doesn't flicker.
 const ZOOM_SLACK: f32 = 0.04;
@@ -378,12 +376,11 @@ impl Window {
         let mut asked = None;
         egui::TopBottomPanel::top("details bar").frame(strip).show(ctx, |ui| asked = details_panel::bar(ui, open, copied));
         let (view, names) = self.details_view(snapshot, now);
-        let screen = ctx.screen_rect();
-        let layout = view::frame_layout(screen.width(), screen.height());
-        // A panel of their own has to leave the body its room and still be worth having; where
-        // it can't, the details go at the top of the body, which then scrolls as a whole.
+        // A panel of their own is used whenever one of at least `DETAILS_MIN_HEIGHT` leaves the body
+        // its room. Where it can't, the details go after the settings and the layout, at the end of
+        // a body that then scrolls as a whole.
         let room = ctx.available_rect().height();
-        let in_body = layout.stacked || layout.body_scrolls || room - BODY_KEPT < DETAILS_PANEL_LEAST;
+        let in_body = room - BODY_KEPT < DETAILS_MIN_HEIGHT;
         if open && !in_body {
             let most = (room - BODY_KEPT).max(DETAILS_MIN_HEIGHT);
             let frame = Frame::new().fill(SURFACE).inner_margin(Margin { left: SPACE_5 as i8, right: SPACE_5 as i8, top: SPACE_3 as i8, bottom: 0 });
@@ -860,7 +857,6 @@ impl Window {
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
                 ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    details_in_body(ui, details);
                     settings.show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         requests = draw_table(ui);
@@ -868,6 +864,7 @@ impl Window {
                     ui.allocate_ui(vec2(ui.available_width(), view::STACKED_CANVAS_HEIGHT), |ui| {
                         Frame::new().inner_margin(CANVAS_MARGIN).show(ui, |ui| canvas.show(ui, layout, snapshot, now));
                     });
+                    details_in_body(ui, details);
                 });
             });
         } else if frame.body_scrolls || details.is_some() {
@@ -877,7 +874,6 @@ impl Window {
                 let visible = ui.available_height();
                 ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    details_in_body(ui, details);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let size = vec2(frame.settings_width, 0.0);
@@ -893,6 +889,7 @@ impl Window {
                             Frame::new().inner_margin(CANVAS_MARGIN).show(ui, |ui| canvas.show(ui, layout, snapshot, now));
                         });
                     });
+                    details_in_body(ui, details);
                 });
             });
         } else {
@@ -1044,9 +1041,12 @@ impl Window {
     }
 }
 
-/// The connection details at the top of a body that scrolls as a whole, ruled off from what follows.
+/// The connection details at the end of a body that scrolls as a whole, ruled off from what is
+/// before them.
 fn details_in_body(ui: &mut Ui, details: Option<&(details::DetailsView, [String; 2])>) {
     let Some((view, names)) = details else { return };
+    let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rule, 0.0, LINE);
     let frame = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
     frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1054,8 +1054,6 @@ fn details_in_body(ui: &mut Ui, details: Option<&(details::DetailsView, [String;
         details_panel::header(ui, view, names, shape);
         details_panel::content(ui, view, names, shape, true);
     });
-    let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rule, 0.0, LINE);
 }
 
 /// A dialog's time left: a `COUNTDOWN_HEIGHT` bar, `accent` for the `share` still to go.
@@ -1245,8 +1243,8 @@ mod tests {
             let tile = ctx.read_response(monitor_id(device, 0)).unwrap().rect;
             assert!(tile.bottom() <= screen.bottom() && tile.top() >= first_row.top() - 60.0, "{device:?} {tile:?}");
         }
-        // Too short for both: the details go at the top of the body, and the screens keep about the
-        // size they have with the details closed (the body's scroll bar takes a little).
+        // At 900×600 a 120 px panel still leaves the body 260 px, and the screens keep about the
+        // size they have with the details closed.
         let tiles = |open: bool| {
             let (ctx, mut window, s) = (context(), self::window(), linked());
             window.details_open = open;
@@ -1296,7 +1294,33 @@ mod tests {
         let id = details_panel::cell_id("Varies by, last 10 s", 0);
         ctx.memory_mut(|m| m.request_focus(id));
         frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now());
-        assert!(ctx.memory(|m| m.has_focus(id)), "a detail can hold the keyboard");
+        assert!(ctx.memory(|m| m.has_focus(id)), "a detail can hold the keyboard for a screen reader");
+    }
+
+    #[test]
+    fn without_a_screen_reader_tab_goes_from_the_details_bar_to_the_settings() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        window.not_installed = false;
+        for _ in 0..2 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        }
+        let id = details_panel::cell_id("Varies by, last 10 s", 0);
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        assert!(!ctx.memory(|m| m.has_focus(id)), "a figure isn't a stop for Tab");
+        // From the bar's toggle, Tab soon reaches the first setting, with no figure on the way.
+        ctx.memory_mut(|m| m.request_focus(details_panel::toggle_id()));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let mut stops = Vec::new();
+        for _ in 0..6 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![key(egui::Key::Tab, Modifiers::NONE)], Instant::now());
+            stops.push(ctx.memory(|m| m.focused()));
+        }
+        // Copy details, then egui's own drag handle and scroll bar for the panel, then the first setting.
+        let share = stops.iter().position(|f| *f == Some(cell_id("Share mouse", 0)));
+        assert!(share.is_some_and(|at| at <= 3), "{stops:?}");
     }
 
     #[test]
