@@ -9,14 +9,78 @@
 //! with both the position and the estimate on the span. Otherwise the push waits for the next
 //! position, which comes within a few milliseconds of any movement.
 //!
-//! Pure: times are microseconds on one monotonic clock, passed in.
+//! Both devices also wait a moment after control arrives before a push can cross back: see
+//! `Settle`.
+//!
+//! Pure: times are passed in, positions' in microseconds on one monotonic clock.
+
+use crate::spatial::SHARED_EDGE_INSET;
 
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use position::*;
 
+/// What became of a push that has pushed enough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The position is too old to go by. The push waits for a newer one.
+    Stale,
+    /// In the guard strip at the end of the span, beside a monitor that doesn't cross.
+    Guard,
+    /// Too soon after control arrived. The push starts again.
+    Settle,
+    /// The estimate has left the span.
+    OffSpan,
+}
+
+/// How long after control arrives a push can't cross back, at most.
+pub const SETTLE_MS: u64 = 250;
+/// And at least, once the cursor has been well away from the edge.
+pub const SETTLE_FLOOR_MS: u64 = 60;
+/// How much further from the edge than where it came in the cursor has to have been for a push
+/// back to be meant.
+pub const SETTLE_CLEAR: i32 = 12;
+
+/// The wait after control arrives before a push can cross back, so that a hand still moving
+/// doesn't bounce the cursor straight back. It ends at `SETTLE_MS`, or at `SETTLE_FLOOR_MS` once
+/// the cursor has been `SETTLE_CLEAR` further in than it came in, so a quick return that was meant
+/// isn't held up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settle {
+    since_ms: Option<u64>,
+    cleared: bool,
+}
+
+impl Settle {
+    pub const fn new() -> Self {
+        Self { since_ms: None, cleared: false }
+    }
+
+    /// Control arrived at `now_ms`.
+    pub fn arrived(&mut self, now_ms: u64) {
+        self.since_ms = Some(now_ms);
+        self.cleared = false;
+    }
+
+    /// The cursor is `distance` pixels in from the shared edge, if it is over a monitor.
+    pub fn observe(&mut self, distance: Option<i32>) {
+        if distance.is_some_and(|d| d >= SHARED_EDGE_INSET + SETTLE_CLEAR) {
+            self.cleared = true;
+        }
+    }
+
+    /// How much longer a push has to wait, or 0.
+    pub fn left_ms(&self, now_ms: u64) -> u64 {
+        let Some(since) = self.since_ms else { return 0 };
+        let wait = if self.cleared { SETTLE_FLOOR_MS } else { SETTLE_MS };
+        wait.saturating_sub(now_ms.saturating_sub(since))
+    }
+}
+
+
 /// Debian's side: only Debian's positions come late.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod position {
+    use super::Refusal;
     use crate::protocol::MonitorRect;
     use std::collections::VecDeque;
 
@@ -108,17 +172,6 @@ mod position {
         /// The movement since `sample`, in raw counts.
         pub moved: (i32, i32),
         pub trust: Trust,
-    }
-
-    /// What became of a push that has pushed enough.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Refusal {
-        /// The position is too old to go by. The push waits for a newer one.
-        Stale,
-        /// In the guard strip at the end of the span, beside a monitor that doesn't cross.
-        Guard,
-        /// The estimate has left the span.
-        OffSpan,
     }
 
     /// Whether a completed push crosses, and at which point.
@@ -277,6 +330,29 @@ mod tests {
         let mut t = CursorTrack::new(0, (3200, 720));
         t.heard(s);
         t
+    }
+
+    #[test]
+    fn the_settle_ends_at_250_ms_or_once_the_cursor_has_been_away_from_the_edge_and_after_60() {
+        let mut settle = Settle::new();
+        assert_eq!(settle.left_ms(0), 0, "nothing arrived yet");
+        settle.arrived(1000);
+        assert_eq!(settle.left_ms(1000), SETTLE_MS);
+        assert_eq!(settle.left_ms(1100), 150);
+        assert_eq!(settle.left_ms(1250), 0);
+        // Into the screen 12 px past where it came in, at 24 from the edge, and back.
+        settle.arrived(2000);
+        settle.observe(Some(SHARED_EDGE_INSET + SETTLE_CLEAR - 1));
+        assert_eq!(settle.left_ms(2100), 150, "23 px isn't away");
+        settle.observe(Some(SHARED_EDGE_INSET + SETTLE_CLEAR));
+        settle.observe(Some(0));
+        assert_eq!(settle.left_ms(2059), 1, "60 ms at least");
+        assert_eq!(settle.left_ms(2060), 0);
+        // Each arrival starts again.
+        settle.arrived(3000);
+        assert_eq!(settle.left_ms(3100), 150);
+        settle.observe(None);
+        assert_eq!(settle.left_ms(3100), 150);
     }
 
     #[test]

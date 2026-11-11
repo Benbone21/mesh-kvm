@@ -1089,9 +1089,6 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
 const DEBIAN: DeviceId = NodeId::Debian as DeviceId;
 const WINDOWS: DeviceId = NodeId::Windows as DeviceId;
 
-/// Time after any focus change during which Debian's edges cannot be crossed.
-const EDGE_SETTLE: Duration = Duration::from_millis(250);
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hotkey {
     ManualSwitch,
@@ -1347,7 +1344,6 @@ struct Core<'a> {
     router: Router,
     backend: LinuxBackend,
     peer: UdpPeer<'a>,
-    last_focus_change: Instant,
     edge: EdgeWatch,
     /// A push that completed and waits for a position to confirm it.
     holding: Option<Held>,
@@ -1361,8 +1357,7 @@ impl Core<'_> {
         apply(&actions, &mut self.backend, &mut self.peer);
         let after = self.router.active();
         if after != before {
-            self.last_focus_change = Instant::now();
-            self.edge.reset();
+            self.edge.arrived(self.peer.now_ms());
             self.holding = None;
             let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
             println!("[Debian] Focus switched to {name}");
@@ -1377,8 +1372,7 @@ impl Core<'_> {
         let can_cross = self.router.online()
             && !self.router.panicked()
             && !self.router.captive()
-            && self.router.active() == DEBIAN
-            && self.last_focus_change.elapsed() >= EDGE_SETTLE;
+            && self.router.active() == DEBIAN;
         if !can_cross {
             self.holding = None;
             return;
@@ -1390,6 +1384,10 @@ impl Core<'_> {
         }
         let held = self.backend.any_button_held();
         if !self.edge.press(monitors, here.sample, (dx, dy), held) {
+            self.holding = None;
+            return;
+        }
+        if self.edge.too_soon(self.peer.now_ms()) {
             self.holding = None;
             return;
         }
@@ -1520,7 +1518,6 @@ pub fn run_debian_node(
             motion: MotionBatch::default(),
             clock,
         },
-        last_focus_change: Instant::now() - EDGE_SETTLE,
         edge: EdgeWatch::new(),
         holding: None,
     };

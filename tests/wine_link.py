@@ -775,6 +775,25 @@ def input_checks(peer, inbox):
     corner = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
     check("one monitor has no guard strip: a push at the very end of the span crosses", corner is not None,
           str(corner and corner[1]))
+
+    # n. Pushed straight back at the edge it came in by, the cursor stays for the settle. Gone 30 px
+    # in first, a quick return is meant, and crosses back well inside the settle's 250 ms: every
+    # push below is over 150 ms after control arrived.
+    def arrive_then(moves):
+        peer.drive_to_debian()
+        inbox.clear()
+        peer.send(heartbeat())
+        peer.send(focus_switch_at(WINDOWS, 12, 300))
+        peer.send(active_view(WINDOWS))
+        start = time.time()
+        for at, dx in moves:
+            time.sleep(max(0.0, start + at - time.time()))
+            peer.send(mouse_move(dx, 0))
+        return inbox.wait_for(FOCUS_SWITCH_AT, 0.6, lambda f: f["target"] == DEBIAN)
+    bounced = arrive_then([(0.03 + 0.02 * i, -100) for i in range(7)])
+    check("pushed straight back at the edge it came in by, the cursor doesn't bounce back", bounced is None)
+    quick = arrive_then([(0.03, 30)] + [(0.08 + 0.02 * i, -100) for i in range(4)])
+    check("a quick return 30 px in and back crosses inside the 250 ms settle", quick is not None)
     return crossing
 
 
@@ -2036,7 +2055,7 @@ def test(exe_path, linux_path):
             # column at 2559, and the laptop still sits where the fresh layout put it.
             fields = crossing[1]
             check("the crossing lands on Debian's own monitor, in from the edge",
-                  fields["x"] == 2559 - 28, str(fields))
+                  fields["x"] == 2559 - 12, str(fields))
         keyboard_checks(peer, inbox, exe)
         link_state_checks(peer, inbox)
         dropout_checks(peer, inbox)

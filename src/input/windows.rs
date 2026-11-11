@@ -10,7 +10,7 @@ use crate::protocol::{
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Routed, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::Channel;
-use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, SharedSpatialState};
+use crate::spatial::{take_studio_requests, EdgeWatch, MonitorRect, Push, SharedSpatialState};
 use std::net::{SocketAddr, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
@@ -65,8 +65,6 @@ const PEER: DeviceId = NodeId::Debian as DeviceId;
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// Heartbeats go out every this many ticks, which is 400 ms.
 const TICKS_PER_HEARTBEAT: u32 = 4;
-/// How long after a focus change the cursor must wait before it can cross back.
-const EDGE_SETTLE_MS: u64 = 250;
 /// Receive poll gaps. The socket is non-blocking, and a laptop on battery has no peer to hurry for.
 const RX_IDLE_LINKED: Duration = Duration::from_millis(1);
 const RX_IDLE_ALONE: Duration = Duration::from_millis(10);
@@ -113,7 +111,6 @@ static MOUSE_PINNED: AtomicBool = AtomicBool::new(false);
 /// Last known cursor position, clamped to the screen.
 static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
-static FOCUS_CHANGED_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic on purpose: with the wall clock, a backwards jump (NTP resync after waking away
 /// from home) makes the peer look online until the clock catches up, swallowing the keyboard.
@@ -195,7 +192,7 @@ fn clamp_to_desktop(pt: (i32, i32)) -> (i32, i32) {
 /// actions, and the last event's `swallow`. A poisoned router swallows nothing and does nothing.
 fn route_events(events: &[Event]) -> Routed {
     let mut routed = Routed::default();
-    {
+    let changed = {
         let Some(mut router) = win_logic::lock_live(router_lock()) else {
             return Routed::default();
         };
@@ -205,9 +202,11 @@ fn route_events(events: &[Event]) -> Routed {
             routed.swallow = step.swallow;
             routed.actions.extend(step.actions);
         }
-        if router.active() != before {
-            FOCUS_CHANGED_MS.store(now_ms(), Ordering::SeqCst);
-        }
+        router.active() != before
+    };
+    // Outside the router's lock, which `push_edge` never holds while it has the edge's.
+    if changed {
+        edge_state().arrived(now_ms());
     }
     apply(&routed.actions, &mut WindowsBackend, &mut UdpPeer);
     let may_have_raced = routed.actions.iter().any(|a| {
@@ -536,18 +535,16 @@ fn push_edge(x: i32, y: i32, dx: i32, dy: i32, from_peer: bool) -> bool {
         let router = router();
         router.online() && !router.panicked() && !router.captive() && router.active() == ME
     };
-    let settled =
-        now_ms().saturating_sub(FOCUS_CHANGED_MS.load(Ordering::SeqCst)) >= EDGE_SETTLE_MS;
-    if !may_cross || !settled {
+    if !may_cross {
         return false;
     }
     let buttons_held = BUTTONS_HELD_MASK.load(Ordering::SeqCst) != 0
         || LOCAL_BUTTONS_MASK.load(Ordering::SeqCst) != 0;
-    let pushed_through = {
+    let push = {
         let monitors = monitors();
-        edge_state().cross(&monitors, (x, y), (dx, dy), buttons_held)
+        edge_state().cross(&monitors, (x, y), (dx, dy), buttons_held, now_ms())
     };
-    if !pushed_through {
+    if push != Push::Crossed {
         return false;
     }
     // Where the cursor lands. If the layout is busy, the next push crosses instead.
