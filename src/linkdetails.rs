@@ -26,6 +26,9 @@ const KEPT_EVENTS: usize = 20;
 const NEAR_MS: i64 = 3000;
 /// The longest a drop that's back waits for the other device's process to be looked at.
 const DECIDE_WAIT_MS: i64 = 5000;
+/// A drop settled without that answer is asked about this often, for this long.
+const UNCHECKED_ASK_EVERY_MS: i64 = 10_000;
+const UNCHECKED_ASKED_FOR_MS: i64 = 120_000;
 const CLUES_KEPT: usize = 64;
 const DAY_MS: i64 = 86_400_000;
 
@@ -53,7 +56,11 @@ pub fn peer_seen(at_ms: i64, peer: Option<Identity>) {
 /// How often to ask the other device which process it runs, while that's wanted: often while a
 /// drop that's back waits on it, and now and then while it has never answered.
 pub fn peer_wanted() -> Option<std::time::Duration> {
-    store().peer_wanted()
+    let now = crate::linklog::wall_ms();
+    let mut store = store();
+    store.decide(now);
+    store.give_up(now);
+    store.peer_wanted(now)
 }
 
 /// The API's answer for `path`, if it is this one.
@@ -213,6 +220,21 @@ struct Drop {
     /// The other device has answered since the link came back.
     #[serde(skip)]
     peer_checked: bool,
+    /// `peer_before` is from before an earlier drop that was never checked, so a change can't be
+    /// put down to this drop alone.
+    #[serde(skip)]
+    peer_carried: bool,
+}
+
+/// A drop settled without the other device's answer.
+#[derive(Debug, Clone, PartialEq)]
+struct Unchecked {
+    id: u64,
+    /// The process before the drop.
+    before: Identity,
+    /// That process was from before an earlier drop that was never checked either.
+    carried: bool,
+    settled_ms: i64,
 }
 
 /// Something this device logged that can explain a drop, and the span it covers.
@@ -287,9 +309,9 @@ struct Store {
     control: Control,
     peer: Option<Identity>,
     peer_answered: bool,
-    /// A drop settled before the other device said which process it runs, and the process it
-    /// ran before: a late answer can still show it restarted.
-    unchecked: Option<(u64, Identity)>,
+    /// A drop settled before the other device said which process it runs: a late answer can
+    /// still show it restarted.
+    unchecked: Option<Unchecked>,
     /// The Wi-Fi network as the `net` lines last said, `None` until one has.
     wifi_seen: Option<Option<String>>,
     next_id: u64,
@@ -465,8 +487,14 @@ impl Store {
     fn down(&mut self, at_ms: i64, offset_s: i32, d: &Details) {
         // A drop still waiting when the next comes goes with what is known.
         if self.pending.is_some() {
-            self.settle();
+            self.settle(at_ms);
         }
+        // An earlier drop that was never checked is left as it was, and the question moves on to
+        // this one, against the process from before that one.
+        let (peer_before, peer_carried) = match self.unchecked.take() {
+            Some(earlier) => (Some(earlier.before), true),
+            None => (self.peer.clone(), false),
+        };
         let silent_ms: i64 = figure(d, "silent_ms").unwrap_or(0);
         let id = self.event(at_ms, "drop", d);
         let day = local_day(at_ms, offset_s);
@@ -485,9 +513,10 @@ impl Store {
             length_ms: None,
             cause: None,
             restarted: None,
-            peer_before: self.peer.clone(),
+            peer_before,
             peer_after: None,
             peer_checked: false,
+            peer_carried,
         });
     }
 
@@ -524,10 +553,11 @@ impl Store {
     }
 
     fn peer_seen(&mut self, at_ms: i64, peer: Option<Identity>) {
+        self.give_up(at_ms);
         self.peer_answered = true;
-        if let Some((id, before)) = self.unchecked.take() {
-            if peer.as_ref().is_some_and(|after| *after != before) {
-                self.restarted_after_all(id);
+        if let Some(earlier) = self.unchecked.take() {
+            if peer.as_ref().is_some_and(|after| *after != earlier.before) {
+                self.restarted_after_all(earlier.id, earlier.carried);
             }
         }
         if let Some(drop) = self.pending.as_mut() {
@@ -543,28 +573,41 @@ impl Store {
     }
 
     /// A drop settled without the other device's answer, which has now come and names another
-    /// process: it restarted, unless sleep explains the drop.
-    fn restarted_after_all(&mut self, id: u64) {
+    /// process: it restarted, unless sleep explains the drop. When the process it is compared with
+    /// is from before an earlier drop too, the change may belong to that one, so it only stands in
+    /// for a cause that was unknown.
+    fn restarted_after_all(&mut self, id: u64, carried: bool) {
+        let overrides = |cause: Option<Cause>| match cause {
+            Some(Cause::Asleep) => false,
+            Some(Cause::Unknown | Cause::Unreachable) | None => true,
+            Some(_) => !carried,
+        };
         let drops = self.last_drop.iter_mut().chain(self.pending.iter_mut()).filter(|d| d.id == id);
         for drop in drops {
-            if drop.cause != Some(Cause::Asleep) {
+            if overrides(drop.cause) {
                 drop.cause = Some(Cause::Restart);
                 drop.restarted = Some("other");
             }
         }
-        if let Some(event) = self.events.iter_mut().find(|e| e.id == id && e.cause != Some(Cause::Asleep)) {
+        if let Some(event) = self.events.iter_mut().find(|e| e.id == id && overrides(e.cause)) {
             event.cause = Some(Cause::Restart);
             event.fields.insert("restarted".into(), Value::from("other"));
         }
     }
 
-    fn peer_wanted(&self) -> Option<std::time::Duration> {
+    /// Asked every second while a drop that's back waits on the answer; for one settled without
+    /// it, every 10 s, for 2 minutes, then its cause stays as it is.
+    fn peer_wanted(&self, now_ms: i64) -> Option<std::time::Duration> {
         use std::time::Duration;
         let waiting = self.pending.as_ref().is_some_and(|p| p.back_ms.is_some() && !p.peer_checked && p.peer_before.is_some());
-        if waiting || (self.unchecked.is_some() && self.online == Some(true)) {
+        if waiting {
             return Some(Duration::from_secs(1));
         }
-        (self.online == Some(true) && !self.peer_answered).then_some(Duration::from_secs(10))
+        let linked = self.online == Some(true);
+        if linked && self.unchecked.as_ref().is_some_and(|u| now_ms - u.settled_ms < UNCHECKED_ASKED_FOR_MS) {
+            return Some(Duration::from_millis(UNCHECKED_ASK_EVERY_MS as u64));
+        }
+        (linked && !self.peer_answered).then_some(Duration::from_secs(10))
     }
 
     /// Settles the drop waiting once the link is back, the 3 s after the drop have passed, and the
@@ -575,17 +618,24 @@ impl Store {
         let window_closed = now_ms >= drop.detected_ms + NEAR_MS && now_ms >= back;
         let peer_known = drop.peer_checked || drop.peer_before.is_none();
         if window_closed && (peer_known || now_ms >= back + DECIDE_WAIT_MS) {
-            self.settle();
+            self.settle(now_ms);
         }
     }
 
-    fn settle(&mut self) {
+    /// A drop settled without the answer is given up on after 2 minutes: its cause stays.
+    fn give_up(&mut self, now_ms: i64) {
+        if self.unchecked.as_ref().is_some_and(|u| now_ms - u.settled_ms >= UNCHECKED_ASKED_FOR_MS) {
+            self.unchecked = None;
+        }
+    }
+
+    fn settle(&mut self, now_ms: i64) {
         let Some(mut drop) = self.pending.take() else { return };
         if !drop.peer_checked {
             // Settled without hearing which process the other device runs now. A later answer is
             // for this drop, and the next one mustn't be held against a process from before it.
             if let Some(before) = drop.peer_before.clone() {
-                self.unchecked = Some((drop.id, before));
+                self.unchecked = Some(Unchecked { id: drop.id, before, carried: drop.peer_carried, settled_ms: now_ms });
             }
             self.peer = None;
         }
@@ -609,16 +659,20 @@ impl Store {
         if found(Clue::Asleep, near) {
             return (Cause::Asleep, None);
         }
-        if let (Some(before), Some(after)) = (&drop.peer_before, &drop.peer_after) {
-            if before != after {
-                return (Cause::Restart, Some("other"));
-            }
+        let other_restarted = matches!((&drop.peer_before, &drop.peer_after), (Some(before), Some(after)) if before != after);
+        // Compared with a process from before an earlier drop, a change may belong to that one,
+        // so it explains this drop only when nothing else does.
+        if other_restarted && !drop.peer_carried {
+            return (Cause::Restart, Some("other"));
         }
         if found(Clue::Restart, near) {
             return (Cause::Restart, Some("this"));
         }
         if found(Clue::Wifi, near) {
             return (Cause::Wifi, None);
+        }
+        if other_restarted {
+            return (Cause::Restart, Some("other"));
         }
         if found(Clue::Timeout, (near.0, drop.back_ms.unwrap_or(drop.detected_ms))) {
             return (Cause::Unreachable, None);
@@ -714,6 +768,7 @@ fn word_kind(word: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const T: i64 = 1_762_862_400_000; // 2025-11-11 12:00:00 UTC
 
@@ -976,42 +1031,77 @@ mod tests {
     #[test]
     fn the_other_devices_process_is_asked_for_while_a_drop_waits_on_it_or_it_never_said() {
         let mut store = fed(&[(0, "up", up("100"))]);
-        assert_eq!(store.peer_wanted(), Some(std::time::Duration::from_secs(10)), "linked, and never asked");
+        let at = |ms| T + ms;
+        assert_eq!(store.peer_wanted(at(0)), Some(Duration::from_secs(10)), "linked, and never asked");
         store.peer_seen(T + 100, None);
-        assert_eq!(store.peer_wanted(), None, "an older service that doesn't say is left alone");
+        assert_eq!(store.peer_wanted(at(100)), None, "an older service that doesn't say is left alone");
         store.peer_seen(T + 200, Some(identity(7, "0.9.4")));
         store.take(T + 10_000, 0, "down", &down("1000"));
-        assert_eq!(store.peer_wanted(), None, "nothing to ask while it's down");
+        assert_eq!(store.peer_wanted(at(10_000)), None, "nothing to ask while it's down");
         store.take(T + 11_000, 0, "up", &up("1000"));
-        assert_eq!(store.peer_wanted(), Some(std::time::Duration::from_secs(1)));
+        assert_eq!(store.peer_wanted(at(11_000)), Some(Duration::from_secs(1)));
         store.peer_seen(T + 11_200, Some(identity(7, "0.9.4")));
-        assert_eq!(store.peer_wanted(), None);
+        assert_eq!(store.peer_wanted(at(11_200)), None);
     }
 
     #[test]
-    fn a_late_answer_labels_the_drop_it_belongs_to_and_not_the_next() {
+    fn a_drop_settled_unanswered_is_asked_about_every_10_s_for_2_minutes() {
         let mut store = Store::new();
         store.peer_seen(T, Some(identity(100, "0.9.4")));
         store.take(T + 10_000, 0, "down", &down("1000"));
         store.take(T + 10_500, 0, "up", &up("500"));
-        // No answer within 5 s of the return: settled as unknown, and still asked about.
+        assert_eq!(store.peer_wanted(T + 12_000), Some(Duration::from_secs(1)), "while the drop waits on it");
+        assert_eq!(drop_at(&mut store, 15_500)["cause"], "unknown", "settled 5 s after it came back");
+        assert_eq!(store.peer_wanted(T + 15_600), Some(Duration::from_secs(10)));
+        assert_eq!(store.peer_wanted(T + 135_499), Some(Duration::from_secs(10)));
+        assert_eq!(store.peer_wanted(T + 135_500), None, "given up after 2 minutes");
+        store.peer_seen(T + 140_000, Some(identity(200, "0.9.4")));
+        assert_eq!(drop_at(&mut store, 140_000)["cause"], "unknown", "an answer after that changes nothing");
+    }
+
+    #[test]
+    fn a_late_answer_still_labels_the_drop_it_belongs_to() {
+        let mut store = Store::new();
+        store.peer_seen(T, Some(identity(100, "0.9.4")));
+        store.take(T + 10_000, 0, "down", &down("1000"));
+        store.take(T + 10_500, 0, "up", &up("500"));
         assert_eq!(drop_at(&mut store, 15_500)["cause"], "unknown");
-        assert_eq!(store.peer_wanted(), Some(std::time::Duration::from_secs(1)));
-        // A roam brings a second drop before the answer comes.
+        store.peer_seen(T + 25_000, Some(identity(200, "0.9.4")));
+        let drop = drop_at(&mut store, 25_000);
+        assert_eq!((drop["cause"].as_str(), drop["restarted"].as_str()), (Some("restart"), Some("other")));
+        assert_eq!(store.peer_wanted(T + 25_000), None);
+    }
+
+    fn drop_causes(store: &mut Store, now: i64) -> Vec<(String, Option<String>)> {
+        let json = store.json(T + now, 0);
+        json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "drop")
+            .map(|e| (e["cause"].as_str().unwrap().to_string(), e["fields"]["restarted"].as_str().map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_drop_takes_over_the_question_and_a_wifi_cause_stands() {
+        let mut store = Store::new();
+        store.peer_seen(T, Some(identity(100, "0.9.4")));
+        store.take(T + 10_000, 0, "down", &down("1000"));
+        store.take(T + 10_500, 0, "up", &up("500"));
+        assert_eq!(drop_at(&mut store, 15_500)["cause"], "unknown");
+        // A roam brings a second drop before the answer comes. The first is left as it was.
         store.take(T + 19_000, 0, "roam", &d(&[]).text("from", "aa").text("to", "bb"));
         store.take(T + 20_000, 0, "down", &down("500"));
         store.take(T + 21_000, 0, "up", &up("1000"));
         store.peer_seen(T + 21_200, Some(identity(200, "0.9.4")));
-        let json = store.json(T + 30_000, 0);
-        let causes: Vec<(&str, Option<&str>)> =
-            json["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "drop").map(|e| (e["cause"].as_str().unwrap(), e["fields"]["restarted"].as_str())).collect();
-        assert_eq!(causes, [("restart", Some("other")), ("wifi", None)]);
-        assert_eq!(json["stability"]["last_drop"]["cause"], "wifi");
-        assert_eq!(store.peer_wanted(), None);
+        // The restart could belong to either drop, so it doesn't overrule the roam.
+        assert_eq!(drop_causes(&mut store, 30_000), [("unknown".to_string(), None), ("wifi".to_string(), None)]);
+        assert_eq!(store.peer_wanted(T + 30_000), None);
     }
 
     #[test]
-    fn two_drops_in_quick_succession_never_compare_the_second_with_a_process_from_before_the_first() {
+    fn with_nothing_else_to_go_on_the_restart_goes_to_the_later_drop() {
         let mut store = Store::new();
         store.peer_seen(T, Some(identity(100, "0.9.4")));
         store.take(T + 10_000, 0, "down", &down("1000"));
@@ -1019,14 +1109,27 @@ mod tests {
         store.take(T + 11_000, 0, "down", &down("500"));
         store.take(T + 12_000, 0, "up", &up("1000"));
         store.peer_seen(T + 12_100, Some(identity(200, "0.9.4")));
-        let json = store.json(T + 20_000, 0);
-        let causes: Vec<&str> = json["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "drop").map(|e| e["cause"].as_str().unwrap()).collect();
-        assert_eq!(causes, ["restart", "unknown"], "the change is put down to the first drop, once");
+        assert_eq!(drop_causes(&mut store, 20_000), [("unknown".to_string(), None), ("restart".to_string(), Some("other".to_string()))]);
         // The answer after the second drop is now what a third is compared with.
         store.take(T + 30_000, 0, "down", &down("500"));
         store.take(T + 30_500, 0, "up", &up("500"));
         store.peer_seen(T + 30_600, Some(identity(200, "0.9.4")));
         assert_eq!(drop_at(&mut store, 34_000)["cause"], "unknown");
+    }
+
+    #[test]
+    fn a_late_answer_for_a_carried_question_only_stands_in_for_an_unknown_cause() {
+        let mut store = Store::new();
+        store.peer_seen(T, Some(identity(100, "0.9.4")));
+        store.take(T + 10_000, 0, "down", &down("1000"));
+        store.take(T + 10_500, 0, "up", &up("500"));
+        drop_at(&mut store, 15_500);
+        store.take(T + 19_000, 0, "roam", &d(&[]).text("from", "aa").text("to", "bb"));
+        store.take(T + 20_000, 0, "down", &down("500"));
+        store.take(T + 21_000, 0, "up", &up("1000"));
+        assert_eq!(drop_at(&mut store, 26_000)["cause"], "wifi", "settled unanswered");
+        store.peer_seen(T + 30_000, Some(identity(200, "0.9.4")));
+        assert_eq!(drop_causes(&mut store, 30_000), [("unknown".to_string(), None), ("wifi".to_string(), None)]);
     }
 
     #[test]

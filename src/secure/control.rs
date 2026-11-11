@@ -512,9 +512,42 @@ pub fn set_peer_online(online: bool) {
     }
 }
 
+/// When the details connection was last used, for closing it once nobody is looking.
+static DETAILS_USED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// The details connection closes this long after its last call, as when the panel closes, so that
+/// neither device keeps a socket and a serving thread for it.
+const DETAILS_IDLE: Duration = Duration::from_secs(10);
+const DETAILS_IDLE_CHECK: Duration = Duration::from_secs(2);
+
 /// A read of the other device's connection details, on their own connection.
 pub fn peer_details_call(path: &str) -> Result<(u16, String), String> {
-    DETAILS_LINK.call(super::services().pairing.as_deref(), TARGET.get().copied(), "GET", path, "")
+    static CLOSER: std::sync::Once = std::sync::Once::new();
+    CLOSER.call_once(|| {
+        let _ = std::thread::Builder::new().name("mesh-kvm-details-idle".into()).spawn(close_idle_details);
+    });
+    *DETAILS_USED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let result = DETAILS_LINK.call(super::services().pairing.as_deref(), TARGET.get().copied(), "GET", path, "");
+    *DETAILS_USED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    result
+}
+
+/// Whether the details connection has gone unused long enough to close.
+fn details_idle(used_at: Option<Instant>, now: Instant) -> bool {
+    used_at.is_some_and(|at| now.saturating_duration_since(at) >= DETAILS_IDLE)
+}
+
+fn close_idle_details() {
+    loop {
+        std::thread::sleep(DETAILS_IDLE_CHECK);
+        let mut used = DETAILS_USED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        // A call in flight holds the connection, so it is left alone until the next look.
+        if details_idle(*used, Instant::now()) {
+            if let Ok(mut slot) = DETAILS_LINK.connection.try_lock() {
+                *slot = None;
+                *used = None;
+            }
+        }
+    }
 }
 
 /// The connection to the peer's API as it last went: `up`, `down`, or `unused` while nothing has
@@ -586,6 +619,14 @@ mod tests {
         });
         serve(listener, peer, Arc::new(server), incoming).unwrap();
         (addr, rx)
+    }
+
+    #[test]
+    fn the_details_connection_closes_after_ten_idle_seconds() {
+        let now = Instant::now();
+        assert!(!details_idle(None, now), "nothing open, nothing to close");
+        assert!(!details_idle(Some(now - Duration::from_secs(9)), now));
+        assert!(details_idle(Some(now - DETAILS_IDLE), now));
     }
 
     /// What a reconnect takes against the plain connect it replaced, which is `TcpStream::connect_timeout`
