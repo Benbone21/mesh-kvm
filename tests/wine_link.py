@@ -1075,9 +1075,10 @@ def audio_checks():
         ours.settimeout(0.1)
     peer = AudioPeer(ours)
     audio = local()["audio"]
-    check("audio reports its device lists", isinstance(audio["inputs"], list) and isinstance(audio["outputs"], list),
-          str(audio))
-    check("nothing is chosen, so nothing is sent", audio["tx_enabled"] is False and audio["input"] == "")
+    check("audio reports its outputs", isinstance(audio["outputs"], list), str(audio))
+    check("and nothing of the microphone or the virtual devices",
+          not any(key in audio for key in ("input", "inputs", "virtual", "tx_mic_ready", "rx_mic_live")), str(audio))
+    check("nothing is chosen, so nothing is sent", audio["tx_enabled"] is False and audio["output"] == "")
 
     # The format from before versions were numbered is refused without a word, plain as it is.
     older = b"MKVA" + struct.pack("<Q", 2) + b"\x55" * 960
@@ -1101,9 +1102,30 @@ def audio_checks():
     time.sleep(0.2)
     check("a later version is left alone too", local()["audio"]["rx_packets"] == 0)
 
-    chosen = {"action": "set_audio_device", "role": "input", "id": "default"}
-    post_from(PEER, "/api/local/action", chosen)
-    check("the other device can't switch on this one's microphone", local()["audio"]["input"] == "")
+    # A 0.9.0 or 0.9.1 peer with a microphone chosen sends it as stream 1. It is dropped: never
+    # played, never counted, no note about another version, and no report goes back for it.
+    check("the note about the old packets clears", wait_for(lambda s: not s["audio"]["rx_other_version"], 15) is not None)
+    mic_reports = 0
+    deadline = time.time() + 1.5
+    seq = 0
+    while time.time() < deadline:
+        peer.to_exe(AUDIO_MAGIC + bytes([AUDIO_VERSION, 1, 1]) + struct.pack("<HI", 91, seq) + bytes([0xfc, 0xff, 0xfe]))
+        if seq % 10 == 0:
+            peer.to_exe(AUDIO_MAGIC + bytes([AUDIO_VERSION, 3, 1]) + struct.pack("<HI", 91, seq))
+        seq += 1
+        while got := peer.read():
+            mic_reports += got[0][:7] == AUDIO_MAGIC + bytes([AUDIO_VERSION, 4, 1])
+        time.sleep(0.01)
+    audio = local()["audio"]
+    check("a mic stream from an older peer is not played or counted",
+          audio["rx_packets"] == 0 and audio["rx_peak"] == 0 and audio["rx_live"] is False, str(audio))
+    check("and isn't taken for another version", audio["rx_other_version"] is False, str(audio))
+    check("and gets no report back", mic_reports == 0, str(mic_reports))
+    for source in (PEER, None):
+        chosen = {"action": "set_audio_device", "role": "input", "id": "default"}
+        reply = (api_from(PEER, "POST", "/api/local/action", json.dumps(chosen)) or (None, ""))[1] if source \
+            else json.dumps(call("/api/local/action", chosen))
+        check(f"a microphone can't be chosen ({'from the other device' if source else 'here'})", "audio choices" in reply, reply)
     reply = call("/api/local/action", {"action": "set_audio_device", "role": "output", "id": "default"})
     check("choosing an output is accepted", reply.get("ok") is True, str(reply))
     audio = wait_for(lambda s: s["audio"]["tx_enabled"], 5)
@@ -1132,6 +1154,7 @@ def audio_checks():
         check("an open output on the other device counts as connected", audio["tx_connected"] is True, str(audio))
         check("but not as playing, with nothing to hear", audio["tx_reaching"] is False, str(audio))
         check("and it reports back to the other device", answered)
+        check("the sound stream still works after the mic packets", local()["audio"]["rx_live"] is True, str(local()["audio"]))
         audio = local()["audio"]
         # Both directions on one output is what calls for process loopback, which Wine doesn't have.
         check("with process loopback refused, it falls back and says an echo is possible",

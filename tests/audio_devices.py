@@ -2,8 +2,8 @@
 """Two whole audio devices, each beside a private PipeWire, sending to each other over loopback.
 
 It checks the things only real audio can show: that sound sent both ways doesn't come back as an
-echo, that muting waits for the other device and restores, that devices can come and go, that a
-microphone and an output mix without clipping, and how long sound takes from one device's speakers
+echo, that muting waits for the other device and restores, that devices can come and go, that two
+loud apps on the output mix without clipping, and how long sound takes from one device's speakers
 to the other's.
 
 Everything runs in its own namespaces, with its own sound servers on null outputs. It can't reach
@@ -329,24 +329,24 @@ def mute_test():
 
 def hotplug_test():
     scene("a chosen output comes and goes")
-    a = device("a", 24951, 24952, 16, MK_CHOOSE_OUTPUT="hot_sink", MK_CHOOSE_INPUT="hot_mic")
+    a = device("a", 24951, 24952, 16, MK_CHOOSE_OUTPUT="hot_sink")
     b = device("b", 24952, 24951, 16)
     ra, rb = Reader(a), Reader(b)
     time.sleep(1.5)
-    check("a missing device leaves a note", len(ra.last.get("notes", [])) == 2, str(ra.last.get("notes")))
+    check("a missing device leaves a note", len(ra.last.get("notes", [])) == 1, str(ra.last.get("notes")))
     args = "{ factory.name=support.null-audio-sink node.name=hot_sink node.description=Hot media.class=Audio/Sink audio.position=[FL FR] node.driver=true }"
     cli = subprocess.Popen(["pw-cli"], env=env_for("a"), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
     cli.stdin.write(f"create-node adapter {args}\n"); cli.stdin.flush()
     time.sleep(1)
     check("plugging it in lists it and clears its note",
-          "Hot" in [d["name"] for d in ra.last.get("outputs", [])] and len(ra.last.get("notes", [])) == 1)
+          "Hot" in [d["name"] for d in ra.last.get("outputs", [])] and len(ra.last.get("notes", [])) == 0)
     pa = play("a", 1000, 3, "tone-hot", sink="hot_sink")
     time.sleep(1.5)
     check("the chosen output is what's sent, with no restart", rb.last.get("rx_peak", 0) > 10)
     cli.terminate(); cli.wait()
     pa.kill(); pa.wait()
     time.sleep(1)
-    check("unplugging it brings the note back", len(ra.last.get("notes", [])) == 2)
+    check("unplugging it brings the note back", len(ra.last.get("notes", [])) == 1)
     pd = play("a", 1000, 3, "tone-default")
     time.sleep(1.5)
     check("the default stands in", rb.last.get("rx_peak", 0) > 10)
@@ -363,8 +363,8 @@ def hotplug_test():
     time.sleep(1)
 
 def mix_test():
-    scene("microphone and output together, both loud")
-    a = device("a", 24951, 24952, 10, MK_CHOOSE_OUTPUT="test_speakers", MK_CHOOSE_INPUT="test_mic")
+    scene("two apps on the output together, both loud")
+    a = device("a", 24951, 24952, 10, MK_CHOOSE_OUTPUT="test_speakers")
     b = device("b", 24952, 24951, 10)
     ra, rb = Reader(a), Reader(b)
     time.sleep(1.5)
@@ -374,7 +374,7 @@ def mix_test():
         p = subprocess.Popen(["pw-play", *FMT, "--target", sink, "-P", f"node.name={node}", "-"], env=env_for("a"), stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         threading.Thread(target=lambda: (p.stdin.write(np.stack([s, s], 1).tobytes()), p.stdin.close()), daemon=True).start()
         return p
-    p1, p2 = loud(700, "test_speakers", "tone-out"), loud(1900, "test_mic", "tone-mic")
+    p1, p2 = loud(700, "test_speakers", "tone-one"), loud(1900, "test_speakers", "tone-two")
     time.sleep(2.5)
     r = record("b", 2)
     check("both reach B", level(r, 700) > -12 and level(r, 1900) > -12, f"{level(r, 700):.1f} and {level(r, 1900):.1f} dB")

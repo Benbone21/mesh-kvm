@@ -195,9 +195,6 @@ def default_settings():
 
 
 DEBIAN_DEVICES = {
-    "inputs": [{"id": "alsa_input.mic", "name": "USB Audio Microphone"},
-               {"id": "alsa_input.line", "name": "USB Audio Line Input"},
-               {"id": "alsa_input.brio", "name": "Logitech BRIO 4K Stream Edition Webcam Analog Stereo Microphone Input"}],
     "outputs": [{"id": "alsa_output.front", "name": "USB Audio Front Headphones"},
                 {"id": "alsa_output.spdif", "name": "USB Audio S/PDIF Output"},
                 {"id": "alsa_output.speaker", "name": "USB Audio Speakers"},
@@ -205,9 +202,6 @@ DEBIAN_DEVICES = {
                 {"id": "alsa_output.hdmi", "name": "HDMI / DisplayPort 2 Output (Alienware AW2725DF)"}],
 }
 WINDOWS_DEVICES = {
-    "inputs": [{"id": "{0.0.1.a}", "name": "Microphone Array (Realtek(R) Audio)"},
-               {"id": "{0.0.1.b}", "name": "Microphone (USB Audio Device) (1)"},
-               {"id": "{0.0.1.c}", "name": "Microphone (USB Audio Device) (2)"}],
     "outputs": [{"id": "{0.0.0.a}", "name": "Speakers (Realtek(R) Audio)"},
                 {"id": "{0.0.0.b}", "name": "Headphones (USB Audio Device) (1)"},
                 {"id": "{0.0.0.c}", "name": "Headphones (USB Audio Device) (2)"},
@@ -216,7 +210,7 @@ WINDOWS_DEVICES = {
 
 
 def audio_idle():
-    return {"tx_enabled": False, "input": "", "output": "", "play": "default", "notes": [], "echo_safe": True,
+    return {"tx_enabled": False, "output": "", "play": "default", "notes": [], "echo_safe": True,
             "bitrate": 96, "tx_volume": 100, "tx_peak": 0, "tx_reaching": False, "tx_connected": False, "tx_loss": 0,
             "play_only_on_other": True, "rx_muted": False, "rx_volume": 100, "rx_peak": 0, "rx_packets": 0,
             "rx_live": False, "rx_loss": 0.0, "rx_unrepaired": 0.0, "rx_buffer_ms": 0, "rx_other_version": False, "hint": ""}
@@ -229,15 +223,14 @@ def audio_states():
     receiving = {"rx_peak": 58, "rx_packets": 91200, "rx_live": True, "rx_loss": 2.6, "rx_unrepaired": 0.3, "rx_buffer_ms": 30}
     return {
         "idle": ({}, {}),
-        "sending": (sending | {"input": "alsa_input.brio", "output": "bluez_output.sony"}, receiving),
-        "failure": ({"tx_enabled": True, "input": "alsa_input.mic", "tx_connected": True},
-                    {"tx_enabled": True, "input": "{0.0.1.a}", "tx_connected": True,
-                     "notes": ["The microphone or line-in couldn't be opened. Check that Microphone access is on in Windows privacy settings."]}),
+        "sending": (sending | {"output": "bluez_output.sony"}, receiving),
+        "failure": ({"tx_enabled": True, "output": "alsa_output.front", "tx_connected": True},
+                    {"tx_enabled": True, "output": "{0.0.0.a}", "tx_connected": True,
+                     "notes": ["The output to send couldn't be opened."]}),
         "echo": (sending | receiving, sending | receiving | {"echo_safe": False}),
-        "missing": ({"tx_enabled": True, "input": "alsa_input.gone", "output": "bluez_output.gone", "play": "bluez_output.gone",
+        "missing": ({"tx_enabled": True, "output": "bluez_output.gone", "play": "bluez_output.gone",
                      "tx_connected": True,
-                     "notes": ["The chosen microphone or line-in isn't connected, so the system default is being used.",
-                               "The chosen output to send isn't connected, so the system default is being used.",
+                     "notes": ["The chosen output to send isn't connected, so the system default is being used.",
                                "The chosen output to play on isn't connected, so the system default is being used."]}, {}),
         "old": ({"rx_other_version": True}, None),
         "laptop": ({}, sending | {"output": "{0.0.0.b}", "hint": "All of this device's sound is sent, from every app and output."}),
@@ -385,8 +378,9 @@ def act(world, node, body):
         world.settings[node]["sharing"].update({k: v for k, v in body.items() if k != "action"})
     elif action == "set_audio_device":
         audio = world.settings[node]["audio"]
-        audio[body["role"]] = body["id"]
-        audio["tx_enabled"] = audio["input"] != "" or audio["output"] != ""
+        if body["role"] in ("output", "play"):
+            audio[body["role"]] = body["id"]
+        audio["tx_enabled"] = audio["output"] != ""
     elif action == "set_audio_bitrate":
         world.settings[node]["audio"]["bitrate"] = body["kbps"]
     elif action == "set_play_only_on_other":
