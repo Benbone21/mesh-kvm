@@ -7,6 +7,8 @@ pub mod model;
 mod pairing;
 pub mod single;
 mod canvas;
+mod details;
+mod details_panel;
 mod dialog;
 #[cfg(test)]
 mod fixtures;

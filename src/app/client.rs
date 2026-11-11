@@ -1,5 +1,6 @@
 //! Talks to the local mesh-kvm service (and, through its peer proxy, to the other device).
 
+use super::details::{self, Fetched};
 use super::model::{older_message, release_route, Control, Device, DeviceStatus, LayoutState, Release, Snapshot};
 use super::pairing::PairingStatus;
 use crate::platform::DisplayInfo;
@@ -8,7 +9,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long an error stays up before a later change that works may clear it.
@@ -31,6 +32,10 @@ const ONE_WAY_HOLD: Duration = Duration::from_secs(1);
 /// How long a setting's error stays under its row when no later change clears it.
 const ROW_ERROR_SHOWN: Duration = Duration::from_secs(10);
 const NOT_RUNNING: &str = "mesh-kvm isn't running on this device. Start mesh-kvm, then try again.";
+/// The most often each device's connection details are asked for, while they're shown.
+pub const DETAILS_EVERY: Duration = Duration::from_secs(1);
+/// How often a details thread that isn't wanted looks whether the client has gone.
+const DETAILS_IDLE_CHECK: Duration = Duration::from_secs(1);
 
 struct Job {
     /// The device's name as a sentence starts it, for any error.
@@ -53,6 +58,11 @@ struct Shared {
     stop: AtomicBool,
     /// The window wants to see `/api/pairing`, which holds a code and so isn't asked for otherwise.
     pairing_wanted: AtomicBool,
+    /// The window shows the connection details, which aren't asked for otherwise.
+    details_wanted: Mutex<bool>,
+    details_changed: Condvar,
+    /// This device's details, then the other device's.
+    details: Mutex<[Fetched; 2]>,
 }
 
 /// What the service said to a pairing action.
@@ -120,7 +130,18 @@ impl Client {
             error_hold,
             stop: AtomicBool::new(false),
             pairing_wanted: AtomicBool::new(false),
+            details_wanted: Mutex::new(false),
+            details_changed: Condvar::new(),
+            details: Mutex::default(),
         });
+        let on_update: Arc<Mutex<Box<dyn Fn() + Send>>> = Arc::new(Mutex::new(on_update));
+        for which in 0..2 {
+            let (shared, on_update) = (shared.clone(), on_update.clone());
+            std::thread::Builder::new()
+                .name("mesh-kvm-app-details".into())
+                .spawn(move || poll_details(port, which, &shared, &|| (lock(&on_update))()))
+                .expect("start a details thread");
+        }
         let poller = shared.clone();
         std::thread::Builder::new()
             .name("mesh-kvm-app-poll".into())
@@ -148,7 +169,7 @@ impl Client {
                     *lock(&poller.snapshot) = snap.clone();
                     let now = (snap, lock(&poller.last_error).as_ref().map(|(m, _)| m.clone()));
                     if last.as_ref() != Some(&now) {
-                        on_update();
+                        (lock(&on_update))();
                     }
                     last = Some(now);
                     std::thread::sleep(interval);
@@ -199,6 +220,30 @@ impl Client {
     #[cfg(test)]
     pub(super) fn wants_pairing(&self) -> bool {
         self.shared.pairing_wanted.load(Ordering::Relaxed)
+    }
+
+    /// Says whether the connection details are shown, so they are asked for only then. Hiding
+    /// them forgets the last answers, so that none are shown stale when they open again.
+    pub fn want_details(&self, wanted: bool) {
+        let mut was = lock(&self.shared.details_wanted);
+        if *was == wanted {
+            return;
+        }
+        *was = wanted;
+        if !wanted {
+            *lock(&self.shared.details) = Default::default();
+        }
+        self.shared.details_changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(super) fn wants_details(&self) -> bool {
+        *lock(&self.shared.details_wanted)
+    }
+
+    /// This device's connection details, then the other device's, as last asked.
+    pub fn details(&self) -> [Fetched; 2] {
+        lock(&self.shared.details).clone()
     }
 
     /// Sends a pairing action such as `{"action": "pair_enter", "code": "482917"}` to this device.
@@ -384,6 +429,45 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.details_changed.notify_all();
+    }
+}
+
+/// Asks for one device's connection details, here (`which` 0) or through the peer proxy, at most
+/// once each `DETAILS_EVERY` and only while they're wanted. The other device's thread can wait on
+/// a slow link without holding this device's up.
+fn poll_details(port: u16, which: usize, shared: &Shared, on_update: &dyn Fn()) {
+    let path = if which == 0 { details::PATH.to_string() } else { format!("/api/peer{}", details::PATH) };
+    loop {
+        {
+            let wanted = lock(&shared.details_wanted);
+            let (wanted, _) = shared
+                .details_changed
+                .wait_timeout_while(wanted, DETAILS_IDLE_CHECK, |w| !*w && !shared.stop.load(Ordering::Relaxed))
+                .unwrap_or_else(|e| e.into_inner());
+            if !*wanted {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                continue;
+            }
+        }
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let asked = Instant::now();
+        let got = details::fetched(http_call_port(LOCALHOST, port, "GET", &path, ""), Instant::now());
+        // Hidden while this was asked: the answer isn't kept.
+        if *lock(&shared.details_wanted) {
+            lock(&shared.details)[which] = got;
+            on_update();
+        }
+        let next = asked + DETAILS_EVERY;
+        let wanted = lock(&shared.details_wanted);
+        // Woken early only to be hidden, or to stop.
+        let _ = shared.details_changed.wait_timeout_while(wanted, next.saturating_duration_since(Instant::now()), |w| {
+            *w && !shared.stop.load(Ordering::Relaxed)
+        });
     }
 }
 
@@ -1055,6 +1139,54 @@ mod tests {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let (client, _rx) = start(port);
         assert_eq!(client.pairing_action(serde_json::json!({ "action": "pair_cancel" })), PairingReply::NoAnswer);
+    }
+
+    fn asks_for_details(log: &Log) -> [usize; 2] {
+        let log = log.lock().unwrap();
+        let count = |path: &str| log.iter().filter(|r| r.1 == path).count();
+        [count("/api/local/link"), count("/api/peer/api/local/link")]
+    }
+
+    fn details_stub(peer_status: u16) -> (u16, Log) {
+        stub(move |method, path, _| match (method, path) {
+            ("GET", "/api/local") => (200, local_json("debian")),
+            ("GET", "/api/local/link") => (200, r#"{"version":"0.9.4","now_ms":5,"online":true}"#.into()),
+            ("GET", "/api/peer/api/local/link") => (peer_status, r#"{"error":"not found"}"#.into()),
+            _ => (404, "{}".into()),
+        })
+    }
+
+    #[test]
+    fn the_details_are_asked_for_only_while_shown_and_at_most_once_a_second() {
+        let (port, log) = details_stub(404);
+        let (client, _rx) = start(port);
+        wait_for("the local device", || client.snapshot().local.is_some());
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(asks_for_details(&log), [0, 0], "hidden, nothing is asked");
+        client.want_details(true);
+        wait_for("both answers", || client.details().iter().all(|f| *f != Fetched::Waiting));
+        let [here, peer] = client.details();
+        assert!(matches!(here, Fetched::Got(ref d, _) if d.version == "0.9.4"), "{here:?}");
+        assert_eq!(peer, Fetched::Missing(details::Missing::NeedsUpdate), "an older device has no such path");
+        std::thread::sleep(Duration::from_millis(1500));
+        let asked = asks_for_details(&log);
+        assert!(asked.iter().all(|n| (1..=2).contains(n)), "{asked:?} in 1.5 s");
+        client.want_details(false);
+        assert_eq!(client.details(), [Fetched::Waiting, Fetched::Waiting], "nothing is kept to show stale");
+        std::thread::sleep(Duration::from_millis(100));
+        let hidden = asks_for_details(&log);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(asks_for_details(&log), hidden, "hidden again, nothing more is asked");
+    }
+
+    #[test]
+    fn a_peer_out_of_reach_says_so_and_this_devices_details_still_come() {
+        let (port, _) = details_stub(502);
+        let (client, _rx) = start(port);
+        client.want_details(true);
+        wait_for("both answers", || client.details().iter().all(|f| *f != Fetched::Waiting));
+        assert_eq!(client.details()[1], Fetched::Missing(details::Missing::OutOfReach));
+        assert!(matches!(client.details()[0], Fetched::Got(..)));
     }
 
     #[test]

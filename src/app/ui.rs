@@ -4,6 +4,8 @@
 
 use super::canvas::Canvas;
 use super::client::{Client, PairingReply};
+use super::details::{self, Column, Fetched, Missing};
+use super::details_panel::{self, DetailsRequest};
 use super::dialog;
 use super::launch::ServiceStarter;
 use super::motion;
@@ -13,7 +15,7 @@ use super::rows::{self, ActionKind, ChoiceValue, GroupRows, Pick, RowsInput, Set
 use super::sparkline::Sparklines;
 use super::table::{Table, TableRequest};
 use super::theme::{
-    self, line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, LINE, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+    self, line, Type, ACCENT, BG, COUNTDOWN_HEIGHT, DANGER, LINE, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
     SURFACE, TEXT, TEXT_DIM,
 };
 use super::top::{self, TopRequest};
@@ -40,6 +42,14 @@ const MODE_PROMPT_SECONDS: f32 = crate::displays::REVERT_AFTER.as_secs() as f32;
 /// The app size a person can choose, on top of what the window's size does by itself.
 pub(super) const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.5];
 const UI_SCALE_KEY: &str = "ui_scale";
+const DETAILS_OPEN_KEY: &str = "details_open";
+/// How long Copy details says it copied.
+const COPIED_SHOWN: Duration = Duration::from_millis(1500);
+/// What the connection details may take of the height the window has left under the figures.
+const DETAILS_SHARE: f32 = 0.6;
+const DETAILS_MIN_HEIGHT: f32 = 120.0;
+/// What the connection details leave the settings and the layout at least.
+const BODY_KEPT: f32 = 80.0;
 const DEFAULT_UI_SCALE: f32 = 1.0;
 /// How far the window's own zoom has to move before it changes, so a resize doesn't flicker.
 const ZOOM_SLACK: f32 = 0.04;
@@ -78,6 +88,7 @@ pub fn run_window(starter: ServiceStarter) -> Result<(), String> {
             let mut window = Window::new(client, starter);
             let saved = cc.storage.and_then(|s| eframe::get_value::<f32>(s, UI_SCALE_KEY));
             window.ui_scale = saved.map_or(DEFAULT_UI_SCALE, nearest_ui_scale);
+            window.details_open = cc.storage.and_then(|s| eframe::get_value::<bool>(s, DETAILS_OPEN_KEY)).unwrap_or(false);
             Ok(Box::new(window))
         }),
     )
@@ -172,6 +183,10 @@ struct Window {
     dialog_opened: Option<Instant>,
     /// How much of the dialogs shows through, from the fade.
     dialog_opacity: f32,
+    /// The connection details are open. Closed until the person opens them, and remembered.
+    details_open: bool,
+    /// When Copy details last copied.
+    copied_at: Option<Instant>,
 }
 
 impl eframe::App for Window {
@@ -182,6 +197,7 @@ impl eframe::App for Window {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, UI_SCALE_KEY, &self.ui_scale);
+        eframe::set_value(storage, DETAILS_OPEN_KEY, &self.details_open);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -220,6 +236,8 @@ impl Window {
             square: (Color32::TRANSPARENT, Color32::TRANSPARENT, Instant::now()),
             dialog_opened: None,
             dialog_opacity: 1.0,
+            details_open: false,
+            copied_at: None,
         }
     }
 
@@ -297,8 +315,9 @@ impl Window {
         for request in requests {
             self.apply_top(snapshot, request);
         }
+        let inline = self.details(ctx, snapshot, now);
 
-        self.body(ctx, snapshot, &on, now);
+        self.body(ctx, snapshot, &on, now, inline.as_ref());
 
         let first_run = model::needs_peer(snapshot);
         // Only a change waiting for an answer is a dialog. One being made or undone is a notice,
@@ -331,6 +350,7 @@ impl Window {
             self.layout.next_wake(now),
             self.client.next_row_error_change(),
             self.sparklines.next_wake(now),
+            self.copied_at.and_then(|at| (at + COPIED_SHOWN).checked_duration_since(now)),
         ];
         let wake = wake.into_iter().flatten().min();
         if let Some(wake) = wake {
@@ -339,6 +359,69 @@ impl Window {
         if start == ServiceStart::Starting {
             ctx.request_repaint_after(START_CHECK);
         }
+    }
+
+    /// The Connection details bar under the figures, and the details under it while open. They
+    /// are asked for only while open, and there are none to show with no service. Where the body
+    /// scrolls as a whole, in a narrow or short window, the details go at its top instead of in a
+    /// panel of their own, and come back for the body to draw.
+    fn details(&mut self, ctx: &egui::Context, snapshot: &Snapshot, now: Instant) -> Option<(details::DetailsView, [String; 2])> {
+        let shown = snapshot.local.is_some();
+        self.client.want_details(shown && self.details_open);
+        if !shown {
+            return None;
+        }
+        let copied = self.copied_at.is_some_and(|at| now.saturating_duration_since(at) < COPIED_SHOWN);
+        let strip = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_1 as i8));
+        let open = self.details_open;
+        let mut asked = None;
+        egui::TopBottomPanel::top("details bar").frame(strip).show(ctx, |ui| asked = details_panel::bar(ui, open, copied));
+        let (view, names) = self.details_view(snapshot, now);
+        let screen = ctx.screen_rect();
+        let layout = view::frame_layout(screen.width(), screen.height());
+        let in_body = layout.stacked || layout.body_scrolls;
+        if open && !in_body {
+            let room = ctx.available_rect().height();
+            let most = (room - BODY_KEPT).max(DETAILS_MIN_HEIGHT);
+            let frame = Frame::new().fill(SURFACE).inner_margin(Margin { left: SPACE_5 as i8, right: SPACE_5 as i8, top: SPACE_3 as i8, bottom: 0 });
+            egui::TopBottomPanel::top("details")
+                .frame(frame)
+                .resizable(false)
+                .exact_height((room * DETAILS_SHARE).clamp(DETAILS_MIN_HEIGHT, most))
+                .show(ctx, |ui| {
+                    ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| details_panel::body(ui, &view, &names));
+                });
+        }
+        match asked {
+            Some(DetailsRequest::Toggle) => {
+                self.details_open = !open;
+                self.client.want_details(self.details_open);
+                ctx.request_repaint();
+            }
+            Some(DetailsRequest::Copy) => {
+                let wall = crate::linklog::wall_ms();
+                let stamp = details::date_time(wall, crate::linklog::utc_offset_s(wall));
+                ctx.copy_text(details::copy_text(&view, [&names[0], &names[1]], &stamp));
+                self.copied_at = Some(now);
+            }
+            None => {}
+        }
+        (open && in_body).then_some((view, names))
+    }
+
+    /// What the details panel says now, and each column's device name, this device first.
+    fn details_view(&self, snapshot: &Snapshot, now: Instant) -> (details::DetailsView, [String; 2]) {
+        let mut fetched = self.client.details();
+        if view::not_paired(snapshot) {
+            fetched[1] = Fetched::Missing(Missing::NotPaired);
+        }
+        let names = snapshot.in_order().map(|device| snapshot.title(device));
+        let columns = [
+            Column { name: names[0].clone(), other: names[1].clone(), fetched: &fetched[0] },
+            Column { name: names[1].clone(), other: names[0].clone(), fetched: &fetched[1] },
+        ];
+        let offset = crate::linklog::utc_offset_s(crate::linklog::wall_ms());
+        (details::view(columns, now, offset), names)
     }
 
     /// The status square's colour now: it moves from the one it had to the new one over
@@ -747,7 +830,7 @@ impl Window {
 
     /// The settings table and the layout canvas, side by side or one above the other, or why
     /// there are none.
-    fn body(&mut self, ctx: &egui::Context, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant) {
+    fn body(&mut self, ctx: &egui::Context, snapshot: &Snapshot, on: &ControlsEnabled, now: Instant, details: Option<&(details::DetailsView, [String; 2])>) {
         if snapshot.local.is_none() {
             self.no_service_body(ctx, snapshot);
             return;
@@ -768,6 +851,7 @@ impl Window {
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
                 ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    details_in_body(ui, details);
                     settings.show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         requests = draw_table(ui);
@@ -783,6 +867,8 @@ impl Window {
             egui::CentralPanel::default().frame(Frame::new().fill(BG)).show(ctx, |ui| {
                 let visible = ui.available_height();
                 ScrollArea::vertical().auto_shrink(false).drag_to_scroll(false).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    details_in_body(ui, details);
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         let size = vec2(frame.settings_width, 0.0);
@@ -949,6 +1035,18 @@ impl Window {
     }
 }
 
+/// The connection details at the top of a body that scrolls as a whole, ruled off from what follows.
+fn details_in_body(ui: &mut Ui, details: Option<&(details::DetailsView, [String; 2])>) {
+    let Some((view, names)) = details else { return };
+    let frame = Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(SPACE_5 as i8, SPACE_3 as i8));
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        details_panel::body(ui, view, names);
+    });
+    let (rule, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rule, 0.0, LINE);
+}
+
 /// A dialog's time left: a `COUNTDOWN_HEIGHT` bar, `accent` for the `share` still to go.
 fn countdown(ui: &mut Ui, share: f32) {
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), COUNTDOWN_HEIGHT), Sense::hover());
@@ -1025,6 +1123,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn draws_every_state_with_the_connection_details_open() {
+        for size in [MIN_WINDOW_SIZE, [899.0, 760.0], WINDOW_SIZE, [1280.0, 599.0]] {
+            for snapshot in states() {
+                let (ctx, mut window) = (context(), window());
+                window.details_open = true;
+                for _ in 0..3 {
+                    frame(&ctx, &mut window, &snapshot, size, vec![], Instant::now());
+                }
+            }
+        }
+    }
+
+    fn click_at(ctx: &egui::Context, window: &mut Window, snapshot: &Snapshot, at: Pos2, now: Instant) {
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, true)], now);
+        frame(ctx, window, snapshot, WINDOW_SIZE, vec![pointer(at, false)], now);
+    }
+
+    #[test]
+    fn the_connection_details_start_closed_unasked_and_open_on_a_click() {
+        let (ctx, mut window, s) = (context(), window(), secure(linked(), "encrypted"));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()));
+        assert!(text.contains("CONNECTION DETAILS") && !text.contains("LATENCY"), "{text}");
+        assert!(!window.client.wants_details(), "closed, they aren't asked for");
+        let toggle = ctx.read_response(details_panel::toggle_id()).unwrap().rect;
+        assert!(toggle.height() >= 24.0, "{toggle:?}");
+        click_at(&ctx, &mut window, &s, toggle.center(), Instant::now());
+        assert!(window.details_open && window.client.wants_details());
+        // Tall enough that nothing is scrolled out of sight.
+        frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now());
+        let text = drawn_text(&frame(&ctx, &mut window, &s, [1280.0, 3000.0], vec![], Instant::now()));
+        for line in ["LATENCY", "PACKETS", "STABILITY", "WI-FI", "SOUND", "MESH-KVM ITSELF", "HISTORY", "Copy details", "Round trip, last 10 s", "DEBIAN-HOST", "WINDOWS-HOST"] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        // Nothing answers in the tests, so each device says so.
+        assert!(text.contains("Not answering"), "{text}");
+        let toggle = ctx.read_response(details_panel::toggle_id()).unwrap().rect;
+        click_at(&ctx, &mut window, &s, toggle.center(), Instant::now());
+        assert!(!window.details_open && !window.client.wants_details());
+    }
+
+    #[test]
+    fn the_connection_details_open_and_close_from_the_keyboard() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        ctx.memory_mut(|m| m.request_focus(details_panel::toggle_id()));
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![key(egui::Key::Space, Modifiers::NONE)], Instant::now());
+        assert!(window.details_open);
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![key(egui::Key::Enter, Modifiers::NONE)], Instant::now());
+        assert!(!window.details_open);
+    }
+
+    #[test]
+    fn copy_details_puts_both_columns_on_the_clipboard() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        for _ in 0..2 {
+            frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        }
+        let output = frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now());
+        let at = texts(&output).into_iter().find(|(t, _)| t == details_panel::COPY).unwrap().1.center();
+        let now = Instant::now();
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![Event::PointerMoved(at)], now);
+        frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![pointer(at, true)], now);
+        let output = frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![pointer(at, false)], now);
+        let copied = output.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+        let copied = copied.expect("a copy");
+        assert!(copied.starts_with("mesh-kvm connection details, "), "{copied}");
+        assert!(copied.contains("debian-host") && copied.contains("windows-host") && copied.contains("HISTORY, WINDOWS-HOST"), "{copied}");
+        let text = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], now));
+        assert!(text.contains(details_panel::COPIED), "it says so: {text}");
+        let later = drawn_text(&frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], now + COPIED_SHOWN));
+        assert!(later.contains(details_panel::COPY), "and goes back: {later}");
+    }
+
+    #[test]
+    fn a_screen_reader_hears_each_detail_by_its_row_and_device() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        let nodes = spoken_frame(&ctx, &mut window, &s, Instant::now());
+        assert!(nodes.iter().any(|(words, ..)| words == "Connection details, shown"), "{nodes:?}");
+        let update = frame(&ctx, &mut window, &s, WINDOW_SIZE, vec![], Instant::now()).platform_output.accesskit_update.unwrap();
+        let named = |label: &str| update.nodes.iter().find(|(_, n)| n.label() == Some(label)).map(|(_, n)| n.value().map(str::to_string));
+        assert_eq!(named("Round trip, last 10 s, debian-host"), Some(Some(details::NONE.to_string())), "{:?}", update.nodes.len());
+        assert!(named("Version, windows-host").is_some());
+    }
+
+    #[test]
+    fn the_connection_details_fit_the_smallest_window() {
+        let (ctx, mut window, s) = (context(), window(), linked());
+        window.details_open = true;
+        for _ in 0..3 {
+            frame(&ctx, &mut window, &s, MIN_WINDOW_SIZE, vec![], Instant::now());
+        }
+        let screen = ctx.screen_rect();
+        for column in 0..2 {
+            let cell = ctx.read_response(details_panel::cell_id("Round trip, last 10 s", column)).unwrap().rect;
+            assert!(cell.left() >= 0.0 && cell.right() <= screen.right() + 0.5, "{cell:?} in {screen:?}");
+            assert!(cell.width() >= 200.0, "room for a value: {cell:?}");
+        }
+        let toggle = ctx.read_response(details_panel::toggle_id()).unwrap().rect;
+        let rule = ctx.read_response(details_panel::cell_id("Round trip, last 10 s", 0)).unwrap().rect;
+        assert!(rule.top() > toggle.bottom(), "the figures are under the bar");
     }
 
     #[test]
