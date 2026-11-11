@@ -642,6 +642,15 @@ fn reaches_router(blocking: bool, grabbed: bool, release: bool) -> bool {
     release || !blocking || grabbed
 }
 
+/// Where one local event goes: to the router, and whether to put it on the desktop if the router
+/// doesn't send it to the peer. `held` is a grab that stays; `only_here` that the grab kept the event
+/// from the desktop. While input goes to the peer, an event the desktop never saw goes to the
+/// router as a grabbed one would, and nothing is put on Debian; only with Debian in charge is a
+/// lost event handed back.
+fn local_route(blocking: bool, held: bool, only_here: bool, release: bool) -> (bool, bool) {
+    (reaches_router(blocking, held || only_here, release), only_here && !blocking)
+}
+
 impl EvdevDevice {
     /// Reads pending events into `buf` and returns how many; 0 when there are none.
     /// An unplugged device says so here, and is marked gone.
@@ -1111,27 +1120,31 @@ impl LinuxBackend {
         }
     }
 
-    /// Whether input read off mouse `i` should be put on the desktop if it isn't going to the
-    /// peer: it reached only this process, from a grab that is on its way out or no longer wanted.
-    /// Moving the pointer while focus comes back to Debian then isn't lost.
-    fn mouse_hand_back(&self, i: usize, ev: &InputEvent) -> bool {
-        let device = &self.mice[i];
-        device.only_here(ev) && !(self.block_mice && device.grabbed())
+    /// Where an event read off keyboard `i` goes: see `local_route`.
+    fn key_route(&self, i: usize, ev: &InputEvent, release: bool) -> (bool, bool) {
+        let device = &self.keyboards[i];
+        local_route(self.block_keyboards, device.grabbed(), device.only_here(ev), release)
     }
 
-    /// Puts a key read off keyboard `i` on the desktop if the grab kept it from there, once.
-    fn hand_back_key(&mut self, i: usize, ev: &InputEvent, forwarded: bool) {
+    /// Where an event read off mouse `i` goes: see `local_route`. Moving the pointer while focus
+    /// comes back to Debian then isn't lost.
+    fn mouse_route(&self, i: usize, ev: &InputEvent, release: bool) -> (bool, bool) {
+        let device = &self.mice[i];
+        local_route(self.block_mice, device.grabbed(), device.only_here(ev), release)
+    }
+
+    /// Puts a key read off keyboard `i` on the desktop if the grab kept it from there, once, and
+    /// lets go of one it put there.
+    fn hand_back_key(&mut self, i: usize, ev: &InputEvent, hand_back: bool, forwarded: bool) {
         let device = &mut self.keyboards[i];
-        let only_here = device.only_here(ev) && !(self.block_keyboards && device.grabbed());
-        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, only_here, forwarded) {
+        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, hand_back, forwarded) {
             self.vkbd.inject_key(ev.code, pressed);
         }
     }
 
-    fn hand_back_button(&mut self, i: usize, ev: &InputEvent, button: u8, forwarded: bool) {
-        let only_here = self.mouse_hand_back(i, ev);
+    fn hand_back_button(&mut self, i: usize, ev: &InputEvent, button: u8, hand_back: bool, forwarded: bool) {
         let device = &mut self.mice[i];
-        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, only_here, forwarded) {
+        if let Some(pressed) = hand_back_press(&mut device.handed_back, ev.code, ev.value, hand_back, forwarded) {
             self.vrel.button(button, pressed);
         }
     }
@@ -1545,14 +1558,13 @@ pub fn run_debian_node(
                     }
                     match hotkeys.feed(ev.code, ev.value) {
                         KeyRoute::Forward { scancode, pressed } => {
-                            let keyboard = &core.backend.keyboards[i];
-                            let blocking = core.backend.block_keyboards;
+                            let (to_router, hand_back) = core.backend.key_route(i, ev, !pressed);
                             let mut forwarded = false;
-                            if reaches_router(blocking, keyboard.grabbed(), !pressed) {
+                            if to_router {
                                 let actions = core.route(Event::LocalKey { scancode, pressed });
                                 forwarded = actions.iter().any(|a| matches!(a, Action::ForwardKey { .. }));
                             }
-                            core.backend.hand_back_key(i, ev, forwarded);
+                            core.backend.hand_back_key(i, ev, hand_back, forwarded);
                         }
                         KeyRoute::Consumed => {}
                         KeyRoute::Hotkey(Hotkey::Panic) => {
@@ -1604,19 +1616,17 @@ pub fn run_debian_node(
                         EV_KEY => {
                             if let Some(button) = button_id(ev.code) {
                                 let pressed = ev.value != 0;
-                                let grabbed = core.backend.mice[i].grabbed();
+                                let (to_router, hand_back) = core.backend.mouse_route(i, ev, !pressed);
                                 let mut forwarded = false;
-                                if reaches_router(core.backend.block_mice, grabbed, !pressed) {
+                                if to_router {
                                     let actions = core.route(Event::LocalButton { button, pressed });
                                     forwarded = actions.iter().any(|a| matches!(a, Action::ForwardButton { .. }));
                                 }
-                                core.backend.hand_back_button(i, ev, button, forwarded);
+                                core.backend.hand_back_button(i, ev, button, hand_back, forwarded);
                             }
                         }
                         EV_SYN if ev.code == SYN_REPORT => {
-                            let grabbed = core.backend.mice[i].grabbed();
-                            let to_router = reaches_router(core.backend.block_mice, grabbed, false);
-                            let hand_back = core.backend.mouse_hand_back(i, ev);
+                            let (to_router, hand_back) = core.backend.mouse_route(i, ev, false);
                             if acc_dx != 0 || acc_dy != 0 {
                                 let mut forwarded = false;
                                 if to_router {
@@ -1870,6 +1880,23 @@ mod tests {
         assert!(reaches_router(true, false, true));
         assert!(reaches_router(true, true, true));
         assert!(reaches_router(false, false, true));
+    }
+
+    #[test]
+    fn a_lost_event_is_handed_back_only_while_debian_has_the_input() {
+        // Debian active, a release under way, the grab kept this one from the desktop.
+        assert_eq!(local_route(false, false, true, false), (true, true));
+        // Back to the laptop before the release landed: it goes there, and nothing on Debian.
+        assert_eq!(local_route(true, false, true, false), (true, false));
+        // The desktop saw it itself, with the laptop wanting a grab that waits.
+        assert_eq!(local_route(true, false, false, false), (false, false));
+        assert_eq!(local_route(true, false, false, true), (true, false), "releases always go");
+        // An ordinary grab.
+        assert_eq!(local_route(true, true, true, false), (true, false));
+        // A release that failed, with Debian in charge: handed back.
+        assert_eq!(local_route(false, true, true, false), (true, true));
+        // Nothing grabbed at all.
+        assert_eq!(local_route(false, false, false, false), (true, false));
     }
 
     #[test]
