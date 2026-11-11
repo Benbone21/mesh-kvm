@@ -15,7 +15,7 @@ mod win;
 pub use qos::Class;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,8 @@ enum Msg {
     Resume,
 }
 
-static WAKE: OnceLock<SyncSender<Msg>> = OnceLock::new();
+/// Unbounded, so that a stop can't be lost behind wakes.
+static WAKE: OnceLock<Sender<Msg>> = OnceLock::new();
 /// Each registered socket. The thread keeps how each one stands; this lock is only held to copy.
 static SOCKETS: Mutex<Vec<qos::Target>> = Mutex::new(Vec::new());
 
@@ -89,13 +90,13 @@ pub fn enabled() -> bool {
 
 fn wake() {
     if let Some(tx) = WAKE.get() {
-        let _ = tx.try_send(Msg::Wake);
+        let _ = tx.send(Msg::Wake);
     }
 }
 
 /// Starts the thread, once. Until it runs, which it never does in tests, nothing is changed.
 pub fn start() {
-    let (tx, rx) = sync_channel(64);
+    let (tx, rx) = channel();
     if WAKE.set(tx).is_err() {
         return;
     }
@@ -107,7 +108,7 @@ pub fn start() {
 pub fn stop() {
     let Some(tx) = WAKE.get() else { return };
     let (done, wait) = sync_channel(1);
-    if tx.try_send(Msg::Stop(done)).is_ok() {
+    if tx.send(Msg::Stop(done)).is_ok() {
         let _ = wait.recv_timeout(STOP_WAIT);
     }
 }
@@ -115,7 +116,7 @@ pub fn stop() {
 /// Undoes `stop`, for a service that carries on after a restart failed.
 pub fn resume() {
     if let Some(tx) = WAKE.get() {
-        let _ = tx.try_send(Msg::Resume);
+        let _ = tx.send(Msg::Resume);
     }
 }
 
@@ -139,6 +140,7 @@ fn run(rx: Receiver<Msg>) {
     let (mut wlan, mut marker) = backends();
     let mut wifi = policy::WifiPolicy::default();
     let mut entries: Vec<qos::Entry> = Vec::new();
+    let mut retries = qos::Retries::new();
     let mut stopped = false;
     loop {
         let stopping = match rx.recv_timeout(LOOK_EVERY) {
@@ -170,6 +172,7 @@ fn run(rx: Receiver<Msg>) {
             continue;
         }
         let on = enabled();
+        let retry = retries.due(Instant::now(), crate::linklog::network_changes(), crate::linklog::sleeps());
         let targets = SOCKETS.lock().unwrap_or_else(PoisonError::into_inner).clone();
         for (i, target) in targets.into_iter().enumerate() {
             match entries.get_mut(i) {
@@ -178,7 +181,7 @@ fn run(rx: Receiver<Msg>) {
             }
         }
         for entry in entries.iter_mut() {
-            if let Some(pairs) = entry.sync(on, marker.as_mut()) {
+            if let Some(pairs) = entry.sync(on, retry, marker.as_mut()) {
                 log("qos", pairs);
             }
         }

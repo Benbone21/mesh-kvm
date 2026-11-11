@@ -19,6 +19,12 @@ use windows_sys::Win32::NetworkManagement::WiFi::{
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
+/// Background scans are paused as well as streaming mode turned on: streaming mode only stops the
+/// scans the driver starts itself, not the ones Windows asks for. False leaves scans alone.
+const PAUSE_BACKGROUND_SCANS: bool = true;
+/// qWAVE wants a new handle after this.
+const ERROR_DEVICE_REINITIALIZATION_NEEDED: i32 = 1164;
+
 /// The client version for Windows Vista and later.
 const WLAN_CLIENT_VERSION: u32 = 2;
 
@@ -134,7 +140,7 @@ impl Wlan for NativeWifi {
         // SAFETY: the list holds `dwNumberOfItems` entries from `InterfaceInfo` on.
         let interfaces: Vec<WLAN_INTERFACE_INFO> = unsafe {
             let count = (*list).dwNumberOfItems as usize;
-            std::slice::from_raw_parts((*list).InterfaceInfo.as_ptr(), count).to_vec()
+            std::slice::from_raw_parts(std::ptr::addr_of!((*list).InterfaceInfo).cast::<WLAN_INTERFACE_INFO>(), count).to_vec()
         };
         // SAFETY: memory the API allocated, freed once.
         unsafe { (api.free)(list.cast()) };
@@ -148,7 +154,7 @@ impl Wlan for NativeWifi {
                 continue;
             }
             set.push(*guid);
-            if Self::set_flag(api, self.handle, guid, wlan_intf_opcode_background_scan_enabled, false) != 0 {
+            if !PAUSE_BACKGROUND_SCANS || Self::set_flag(api, self.handle, guid, wlan_intf_opcode_background_scan_enabled, false) != 0 {
                 bgscan_off = false;
             }
         }
@@ -168,7 +174,9 @@ impl Wlan for NativeWifi {
         }
         for guid in std::mem::take(&mut self.set) {
             Self::set_flag(api, self.handle, &guid, wlan_intf_opcode_media_streaming_mode, false);
-            Self::set_flag(api, self.handle, &guid, wlan_intf_opcode_background_scan_enabled, true);
+            if PAUSE_BACKGROUND_SCANS {
+                Self::set_flag(api, self.handle, &guid, wlan_intf_opcode_background_scan_enabled, true);
+            }
         }
         // SAFETY: the handle WlanOpenHandle gave, closed once.
         unsafe { (api.close)(self.handle, null()) };
@@ -181,9 +189,11 @@ impl Wlan for NativeWifi {
 type QosCreateHandle = unsafe extern "system" fn(*const QOS_VERSION, *mut HANDLE) -> BOOL;
 type QosAddSocketToFlow = unsafe extern "system" fn(HANDLE, SOCKET, *const SOCKADDR, QOS_TRAFFIC_TYPE, u32, *mut u32) -> BOOL;
 type QosRemoveSocketFromFlow = unsafe extern "system" fn(HANDLE, SOCKET, u32, u32) -> BOOL;
+type QosCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
 
 struct QosApi {
     create: QosCreateHandle,
+    close: QosCloseHandle,
     add: QosAddSocketToFlow,
     remove: QosRemoveSocketFromFlow,
 }
@@ -196,6 +206,7 @@ fn qos_api() -> Result<&'static QosApi, String> {
         unsafe {
             Ok(QosApi {
                 create: std::mem::transmute::<_, QosCreateHandle>(f("QOSCreateHandle")?),
+                close: std::mem::transmute::<_, QosCloseHandle>(f("QOSCloseHandle")?),
                 add: std::mem::transmute::<_, QosAddSocketToFlow>(f("QOSAddSocketToFlow")?),
                 remove: std::mem::transmute::<_, QosRemoveSocketFromFlow>(f("QOSRemoveSocketFromFlow")?),
             })
@@ -286,12 +297,27 @@ impl Marker for QwaveMarker {
         let dest = target.dest.ok_or("no destination yet")?;
         let raw = RawAddr::new(dest);
         let (kind, kind_name, dscp) = traffic(target.class);
-        let mut flow = 0u32;
-        clear_last_error();
-        // SAFETY: a registered socket, an address that lives through the call, and a flow id that
-        // starts at 0 as the API asks.
-        if unsafe { (api.add)(handle, target.raw as SOCKET, raw.as_ptr(), kind, QOS_NON_ADAPTIVE_FLOW, &mut flow) } == 0 {
-            return Err(last_error("QOSAddSocketToFlow"));
+        let add = |handle| {
+            let mut flow = 0u32;
+            clear_last_error();
+            // SAFETY: a registered socket, an address that lives through the call, and a flow id
+            // that starts at 0 as the API asks.
+            let added = unsafe { (api.add)(handle, target.raw as SOCKET, raw.as_ptr(), kind, QOS_NON_ADAPTIVE_FLOW, &mut flow) } != 0;
+            (added, flow, std::io::Error::last_os_error().raw_os_error())
+        };
+        let (mut added, mut flow, mut code) = add(handle);
+        if !added && code == Some(ERROR_DEVICE_REINITIALIZATION_NEEDED) {
+            // The API asks for a new handle, and once it has one the add is tried again.
+            // SAFETY: the handle QOSCreateHandle gave, closed once.
+            unsafe { (api.close)(self.handle) };
+            self.handle = null_mut();
+            (added, flow, code) = add(self.handle(api)?);
+        }
+        if !added {
+            return Err(match code {
+                Some(0) | None => "QOSAddSocketToFlow failed and gave no reason".to_string(),
+                Some(code) => error_text("QOSAddSocketToFlow", code as u32),
+            });
         }
         let pairs = vec![
             ("dscp", dscp.to_string()),

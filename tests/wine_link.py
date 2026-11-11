@@ -1030,8 +1030,9 @@ def low_latency_checks():
         m = re.search(r" qos socket=(\w+) (.*)", line)
         if m:
             qos.setdefault(m.group(1), m.group(2))
-    check("each socket that sends says once how its packets are marked, or why not",
-          all(name in qos for name in ("input", "input_rx", "audio_tx")) and all(" applied=" in " " + v for v in qos.values()), str(qos))
+    check("each socket that sends says how its packets are marked, or why not",
+          all(name in qos for name in ("input", "audio_tx")) and all(" applied=" in " " + v for v in qos.values()), str(qos))
+    check("and the input socket's clone, which only sends handshakes, isn't marked", "input_rx" not in qos, str(qos))
     check("Low-latency Wi-Fi is on by default", local().get("low_latency_wifi") is True, str(local().get("low_latency_wifi")))
     call("/api/local/action", {"action": "set_low_latency_wifi", "enabled": False})
     check("and can be turned off", local().get("low_latency_wifi") is False, str(local().get("low_latency_wifi")))

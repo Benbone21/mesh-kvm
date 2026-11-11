@@ -898,9 +898,9 @@ pub fn run_windows_node(
             .map_err(|e| format!("Failed to make UDP socket non-blocking: {}", e))?;
     }
 
-    // Both handles send: the hooks on one, handshakes and replies on the other.
+    // The hooks and heartbeats send on this one. The clone sends only what the channel has
+    // due (handshakes, their replies, keepalives) and isn't marked: qWAVE's view of a duplicated handle is unknown.
     crate::lowlat::mark(&socket, crate::lowlat::Class::Input, "input", Some(peer_addr));
-    crate::lowlat::mark(&rx_socket, crate::lowlat::Class::Input, "input_rx", Some(peer_addr));
     let _ = NET_STATE.set(PeerSocket::new(socket, peer_addr, Arc::clone(&channel)));
     let rx_peer = PeerSocket::new(rx_socket, peer_addr, channel);
 

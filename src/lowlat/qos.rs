@@ -59,15 +59,18 @@ pub struct Entry {
     state: State,
     /// Whether any line has been logged for it yet, so that the first one says it's off.
     said: bool,
+    /// The last failure logged, so that one that keeps happening is logged once.
+    last_error: Option<String>,
 }
 
 impl Entry {
     pub fn new(target: Target) -> Entry {
-        Entry { target, state: State::Unmarked, said: false }
+        Entry { target, state: State::Unmarked, said: false, last_error: None }
     }
 
     /// Brings the socket to what `on` calls for. A `qos` line comes back when its state changed.
-    pub fn sync(&mut self, on: bool, marker: &mut dyn Marker) -> Option<Pairs> {
+    /// `retry` tries a failed mark again: marking can fail until the Wi-Fi is up, as at login.
+    pub fn sync(&mut self, on: bool, retry: bool, marker: &mut dyn Marker) -> Option<Pairs> {
         let name = ("socket", self.target.name.to_string());
         if !on {
             let was_marked = matches!(self.state, State::Marked { .. });
@@ -87,7 +90,8 @@ impl Entry {
             return None;
         }
         match self.state {
-            State::Marked { dest: d, .. } | State::Failed { dest: d } if d == dest => return None,
+            State::Marked { dest: d, .. } if d == dest => return None,
+            State::Failed { dest: d } if d == dest && !retry => return None,
             State::Marked { token, .. } => marker.unmark(&self.target, token),
             _ => {}
         }
@@ -95,15 +99,46 @@ impl Entry {
         match marker.mark(&self.target) {
             Ok((what, token)) => {
                 self.state = State::Marked { dest, token };
+                self.last_error = None;
                 let mut pairs = vec![name];
                 pairs.extend(what);
                 Some(pairs)
             }
             Err(error) => {
                 self.state = State::Failed { dest };
+                if self.last_error.as_ref() == Some(&error) {
+                    return None;
+                }
+                self.last_error = Some(error.clone());
                 Some(vec![name, ("applied", "none".into()), ("error", error)])
             }
         }
+    }
+}
+
+/// When failed marks are tried again: after the network changes or the device wakes, and every
+/// minute otherwise.
+pub struct Retries {
+    last: Option<(std::time::Instant, u64, u64)>,
+}
+
+pub const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl Retries {
+    pub fn new() -> Retries {
+        Retries { last: None }
+    }
+
+    /// Whether this round should try failed marks again. The first round is a first try anyway.
+    pub fn due(&mut self, now: std::time::Instant, net_changes: u64, sleeps: u64) -> bool {
+        let due = match self.last {
+            None => false,
+            Some((at, net, slept)) => net != net_changes || slept != sleeps || now.saturating_duration_since(at) >= RETRY_EVERY,
+        };
+        if due || self.last.is_none() {
+            self.last = Some((now, net_changes, sleeps));
+        }
+        due
     }
 }
 
@@ -219,42 +254,76 @@ mod tests {
     #[test]
     fn a_socket_is_marked_once_and_unmarked_when_the_setting_goes_off() {
         let (mut e, mut m) = (entry(None), FakeMarker::default());
-        assert_eq!(text(e.sync(true, &mut m)).as_deref(), Some("socket=input applied=fake"));
-        assert_eq!(e.sync(true, &mut m), None);
+        assert_eq!(text(e.sync(true, false, &mut m)).as_deref(), Some("socket=input applied=fake"));
+        assert_eq!(e.sync(true, false, &mut m), None);
         assert_eq!(m.marks.len(), 1);
-        assert_eq!(text(e.sync(false, &mut m)).as_deref(), Some("socket=input applied=off reason=setting"));
+        assert_eq!(text(e.sync(false, false, &mut m)).as_deref(), Some("socket=input applied=off reason=setting"));
         assert_eq!(m.unmarks, [1]);
-        assert_eq!(e.sync(false, &mut m), None);
-        assert_eq!(text(e.sync(true, &mut m)).as_deref(), Some("socket=input applied=fake"));
+        assert_eq!(e.sync(false, false, &mut m), None);
+        assert_eq!(text(e.sync(true, false, &mut m)).as_deref(), Some("socket=input applied=fake"));
     }
 
     #[test]
     fn off_from_the_start_is_said_once_and_nothing_is_touched() {
         let (mut e, mut m) = (entry(None), FakeMarker::default());
-        assert_eq!(text(e.sync(false, &mut m)).as_deref(), Some("socket=input applied=off reason=setting"));
-        assert_eq!(e.sync(false, &mut m), None);
+        assert_eq!(text(e.sync(false, false, &mut m)).as_deref(), Some("socket=input applied=off reason=setting"));
+        assert_eq!(e.sync(false, false, &mut m), None);
         assert!(m.marks.is_empty() && m.unmarks.is_empty());
     }
 
     #[test]
-    fn a_failure_is_logged_once_until_the_setting_or_the_destination_changes() {
-        let mut m = FakeMarker { fail: Some("qwave.dll: not found".into()), ..Default::default() };
+    fn a_failure_is_logged_once_and_tried_again_only_when_asked() {
+        let mut m = FakeMarker { fail: Some("QOSAddSocketToFlow: host unreachable".into()), ..Default::default() };
         let mut e = entry(None);
-        assert_eq!(text(e.sync(true, &mut m)).as_deref(), Some("socket=input applied=none error=qwave.dll: not found"));
-        assert_eq!(e.sync(true, &mut m), None);
-        assert_eq!(m.marks.len(), 1, "not tried again");
-        e.sync(false, &mut m);
-        assert!(m.unmarks.is_empty(), "nothing was marked, so nothing is undone");
-        assert!(e.sync(true, &mut m).is_some());
+        assert_eq!(text(e.sync(true, false, &mut m)).as_deref(), Some("socket=input applied=none error=QOSAddSocketToFlow: host unreachable"));
+        assert_eq!(e.sync(true, false, &mut m), None);
+        assert_eq!(m.marks.len(), 1, "not tried again between retries");
+        assert_eq!(e.sync(true, true, &mut m), None, "tried again, the same failure isn't logged again");
         assert_eq!(m.marks.len(), 2);
+        e.sync(false, false, &mut m);
+        assert!(m.unmarks.is_empty(), "nothing was marked, so nothing is undone");
+        assert_eq!(e.sync(true, false, &mut m), None, "the setting back on tries again, quietly");
+        assert_eq!(m.marks.len(), 3);
+        m.fail = Some("QOSCreateHandle: access denied".into());
+        assert!(text(e.sync(true, true, &mut m)).unwrap().ends_with("error=QOSCreateHandle: access denied"), "a new failure is news");
+    }
+
+    #[test]
+    fn failed_marks_are_retried_on_a_network_change_a_wake_or_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |s| start + std::time::Duration::from_secs(s);
+        let mut r = Retries::new();
+        assert!(!r.due(at(0), 0, 0));
+        assert!(!r.due(at(30), 0, 0));
+        assert!(r.due(at(31), 1, 0), "the network changed");
+        assert!(!r.due(at(32), 1, 0));
+        assert!(r.due(at(33), 1, 1), "a wake");
+        assert!(!r.due(at(92), 1, 1));
+        assert!(r.due(at(93), 1, 1), "a minute on");
+    }
+
+    #[test]
+    fn a_mark_that_failed_at_login_succeeds_on_a_retry_once_the_wifi_is_up() {
+        let mut m = FakeMarker { needs_dest: true, fail: Some("QOSAddSocketToFlow: host unreachable".into()), ..Default::default() };
+        let mut e = entry(Some("192.168.8.241:24850".parse().unwrap()));
+        assert!(e.sync(true, false, &mut m).is_some());
+        m.fail = None;
+        assert_eq!(e.sync(true, false, &mut m), None, "no retry asked for yet");
+        assert_eq!(text(e.sync(true, true, &mut m)).as_deref(), Some("socket=input applied=fake"));
+        assert_eq!(e.sync(true, true, &mut m), None, "a marked socket isn't marked again");
+        assert_eq!(m.marks.len(), 2);
+        // And a later failure is logged even if it is the first one again.
+        e.sync(false, false, &mut m);
+        m.fail = Some("QOSAddSocketToFlow: host unreachable".into());
+        assert!(e.sync(true, false, &mut m).is_some());
     }
 
     #[test]
     fn a_destination_that_moves_changes_nothing_where_marks_do_not_need_one() {
         let (mut e, mut m) = (entry(None), FakeMarker::default());
-        assert!(e.sync(true, &mut m).is_some());
+        assert!(e.sync(true, false, &mut m).is_some());
         e.target.dest = Some("192.168.8.210:40000".parse().unwrap());
-        assert_eq!(e.sync(true, &mut m), None);
+        assert_eq!(e.sync(true, false, &mut m), None);
         assert_eq!((m.marks.len(), m.unmarks.len()), (1, 0));
     }
 
@@ -262,14 +331,14 @@ mod tests {
     fn qwave_waits_for_a_destination_and_follows_it_when_it_moves() {
         let mut m = FakeMarker { needs_dest: true, ..Default::default() };
         let mut e = entry(None);
-        assert_eq!(e.sync(true, &mut m), None, "unconnected UDP needs to know where it sends");
+        assert_eq!(e.sync(true, false, &mut m), None, "unconnected UDP needs to know where it sends");
         let first: SocketAddr = "192.168.8.241:40000".parse().unwrap();
         e.target.dest = Some(first);
-        assert!(e.sync(true, &mut m).is_some());
-        assert_eq!(e.sync(true, &mut m), None);
+        assert!(e.sync(true, false, &mut m).is_some());
+        assert_eq!(e.sync(true, false, &mut m), None);
         let second: SocketAddr = "192.168.8.241:40001".parse().unwrap();
         e.target.dest = Some(second);
-        assert!(e.sync(true, &mut m).is_some());
+        assert!(e.sync(true, false, &mut m).is_some());
         assert_eq!(m.marks, [Some(first), Some(second)]);
         assert_eq!(m.unmarks, [1], "the old flow goes first");
     }
@@ -283,12 +352,12 @@ mod tests {
         assert_eq!(read_tos(&input), 0);
         let mut marker = TosMarker;
         let mut e = Entry::new(Target { name: "input", class: Class::Input, raw: input.as_raw_fd() as u64, dest: None });
-        assert_eq!(text(e.sync(true, &mut marker)).as_deref(), Some("socket=input dscp=46 applied=ip_tos"));
+        assert_eq!(text(e.sync(true, false, &mut marker)).as_deref(), Some("socket=input dscp=46 applied=ip_tos"));
         assert_eq!(read_tos(&input), 46 << 2);
         let mut a = Entry::new(Target { name: "audio_tx", class: Class::Audio, raw: audio.as_raw_fd() as u64, dest: None });
-        a.sync(true, &mut marker);
+        a.sync(true, false, &mut marker);
         assert_eq!(read_tos(&audio), 34 << 2);
-        e.sync(false, &mut marker);
+        e.sync(false, false, &mut marker);
         assert_eq!(read_tos(&input), 0, "off takes the mark away");
         assert_eq!(read_tos(&audio), 34 << 2);
     }
@@ -299,7 +368,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         let Ok(socket) = std::net::UdpSocket::bind("[::1]:0") else { return };
         let mut e = Entry::new(Target { name: "input", class: Class::Input, raw: socket.as_raw_fd() as u64, dest: None });
-        assert_eq!(text(e.sync(true, &mut TosMarker)).as_deref(), Some("socket=input dscp=46 applied=ipv6_tclass"));
+        assert_eq!(text(e.sync(true, false, &mut TosMarker)).as_deref(), Some("socket=input dscp=46 applied=ipv6_tclass"));
         assert_eq!(read_tos(&socket), 46 << 2);
     }
 
@@ -315,7 +384,7 @@ mod tests {
         let done = unsafe { libc::setsockopt(rx.as_raw_fd(), libc::IPPROTO_IP, libc::IP_RECVTOS, (&on as *const libc::c_int).cast(), 4) };
         assert_eq!(done, 0);
         let mut e = Entry::new(Target { name: "input", class: Class::Input, raw: tx.as_raw_fd() as u64, dest: None });
-        e.sync(true, &mut TosMarker);
+        e.sync(true, false, &mut TosMarker);
         tx.send_to(b"x", rx.local_addr().unwrap()).unwrap();
         assert_eq!(received_tos(&rx), Some(46 << 2));
     }
