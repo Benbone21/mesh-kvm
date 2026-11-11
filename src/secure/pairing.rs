@@ -1045,6 +1045,10 @@ mod tests {
         let (b, b_path) = entering_side("repaired-b", &pb, a.listening_port().unwrap());
         b.enter_code(&code_of(&a)).unwrap();
         wait_for(&a, "paired");
+        // The entering side saves its file only once the showing side's `ok` has come, which can
+        // be after the showing side says it is paired. Read before that, the file isn't there yet
+        // and a fresh identity, with a key of its own, comes back in its place.
+        wait_for(&b, "paired");
         let new_peer = loaded(&b_path).identity.public;
         let goodbye = || a.api(&HttpRequest::for_test("POST", "/api/local/action", PEER_UNPAIRED_BODY, Source::Peer)).unwrap();
 
