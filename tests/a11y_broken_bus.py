@@ -9,7 +9,9 @@ must have said "accessibility is off". Then accessibility is turned off and on a
 screen reader starts, and the app must survive the second failure too. Two more cases keep the fix
 honest: with a healthy bus (and a pretend registry) the app must register its window as it always
 did, before and after the toggle, and say nothing; and with a bus that's broken at the start but
-works by the time accessibility comes on again, the app must register then.
+works by the time accessibility comes on again, the app must register then. Last, the bus goes
+away under a registered window, and the app must keep running, then say "accessibility is off"
+when accessibility comes on again with no bus.
 
 Everything runs inside bubblewrap, which gives it its own /run (so its own /run/user/<uid>, with no
 way to the desktop's session bus, accessibility bus, Wayland, PipeWire or systemd), its own /tmp,
@@ -43,11 +45,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SURVIVE = 5.0
 AFTER_TOGGLE = 3.0
 OFF_LINE = "accessibility is off"
-# The two broken buses; a healthy one, where the app must register as before; and a broken one
-# that's healthy by the time IsEnabled comes on again, where accessibility must come back.
-CASES = ("wrong-guid", "nobody-listens", "healthy", "recovers")
+# The two broken buses; a healthy one, where the app must register as before; a broken one
+# that's healthy by the time IsEnabled comes on again, where accessibility must come back; and a
+# healthy one that goes away while the window is registered.
+CASES = ("wrong-guid", "nobody-listens", "healthy", "recovers", "bus-dies")
 ROOT = "/org/a11y/atspi/accessible/root"
 SOCKET = "wayland-a11y-test"
+# Everything the sandbox makes goes under here, with names no real session uses.
+TEST_DIR = "a11y-test"
+TOKEN_ENV = "MESH_KVM_A11Y_SANDBOX_TOKEN"
 
 FAKE_A11Y_XML = """
 <node>
@@ -99,7 +105,8 @@ def real_session():
     # By process name, so no shell whose command line happens to mention them is counted.
     daemons = [line for line in run("pgrep", "-a", "dbus-daemon").splitlines() if "accessibility.conf" in line]
     processes = sorted(set(run("pgrep", "-a", "at-spi").splitlines()) | set(daemons))
-    address = run("busctl", "--user", "call", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress")
+    # --auto-start=no, so reading it can't start at-spi-bus-launcher.
+    address = run("busctl", "--user", "--auto-start=no", "call", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress")
     return {"processes": processes, "address": address}
 
 
@@ -187,6 +194,41 @@ def port_open(port):
         return False
 
 
+def run_is_private_tmpfs():
+    """Whether the topmost mount on /run is a tmpfs, as bwrap's --tmpfs /run makes it."""
+    on_run = []
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            fields = line.split()
+            if fields[4] == "/run":
+                on_run.append(fields[fields.index("-") + 1])
+    return bool(on_run) and on_run[-1] == "tmpfs"
+
+
+def refuse_unless_sandboxed(token, runtime, fresh):
+    """The inner modes make D-Bus sockets and start daemons. Outside the sandbox that would be the
+    real session, so they stop here, before creating anything, unless all of these hold: the token
+    the outer run made is in the environment bwrap set up, /run is a tmpfs, and (for a fresh run)
+    /run/user/<uid> is empty, as bwrap's --dir leaves it."""
+    problems = []
+    if not token or os.environ.get(TOKEN_ENV) != token:
+        problems.append("the sandbox token is missing or wrong")
+    if not run_is_private_tmpfs():
+        problems.append("/run isn't a tmpfs")
+    try:
+        entries = os.listdir(runtime)
+    except OSError as e:
+        entries = [f"({e})"]
+    if fresh and entries:
+        problems.append(f"{runtime} isn't empty")
+    if not fresh and not os.environ.get("DBUS_SESSION_BUS_ADDRESS", "").startswith(f"unix:path={runtime}/{TEST_DIR}/"):
+        problems.append("the session bus isn't the sandbox's own")
+    if problems:
+        print(f"Refusing to run outside the sandbox: {'; '.join(problems)}. Run tests/a11y_broken_bus.py without "
+              "internal options.", file=sys.stderr)
+        sys.exit(2)
+
+
 def start_dbus(runtime, name):
     path = os.path.join(runtime, name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -198,25 +240,26 @@ def start_dbus(runtime, name):
     return daemon, daemon.stdout.readline().strip()
 
 
-def inside(case, exe, display):
+def inside(case, exe, display, token):
     uid = os.getuid()
     runtime = f"/run/user/{uid}"
-    os.makedirs(runtime, mode=0o700, exist_ok=True)
+    refuse_unless_sandboxed(token, runtime, fresh=True)
     os.chmod(runtime, 0o700)
-    home = os.path.join(runtime, "home")
-    os.makedirs(home, exist_ok=True)
-    env = {"PATH": os.environ["PATH"], "HOME": home, "XDG_RUNTIME_DIR": runtime, "LANG": "C.UTF-8",
+    test_dir = os.path.join(runtime, TEST_DIR)
+    home = os.path.join(test_dir, "home")
+    os.makedirs(home)
+    env = {"PATH": os.environ["PATH"], "HOME": home, "XDG_RUNTIME_DIR": runtime, "LANG": "C.UTF-8", TOKEN_ENV: token,
            "XDG_CONFIG_HOME": os.path.join(home, ".config"), "XDG_DATA_HOME": os.path.join(home, ".local/share"),
            "XDG_CACHE_HOME": os.path.join(home, ".cache"), "XDG_STATE_HOME": os.path.join(home, ".local/state"),
-           "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={runtime}/no-system-bus"}
+           "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={test_dir}/no-system-bus"}
     os.environ.clear()
     os.environ.update(env)
 
-    _session, session_address = start_dbus(runtime, "bus")
+    _session, session_address = start_dbus(test_dir, "session-bus")
     os.environ["DBUS_SESSION_BUS_ADDRESS"] = session_address
     # A daemon of its own, like the desktop's accessibility bus.
-    _other, other_address = start_dbus(runtime, "at-spi/bus_1")
-    nobody = f"unix:path={runtime}/at-spi/nobody-listens"
+    a11y_bus, other_address = start_dbus(test_dir, "a11y-bus")
+    nobody = f"unix:path={test_dir}/nobody-listens"
     then = ""
     if case == "wrong-guid":
         # The socket is that daemon's, but the address says another GUID, as after a re-bind.
@@ -227,20 +270,21 @@ def inside(case, exe, display):
         a11y_address = re.sub(r"guid=[0-9a-f]{32}", f"guid={wrong}", other_address)
     elif case == "nobody-listens":
         a11y_address = nobody
-    elif case == "healthy":
+    elif case in ("healthy", "bus-dies"):
         a11y_address = other_address
     else:
         a11y_address, then = nobody, other_address
-    embedded_log = os.path.join(runtime, "embedded")
+    embedded_log = os.path.join(test_dir, "embedded")
     open(embedded_log, "w").close()
 
     fake = subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--fake-a11y", a11y_address,
-                             "--then", then, "--registry-on", other_address, "--embedded-log", embedded_log],
+                             "--then", then, "--registry-on", other_address, "--embedded-log", embedded_log,
+                             "--sandbox-token", token],
                             stdout=subprocess.PIPE, text=True)
     if fake.stdout.readline().strip() != "ready":
         raise RuntimeError("the pretend accessibility service didn't start")
 
-    log = open(os.path.join(runtime, "compositor.log"), "w")
+    log = open(os.path.join(test_dir, "compositor.log"), "w")
     if display == "kwin_wayland":
         subprocess.Popen(["kwin_wayland", "--virtual", "--socket", SOCKET, "--width", "1280", "--height", "800"],
                          stdout=log, stderr=log, env=dict(os.environ, KWIN_COMPOSE="Q"))
@@ -255,7 +299,7 @@ def inside(case, exe, display):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO)
     wait_for("tests/fake_service.py", lambda: port_open(24880))
 
-    stderr_path = os.path.join(runtime, "app.stderr")
+    stderr_path = os.path.join(test_dir, "app.stderr")
     with open(stderr_path, "w") as stderr:
         app = subprocess.Popen([exe, "--app"], stdout=subprocess.DEVNULL, stderr=stderr, cwd=home,
                                env=dict(os.environ, LIBGL_ALWAYS_SOFTWARE="1", **app_display))
@@ -264,7 +308,14 @@ def inside(case, exe, display):
     first = open(stderr_path).read()
     embeds_at_start = app_embeds(embedded_log, app.pid)
     windows_at_start = children(other_address, embeds_at_start)
-    if alive_at_start:
+    if alive_at_start and case == "bus-dies":
+        # The bus goes away under a registered window while the window keeps updating, then
+        # IsEnabled goes off and on with the bus still gone.
+        a11y_bus.kill()
+        time.sleep(AFTER_TOGGLE)
+        os.kill(fake.pid, signal.SIGUSR1)
+        time.sleep(AFTER_TOGGLE)
+    elif alive_at_start:
         os.kill(fake.pid, signal.SIGUSR1)
         time.sleep(AFTER_TOGGLE)
     alive_after_toggle = app.poll() is None
@@ -306,11 +357,13 @@ def children(address, embedded):
 
 def sandboxed(case, exe, display):
     uid = os.getuid()
+    token = secrets.token_hex(16)
     command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
                "--tmpfs", "/run", "--dir", f"/run/user/{uid}", "--tmpfs", "/tmp", "--dir", "/tmp/.X11-unix",
                "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
-               "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
-               "--", sys.executable, "-I", os.path.abspath(__file__), "--inside", case, "--inner-exe", exe, "--display", display]
+               "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin", "--setenv", TOKEN_ENV, token,
+               "--", sys.executable, "-I", os.path.abspath(__file__), "--inside", case, "--inner-exe", exe,
+               "--display", display, "--sandbox-token", token]
     done = subprocess.run(command, capture_output=True, text=True, timeout=120)
     for line in done.stdout.splitlines():
         if line.startswith("{"):
@@ -331,18 +384,22 @@ def main():
     parser.add_argument("--expect-abort", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="show what the app printed")
     parser.add_argument("--case", choices=CASES, action="append", help="run only this case (can be repeated)")
-    parser.add_argument("--fake-a11y")
-    parser.add_argument("--then", default="")
-    parser.add_argument("--registry-on")
-    parser.add_argument("--embedded-log")
-    parser.add_argument("--inside", choices=CASES)
-    parser.add_argument("--inner-exe")
-    parser.add_argument("--display")
+    # Only for the sandbox's own use, and refused anywhere else.
+    internal = argparse.SUPPRESS
+    parser.add_argument("--fake-a11y", help=internal)
+    parser.add_argument("--then", default="", help=internal)
+    parser.add_argument("--registry-on", help=internal)
+    parser.add_argument("--embedded-log", help=internal)
+    parser.add_argument("--inside", choices=CASES, help=internal)
+    parser.add_argument("--inner-exe", help=internal)
+    parser.add_argument("--display", help=internal)
+    parser.add_argument("--sandbox-token", help=internal)
     args = parser.parse_args()
     if args.fake_a11y:
+        refuse_unless_sandboxed(args.sandbox_token, f"/run/user/{os.getuid()}", fresh=False)
         return fake_a11y(args.fake_a11y, args.then, args.registry_on, args.embedded_log)
     if args.inside:
-        return inside(args.inside, args.inner_exe, args.display)
+        return inside(args.inside, args.inner_exe, args.display, args.sandbox_token)
 
     exe = os.path.abspath(args.exe)
     missing = [tool for tool in ("bwrap", "dbus-daemon", "gdbus") if not shutil.which(tool)]
@@ -374,8 +431,13 @@ def main():
                 what = (f"registered with the accessibility bus ({result['embeds']} times, window seen: "
                         f"{result['windows_at_start']}, {result['windows']}) and said nothing")
             elif args.expect_abort:
-                ok = not result["alive_at_start"] and "panicked" in result["stderr"]
-                what = "aborts at start, as a build without the fix does"
+                ok = not result["alive_after_toggle"] and "panicked" in result["stderr"]
+                what = ("aborts at start" if not result["alive_at_start"] else "aborts when IsEnabled comes on again") + \
+                    ", as a build without the fix does"
+            elif case == "bus-dies":
+                ok = alive and result["embeds_at_start"] == 1 and result["off_lines"] == 1
+                what = (f"registered, then kept running when the bus went away, and said \"{OFF_LINE}\" once when "
+                        "IsEnabled came on again with no bus")
             elif case == "recovers":
                 ok = (alive and result["off_lines"] == 1 and result["embeds_at_start"] == 0 and result["embeds"] == 1
                       and result["windows"] == 1)
