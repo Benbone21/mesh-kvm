@@ -493,7 +493,8 @@ impl Window {
             TopRequest::ReleaseAll => self.client.release_all_input(),
             TopRequest::Update(button) => {
                 if let Some(here) = snapshot.this_device() {
-                    self.client.local_action(here, button.action());
+                    let device = if button.is_for_other() { here.other() } else { here };
+                    self.client.local_action(device, button.action());
                 }
             }
             TopRequest::DismissError => self.client.dismiss_error(),
@@ -1474,6 +1475,9 @@ mod tests {
             let text = drawn_text(&output);
             if let Some(button) = banner.button {
                 assert!(text.contains(button.label()), "{text}");
+            }
+            for button in &banner.more {
+                assert!(text.contains(button.short_label()), "{text}");
             }
             assert_eq!(text.contains(top::RELEASE_NOTES), banner.notes.is_some(), "{text}");
             let strip = ctx.screen_rect().width();

@@ -90,7 +90,8 @@ pub fn status_bar(ui: &mut Ui, line: &StatusLine, square: Color32, switch_name: 
 pub fn update_line(ui: &mut Ui, banner: &Banner) -> Option<TopRequest> {
     let mut request = None;
     let gap = SPACE_3;
-    let button = banner.button.map_or(0.0, |b| flat_button_width(ui, b.label(), ButtonKind::Primary) + gap);
+    let more: f32 = banner.more.iter().map(|b| flat_button_width(ui, b.short_label(), ButtonKind::Secondary) + gap).sum();
+    let button = banner.button.map_or(0.0, |b| flat_button_width(ui, b.label(), ButtonKind::Primary) + gap) + more;
     let notes = banner.notes.as_ref().map_or(0.0, |_| {
         ui.fonts(|f| f.layout_no_wrap(RELEASE_NOTES.into(), Type::Body.font(), ACCENT)).size().x + gap
     });
@@ -125,6 +126,12 @@ pub fn update_line(ui: &mut Ui, banner: &Banner) -> Option<TopRequest> {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if flat_button(ui, b.label(), ButtonKind::Primary, button_size(), true).clicked() {
                     request = Some(TopRequest::Update(b));
+                }
+                // Laid out from the right, so the last of them goes first.
+                for &b in banner.more.iter().rev() {
+                    if flat_button(ui, b.short_label(), ButtonKind::Secondary, button_size(), true).clicked() {
+                        request = Some(TopRequest::Update(b));
+                    }
                 }
             });
         }

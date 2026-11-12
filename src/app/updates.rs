@@ -47,6 +47,8 @@ impl UpdateStatus {
 pub enum UpdateButton {
     Both,
     ThisDevice,
+    /// The other device alone, asked from here.
+    OtherDevice,
 }
 
 impl UpdateButton {
@@ -54,14 +56,29 @@ impl UpdateButton {
         match self {
             Self::Both => "Update both devices",
             Self::ThisDevice => "Update this device",
+            Self::OtherDevice => "Update the other device",
         }
+    }
+
+    /// What it says as a smaller button beside "Update both devices".
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Both => "Both",
+            Self::ThisDevice => "Only this one",
+            Self::OtherDevice => "Only the other",
+        }
+    }
+
+    /// True when the action goes to the other device's service and not this one's.
+    pub fn is_for_other(self) -> bool {
+        self == Self::OtherDevice
     }
 
     /// The action for this device's service. It names nothing: only what's checked can install.
     pub fn action(self) -> serde_json::Value {
         match self {
             Self::Both => serde_json::json!({ "action": "update_both" }),
-            Self::ThisDevice => serde_json::json!({ "action": "install_update" }),
+            Self::ThisDevice | Self::OtherDevice => serde_json::json!({ "action": "install_update" }),
         }
     }
 }
@@ -73,6 +90,8 @@ pub struct Banner {
     /// A smaller line of what to expect.
     pub detail: Option<String>,
     pub button: Option<UpdateButton>,
+    /// Smaller buttons beside it, for updating one device and not the other.
+    pub more: Vec<UpdateButton>,
     /// The version whose release notes to link to.
     pub notes: Option<String>,
     pub failed: bool,
@@ -83,11 +102,11 @@ pub struct Banner {
 impl Banner {
     fn step(text: impl Into<String>) -> Self {
         let detail = Some("Sharing drops for a few seconds.".to_string());
-        Self { text: text.into(), detail, button: None, notes: None, failed: false, busy: true }
+        Self { text: text.into(), detail, button: None, more: Vec::new(), notes: None, failed: false, busy: true }
     }
 
     fn ready(version: &str, detail: String, button: Option<UpdateButton>) -> Self {
-        Self { text: format!("Version {version} is ready"), detail: Some(detail), button, notes: Some(version.to_string()), failed: false, busy: false }
+        Self { text: format!("Version {version} is ready"), detail: Some(detail), button, more: Vec::new(), notes: Some(version.to_string()), failed: false, busy: false }
     }
 }
 
@@ -109,11 +128,11 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
         "failed" => {
             let text = local.note.clone().unwrap_or_else(|| "The update didn't work.".to_string());
             let button = local.available.as_deref().filter(|_| local.ready).and_then(|v| ready_banner(snapshot, v, &name).button);
-            return Some(Banner { text, detail: None, button, notes: None, failed: true, busy: false });
+            return Some(Banner { text, detail: None, button, more: Vec::new(), notes: None, failed: true, busy: false });
         }
         "view_only" => {
             let version = local.available.clone()?;
-            return Some(Banner { text: format!("Version {version} is available"), detail: None, button: None, notes: Some(version), failed: false, busy: false });
+            return Some(Banner { text: format!("Version {version} is available"), detail: None, button: None, more: Vec::new(), notes: Some(version), failed: false, busy: false });
         }
         _ => {}
     }
@@ -125,9 +144,11 @@ pub fn update_banner(snapshot: &Snapshot) -> Option<Banner> {
         let version = local.available.as_deref()?;
         peer.filter(|p| p.is_ready_with(version))?;
         let text = format!("Getting version {version} on this device: {}%", local.progress.unwrap_or(0));
-        return Some(Banner { text, detail: None, button: None, notes: Some(version.to_string()), failed: false, busy: false });
+        return Some(Banner { text, detail: None, button: None, more: Vec::new(), notes: Some(version.to_string()), failed: false, busy: false });
     }
-    let version = local.available.as_deref().filter(|_| local.ready)?;
+    let Some(version) = local.available.as_deref().filter(|_| local.ready) else {
+        return other_is_behind(snapshot, peer?, &name);
+    };
     if local.is_blocked() {
         let why = match local.preflight.as_deref() {
             Some("denied") => "This device doesn't allow mesh-kvm to install updates.",
@@ -153,7 +174,7 @@ pub fn with_install_hint(banner: Option<Banner>, not_installed: bool) -> Option<
     match banner {
         Some(banner) if banner.busy || banner.failed || banner.button.is_some() => Some(banner),
         Some(banner) => Some(Banner { detail: Some(HOW_TO_INSTALL.to_string()), ..banner }),
-        None => Some(Banner { text: NOT_INSTALLED.to_string(), detail: Some(HOW_TO_INSTALL.to_string()), button: None, notes: None, failed: false, busy: false }),
+        None => Some(Banner { text: NOT_INSTALLED.to_string(), detail: Some(HOW_TO_INSTALL.to_string()), button: None, more: Vec::new(), notes: None, failed: false, busy: false }),
     }
 }
 
@@ -175,7 +196,8 @@ fn ready_banner(snapshot: &Snapshot, version: &str, name: &str) -> Banner {
         return Banner::ready(version, format!("{name} can't install it by itself. {apart}"), Some(UpdateButton::ThisDevice));
     }
     if update.is_ready_with(version) {
-        return Banner::ready(version, SHARING_DROPS.to_string(), Some(UpdateButton::Both));
+        let more = vec![UpdateButton::ThisDevice, UpdateButton::OtherDevice];
+        return Banner { more, ..Banner::ready(version, SHARING_DROPS.to_string(), Some(UpdateButton::Both)) };
     }
     if peer.version == version {
         return Banner::ready(version, SHARING_DROPS.to_string(), Some(UpdateButton::ThisDevice));
@@ -184,6 +206,18 @@ fn ready_banner(snapshot: &Snapshot, version: &str, name: &str) -> Banner {
         return Banner::ready(version, format!("Waiting for {name} to get it: {}%", update.progress.unwrap_or(0)), None);
     }
     Banner::ready(version, format!("{name} doesn't have it yet. {apart}"), Some(UpdateButton::ThisDevice))
+}
+
+/// This device is already on the version the other one has ready, so the other can be told to
+/// install it from here.
+fn other_is_behind(snapshot: &Snapshot, peer: &UpdateStatus, name: &str) -> Option<Banner> {
+    let here = &snapshot.local.as_ref()?.version;
+    if !peer.is_ready_with(here) || peer.is_blocked() {
+        return None;
+    }
+    let mut banner = Banner::ready(here, "The two won't work together until both match.".to_string(), Some(UpdateButton::OtherDevice));
+    banner.text = format!("Version {here} is ready on {name}");
+    Some(banner)
 }
 
 /// A device that should look for an update now, as the other one has found it. The two check at
@@ -283,6 +317,27 @@ mod tests {
         assert_eq!(banner.button.unwrap().label(), "Update both devices");
         assert_eq!(banner.notes.as_deref(), Some("0.7.1"));
         assert!(banner.detail.unwrap().contains("Sharing drops"), "it says so first");
+    }
+
+    #[test]
+    fn with_both_ready_either_device_can_also_be_updated_alone() {
+        let banner = update_banner(&snapshot(ready(), Some(Some(ready())))).unwrap();
+        assert_eq!(banner.more, [UpdateButton::ThisDevice, UpdateButton::OtherDevice]);
+        assert!(!UpdateButton::ThisDevice.is_for_other() && UpdateButton::OtherDevice.is_for_other());
+        assert_eq!(update_banner(&snapshot(ready(), None)).unwrap().more, [], "one button is enough");
+    }
+
+    #[test]
+    fn a_device_already_on_the_version_can_update_the_other_from_here() {
+        let mut there = status("ready", Some("0.7.0"), true);
+        let behind = |there: &UpdateStatus| update_banner(&snapshot(status("idle", None, false), Some(Some(there.clone()))));
+        let banner = behind(&there).unwrap();
+        assert_eq!(banner.text, "Version 0.7.0 is ready on SACBOOKPRO");
+        assert_eq!((banner.button, banner.more.len()), (Some(UpdateButton::OtherDevice), 0));
+        assert!(banner.detail.unwrap().contains("won't work together"));
+        there.preflight = Some("denied".into());
+        assert_eq!(behind(&there), None, "it can't install by itself");
+        assert_eq!(behind(&status("ready", Some("0.7.1"), true)), None, "a version this device isn't on");
     }
 
     #[test]
@@ -424,7 +479,7 @@ mod tests {
 
     #[test]
     fn the_action_names_no_file_or_version() {
-        for button in [UpdateButton::Both, UpdateButton::ThisDevice] {
+        for button in [UpdateButton::Both, UpdateButton::ThisDevice, UpdateButton::OtherDevice] {
             assert_eq!(button.action().as_object().unwrap().len(), 1, "{:?}", button.action());
         }
     }
