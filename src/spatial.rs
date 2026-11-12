@@ -2752,7 +2752,7 @@ mod tests {
         track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0, received_us: 0 });
         let decide = |edge: &EdgeWatch, track: &mut CursorTrack, now_us| {
             let here = track.locate(now_us, monitors, edge.along_x());
-            let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
+            let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p), monitor: monitors.iter().position(|m| contains(m, p)) };
             (here, judge(&here, edge.along_x(), spot))
         };
         // Pushing down while drifting left towards DP-3, with KWin 60 ms behind.

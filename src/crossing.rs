@@ -292,6 +292,8 @@ mod position {
     pub struct Spot {
         pub on_span: bool,
         pub guarded: bool,
+        /// Which of this device's monitors the point is on.
+        pub monitor: Option<usize>,
     }
 
     /// Decides a completed push from where the cursor is (the push itself was counted at `sample`).
@@ -309,7 +311,13 @@ mod position {
             return Gate::Hold(Refusal::Guard);
         }
         match here.trust {
-            Trust::TrackerSilent => Gate::Cross { at: here.sample },
+            // With positions gone, the last one is gone by only where the movement since agrees:
+            // the estimate on the span, on the same monitor. A frozen position above the laptop
+            // must not carry a cursor the mouse has since moved onto the side display.
+            Trust::TrackerSilent if at_estimate.on_span && at_estimate.monitor == at_sample.monitor => {
+                Gate::Cross { at: here.sample }
+            }
+            Trust::TrackerSilent => Gate::Hold(Refusal::OffSpan),
             Trust::Unverified => Gate::Hold(Refusal::Stale),
             Trust::Fresh | Trust::Still if !at_estimate.on_span => Gate::Hold(Refusal::OffSpan),
             Trust::Fresh | Trust::Still => Gate::Cross { at: here.estimate },
@@ -351,6 +359,8 @@ mod position {
     pub const SILENCES_WITHIN_MS: u64 = 60_000;
     /// And no more often than this.
     pub const RESPAWN_GAP_MS: u64 = 30_000;
+    /// The script says it runs every 2 s. Nothing at all from it for this long, and it is lost.
+    pub const ALIVE_LOST_MS: u64 = 7000;
 
     /// When to start the tracker again: silent often lately, and not too soon after the last time.
     #[derive(Default)]
@@ -366,13 +376,26 @@ mod position {
             while self.silences.front().is_some_and(|&at| now_ms.saturating_sub(at) > SILENCES_WITHIN_MS) {
                 self.silences.pop_front();
             }
-            let rested = self.last_ms.is_none_or(|last| now_ms.saturating_sub(last) >= RESPAWN_GAP_MS);
-            let due = self.silences.len() >= SILENCES_FOR_RESPAWN && rested;
+            let due = self.silences.len() >= SILENCES_FOR_RESPAWN && self.rested(now_ms);
             if due {
                 self.last_ms = Some(now_ms);
                 self.silences.clear();
             }
             due
+        }
+
+        /// The tracker is lost at `now_ms`. True if it should start again now.
+        pub fn lost(&mut self, now_ms: u64) -> bool {
+            let due = self.rested(now_ms);
+            if due {
+                self.last_ms = Some(now_ms);
+                self.silences.clear();
+            }
+            due
+        }
+
+        fn rested(&self, now_ms: u64) -> bool {
+            self.last_ms.is_none_or(|last| now_ms.saturating_sub(last) >= RESPAWN_GAP_MS)
         }
     }
 
@@ -640,15 +663,19 @@ mod tests {
     /// The owner's desk: the laptop under DP-2, the bright edge 1920..4479 along y = 1439, and the
     /// guard strip beside DP-3 at 1920..1967.
     fn spot((x, y): (i32, i32)) -> Spot {
-        Spot { on_span: y == 1439 && (1920..=4479).contains(&x), guarded: y == 1439 && (1920..1968).contains(&x) }
+        Spot {
+            on_span: y == 1439 && (1920..=4479).contains(&x),
+            guarded: y == 1439 && (1920..1968).contains(&x),
+            monitor: Some(usize::from(x >= 1920)),
+        }
     }
 
     fn nowhere(_: (i32, i32)) -> Spot {
-        Spot { on_span: false, guarded: false }
+        Spot { on_span: false, guarded: false, monitor: None }
     }
 
     fn all_guarded(_: (i32, i32)) -> Spot {
-        Spot { on_span: true, guarded: true }
+        Spot { on_span: true, guarded: true, monitor: Some(1) }
     }
 
     #[test]
@@ -810,6 +837,39 @@ mod tests {
         for at in [0, 40_000, 80_000, 120_000] {
             assert!(!respawn.silenced(at), "{at}");
         }
+    }
+
+    #[test]
+    fn with_positions_gone_a_frozen_one_isnt_believed_against_the_movement_since() {
+        // Frozen at 2000, above the laptop; the mouse has since gone 600 px left, onto DP-3.
+        let mut t = track_with(sample(2000, 1439, 1, 0));
+        t.moved(50 * MS, -600, 30);
+        let mut here = t.locate(5000 * MS, &desk(), true);
+        here.trust = Trust::TrackerSilent;
+        assert_eq!(here.estimate, (1400, 1439));
+        assert_eq!(judge(&here, true, spot), Gate::Hold(Refusal::OffSpan));
+        // Pushing straight down where it froze, it crosses there, as before positions were checked.
+        let mut t = track_with(sample(2500, 1439, 1, 0));
+        t.moved(50 * MS, 0, 30);
+        let mut here = t.locate(5000 * MS, &desk(), true);
+        here.trust = Trust::TrackerSilent;
+        assert_eq!(judge(&here, true, spot), Gate::Cross { at: (2500, 1439) });
+        // An estimate on the span but on another monitor than the position is no agreement.
+        let other = |p: (i32, i32)| Spot { monitor: Some(usize::from(p.0 >= 2400)), ..spot(p) };
+        let mut t = track_with(sample(2500, 1439, 1, 0));
+        t.moved(50 * MS, -200, 30);
+        let mut here = t.locate(5000 * MS, &desk(), true);
+        here.trust = Trust::TrackerSilent;
+        assert_eq!(judge(&here, true, other), Gate::Hold(Refusal::OffSpan));
+    }
+
+    #[test]
+    fn a_lost_tracker_starts_again_at_most_every_30_s_and_shares_the_gap_with_silences() {
+        let mut respawn = Respawn::default();
+        assert!(respawn.lost(7_000));
+        assert!(!respawn.lost(8_000));
+        assert!(!respawn.silenced(9_000) && !respawn.silenced(10_000) && !respawn.silenced(11_000));
+        assert!(respawn.lost(37_000));
     }
 
     #[test]

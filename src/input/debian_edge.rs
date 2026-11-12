@@ -3,7 +3,8 @@
 //! position comes, and say what happened in the link log.
 
 use crate::crossing::{
-    judge, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Respawn, Sample, Spot, TrackerNews, Trust, HELD_SILENT_MS,
+    judge, CrossLine, CursorTrack, Gate, Refusal, RefusalLog, Respawn, Sample, Spot, TrackerNews, Trust, ALIVE_LOST_MS,
+    HELD_SILENT_MS,
 };
 use crate::protocol::NodeId;
 use crate::spatial::{EdgeWatch, SpatialConfig};
@@ -13,6 +14,8 @@ pub trait EdgeLog {
     fn tracker(&mut self, news: TrackerNews, age_ms: u64);
     fn refused(&mut self, line: (Refusal, u32));
     fn crossed(&mut self, line: CrossLine);
+    /// The tracker is lost, and starts again.
+    fn lost(&mut self, reason: &str);
 }
 
 /// The link log.
@@ -34,6 +37,11 @@ impl EdgeLog for LinkLog {
 
     fn crossed(&mut self, line: CrossLine) {
         line.record();
+    }
+
+    fn lost(&mut self, reason: &str) {
+        let details = crate::linklog::Details::new().text("state", "lost").text("reason", reason);
+        crate::linklog::record("cursor_tracker", details);
     }
 }
 
@@ -72,6 +80,8 @@ pub struct DebianEdge {
     said_silent: bool,
     respawn: Respawn,
     respawn_due: bool,
+    /// Nothing from the script for `ALIVE_LOST_MS`, though it says it runs every 2 s.
+    lost: bool,
 }
 
 /// The moment, on both clocks the decision uses.
@@ -91,6 +101,7 @@ impl DebianEdge {
             said_silent: false,
             respawn: Respawn::default(),
             respawn_due: false,
+            lost: false,
         }
     }
 
@@ -104,6 +115,24 @@ impl DebianEdge {
     #[cfg(test)]
     pub fn holding(&self) -> bool {
         self.holding.is_some()
+    }
+
+    /// Looks at when anything at all last came from the script, `None` while no `Alive` has ever
+    /// come (an older script, or a KWin without timers, can't say it runs). Nothing for
+    /// `ALIVE_LOST_MS` and it is lost, whichever device has control and whatever holds the
+    /// pointer: true if it should start again now, at most every `RESPAWN_GAP_MS`.
+    pub fn pulse(&mut self, last_heard_us: Option<i64>, now: Now, log: &mut impl EdgeLog) -> bool {
+        self.lost = last_heard_us.is_some_and(|at| now.us - at > ALIVE_LOST_MS as i64 * 1000);
+        let respawn = self.lost && self.respawn.lost(now.ms);
+        if respawn {
+            log.lost("no_alive");
+        }
+        respawn
+    }
+
+    /// True while the script is lost, so that a game flag it set long ago is none.
+    pub fn tracker_lost(&self) -> bool {
+        self.lost
     }
 
     /// True once, when the tracker has been silent often enough to start it again.
@@ -167,13 +196,22 @@ impl DebianEdge {
             self.refusals.cleared();
             return;
         }
-        if self.silent(now) {
-            self.note_silence(now, log);
+        let silent = self.silent(now);
+        if self.lost || silent {
             here.trust = Trust::TrackerSilent;
         }
         let edge = &self.edge;
-        let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p) };
-        match judge(&here, edge.along_x(), spot) {
+        let spot = |p| Spot {
+            on_span: edge.on_span(monitors, p),
+            guarded: edge.guarded(monitors, p),
+            monitor: monitors.iter().position(|m| (m.x..m.x + m.w).contains(&p.0) && (m.y..m.y + m.h).contains(&p.1)),
+        };
+        let gate = judge(&here, edge.along_x(), spot);
+        // Resting in a guard strip is no sign of a silent tracker: the push would wait anyway.
+        if silent && !self.lost && gate != Gate::Hold(Refusal::Guard) {
+            self.note_silence(now, log);
+        }
+        match gate {
             Gate::Cross { at } => {
                 self.edge.clear();
                 self.refusals.cleared();
@@ -255,6 +293,9 @@ mod tests {
         fn crossed(&mut self, line: CrossLine) {
             let text: Vec<String> = line.fields().iter().map(|(k, v)| format!("{k}={v}")).collect();
             self.0.push(format!("cross {}", text.join(" ")));
+        }
+        fn lost(&mut self, reason: &str) {
+            self.0.push(format!("cursor_tracker lost {reason}"));
         }
     }
 
@@ -377,7 +418,7 @@ mod tests {
             d.look(&cfg, false, at(t), &mut router, &mut log);
         }
         assert!(router.crossings.is_empty());
-        assert!(log.0.contains(&"cursor_tracker Silent".to_string()));
+        assert!(!log.0.iter().any(|l| l.starts_with("cursor_tracker")), "resting in the strip says nothing: {:?}", log.0);
     }
 
     #[test]
@@ -439,5 +480,87 @@ mod tests {
             assert_eq!(respawned, round == 2, "round {round}");
         }
         assert_eq!(log.0.iter().filter(|l| *l == "cursor_tracker Silent").count(), 1, "said once until it's back");
+    }
+
+    #[test]
+    fn nothing_from_the_script_for_7_s_is_a_lost_tracker_whoever_has_control() {
+        for blocked in [false, true] {
+            let (cfg, mut d, _, mut log) = setup();
+            let mut router = FakeRouter { blocked, ..Default::default() };
+            // Steady movement, a game holding the pointer or the laptop in control: all the same.
+            for ms in (10..7000).step_by(10) {
+                d.track.moved(ms * MS, 1, 0);
+                d.push(&cfg, (1, 0), false, false, at(ms), &mut router, &mut log);
+                assert!(!d.pulse(Some(0), at(ms), &mut log), "{ms}");
+            }
+            assert!(d.pulse(Some(0), at(7001), &mut log), "blocked {blocked}");
+            assert!(d.tracker_lost());
+            assert_eq!(log.0.last().map(String::as_str), Some("cursor_tracker lost no_alive"));
+            // Lost still, but started again only 30 s on.
+            assert!(!d.pulse(Some(0), at(8000), &mut log));
+            assert!(d.pulse(Some(0), at(37_001), &mut log));
+            // Something comes: it's back.
+            assert!(!d.pulse(Some(37_500 * MS), at(37_600), &mut log));
+            assert!(!d.tracker_lost());
+        }
+    }
+
+    #[test]
+    fn alive_calls_alone_keep_a_still_or_locked_pointer_from_counting_as_lost() {
+        let (_, mut d, _, mut log) = setup();
+        let mut last = 0;
+        for ms in (0..120_000).step_by(40) {
+            if ms % 2000 == 0 {
+                last = ms * MS;
+            }
+            assert!(!d.pulse(Some(last), at(ms), &mut log));
+            assert!(!d.tracker_lost());
+        }
+        // A script that never said it runs is never taken for lost by this.
+        assert!(!d.pulse(None, at(1_000_000), &mut log));
+        assert!(log.0.is_empty());
+    }
+
+    #[test]
+    fn a_lost_tracker_doesnt_carry_a_cursor_across_from_the_side_display() {
+        let (cfg, mut d, mut router, mut log) = setup();
+        d.hear(&cfg, sample(2000, 2, 2, 3), false, at(3), &mut router, &mut log);
+        assert!(d.pulse(Some(3 * MS), at(8000), &mut log));
+        // The mouse carries the cursor 600 px left onto DP-3 along the bottom, pushing down.
+        for (i, t) in (8010..8070).step_by(10).enumerate() {
+            d.track.moved(t * MS, -100, 30);
+            d.push(&cfg, (-100, 30), false, false, at(t), &mut router, &mut log);
+            assert!(router.crossings.is_empty(), "push {i}");
+        }
+        for t in (8100..9000).step_by(40) {
+            d.look(&cfg, false, at(t), &mut router, &mut log);
+        }
+        assert!(router.crossings.is_empty());
+    }
+
+    #[test]
+    fn a_lost_tracker_still_crosses_a_push_straight_down_where_it_froze() {
+        let (cfg, mut d, mut router, mut log) = setup();
+        d.hear(&cfg, sample(3000, 2, 2, 3), false, at(3), &mut router, &mut log);
+        assert!(d.pulse(Some(3 * MS), at(8000), &mut log));
+        d.push(&cfg, (0, 30), false, false, at(8010), &mut router, &mut log);
+        d.push(&cfg, (0, 30), false, false, at(8020), &mut router, &mut log);
+        assert_eq!(router.crossings, vec![((1080, SHARED_EDGE_INSET), false)]);
+    }
+
+    #[test]
+    fn resting_in_the_guard_strip_pushing_down_never_starts_the_tracker_again() {
+        let (cfg, mut d, mut router, mut log) = held_near_the_strip(1950);
+        let mut t = 40;
+        for _ in 0..5 {
+            // No positions at all, pushing down now and then.
+            for _ in 0..10 {
+                d.look(&cfg, false, at(t), &mut router, &mut log);
+                t += 40;
+            }
+            d.push(&cfg, (0, 30), false, false, at(t), &mut router, &mut log);
+        }
+        assert!(!d.take_respawn());
+        assert!(router.crossings.is_empty());
     }
 }

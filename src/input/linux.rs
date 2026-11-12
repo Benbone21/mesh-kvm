@@ -1046,6 +1046,9 @@ struct Reading {
 /// Puts dbus-monitor's lines back together into calls: a header line, then one line per argument.
 #[derive(Default)]
 struct MonitorReader {
+    /// An `Alive` call came, with the game flag it carried, not yet taken.
+    alive: Option<bool>,
+    in_alive: bool,
     args: Vec<i64>,
     /// Which of `args` came as a double.
     doubles: Vec<bool>,
@@ -1062,9 +1065,10 @@ impl MonitorReader {
             self.args.clear();
             self.doubles.clear();
             self.in_update = trimmed.starts_with("method call") && trimmed.ends_with("member=Update");
+            self.in_alive = trimmed.starts_with("method call") && trimmed.ends_with("member=Alive");
             return legacy;
         }
-        if !self.in_update {
+        if !self.in_update && !self.in_alive {
             return None;
         }
         let number = ["int32 ", "uint32 ", "int64 ", "uint64 ", "double "].iter().find_map(|kind| {
@@ -1073,7 +1077,15 @@ impl MonitorReader {
         });
         self.args.push(number?);
         self.doubles.push(trimmed.starts_with("double "));
-        if self.args.len() < 5 {
+        // Alive: seq, stamp, game flag.
+        if self.in_alive && self.args.len() == 3 {
+            self.alive = Some(self.args[2] != 0);
+            self.args.clear();
+            self.doubles.clear();
+            self.in_alive = false;
+            return None;
+        }
+        if self.in_alive || self.args.len() < 5 {
             return None;
         }
         let reading = self.reading();
@@ -1081,6 +1093,11 @@ impl MonitorReader {
         self.doubles.clear();
         self.in_update = false;
         Some(reading)
+    }
+
+    /// The game flag of an `Alive` call read since the last look, if one was.
+    fn take_alive(&mut self) -> Option<bool> {
+        self.alive.take()
     }
 
     fn reading(&self) -> Reading {
@@ -1126,6 +1143,10 @@ struct TrackerControl {
     /// The service is stopping: the tracker mustn't start again behind the script's unload.
     stopping: AtomicBool,
     monitor_pid: std::sync::atomic::AtomicI32,
+    /// When anything at all last came from the script, on the monotonic clock, or 0.
+    last_heard_us: std::sync::atomic::AtomicI64,
+    /// An `Alive` has come from a script, ever, so it can say it runs.
+    says_alive: AtomicBool,
 }
 
 impl TrackerControl {
@@ -1133,6 +1154,15 @@ impl TrackerControl {
     fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.restart();
+    }
+
+    /// When anything last came from a script that can say it runs: see `DebianEdge::pulse`.
+    fn heard_from(&self) -> Option<i64> {
+        self.says_alive.load(Ordering::SeqCst).then(|| self.last_heard_us.load(Ordering::SeqCst))
+    }
+
+    fn heard_now(&self) {
+        self.last_heard_us.store(mono_us(), Ordering::SeqCst);
     }
 
     fn stopping(&self) -> bool {
@@ -1178,9 +1208,13 @@ fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<A
             let mut said_bad_stamp = false;
             let mut last_start: Option<Instant> = None;
             let mut said_exit = false;
+            let mut asked = false;
             loop {
-                // Waits out the gap since the last start, looking for the service stopping meanwhile.
-                while last_start.is_some_and(|started| started.elapsed() < Duration::from_millis(RESPAWN_GAP_MS))
+                // A start the input loop asked for goes at once: it keeps to the gap itself. One
+                // after dbus-monitor ended by itself waits out the gap since the last start, looking
+                // for the service stopping meanwhile.
+                while !asked
+                    && last_start.is_some_and(|started| started.elapsed() < Duration::from_millis(RESPAWN_GAP_MS))
                     && !control.stopping()
                 {
                     std::thread::sleep(Duration::from_millis(100));
@@ -1195,7 +1229,7 @@ fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<A
                 if control.stopping() {
                     return;
                 }
-                let asked = control.restart.swap(false, Ordering::SeqCst);
+                asked = control.restart.swap(false, Ordering::SeqCst);
                 // Asked for, the input loop said why. A dbus-monitor that never works is said once.
                 if !asked && (heard || !said_exit) {
                     said_exit = true;
@@ -1232,8 +1266,8 @@ fn run_kwin_tracker(
     });
     let Ok(mut child) = child else { return false };
     control.monitor_pid.store(child.id() as i32, Ordering::SeqCst);
-    // A stop that came between the start and the pid being kept found no pid to end.
-    if control.stopping() {
+    // A stop or restart that came between the start and the pid being kept found no pid to end.
+    if control.stopping() || control.restart.load(Ordering::SeqCst) {
         control.monitor_pid.store(0, Ordering::SeqCst);
         let _ = child.kill();
         let _ = child.wait();
@@ -1260,8 +1294,15 @@ fn run_kwin_tracker(
         let mut reader = MonitorReader::default();
         let mut unnumbered = 0u32;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Some(reading) = reader.feed(&line) else { continue };
+            let reading = reader.feed(&line);
+            if let Some(game) = reader.take_alive() {
+                control.says_alive.store(true, Ordering::SeqCst);
+                control.heard_now();
+                kwin_game_active.store(game, Ordering::Relaxed);
+            }
+            let Some(reading) = reading else { continue };
             heard = true;
+            control.heard_now();
             if reading.bad_stamp && !*said_bad_stamp {
                 *said_bad_stamp = true;
                 crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "bad_stamp"));
@@ -2015,9 +2056,19 @@ pub fn run_debian_node(
             // A held push is decided again as time passes, so one waiting on a silent tracker gets
             // across; found silent often, as after KWin restarted, the tracker starts again.
             core.look_at_edge(&cfg_snapshot);
-            if core.edge.take_respawn() {
+            // Nothing from the script for 7 s, though it says it runs every 2: lost, whoever has
+            // control and whatever holds the pointer.
+            let now = core.now();
+            let lost_now = core.edge.pulse(tracker.heard_from(), now, &mut LinkLog);
+            let silent_often = !lost_now && core.edge.take_respawn();
+            if silent_often {
                 note_lost("silent");
-                // A game the old script saw is no game until the new one says so.
+            }
+            if core.edge.tracker_lost() {
+                // A game the lost script saw is no game until a new one says so.
+                kwin_game_active.store(false, Ordering::Relaxed);
+            }
+            if lost_now || silent_often {
                 kwin_game_active.store(false, Ordering::Relaxed);
                 tracker.restart();
             }
@@ -2095,6 +2146,21 @@ mod tests {
         let lines = [UPDATE, "   double 10", "   double 20.4", "   int32 1", "   uint32 78", "   int64 5"];
         let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
         assert_eq!(got, vec![Reading { x: 10, y: 20, game: true, seq: Some(78), kwin_ms: Some(5), bad_stamp: false }]);
+    }
+
+    #[test]
+    fn an_alive_call_is_read_as_one_and_is_no_position() {
+        let mut r = MonitorReader::default();
+        let alive = UPDATE.replace("member=Update", "member=Alive");
+        for line in [alive.as_str(), "   int32 80", "   int32 734568123", "   int32 1"] {
+            assert_eq!(r.feed(line), None);
+        }
+        assert_eq!(r.take_alive(), Some(true));
+        assert_eq!(r.take_alive(), None, "taken once");
+        // And a position after it is read whole.
+        let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 81", "   int32 5"];
+        assert_eq!(lines.iter().filter_map(|l| r.feed(l)).count(), 1);
+        assert_eq!(r.take_alive(), None);
     }
 
     #[test]
