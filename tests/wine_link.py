@@ -332,6 +332,18 @@ def link_log_lines():
     return link_log(2000)[0].splitlines()
 
 
+def wait_for_lines(cond, timeout):
+    """The link log's lines once cond holds for them, as the log is written a moment after."""
+    deadline = time.time() + timeout
+    lines = []
+    while time.time() < deadline:
+        lines = link_log_lines()
+        if cond(lines):
+            break
+        time.sleep(0.2)
+    return lines
+
+
 def bincode_text(text):
     raw = text.encode()
     return struct.pack("<Q", len(raw)) + raw
@@ -764,6 +776,68 @@ def input_checks(peer, inbox):
               lambda: active_view(WINDOWS), lambda: mouse_move(-400, 0))
     crossing = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
     check("pushing at the edge in Debian's EdgeMap sends focus to Debian", crossing is not None)
+
+    # m. A guard strip is only where another of this device's monitors carries on the edge, so the
+    # laptop's one monitor has none: a push two pixels from the end of the span still crosses.
+    peer.give_focus_to_laptop(28, 2)
+    time.sleep(0.4)
+    inbox.clear()
+    peer.pump(0.8, heartbeat, lambda: edge_map(LEFT, 0, 5000, 30), lambda: active_view(WINDOWS),
+              lambda: mouse_move(-400, 0))
+    corner = inbox.wait_for(FOCUS_SWITCH_AT, 1, lambda f: f["target"] == DEBIAN)
+    check("one monitor has no guard strip: a push at the very end of the span crosses", corner is not None,
+          str(corner and corner[1]))
+
+    # n. Pushed straight back at the edge it came in by, the cursor stays for the settle. Gone 30 px
+    # in first, a quick return is meant, and crosses back well inside the settle's 250 ms: every
+    # push below is over 150 ms after control arrived.
+    def arrive_then(moves):
+        peer.drive_to_debian()
+        inbox.clear()
+        peer.send(heartbeat())
+        peer.send(focus_switch_at(WINDOWS, 12, 300))
+        peer.send(active_view(WINDOWS))
+        start = time.time()
+        for at, dx in moves:
+            time.sleep(max(0.0, start + at - time.time()))
+            peer.send(mouse_move(dx, 0))
+        return inbox.wait_for(FOCUS_SWITCH_AT, 0.6, lambda f: f["target"] == DEBIAN)
+    bounced = arrive_then([(0.03 + 0.02 * i, -100) for i in range(7)])
+    check("pushed straight back at the edge it came in by, the cursor doesn't bounce back", bounced is None)
+    quick = arrive_then([(0.03, 30)] + [(0.08 + 0.02 * i, -100) for i in range(4)])
+    check("a quick return 30 px in and back crosses inside the 250 ms settle", quick is not None)
+    # Each crossing has its line in the link log, and the refused push before it one too.
+    lines = wait_for_lines(lambda ls: any(" cross dir=to_debian " in l for l in ls), 3)
+    crossed = [l for l in lines if " cross dir=to_debian " in l]
+    check("a crossing writes a cross line with where it went and how early the settle ended",
+          bool(crossed) and all(k in crossed[-1] for k in ("at=0,", "entry=", "sample_age_ms=0", "held_ms=", "settle_left_ms=")),
+          str(crossed[-1:]))
+    check("the push refused for the settle writes a cross_refused line",
+          any(" cross_refused reason=settle count=" in l for l in lines), str([l for l in lines if "cross_refused" in l][-2:]))
+
+    # o. With Debian in control the laptop's cursor sits parked, hidden under a window of its own,
+    # which goes with Release all input and while the laptop is in use.
+    # Wine makes no windows with no display to put them on, the session window included, so without
+    # one these checks would pass whatever the cloak did.
+    windows = bool(os.environ.get("WINE_LINK_DISPLAY"))
+    if windows:
+        hidden = wait_for(lambda s: s.get("cursor_hidden") is True, 2)
+        check("while Debian has control, the laptop's parked cursor is hidden", (hidden or {}).get("cursor_hidden") is True,
+              str((hidden or {}).get("cursor_hidden")))
+    call("/api/action", {"action": "panic"})
+    if windows:
+        shown = wait_for(lambda s: s.get("cursor_hidden") is False, 2)
+        check("Release all input shows the cursor", (shown or {}).get("cursor_hidden") is False, str(shown))
+    peer.give_focus_to_laptop(400, 300)
+    st = wait_for(lambda s: not s["panic_mode"] and s["active_node"] == "Windows", 2)
+    if windows:
+        check("and the laptop in use shows its own", bool(st) and st.get("cursor_hidden") is False,
+              str(st and st.get("cursor_hidden")))
+    else:
+        print("SKIP: hiding the parked cursor and showing it again, as Wine makes no windows without WINE_LINK_DISPLAY",
+              flush=True)
+    check("a cursor parked while Debian had control leaves no game lock behind", bool(st) and not st["game_lock"],
+          str(st and (st["game_lock"], st["active_node"])))
     return crossing
 
 
@@ -2057,7 +2131,7 @@ def test(exe_path, linux_path):
             # column at 2559, and the laptop still sits where the fresh layout put it.
             fields = crossing[1]
             check("the crossing lands on Debian's own monitor, in from the edge",
-                  fields["x"] == 2559 - 28, str(fields))
+                  fields["x"] == 2559 - 12, str(fields))
         keyboard_checks(peer, inbox, exe)
         link_state_checks(peer, inbox)
         dropout_checks(peer, inbox)

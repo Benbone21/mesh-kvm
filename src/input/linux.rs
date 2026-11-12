@@ -12,7 +12,9 @@ use crate::protocol::{
 };
 use crate::router::{Action, DeviceId, EdgeSpan, Event, Router, RouterConfig, KEEP_CURSOR};
 use crate::secure::datagram::{Channel, LinkSecurity};
-use crate::spatial::{take_studio_requests, EdgeWatch, SharedSpatialState, SpatialConfig};
+use super::debian_edge::{self, DebianEdge, LinkLog, Now};
+use crate::crossing::{taken_at, Sample, SampleSlot, RESPAWN_GAP_MS};
+use crate::spatial::{take_studio_requests, SharedSpatialState, SpatialConfig};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -21,7 +23,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -857,19 +859,81 @@ pub fn detect_screen_dimensions() -> (i32, i32) {
     (4480, 1440)
 }
 
-/// Spawns a KWin Scripting bridge that tracks the TRUE KDE Plasma 6 Wayland cursor (x, y)
-/// AND active fullscreen/game windows in real time via `workspace.cursorPosChanged` over session D-Bus.
-fn spawn_kwin_cursor_tracker(
-    real_x: Arc<AtomicI32>,
-    real_y: Arc<AtomicI32>,
-    kwin_game_active: Arc<AtomicBool>,
-) {
-    std::thread::Builder::new()
-        .name("mesh-kvm-kwin-cursor".to_string())
-        .spawn(move || {
-            let script_path = "/tmp/mesh_kvm_kwin_cursor.js";
-            let js = r#"
+/// The KWin script that reports the cursor. Each position goes out with a number and the time KWin
+/// took it, so the receiver can tell how old it is. They go out at most once every `SEND_GAP_MS`,
+/// the latest one always going out at the end of the gap, so that nothing queues up behind a fast
+/// mouse. Within `NEAR` px of an outer edge of the desktop (one with no screen beyond it) the
+/// position also goes out every `BEAT_MS` while the cursor stands still, as a push against the
+/// edge moves nothing and would otherwise wait for a wiggle. Away from the edges that heartbeat
+/// doesn't run. Every `ALIVE_MS` an `Alive` call says the script still runs, whatever the cursor
+/// does. A KWin without `QTimer` gets the older way: every move near an edge, and every 12 ms
+/// elsewhere, and no `Alive`. `tests/kwin_script_sim.js` plays the script against stand-ins for KWin.
+const KWIN_SCRIPT: &str = r#"
+var SEND_GAP_MS = 2;
+var NEAR = 16;
+var BEAT_MS = 16;
 var lastEmit = 0;
+var seq = 0;
+var waiting = false;
+var timer = null;
+var beat = null;
+var alive = null;
+var ALIVE_MS = 2000;
+var screens = [];
+function refreshScreens() {
+    var list = workspace.screens;
+    screens = list ? list : [];
+}
+function screenList() {
+    return screens;
+}
+function onScreen(x, y) {
+    var list = screenList();
+    for (var i = 0; i < list.length; i++) {
+        var g = list[i].geometry;
+        if (x >= g.x && x < g.x + g.width && y >= g.y && y < g.y + g.height) return true;
+    }
+    return false;
+}
+function nearOuterEdge(x, y) {
+    var list = screenList();
+    for (var i = 0; i < list.length; i++) {
+        var g = list[i].geometry;
+        if (x < g.x || x >= g.x + g.width || y < g.y || y >= g.y + g.height) continue;
+        if (y - g.y < NEAR && !onScreen(x, g.y - 1)) return true;
+        if (g.y + g.height - 1 - y < NEAR && !onScreen(x, g.y + g.height)) return true;
+        if (x - g.x < NEAR && !onScreen(g.x - 1, y)) return true;
+        if (g.x + g.width - 1 - x < NEAR && !onScreen(g.x + g.width, y)) return true;
+    }
+    return false;
+}
+// The cursor's pixel. A position in the last half pixel of a screen would round onto no screen.
+function pixel() {
+    var p = workspace.cursorPos;
+    var x = Math.round(p.x);
+    var y = Math.round(p.y);
+    if (!onScreen(x, y)) {
+        if (onScreen(x - 1, y)) {
+            x -= 1;
+        } else if (onScreen(x, y - 1)) {
+            y -= 1;
+        } else if (onScreen(x - 1, y - 1)) {
+            x -= 1;
+            y -= 1;
+        }
+    }
+    return [x, y];
+}
+function followBeat() {
+    if (beat === null) return;
+    var at = pixel();
+    var near = nearOuterEdge(at[0], at[1]);
+    if (near && !beat.active) {
+        beat.start();
+    } else if (!near && beat.active) {
+        beat.stop();
+    }
+}
 function isGameWindow() {
     var w = workspace.activeWindow;
     if (!w) return 0;
@@ -888,16 +952,74 @@ function isGameWindow() {
     }
     return 0;
 }
-function emitPos(force) {
-    var p = workspace.cursorPos;
-    var x = Math.round(p.x);
-    var y = Math.round(p.y);
+function send() {
+    var at = pixel();
     var now = Date.now();
-    var nearEdge = (x <= 16 || x >= 4464 || (x >= 1904 && x <= 1936) ||
-                    y <= 16 || y >= 1424 || (y >= 344 && y <= 376));
-    if (force || nearEdge || (now - lastEmit) >= 12) {
-        lastEmit = now;
-        callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Update", x, y, isGameWindow());
+    lastEmit = now;
+    seq = (seq % 2000000000) + 1;
+    callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Update",
+             at[0] | 0, at[1] | 0, isGameWindow() | 0, seq | 0, (now % 1000000000) | 0);
+}
+// Says the script is running, wherever the cursor is and whether or not it moves.
+function sendAlive() {
+    var now = Date.now();
+    seq = (seq % 2000000000) + 1;
+    callDBus("org.meshkvm.Cursor", "/Cursor", "org.meshkvm.Cursor", "Alive",
+             seq | 0, (now % 1000000000) | 0, isGameWindow() | 0);
+}
+refreshScreens();
+try {
+    timer = new QTimer();
+    timer.singleShot = true;
+    timer.interval = SEND_GAP_MS;
+    timer.timeout.connect(function() { waiting = false; send(); });
+    beat = new QTimer();
+    beat.singleShot = false;
+    beat.interval = BEAT_MS;
+    beat.timeout.connect(function() {
+        var at = pixel();
+        if (nearOuterEdge(at[0], at[1])) {
+            send();
+        } else {
+            beat.stop();
+        }
+    });
+    alive = new QTimer();
+    alive.singleShot = false;
+    alive.interval = ALIVE_MS;
+    alive.timeout.connect(sendAlive);
+    alive.start();
+} catch (e) {
+    timer = null;
+    beat = null;
+    alive = null;
+}
+if (workspace.screensChanged) {
+    workspace.screensChanged.connect(function() { refreshScreens(); followBeat(); });
+}
+function emitPos(force) {
+    followBeat();
+    var now = Date.now();
+    if (timer === null) {
+        var at = pixel();
+        var x = at[0];
+        var y = at[1];
+        var nearEdge = (x <= 16 || x >= 4464 || (x >= 1904 && x <= 1936) ||
+                        y <= 16 || y >= 1424 || (y >= 344 && y <= 376));
+        if (force || nearEdge || (now - lastEmit) >= 12) {
+            send();
+        }
+        return;
+    }
+    if (force || (!waiting && now - lastEmit >= SEND_GAP_MS)) {
+        if (waiting) {
+            timer.stop();
+            waiting = false;
+        }
+        send();
+    } else if (!waiting) {
+        waiting = true;
+        timer.start();
     }
 }
 workspace.cursorPosChanged.connect(function() { emitPos(false); });
@@ -906,71 +1028,299 @@ if (workspace.windowActivated) {
 }
 emitPos(true);
 "#;
-            let _ = fs::write(script_path, js);
 
-            // Start dbus-monitor BEFORE running the KWin script so we catch the initial emitPos(true)
-            let child_opt = Command::new("dbus-monitor")
-                .args(["--session", "interface='org.meshkvm.Cursor'"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok();
+/// One `Update` call from the KWin script, as dbus-monitor prints it.
+#[derive(Debug, PartialEq)]
+struct Reading {
+    x: i32,
+    y: i32,
+    game: bool,
+    /// The script's number for it, and when KWin took it by `Date.now()` modulo 10^9. An older
+    /// script sends neither.
+    seq: Option<u32>,
+    kwin_ms: Option<i64>,
+    /// The stamp came as a double, which has lost its last digits, so it is no stamp.
+    bad_stamp: bool,
+}
 
-            std::thread::sleep(Duration::from_millis(80));
+/// Puts dbus-monitor's lines back together into calls: a header line, then one line per argument.
+#[derive(Default)]
+struct MonitorReader {
+    /// An `Alive` call came, with the game flag it carried, not yet taken.
+    alive: Option<bool>,
+    in_alive: bool,
+    args: Vec<i64>,
+    /// Which of `args` came as a double.
+    doubles: Vec<bool>,
+    in_update: bool,
+}
 
-            let _ = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.unloadScript",
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output();
+impl MonitorReader {
+    fn feed(&mut self, line: &str) -> Option<Reading> {
+        let trimmed = line.trim();
+        let header = ["method call", "method return", "error", "signal"].iter().any(|kind| trimmed.starts_with(kind));
+        if header {
+            // An older script's call has three arguments, and ends only when the next one starts.
+            let legacy = (self.in_update && self.args.len() == 3).then(|| self.reading());
+            self.args.clear();
+            self.doubles.clear();
+            self.in_update = trimmed.starts_with("method call") && trimmed.ends_with("member=Update");
+            self.in_alive = trimmed.starts_with("method call") && trimmed.ends_with("member=Alive");
+            return legacy;
+        }
+        if !self.in_update && !self.in_alive {
+            return None;
+        }
+        let number = ["int32 ", "uint32 ", "int64 ", "uint64 ", "double "].iter().find_map(|kind| {
+            let value = trimmed.strip_prefix(kind)?.trim();
+            value.parse::<i64>().ok().or_else(|| value.parse::<f64>().ok().filter(|v| v.is_finite()).map(|v| v.round() as i64))
+        });
+        self.args.push(number?);
+        self.doubles.push(trimmed.starts_with("double "));
+        // Alive: seq, stamp, game flag.
+        if self.in_alive && self.args.len() == 3 {
+            self.alive = Some(self.args[2] != 0);
+            self.args.clear();
+            self.doubles.clear();
+            self.in_alive = false;
+            return None;
+        }
+        if self.in_alive || self.args.len() < 5 {
+            return None;
+        }
+        let reading = self.reading();
+        self.args.clear();
+        self.doubles.clear();
+        self.in_update = false;
+        Some(reading)
+    }
 
-            if let Ok(out) = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.loadScript",
-                    script_path,
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output()
-            {
-                let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let _ = Command::new("qdbus6")
-                    .args([
-                        "org.kde.KWin",
-                        &format!("/Scripting/Script{}", id),
-                        "org.kde.kwin.Script.run",
-                    ])
-                    .output();
+    /// The game flag of an `Alive` call read since the last look, if one was.
+    fn take_alive(&mut self) -> Option<bool> {
+        self.alive.take()
+    }
+
+    fn reading(&self) -> Reading {
+        let arg = |i: usize| self.args.get(i).copied();
+        let int = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let bad_stamp = self.doubles.get(4).copied().unwrap_or(false);
+        Reading {
+            x: int(arg(0).unwrap_or(0)),
+            y: int(arg(1).unwrap_or(0)),
+            game: arg(2).unwrap_or(0) != 0,
+            seq: arg(3).map(|v| v as u32),
+            kwin_ms: arg(4).filter(|_| !bad_stamp),
+            bad_stamp,
+        }
+    }
+}
+
+/// Microseconds on the monotonic clock, which positions and movement are both timed by.
+fn mono_us() -> i64 {
+    clock_now_us(libc::CLOCK_MONOTONIC)
+}
+
+/// When the kernel says a movement happened, on the clock positions are timed by, so that a late
+/// read of the mouse doesn't make movement KWin already showed look newer than its position. A
+/// device that isn't on the monotonic clock, or a time from the future, goes by `now_us`.
+fn motion_time_us(clock: libc::clockid_t, event_us: i64, now_us: i64) -> i64 {
+    if clock == libc::CLOCK_MONOTONIC && event_us > 0 {
+        event_us.min(now_us)
+    } else {
+        now_us
+    }
+}
+
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Lets the input loop start the tracker again: it ends the running dbus-monitor, and the tracker's
+/// thread then starts dbus-monitor and the script afresh.
+#[derive(Default)]
+struct TrackerControl {
+    restart: AtomicBool,
+    /// The service is stopping: the tracker mustn't start again behind the script's unload.
+    stopping: AtomicBool,
+    monitor_pid: std::sync::atomic::AtomicI32,
+    /// When anything at all last came from the script, on the monotonic clock, or 0.
+    last_heard_us: std::sync::atomic::AtomicI64,
+    /// An `Alive` has come from a script, ever, so it can say it runs.
+    says_alive: AtomicBool,
+}
+
+impl TrackerControl {
+    /// Ends dbus-monitor for good, as the service stops.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.restart();
+    }
+
+    /// When anything last came from a script that can say it runs: see `DebianEdge::pulse`.
+    fn heard_from(&self) -> Option<i64> {
+        self.says_alive.load(Ordering::SeqCst).then(|| self.last_heard_us.load(Ordering::SeqCst))
+    }
+
+    fn heard_now(&self) {
+        self.last_heard_us.store(mono_us(), Ordering::SeqCst);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst) || SHUTDOWN_REQUESTED.load(Ordering::Relaxed) || crate::settings::restart_requested()
+    }
+
+    fn restart(&self) {
+        self.restart.store(true, Ordering::SeqCst);
+        let pid = self.monitor_pid.load(Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
             }
+        }
+    }
+}
 
-            if let Some(mut child) = child_opt {
-                if let Some(stdout) = child.stdout.take() {
-                    let reader = BufReader::new(stdout);
-                    let mut ints: Vec<i32> = Vec::with_capacity(3);
-                    for line in reader.lines().flatten() {
-                        let trimmed = line.trim();
-                        if let Some(rest) = trimmed.strip_prefix("int32 ") {
-                            if let Ok(val) = rest.trim().parse::<i32>() {
-                                ints.push(val);
-                                if ints.len() == 2 {
-                                    real_x.store(ints[0], Ordering::Relaxed);
-                                    real_y.store(ints[1], Ordering::Relaxed);
-                                } else if ints.len() >= 3 {
-                                    kwin_game_active.store(ints[2] != 0, Ordering::Relaxed);
-                                }
-                            }
-                        } else if trimmed.starts_with("method call") {
-                            ints.clear();
-                        }
-                    }
+/// How long a call to KWin may take. A KWin that hangs mustn't hold up the tracker for good.
+const QDBUS_LIMIT: Duration = Duration::from_secs(3);
+
+/// Calls KWin through qdbus6, for at most `QDBUS_LIMIT`. Its output, if it finished.
+fn qdbus(args: &[&str]) -> Option<String> {
+    let mut command = Command::new("qdbus6");
+    command.args(args);
+    match crate::platform::limited::run_limited(command, QDBUS_LIMIT, crate::platform::limited::OnExpiry::Kill) {
+        crate::platform::limited::Ran::Finished(out) => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+fn note_lost(reason: &str) {
+    crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "lost").text("reason", reason));
+}
+
+/// Spawns a KWin Scripting bridge that tracks the TRUE KDE Plasma 6 Wayland cursor (x, y)
+/// AND active fullscreen/game windows in real time via `workspace.cursorPosChanged` over session D-Bus.
+/// Only the newest position is kept, with when KWin took it. If dbus-monitor ends, or the input
+/// loop finds the tracker lost, it starts again, no more often than every `RESPAWN_GAP_MS`.
+fn spawn_kwin_cursor_tracker(positions: Arc<SampleSlot>, kwin_game_active: Arc<AtomicBool>, control: Arc<TrackerControl>) {
+    std::thread::Builder::new()
+        .name("mesh-kvm-kwin-cursor".to_string())
+        .spawn(move || {
+            let mut said_bad_stamp = false;
+            let mut last_start: Option<Instant> = None;
+            let mut said_exit = false;
+            let mut asked = false;
+            loop {
+                // A start the input loop asked for goes at once: it keeps to the gap itself. One
+                // after dbus-monitor ended by itself waits out the gap since the last start, looking
+                // for the service stopping meanwhile.
+                while !asked
+                    && last_start.is_some_and(|started| started.elapsed() < Duration::from_millis(RESPAWN_GAP_MS))
+                    && !control.stopping()
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if control.stopping() {
+                    return;
+                }
+                last_start = Some(Instant::now());
+                let heard = run_kwin_tracker(&positions, &kwin_game_active, &control, &mut said_bad_stamp);
+                // A game the script saw is no game once it has gone, until a new one says so.
+                kwin_game_active.store(false, Ordering::Relaxed);
+                if control.stopping() {
+                    return;
+                }
+                asked = control.restart.swap(false, Ordering::SeqCst);
+                // Asked for, the input loop said why. A dbus-monitor that never works is said once.
+                if !asked && (heard || !said_exit) {
+                    said_exit = true;
+                    note_lost("dbus_monitor_exited");
                 }
             }
         })
         .ok();
+}
+
+/// One run of the tracker: dbus-monitor, then the script, then positions until dbus-monitor ends.
+/// True if it heard any.
+fn run_kwin_tracker(
+    positions: &SampleSlot,
+    kwin_game_active: &AtomicBool,
+    control: &TrackerControl,
+    said_bad_stamp: &mut bool,
+) -> bool {
+    let script_path = "/tmp/mesh_kvm_kwin_cursor.js";
+    let _ = fs::write(script_path, KWIN_SCRIPT);
+
+    // Start dbus-monitor BEFORE running the KWin script so we catch the initial emitPos(true).
+    // Line by line, so a position is never left sitting in its buffer.
+    let monitor_args = ["--session", "interface='org.meshkvm.Cursor'"];
+    let line_buffered = Command::new("stdbuf")
+        .arg("-oL")
+        .arg("dbus-monitor")
+        .args(monitor_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let child = line_buffered.or_else(|_| {
+        Command::new("dbus-monitor").args(monitor_args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    });
+    let Ok(mut child) = child else { return false };
+    control.monitor_pid.store(child.id() as i32, Ordering::SeqCst);
+    // A stop or restart that came between the start and the pid being kept found no pid to end.
+    if control.stopping() || control.restart.load(Ordering::SeqCst) {
+        control.monitor_pid.store(0, Ordering::SeqCst);
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+
+    std::thread::sleep(Duration::from_millis(80));
+
+    // The service may have stopped meanwhile, and unloaded the script: it mustn't come back.
+    if !control.stopping() {
+        qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
+        let loaded = qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", script_path, "mesh_kvm_cursor_watch"]);
+        if let Some(id) = loaded {
+            qdbus(&["org.kde.KWin", &format!("/Scripting/Script{}", id.trim()), "org.kde.kwin.Script.run"]);
+        }
+        // Stopped while loading it: take it away again, whichever unload came first.
+        if control.stopping() {
+            qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
+        }
+    }
+
+    let mut heard = false;
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = MonitorReader::default();
+        let mut unnumbered = 0u32;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let reading = reader.feed(&line);
+            if let Some(game) = reader.take_alive() {
+                control.says_alive.store(true, Ordering::SeqCst);
+                control.heard_now();
+                kwin_game_active.store(game, Ordering::Relaxed);
+            }
+            let Some(reading) = reading else { continue };
+            heard = true;
+            control.heard_now();
+            if reading.bad_stamp && !*said_bad_stamp {
+                *said_bad_stamp = true;
+                crate::linklog::record("cursor_tracker", crate::linklog::Details::new().text("state", "bad_stamp"));
+            }
+            kwin_game_active.store(reading.game, Ordering::Relaxed);
+            let seq = reading.seq.unwrap_or_else(|| {
+                unnumbered = unnumbered.wrapping_add(1);
+                unnumbered
+            });
+            let received_us = mono_us();
+            let taken_us = taken_at(reading.kwin_ms, wall_ms(), received_us);
+            positions.offer(Sample { x: reading.x, y: reading.y, seq, taken_us, received_us });
+        }
+    }
+    control.monitor_pid.store(0, Ordering::SeqCst);
+    let _ = child.kill();
+    let _ = child.wait();
+    heard
 }
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -981,9 +1331,6 @@ extern "C" fn handle_sigint(_sig: libc::c_int) {
 
 const DEBIAN: DeviceId = NodeId::Debian as DeviceId;
 const WINDOWS: DeviceId = NodeId::Windows as DeviceId;
-
-/// Time after any focus change during which Debian's edges cannot be crossed.
-const EDGE_SETTLE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hotkey {
@@ -1053,8 +1400,8 @@ struct LinuxBackend {
     keyboards: Vec<EvdevDevice>,
     block_mice: bool,
     block_keyboards: bool,
-    kwin_x: Arc<AtomicI32>,
-    kwin_y: Arc<AtomicI32>,
+    /// The last warp, for the cursor's track: when, and to where.
+    warped: Option<(i64, i32, i32)>,
     /// What the router has forwarded and not released, as of the last read of the devices.
     forwarded: HeldInput,
     grab_ops: Arc<dyn GrabOps<EvdevHandle>>,
@@ -1180,8 +1527,8 @@ impl InputBackend for LinuxBackend {
 
     fn warp_cursor(&mut self, x: i32, y: i32) {
         self.vmouse.warp_abs(x, y);
-        self.kwin_x.store(x, Ordering::Relaxed);
-        self.kwin_y.store(y, Ordering::Relaxed);
+        // Where KWin really put it comes with its next position.
+        self.warped = Some((mono_us(), x, y));
     }
 
     fn release_held(&mut self) {
@@ -1240,8 +1587,27 @@ struct Core<'a> {
     router: Router,
     backend: LinuxBackend,
     peer: UdpPeer<'a>,
-    last_focus_change: Instant,
-    edge: EdgeWatch,
+    /// The shared edge: the push, where the cursor is, and a push held for a better position.
+    edge: DebianEdge,
+}
+
+/// The router and what its actions touch, as the edge's decision sees them.
+struct Io<'x, 'a> {
+    router: &'x mut Router,
+    backend: &'x mut LinuxBackend,
+    peer: &'x mut UdpPeer<'a>,
+}
+
+impl debian_edge::Router for Io<'_, '_> {
+    fn may_cross(&self) -> bool {
+        self.router.online() && !self.router.panicked() && !self.router.captive() && self.router.active() == DEBIAN
+    }
+
+    fn cross(&mut self, (x, y): (i32, i32), from_peer: bool) -> bool {
+        let actions = self.router.handle(Event::EdgeCrossed { x, y, from_peer }).actions;
+        apply(&actions, self.backend, self.peer);
+        actions.iter().any(|a| matches!(a, Action::SendFocus { .. }))
+    }
 }
 
 impl Core<'_> {
@@ -1250,34 +1616,50 @@ impl Core<'_> {
         let before = self.router.active();
         let actions = self.router.handle(event).actions;
         apply(&actions, &mut self.backend, &mut self.peer);
-        let after = self.router.active();
-        if after != before {
-            self.last_focus_change = Instant::now();
-            self.edge.reset();
-            let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
-            println!("[Debian] Focus switched to {name}");
-        }
+        self.after_routing(before);
         actions
     }
 
+    /// Passes a warp on to the cursor's track, and starts the settle when control changed hands.
+    fn after_routing(&mut self, before: DeviceId) {
+        if let Some((at, x, y)) = self.backend.warped.take() {
+            self.edge.track.warped(at, x, y);
+        }
+        let after = self.router.active();
+        if after != before {
+            self.edge.arrived(self.peer.now_ms());
+            let name = if after == DEBIAN { "DEBIAN" } else { "WINDOWS" };
+            println!("[Debian] Focus switched to {name}");
+        }
+    }
+
+    fn now(&self) -> Now {
+        Now { us: mono_us(), ms: self.peer.now_ms() }
+    }
+
     /// Counts movement of the Debian cursor by `(dx, dy)` against the shared edge, from either
-    /// device's mouse, and crosses to the laptop when the push completes.
+    /// device's mouse: see `DebianEdge::push`.
     fn push_edge(&mut self, cfg: &SpatialConfig, dx: i32, dy: i32, from_peer: bool) {
-        let can_cross = self.router.online()
-            && !self.router.panicked()
-            && !self.router.captive()
-            && self.router.active() == DEBIAN
-            && self.last_focus_change.elapsed() >= EDGE_SETTLE;
-        if !can_cross {
-            return;
-        }
-        let cx = self.backend.kwin_x.load(Ordering::Relaxed);
-        let cy = self.backend.kwin_y.load(Ordering::Relaxed);
-        let held = self.backend.any_button_held();
-        if self.edge.push(cfg.monitors(NodeId::Debian), (cx, cy), (dx, dy), held) {
-            let (x, y) = cfg.entry_on_peer(NodeId::Debian, cx, cy);
-            self.route(Event::EdgeCrossed { x, y, from_peer });
-        }
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.push(cfg, (dx, dy), from_peer, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
+    }
+
+    /// Decides a held push again as time passes: see `DebianEdge::look`.
+    fn look_at_edge(&mut self, cfg: &SpatialConfig) {
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.look(cfg, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
+    }
+
+    /// Takes KWin's newest position, and decides a push that was waiting on it.
+    fn hear_position(&mut self, cfg: &SpatialConfig, sample: Sample) {
+        let (held, now, before) = (self.backend.any_button_held(), self.now(), self.router.active());
+        let Core { router, backend, peer, edge } = self;
+        edge.hear(cfg, sample, held, now, &mut Io { router, backend, peer }, &mut LinkLog);
+        self.after_routing(before);
     }
 }
 
@@ -1301,14 +1683,10 @@ pub fn run_debian_node(
     let vrel = VirtualRelMouse::new()?;
     println!("[Debian] Created /dev/uinput Virtual Keyboard, Absolute Warp Pointer & Relative Pointer.");
 
-    let kwin_x = Arc::new(AtomicI32::new(3200));
-    let kwin_y = Arc::new(AtomicI32::new(720));
+    let positions = Arc::new(SampleSlot::default());
     let kwin_game_active = Arc::new(AtomicBool::new(false));
-    spawn_kwin_cursor_tracker(
-        Arc::clone(&kwin_x),
-        Arc::clone(&kwin_y),
-        Arc::clone(&kwin_game_active),
-    );
+    let tracker = Arc::new(TrackerControl::default());
+    spawn_kwin_cursor_tracker(Arc::clone(&positions), Arc::clone(&kwin_game_active), Arc::clone(&tracker));
 
     let (mice, keyboards) = discover_devices(explicit_mouse.as_deref());
     if mice.is_empty() {
@@ -1356,8 +1734,7 @@ pub fn run_debian_node(
             keyboards,
             block_mice: false,
             block_keyboards: false,
-            kwin_x: Arc::clone(&kwin_x),
-            kwin_y: Arc::clone(&kwin_y),
+            warped: None,
             forwarded: HeldInput::default(),
             grab_ops: Arc::new(EvdevGrab),
         },
@@ -1368,8 +1745,7 @@ pub fn run_debian_node(
             motion: MotionBatch::default(),
             clock,
         },
-        last_focus_change: Instant::now() - EDGE_SETTLE,
-        edge: EdgeWatch::new(),
+        edge: DebianEdge::new(mono_us(), (3200, 720)),
     };
 
     let mut hotkeys = HotkeyFilter::default();
@@ -1404,14 +1780,9 @@ pub fn run_debian_node(
             core.backend.finish_releases(Duration::from_secs(1));
             core.backend.release_held();
             crate::mute::shutdown();
-            let _ = Command::new("qdbus6")
-                .args([
-                    "org.kde.KWin",
-                    "/Scripting",
-                    "org.kde.kwin.Scripting.unloadScript",
-                    "mesh_kvm_cursor_watch",
-                ])
-                .output();
+            // dbus-monitor first, so that the tracker can't load the script again behind this.
+            tracker.stop();
+            qdbus(&["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "mesh_kvm_cursor_watch"]);
             break Ok(());
         }
 
@@ -1477,6 +1848,7 @@ pub fn run_debian_node(
                 Payload::MouseMoveDelta { dx, dy } => {
                     let actions = core.route(Event::PeerMove { dx, dy });
                     if actions.iter().any(|a| matches!(a, Action::InjectMove { .. })) {
+                        core.edge.track.moved(mono_us(), dx, dy);
                         core.push_edge(&cfg_snapshot, dx, dy, true);
                     }
                 }
@@ -1501,7 +1873,7 @@ pub fn run_debian_node(
                     crate::spatial::note_peer_displays(&spatial_state, &name, monitors);
                 }
                 Payload::EdgeMap { edge, start, end, resistance } => {
-                    core.edge.set_span(EdgeSpan { edge, start, end }, resistance);
+                    core.edge.edge.set_span(EdgeSpan { edge, start, end }, resistance);
                 }
                 Payload::GameLock { locked } => {
                     core.route(Event::PeerGameLock(locked));
@@ -1542,6 +1914,11 @@ pub fn run_debian_node(
                     &mut core.peer,
                 );
             }
+        }
+
+        // KWin's newest position, which may decide a push that was waiting on it.
+        if let Some(sample) = positions.newest() {
+            core.hear_position(&cfg_snapshot, sample);
         }
 
         // 2. Read local keyboards. Grabbing only hides events from the desktop, so hotkeys are
@@ -1637,6 +2014,11 @@ pub fn run_debian_node(
                                 if hand_back && !forwarded {
                                     core.backend.vrel.move_rel(acc_dx, acc_dy);
                                 }
+                                // Movement the laptop got didn't move this cursor.
+                                if !forwarded {
+                                    let at = motion_time_us(core.backend.mice[i].clock, event_time_us(ev), mono_us());
+                                    core.edge.track.moved(at, acc_dx, acc_dy);
+                                }
                                 core.push_edge(&cfg_snapshot, acc_dx, acc_dy, false);
                                 acc_dx = 0;
                                 acc_dy = 0;
@@ -1671,6 +2053,25 @@ pub fn run_debian_node(
         // Update live WebUI telemetry every 40ms
         if last_telemetry_sync.elapsed() >= Duration::from_millis(40) {
             last_telemetry_sync = Instant::now();
+            // A held push is decided again as time passes, so one waiting on a silent tracker gets
+            // across; found silent often, as after KWin restarted, the tracker starts again.
+            core.look_at_edge(&cfg_snapshot);
+            // Nothing from the script for 7 s, though it says it runs every 2: lost, whoever has
+            // control and whatever holds the pointer.
+            let now = core.now();
+            let lost_now = core.edge.pulse(tracker.heard_from(), now, &mut LinkLog);
+            let silent_often = !lost_now && core.edge.take_respawn();
+            if silent_often {
+                note_lost("silent");
+            }
+            if core.edge.tracker_lost() {
+                // A game the lost script saw is no game until a new one says so.
+                kwin_game_active.store(false, Ordering::Relaxed);
+            }
+            if lost_now || silent_often {
+                kwin_game_active.store(false, Ordering::Relaxed);
+                tracker.restart();
+            }
             if let Ok(mut guard) = spatial_state.write() {
                 guard.telemetry.active_node = if core.router.active() == WINDOWS {
                     "Windows".to_string()
@@ -1678,8 +2079,7 @@ pub fn run_debian_node(
                     "Debian".to_string()
                 };
                 guard.telemetry.panic_mode = core.router.panicked();
-                guard.telemetry.cursor_x = kwin_x.load(Ordering::Relaxed);
-                guard.telemetry.cursor_y = kwin_y.load(Ordering::Relaxed);
+                (guard.telemetry.cursor_x, guard.telemetry.cursor_y) = core.edge.track.shown();
                 guard.telemetry.game_captive_active = is_game_captive;
                 guard.telemetry.game_reason = if cfg_snapshot.manual_game_lock {
                     "Manual Lock (Ctrl+Alt+G)".to_string()
@@ -1698,7 +2098,7 @@ pub fn run_debian_node(
 
         // Heartbeat, with what the other device needs to check its own edges (every 400ms)
         if heartbeat.due(now_ms()) {
-            core.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
+            core.edge.edge.use_own_layout(&cfg_snapshot, NodeId::Debian);
             for payload in crate::spatial::heartbeat_payloads(&cfg_snapshot, NodeId::Debian) {
                 core.peer.send(payload);
             }
@@ -1732,6 +2132,83 @@ mod tests {
         press(&mut f, KEY_LEFTCTRL);
         press(&mut f, KEY_LEFTALT);
         f
+    }
+
+    const UPDATE: &str = "method call time=1731300000.123456 sender=:1.42 -> destination=org.meshkvm.Cursor serial=99 path=/Cursor; interface=org.meshkvm.Cursor; member=Update";
+
+    #[test]
+    fn a_position_is_read_whole_from_what_dbus_monitor_prints() {
+        let mut r = MonitorReader::default();
+        let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 77", "   int32 123456789"];
+        let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
+        assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: Some(123_456_789), bad_stamp: false }]);
+        // Numbers that come through as doubles are read too, and a game flag.
+        let lines = [UPDATE, "   double 10", "   double 20.4", "   int32 1", "   uint32 78", "   int64 5"];
+        let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
+        assert_eq!(got, vec![Reading { x: 10, y: 20, game: true, seq: Some(78), kwin_ms: Some(5), bad_stamp: false }]);
+    }
+
+    #[test]
+    fn an_alive_call_is_read_as_one_and_is_no_position() {
+        let mut r = MonitorReader::default();
+        let alive = UPDATE.replace("member=Update", "member=Alive");
+        for line in [alive.as_str(), "   int32 80", "   int32 734568123", "   int32 1"] {
+            assert_eq!(r.feed(line), None);
+        }
+        assert_eq!(r.take_alive(), Some(true));
+        assert_eq!(r.take_alive(), None, "taken once");
+        // And a position after it is read whole.
+        let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 81", "   int32 5"];
+        assert_eq!(lines.iter().filter_map(|l| r.feed(l)).count(), 1);
+        assert_eq!(r.take_alive(), None);
+    }
+
+    #[test]
+    fn a_stamp_that_comes_as_a_double_is_no_stamp() {
+        // KWin sends JavaScript numbers as int32 today; a double here has lost the milliseconds.
+        let mut r = MonitorReader::default();
+        let lines = [UPDATE, "   int32 2500", "   int32 1439", "   int32 0", "   int32 77", "   double 7.34568e+08"];
+        let got: Vec<Reading> = lines.iter().filter_map(|l| r.feed(l)).collect();
+        assert_eq!(got, vec![Reading { x: 2500, y: 1439, game: false, seq: Some(77), kwin_ms: None, bad_stamp: true }]);
+        let lines = [UPDATE, "   int32 1", "   int32 2", "   int32 0", "   int32 78", "   int32 734568123"];
+        assert_eq!(lines.iter().filter_map(|l| r.feed(l)).next().map(|g| (g.kwin_ms, g.bad_stamp)), Some((Some(734_568_123), false)));
+    }
+
+    #[test]
+    fn movement_is_timed_when_the_kernel_saw_it() {
+        // Read 40 ms late after a stall, it is still 40 ms old.
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 1_000_000, 1_040_000), 1_000_000);
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 2_000_000, 1_040_000), 1_040_000, "never from the future");
+        assert_eq!(motion_time_us(libc::CLOCK_REALTIME, 1_000_000, 1_040_000), 1_040_000);
+        assert_eq!(motion_time_us(libc::CLOCK_MONOTONIC, 0, 1_040_000), 1_040_000);
+    }
+
+    #[test]
+    fn the_script_sends_whole_numbers() {
+        for arg in ["at[0] | 0", "at[1] | 0", "isGameWindow() | 0", "seq | 0", "(now % 1000000000) | 0"] {
+            assert!(KWIN_SCRIPT.contains(arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn a_position_from_an_older_script_still_counts_once_its_message_ends() {
+        let mut r = MonitorReader::default();
+        for line in [UPDATE, "   int32 1", "   int32 2", "   int32 0"] {
+            assert_eq!(r.feed(line), None);
+        }
+        assert_eq!(r.feed(UPDATE), Some(Reading { x: 1, y: 2, game: false, seq: None, kwin_ms: None, bad_stamp: false }));
+    }
+
+    #[test]
+    fn anything_else_dbus_monitor_prints_is_passed_over() {
+        let mut r = MonitorReader::default();
+        let other = UPDATE.replace("member=Update", "member=Other");
+        let lines = [other.as_str(), "   int32 1", "   int32 2", "   int32 0", "   int32 3", "   int32 4", "", "signal time=1 sender=org.freedesktop.DBus -> destination=:1.9 serial=2 path=/; interface=x; member=NameAcquired", "   string \":1.9\"", "   int32 nope"];
+        assert!(lines.iter().all(|l| r.feed(l).is_none()));
+        // A message cut short by the next one isn't taken for a whole one.
+        assert_eq!(r.feed(UPDATE), None);
+        r.feed("   int32 5");
+        assert_eq!(r.feed(UPDATE), None);
     }
 
     #[test]

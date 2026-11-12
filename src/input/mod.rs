@@ -2,6 +2,8 @@
 //! router `Action`s into backend calls and peer packets.
 
 #[cfg(target_os = "linux")]
+pub mod debian_edge;
+#[cfg(target_os = "linux")]
 pub mod grab;
 pub mod link;
 #[cfg(test)]
@@ -19,6 +21,18 @@ use crate::router::Action;
 use crate::secure::datagram::{Channel, Opened};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+
+/// True while this device hides its own parked cursor, as the other device has control.
+pub fn cursor_hidden() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::cursor_cloaked()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
 
 /// Times focus and panic packets are sent, because the UDP link is lossy.
 const REPEAT_CRITICAL: usize = 3;

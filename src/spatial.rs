@@ -6,6 +6,7 @@
 //! parts never undo each other, on either device. Monitors are facts rather than edits: each
 //! device reports its own, and they never raise the revision.
 
+use crate::crossing::{Refusal, Settle};
 use crate::displays::{DisplayManager, LayoutNews};
 use crate::platform::Platform;
 use crate::input::link::LinkQuality;
@@ -20,6 +21,9 @@ use std::sync::{Arc, RwLock};
 
 /// How far in from a screen edge a cursor enters, on both machines.
 const ENTRY_INSET: i32 = 28;
+/// How far in from the edge it came in by. Less, so that a push back is a short way, and still
+/// enough off the edge that the cursor isn't pushing at it.
+pub const SHARED_EDGE_INSET: i32 = 12;
 const LAYOUT_FILE: &str = "layout.json";
 /// Anything from a file or the network is held to these, so the maths below can't overflow.
 const MAX_COORDINATE: i32 = 1 << 20;
@@ -27,6 +31,12 @@ const MAX_MONITOR_SIZE: i32 = 1 << 16;
 const MAX_MONITORS: usize = 16;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_EDGE_RESISTANCE: i32 = 400;
+/// A laptop this close to lining up with a monitor of its own size is lined up when the layout
+/// loads. Further off than this, it was put there on purpose.
+const ALIGN_SNAP: i32 = 8;
+/// How far along the edge from a monitor that doesn't cross a push can't cross either. See
+/// `EdgeWatch::guarded`.
+pub const GUARD: i32 = 48;
 /// How far ahead of this copy another copy's revision can be and still be believed. No one makes
 /// this many edits, so a bigger jump is a bad value, which would otherwise win every comparison
 /// from then on and leave no edit able to beat it.
@@ -87,13 +97,17 @@ pub struct DeviceLayout {
     /// Stands in for all the monitors when set, in place of their native sizes.
     #[serde(default)]
     pub custom_size: Option<(i32, i32)>,
+    /// The device has said what its monitors are: they aren't a placeholder. A layout saved before
+    /// this was kept had them from the device.
+    #[serde(default = "default_true")]
+    pub reported: bool,
 }
 
 impl DeviceLayout {
     fn placeholder(node: NodeId) -> Self {
         let (w, h) = PLACEHOLDER_SIZE;
         let monitors = vec![MonitorRect { name: "Display".to_string(), x: 0, y: 0, w, h }];
-        Self { node, name: String::new(), x: 0, y: 0, monitors, custom_size: None }
+        Self { node, name: String::new(), x: 0, y: 0, monitors, custom_size: None, reported: false }
     }
 
     /// This device's screens in the shared layout.
@@ -148,6 +162,9 @@ pub struct SpatialConfig {
     /// This device's own choice: it doesn't travel with the layout.
     #[serde(default)]
     pub manual_game_lock: bool,
+    /// `align_exactly` has had its one look at this layout. After that, an offset is a choice.
+    #[serde(default)]
+    pub aligned_once: bool,
 }
 
 /// Where one device goes in an edit.
@@ -223,6 +240,7 @@ impl LegacyLayout {
                     y: 0,
                     monitors: self.debian_monitors,
                     custom_size: None,
+                    reported: true,
                 },
                 DeviceLayout {
                     node: NodeId::Windows,
@@ -231,12 +249,14 @@ impl LegacyLayout {
                     y: self.win_y,
                     monitors: vec![MonitorRect { name: "Laptop display".to_string(), x: 0, y: 0, w, h }],
                     custom_size: custom.then_some((self.win_w, self.win_h)),
+                    reported: true,
                 },
             ],
             attach_side: self.attach_side,
             edge_resistance: self.edge_resistance,
             auto_game_lock: self.auto_game_lock,
             manual_game_lock: self.manual_game_lock,
+            aligned_once: false,
         }
     }
 }
@@ -309,6 +329,7 @@ impl SpatialConfig {
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
+            aligned_once: false,
         };
         config.resnap();
         config
@@ -373,6 +394,10 @@ impl SpatialConfig {
         if renamed {
             device.name = name;
         }
+        let first = !monitors.is_empty() && !device.reported;
+        if first {
+            device.reported = true;
+        }
         let moved = !monitors.is_empty() && device.monitors != monitors;
         if moved {
             device.monitors = monitors;
@@ -406,6 +431,45 @@ impl SpatialConfig {
             laptop.x += x - win_left;
             laptop.y += y - win_top;
         }
+    }
+
+    /// Lines the laptop up exactly with the one monitor of the desktop it nearly lines up with, as
+    /// an edit made on `me`. That is a monitor of the same width (the same height beside the
+    /// desktop) that the laptop touches, and starts within `ALIGN_SNAP` pixels of. Nothing ever made
+    /// a few pixels off a choice, and they put the cursor a few pixels off on every crossing. True
+    /// if it moved.
+    /// It does this once per layout: `aligned_once` is kept in the file, so an offset made on
+    /// purpose afterwards stays.
+    /// The look waits until both devices have said what their monitors are: a placeholder isn't.
+    pub fn align_exactly(&mut self, me: NodeId) -> bool {
+        if !self.devices.iter().all(|d| d.reported) || std::mem::replace(&mut self.aligned_once, true) {
+            return false;
+        }
+        let Some((wl, wt, wr, wb)) = bounds(&self.rects(NodeId::Windows)) else { return false };
+        let (ww, wh) = (wr - wl, wb - wt);
+        let near = |offset: i32| offset != 0 && offset.abs() <= ALIGN_SNAP;
+        let shifts: Vec<(i32, i32)> = self
+            .rects(NodeId::Debian)
+            .iter()
+            .filter_map(|m| {
+                let (dx, dy) = (m.x - wl, m.y - wt);
+                let fits = match self.attach_side {
+                    TouchSide::Bottom => wt == m.y + m.h && m.w == ww && near(dx),
+                    TouchSide::Top => wb == m.y && m.w == ww && near(dx),
+                    TouchSide::Right => wl == m.x + m.w && m.h == wh && near(dy),
+                    TouchSide::Left => wr == m.x && m.h == wh && near(dy),
+                };
+                let along_x = matches!(self.attach_side, TouchSide::Bottom | TouchSide::Top);
+                fits.then_some(if along_x { (dx, 0) } else { (0, dy) })
+            })
+            .collect();
+        let [(dx, dy)] = shifts[..] else { return false };
+        let mut arrangement = self.arrangement();
+        for place in arrangement.devices.iter_mut().filter(|p| p.node == NodeId::Windows) {
+            place.x += dx;
+            place.y += dy;
+        }
+        self.apply_edit(&LayoutEdit { arrangement: Some(arrangement), edge_resistance: None }, me)
     }
 
     /// The edge of `node` that faces the other device.
@@ -473,7 +537,8 @@ impl SpatialConfig {
         let (Some(from), Some(to)) = (self.device(me), self.device(me.other())) else { return (x, y) };
         let rects = to.rects();
         let point = (x.saturating_add(from.x), y.saturating_add(from.y));
-        let (px, py) = inset_on_monitor(&rects, clamp_to_monitors(&rects, point));
+        let shared = self.facing_edge(me.other());
+        let (px, py) = inset_on_monitor(&rects, clamp_to_monitors(&rects, point), Some(shared));
         (px - to.x, py - to.y)
     }
 
@@ -483,7 +548,7 @@ impl SpatialConfig {
             return (KEEP_CURSOR, KEEP_CURSOR);
         }
         let monitors = self.monitors(me);
-        inset_on_monitor(monitors, clamp_to_monitors(monitors, (x, y)))
+        inset_on_monitor(monitors, clamp_to_monitors(monitors, (x, y)), None)
     }
 
     fn take_arrangement_of(&mut self, other: &SpatialConfig) {
@@ -526,6 +591,8 @@ impl SpatialConfig {
         }
         self.revision = theirs.revision.saturating_add(u64::from(kept));
         self.editor = theirs.editor;
+        // Either copy having had its look is enough: an older device's copy has no marker.
+        self.aligned_once |= theirs.aligned_once;
         true
     }
 
@@ -598,11 +665,13 @@ fn clamp_to_monitors(monitors: &[MonitorRect], (x, y): (i32, i32)) -> (i32, i32)
 }
 
 /// Pulls a point `ENTRY_INSET` pixels in from any monitor edge it sits on, so entry does not land
-/// on the boundary pixel. Stays inside the monitor.
-fn inset_on_monitor(monitors: &[MonitorRect], p: (i32, i32)) -> (i32, i32) {
-    let inset = |v: i32, lo: i32, size: i32| {
+/// on the boundary pixel, and `SHARED_EDGE_INSET` from the `shared` one it came in by. Stays inside
+/// the monitor.
+fn inset_on_monitor(monitors: &[MonitorRect], p: (i32, i32), shared: Option<SwitchEdge>) -> (i32, i32) {
+    let by = |edge: SwitchEdge| if shared == Some(edge) { SHARED_EDGE_INSET } else { ENTRY_INSET };
+    let inset = |v: i32, lo: i32, size: i32, (low, high): (SwitchEdge, SwitchEdge)| {
         let hi = lo + size - 1;
-        let (lo_i, hi_i) = (lo + ENTRY_INSET, hi - ENTRY_INSET);
+        let (lo_i, hi_i) = (lo + by(low), hi - by(high));
         if lo_i > hi_i {
             // Too small to inset on both sides: use the middle.
             return lo + (hi - lo) / 2;
@@ -616,7 +685,10 @@ fn inset_on_monitor(monitors: &[MonitorRect], p: (i32, i32)) -> (i32, i32) {
         }
     };
     match monitors.iter().find(|m| contains(m, p)) {
-        Some(m) => (inset(p.0, m.x, m.w), inset(p.1, m.y, m.h)),
+        Some(m) => (
+            inset(p.0, m.x, m.w, (SwitchEdge::Left, SwitchEdge::Right)),
+            inset(p.1, m.y, m.h, (SwitchEdge::Top, SwitchEdge::Bottom)),
+        ),
         None => p,
     }
 }
@@ -632,11 +704,56 @@ pub struct EdgeWatch {
     span: Option<EdgeSpan>,
     tracker: EdgeTracker,
     heard_from_peer: bool,
+    settle: Settle,
+}
+
+/// What a movement at the edge came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Push {
+    /// Not a completed push across.
+    Pushing,
+    Crossed,
+    /// A completed push that doesn't cross, and why.
+    Refused(Refusal),
 }
 
 impl EdgeWatch {
     pub const fn new() -> Self {
-        Self { span: None, tracker: EdgeTracker::new(0), heard_from_peer: false }
+        Self { span: None, tracker: EdgeTracker::new(0), heard_from_peer: false, settle: Settle::new() }
+    }
+
+    /// Control arrived at this device at `now_ms`: any push so far is forgotten, and the settle
+    /// starts.
+    pub fn arrived(&mut self, now_ms: u64) {
+        self.reset();
+        self.settle.arrived(now_ms);
+    }
+
+    /// How much of the full settle was still to go: see `Settle::full_left_ms`.
+    pub fn settle_full_left_ms(&self, now_ms: u64) -> u64 {
+        self.settle.full_left_ms(now_ms)
+    }
+
+    /// For a completed push: true if it is too soon after control arrived. The count then starts
+    /// again, as a push during the settle never counted.
+    pub fn too_soon(&mut self, now_ms: u64) -> bool {
+        let soon = self.settle.left_ms(now_ms) > 0;
+        if soon {
+            self.tracker.clear();
+        }
+        soon
+    }
+
+    /// How far `(x, y)` is in from the shared edge's side of the monitor under it.
+    fn edge_distance(&self, monitors: &[MonitorRect], (x, y): (i32, i32)) -> Option<i32> {
+        let span = self.span?;
+        let m = monitors.iter().find(|m| contains(m, (x, y)))?;
+        Some(match span.edge {
+            SwitchEdge::Left => x - m.x,
+            SwitchEdge::Right => m.x + m.w - 1 - x,
+            SwitchEdge::Top => y - m.y,
+            SwitchEdge::Bottom => m.y + m.h - 1 - y,
+        })
     }
 
     /// Takes the edge from the other device's `EdgeMap`.
@@ -663,28 +780,116 @@ impl EdgeWatch {
         self.tracker.push(span, 0, 0, 1, 1, 0, 0, true);
     }
 
-    /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge.
+    /// True when moving by `(dx, dy)` to `(x, y)` completes a push across the shared edge. The
+    /// count then starts again.
+    #[cfg(test)]
+    pub fn push(&mut self, monitors: &[MonitorRect], at: (i32, i32), delta: (i32, i32), buttons_held: bool) -> bool {
+        let done = self.press(monitors, at, delta, buttons_held);
+        if done {
+            self.tracker.clear();
+        }
+        done
+    }
+
+    /// What moving by `(dx, dy)` to `(x, y)` at `now_ms` comes to: a crossing is a completed
+    /// push, after the settle and outside the guard strip. A push completed in the strip waits
+    /// there, and crosses once the cursor moves out of it along the edge. The laptop's cursor
+    /// position is never late, so it decides at once.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn cross(&mut self, monitors: &[MonitorRect], at: (i32, i32), delta: (i32, i32), buttons_held: bool, now_ms: u64) -> Push {
+        if !self.press(monitors, at, delta, buttons_held) {
+            return Push::Pushing;
+        }
+        if self.too_soon(now_ms) {
+            return Push::Refused(Refusal::Settle);
+        }
+        if self.guarded(monitors, at) {
+            return Push::Refused(Refusal::Guard);
+        }
+        self.tracker.clear();
+        Push::Crossed
+    }
+
+    /// As `push`, but a completed push stays complete until `clear`, as long as the cursor stays
+    /// on the span and doesn't move in: it can wait there for a newer position to confirm it.
     ///
     /// The tracker works on one rectangle, so it is given the monitor under the cursor, and a
     /// point that isn't on an outer edge of the desktop doesn't count: the cursor there just
     /// carries on to the next monitor.
-    pub fn push(&mut self, monitors: &[MonitorRect], (x, y): (i32, i32), (dx, dy): (i32, i32), buttons_held: bool) -> bool {
+    pub fn press(&mut self, monitors: &[MonitorRect], (x, y): (i32, i32), (dx, dy): (i32, i32), buttons_held: bool) -> bool {
         let Some(span) = self.span else { return false };
-        let beyond = match span.edge {
-            SwitchEdge::Left => (x - 1, y),
-            SwitchEdge::Right => (x + 1, y),
-            SwitchEdge::Top => (x, y - 1),
-            SwitchEdge::Bottom => (x, y + 1),
-        };
-        let monitor = monitors.iter().find(|m| contains(m, (x, y)));
-        let (Some(m), false) = (monitor, monitors.iter().any(|m| contains(m, beyond))) else {
+        self.settle.observe(self.edge_distance(monitors, (x, y)));
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else {
             self.reset();
             return false;
         };
         let shift = if matches!(span.edge, SwitchEdge::Top | SwitchEdge::Bottom) { m.x } else { m.y };
         let local = EdgeSpan { edge: span.edge, start: span.start - shift, end: span.end - shift };
-        self.tracker.push(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
+        self.tracker.press(local, x - m.x, y - m.y, m.w, m.h, dx, dy, buttons_held)
     }
+
+    /// True if the shared edge runs along x: the top or bottom.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn along_x(&self) -> bool {
+        self.span.is_some_and(|s| matches!(s.edge, SwitchEdge::Top | SwitchEdge::Bottom))
+    }
+
+    /// Starts the count again, as after a crossing.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn clear(&mut self) {
+        self.tracker.clear();
+    }
+
+    /// True if `(x, y)` is on the shared edge's span: on the outer edge of a monitor, alongside the
+    /// other device.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn on_span(&self, monitors: &[MonitorRect], (x, y): (i32, i32)) -> bool {
+        let Some(span) = self.span else { return false };
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else { return false };
+        let (on_edge, along) = match span.edge {
+            SwitchEdge::Left => (x == m.x, y),
+            SwitchEdge::Right => (x == m.x + m.w - 1, y),
+            SwitchEdge::Top => (y == m.y, x),
+            SwitchEdge::Bottom => (y == m.y + m.h - 1, x),
+        };
+        on_edge && (span.start..=span.end).contains(&along)
+    }
+
+    /// True if `(x, y)` is in a guard strip: within `GUARD` pixels of the end of the span, where a
+    /// monitor that doesn't touch the other device carries on the same edge. Going along that edge
+    /// onto that monitor is no push across, so the last pixels before it don't cross. An end at the
+    /// desktop's own corner has nothing beside it, and no strip.
+    pub fn guarded(&self, monitors: &[MonitorRect], (x, y): (i32, i32)) -> bool {
+        let Some(span) = self.span else { return false };
+        let Some(m) = outer_monitor(monitors, span.edge, (x, y)) else { return false };
+        // A monitor's line on that edge, its pixels along it (end exclusive), and its last pixel on it.
+        let side = |m: &MonitorRect| match span.edge {
+            SwitchEdge::Left => (m.x, (m.y, m.y + m.h), (m.x, m.y + m.h - 1)),
+            SwitchEdge::Right => (m.x + m.w, (m.y, m.y + m.h), (m.x + m.w - 1, m.y + m.h - 1)),
+            SwitchEdge::Top => (m.y, (m.x, m.x + m.w), (m.x + m.w - 1, m.y)),
+            SwitchEdge::Bottom => (m.y + m.h, (m.x, m.x + m.w), (m.x + m.w - 1, m.y + m.h - 1)),
+        };
+        let along = if matches!(span.edge, SwitchEdge::Top | SwitchEdge::Bottom) { x } else { y };
+        let (line, ..) = side(m);
+        monitors.iter().filter(|o| *o != m).any(|o| {
+            let (o_line, (start, end), corner) = side(o);
+            let touches = start <= span.end && end > span.start;
+            let distance = if along >= end { along - end } else { start - 1 - along };
+            o_line == line && !touches && outer_monitor(monitors, span.edge, corner).is_some() && (0..GUARD).contains(&distance)
+        })
+    }
+}
+
+/// The monitor under `(x, y)`, if the point is on the outer edge of the desktop facing `edge`.
+fn outer_monitor(monitors: &[MonitorRect], edge: SwitchEdge, (x, y): (i32, i32)) -> Option<&MonitorRect> {
+    let beyond = match edge {
+        SwitchEdge::Left => (x - 1, y),
+        SwitchEdge::Right => (x + 1, y),
+        SwitchEdge::Top => (x, y - 1),
+        SwitchEdge::Bottom => (x, y + 1),
+    };
+    let monitor = monitors.iter().find(|m| contains(m, (x, y)))?;
+    (!monitors.iter().any(|m| contains(m, beyond))).then_some(monitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,6 +985,9 @@ impl SharedSpatialState {
             crate::settings::adopt_pointer_speed(speed);
         }
         config.report_monitors(me, &crate::settings::device_name(), platform.monitors());
+        if config.align_exactly(me) {
+            crate::settings::log_note("Lined the laptop up exactly with the monitor it was a few pixels off.");
+        }
         let state = Self {
             me,
             peer_pinned,
@@ -832,8 +1040,14 @@ pub fn heartbeat_payloads(config: &SpatialConfig, me: NodeId) -> Vec<Payload> {
 /// lock just means the next heartbeat does this instead.
 pub fn note_peer_displays(state: &RwLock<SharedSpatialState>, name: &str, monitors: Vec<MonitorRect>) {
     if let Ok(mut guard) = state.try_write() {
-        let peer = guard.me.other();
-        if guard.config.report_monitors(peer, name, monitors) {
+        let (me, peer) = (guard.me, guard.me.other());
+        let changed = guard.config.report_monitors(peer, name, monitors);
+        // The first time both devices' monitors are known is the layout's one look at alignment.
+        let looked_before = guard.config.aligned_once;
+        if guard.config.align_exactly(me) {
+            crate::settings::log_note("Lined the laptop up exactly with the monitor it was a few pixels off.");
+        }
+        if changed || guard.config.aligned_once != looked_before {
             guard.save();
         }
     }
@@ -1068,6 +1282,7 @@ fn local_status(g: &SharedSpatialState, platform: &dyn Platform, displays: &Disp
         "game_reason": g.telemetry.game_reason,
         "displays": g.config.monitors(g.me),
         "cursor": [g.telemetry.cursor_x, g.telemetry.cursor_y],
+        "cursor_hidden": crate::input::cursor_hidden(),
         "autostart": platform.autostart_enabled(),
         "input_devices": platform.input_devices(),
         "audio": crate::settings::audio_status_json(),
@@ -1131,11 +1346,21 @@ fn apply_layout_action(state: &Arc<RwLock<SharedSpatialState>>, platform: &dyn P
     }
 }
 
+/// Layouts other modules' tests use.
+#[cfg(test)]
+pub mod test_layouts {
+    /// The owner's layout as it was saved: the laptop 5 px off DP-2.
+    pub fn real() -> super::SpatialConfig {
+        super::parse_layout(super::tests::OLD_LAYOUT).unwrap().config
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crossing::SETTLE_CLEAR;
 
-    const OLD_LAYOUT: &str = r#"{
+    pub(crate) const OLD_LAYOUT: &str = r#"{
         "debian_monitors": [
             {"name": "DP-3 (240Hz Native)", "x": 0, "y": 360, "w": 1920, "h": 1080},
             {"name": "DP-2 (360Hz Native)", "x": 1920, "y": 0, "w": 2560, "h": 1440}
@@ -1174,6 +1399,7 @@ mod tests {
                     y: 0,
                     monitors: vec![dp3(), dp2()],
                     custom_size: None,
+                    reported: true,
                 },
                 DeviceLayout {
                     node: NodeId::Windows,
@@ -1182,12 +1408,14 @@ mod tests {
                     y: win_y,
                     monitors: vec![rect("Laptop", 0, 0, 1920, 1080)],
                     custom_size: None,
+                    reported: true,
                 },
             ],
             attach_side,
             edge_resistance: 55,
             auto_game_lock: true,
             manual_game_lock: false,
+            aligned_once: false,
         }
     }
 
@@ -1226,6 +1454,128 @@ mod tests {
         assert_eq!(laptop.custom_size, None);
         assert_eq!(c.attach_side, TouchSide::Bottom);
         assert_eq!(c.edge_resistance, 55);
+    }
+
+    #[test]
+    fn the_real_layout_is_lined_up_exactly_under_dp2_once() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        let before = c.stamp();
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 1920);
+        assert_eq!(c.device(NodeId::Windows).unwrap().y, 1440);
+        // The normal way of an edit: one past this copy, and the arrangement's stamp with it, so
+        // that the other device fetches it.
+        assert_eq!(c.stamp(), (before.0 + 1, NodeId::Debian));
+        assert_eq!(c.arrangement_stamp, c.stamp());
+        assert!(!c.align_exactly(NodeId::Debian), "lined up, there's nothing more to do");
+        assert_eq!(c.stamp(), (before.0 + 1, NodeId::Debian));
+    }
+
+    #[test]
+    fn a_layout_is_lined_up_once_and_a_deliberate_offset_after_that_stays() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        assert!(c.align_exactly(NodeId::Debian));
+        // Saved, and loaded at the next start.
+        let mut c = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert!(c.aligned_once);
+        // Moved off by 3 px on purpose.
+        let mut place = c.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| p.x = 1923);
+        c.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Windows);
+        let mut c = parse_layout(&serde_json::to_string(&c).unwrap()).unwrap().config;
+        assert!(!c.align_exactly(NodeId::Debian), "never again");
+        assert_eq!(laptop_x(&c), 1923);
+        // A layout that was right already is marked too, so a later offset stays as well.
+        let mut fine = layout(TouchSide::Bottom, 2240, 1440);
+        assert!(!fine.align_exactly(NodeId::Debian));
+        assert!(fine.aligned_once);
+    }
+
+    #[test]
+    fn the_one_look_waits_for_both_devices_real_monitors() {
+        let mut c = SpatialConfig::fresh(NodeId::Debian, Some(SwitchEdge::Bottom));
+        assert!(!c.align_exactly(NodeId::Debian), "placeholders only");
+        assert!(!c.aligned_once, "and the look isn't spent on them");
+        c.report_monitors(NodeId::Debian, "desk", vec![dp3(), dp2()]);
+        assert!(!c.align_exactly(NodeId::Debian));
+        assert!(!c.aligned_once, "the laptop's are still a placeholder");
+        c.report_monitors(NodeId::Windows, "laptop", vec![rect("Laptop", 0, 0, 2560, 1600)]);
+        let mut place = c.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| (p.x, p.y) = (1925, 1440));
+        c.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Debian);
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 1920);
+        assert!(c.aligned_once);
+        // A layout saved before devices said so had real monitors in it.
+        let old = parse_layout(OLD_LAYOUT).unwrap().config;
+        assert!(old.devices.iter().all(|d| d.reported));
+    }
+
+    #[test]
+    fn a_copy_from_a_device_that_never_lines_up_doesnt_undo_the_marker() {
+        // This device lined up; the other device runs an older version that has no marker.
+        let mut mine = parse_layout(OLD_LAYOUT).unwrap().config;
+        mine.align_exactly(NodeId::Debian);
+        let mut theirs_json = serde_json::to_value(&mine).unwrap();
+        theirs_json.as_object_mut().unwrap().remove("aligned_once");
+        let mut theirs = parse_layout(&theirs_json.to_string()).unwrap().config;
+        assert!(!theirs.aligned_once);
+        // The older device edits the arrangement and this one takes it.
+        let mut place = theirs.arrangement();
+        place.devices.iter_mut().filter(|p| p.node == NodeId::Windows).for_each(|p| p.x = 1924);
+        theirs.apply_edit(&LayoutEdit { arrangement: Some(place), edge_resistance: None }, NodeId::Windows);
+        assert!(mine.adopt(&theirs));
+        assert_eq!(laptop_x(&mine), 1924);
+        assert!(mine.aligned_once);
+        assert!(!mine.align_exactly(NodeId::Debian), "their 1924 stands");
+        // And the two copies agree on the arrangement after it.
+        assert_eq!(mine.arrangement(), theirs.arrangement());
+        assert!(!theirs.adopt(&mine));
+    }
+
+    #[test]
+    fn only_a_near_miss_of_one_monitor_the_same_size_is_lined_up() {
+        let laptop_2560 = |x: i32| {
+            let mut c = layout(TouchSide::Bottom, x, 1440);
+            laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 2560, 1600)];
+            c
+        };
+        for x in [1912, 1928] {
+            let mut c = laptop_2560(x);
+            assert!(c.align_exactly(NodeId::Windows), "{x}");
+            assert_eq!(laptop_x(&c), 1920);
+        }
+        for x in [1911, 1929, 1920, 2240] {
+            let mut c = laptop_2560(x);
+            assert!(!c.align_exactly(NodeId::Windows), "{x}");
+            assert_eq!(laptop_x(&c), x);
+        }
+        // A narrower laptop near DP-2's start is a choice, not a near miss.
+        let mut c = layout(TouchSide::Bottom, 1925, 1440);
+        assert!(!c.align_exactly(NodeId::Debian));
+        // Beside the desktop it is the heights that have to match, and y that lines up.
+        let mut c = layout(TouchSide::Right, 4480, 4);
+        laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 1920, 1440)];
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(c.device(NodeId::Windows).unwrap().y, 0);
+        // And under DP-3, with its own width.
+        let mut c = layout(TouchSide::Bottom, 6, 1440);
+        assert!(c.align_exactly(NodeId::Debian));
+        assert_eq!(laptop_x(&c), 0);
+    }
+
+    #[test]
+    fn down_and_back_up_again_lands_on_the_same_column() {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        c.align_exactly(NodeId::Debian);
+        for k in (1..2559).step_by(7).chain([1, 2557, 2558]) {
+            let (lx, ly) = c.entry_on_peer(NodeId::Debian, 1920 + k, 1439);
+            assert_eq!(lx, k, "down at {k}");
+            assert!(ly > 0);
+            let (dx, dy) = c.entry_on_peer(NodeId::Windows, lx, 0);
+            assert_eq!(dx, 1920 + k, "back up at {k}");
+            assert!(dy < 1439);
+        }
     }
 
     #[test]
@@ -2010,9 +2360,9 @@ mod tests {
         assert_eq!(c.edge_span(NodeId::Windows), span(SwitchEdge::Top, -1000, 1919));
         assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Bottom, 1240, 4159));
         // Down from Debian lands on the left monitor, whose x is negative on the laptop.
-        assert_eq!(c.entry_on_peer(NodeId::Debian, 1740, 1439), (-500, 28));
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 1740, 1439), (-500, 12));
         // And back up from it lands where it came from.
-        assert_eq!(c.entry_on_peer(NodeId::Windows, -500, 0), (1740, 1411));
+        assert_eq!(c.entry_on_peer(NodeId::Windows, -500, 0), (1740, 1427));
     }
 
     #[test]
@@ -2046,28 +2396,28 @@ mod tests {
     fn laptop_point_converts_to_debian_coordinates() {
         // Laptop right of DP-2: (-1, 300) is just outside, so it lands on DP-2's last column.
         let c = layout(TouchSide::Right, 4480, 200);
-        assert_eq!(to_debian(&c, -1, 300), (4451, 500));
+        assert_eq!(to_debian(&c, -1, 300), (4467, 500));
     }
 
     #[test]
     fn debian_point_converts_to_laptop_coordinates() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(c.entry_on_peer(NodeId::Debian, 2340, 1439), (100, 28));
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 2340, 1439), (100, 12));
         let c = layout(TouchSide::Right, 4480, 200);
-        assert_eq!(c.entry_on_peer(NodeId::Debian, 4479, 500), (28, 300));
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 4479, 500), (12, 300));
     }
 
     #[test]
     fn laptop_point_clamps_to_nearest_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(to_debian(&c, 100, -1), (2340, 1411));
-        assert_eq!(to_debian(&c, 100, 40), (2340, 1411));
+        assert_eq!(to_debian(&c, 100, -1), (2340, 1427));
+        assert_eq!(to_debian(&c, 100, 40), (2340, 1427));
         // Left of the laptop's origin and below DP-3.
-        assert_eq!(to_debian(&c, -1000, 0), (1240, 1411));
+        assert_eq!(to_debian(&c, -1000, 0), (1240, 1427));
         // The empty corner above DP-3 goes to the closer of the two monitors.
         let c = layout(TouchSide::Top, 0, 0);
         assert_eq!(to_debian(&c, 1900, 100), (1948, 100));
-        assert_eq!(to_debian(&c, 100, 340), (100, 388));
+        assert_eq!(to_debian(&c, 100, 340), (100, 372));
     }
 
     #[test]
@@ -2084,7 +2434,7 @@ mod tests {
     #[test]
     fn hostile_coordinates_stay_on_a_monitor() {
         let c = layout(TouchSide::Bottom, 2240, 1440);
-        assert_eq!(to_debian(&c, i32::MAX, i32::MAX), (4451, 1411));
+        assert_eq!(to_debian(&c, i32::MAX, i32::MAX), (4451, 1427));
         assert_eq!(to_debian(&c, i32::MIN + 1, i32::MIN + 1), (28, 388));
         assert_eq!(c.place_on_own(NodeId::Debian, i32::MAX, i32::MAX), (4451, 1411));
         assert_eq!(c.place_on_own(NodeId::Windows, i32::MIN + 1, i32::MAX), (28, 1051));
@@ -2107,9 +2457,21 @@ mod tests {
     fn entry_is_inset_from_the_edge_it_lands_on_only() {
         let c = layout(TouchSide::Right, 4480, 200);
         // Interior points on the free axis keep their coordinate.
-        assert_eq!(to_debian(&c, -1, 700), (4451, 900));
+        assert_eq!(to_debian(&c, -1, 700), (4467, 900));
         // An interior point is untouched.
         assert_eq!(to_debian(&c, -500, 300), (3980, 500));
+    }
+
+    #[test]
+    fn entry_is_inset_less_from_the_shared_edge_than_from_the_others() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        // Down onto the laptop: 12 in from its top, the edge it came in by.
+        assert_eq!(c.entry_on_peer(NodeId::Debian, 2240, 1439), (ENTRY_INSET, SHARED_EDGE_INSET));
+        // Up onto Debian: 12 in from DP-2's bottom, and the usual 28 from DP-2's left side.
+        assert_eq!(to_debian(&c, 0, 0), (2240, 1427));
+        assert_eq!(c.entry_on_peer(NodeId::Windows, -320, 0), (1920 + ENTRY_INSET, 1427));
+        // A warp the other device asked for isn't a crossing, and keeps the usual inset.
+        assert_eq!(c.place_on_own(NodeId::Debian, 3000, 1439), (3000, 1439 - ENTRY_INSET));
     }
 
     #[test]
@@ -2213,6 +2575,202 @@ mod tests {
         edge.push(monitors, (2340, 1439), (0, 30), false);
         assert!(!edge.push(monitors, (100, 100), (0, 30), false));
         assert!(!edge.push(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn a_completed_push_is_held_until_it_crosses_or_leaves_the_edge() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+        assert!(edge.press(monitors, (2340, 1439), (0, 30), false));
+        // Waiting on a newer position, it stays complete, with or without more push.
+        assert!(edge.press(monitors, (2340, 1439), (0, 0), false));
+        assert!(edge.press(monitors, (2350, 1439), (10, 0), false));
+        // Crossing starts the count again.
+        edge.clear();
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+        // And so does leaving the edge.
+        assert!(edge.press(monitors, (2340, 1439), (0, 30), false));
+        assert!(!edge.press(monitors, (2340, 1400), (0, -5), false));
+        assert!(!edge.press(monitors, (2340, 1439), (0, 30), false));
+    }
+
+    #[test]
+    fn a_point_is_on_the_span_only_on_the_outer_edge_beside_the_other_device() {
+        let c = layout(TouchSide::Bottom, 2240, 1440);
+        let monitors = c.monitors(NodeId::Debian);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(edge.on_span(monitors, (2340, 1439)));
+        assert!(edge.on_span(monitors, (2240, 1439)) && edge.on_span(monitors, (4159, 1439)));
+        assert!(!edge.on_span(monitors, (2239, 1439)), "the bottom of DP-2 beside the laptop only");
+        assert!(!edge.on_span(monitors, (500, 1439)), "DP-3 leads nowhere");
+        assert!(!edge.on_span(monitors, (2340, 1438)));
+        assert!(!EdgeWatch::new().on_span(monitors, (2340, 1439)), "nothing to cross to yet");
+        let c = layout(TouchSide::Right, 4480, 360);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(!edge.on_span(c.monitors(NodeId::Debian), (1919, 700)), "between two of its own monitors");
+        assert!(edge.on_span(c.monitors(NodeId::Debian), (4479, 700)));
+    }
+
+    /// Long after anything arrived.
+    const LATER: u64 = 10_000;
+
+    /// The owner's layout, lined up: the laptop under DP-2, from 1920 to 4479.
+    fn real_layout() -> SpatialConfig {
+        let mut c = parse_layout(OLD_LAYOUT).unwrap().config;
+        c.align_exactly(NodeId::Debian);
+        c
+    }
+
+    #[test]
+    fn the_end_of_the_span_beside_the_side_display_is_guarded() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        let edge = watch(&c, NodeId::Debian);
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Bottom, 1920, 4479));
+        // DP-3's bottom carries on the line of DP-2's, left of where the laptop starts.
+        for x in [1920, 1940, 1967] {
+            assert!(edge.guarded(monitors, (x, 1439)), "{x}");
+        }
+        for x in [1968, 3000, 4432, 4479] {
+            assert!(!edge.guarded(monitors, (x, 1439)), "{x}: the far end is the desktop's own corner");
+        }
+    }
+
+    #[test]
+    fn a_push_in_the_guard_strip_does_not_cross_and_just_past_it_does() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        for x in [1920, 1967] {
+            let mut edge = watch(&c, NodeId::Debian);
+            assert_eq!(edge.cross(monitors, (x, 1439), (0, 99), false, LATER), Push::Refused(Refusal::Guard), "{x}");
+            // Held: moving out of the strip along the edge crosses without pushing all over again.
+            assert_eq!(edge.cross(monitors, (1968, 1439), (1, 0), false, LATER), Push::Crossed, "{x} then out of the strip");
+        }
+        for x in [1968, 4479] {
+            let mut edge = watch(&c, NodeId::Debian);
+            assert_eq!(edge.cross(monitors, (x, 1439), (0, 99), false, LATER), Push::Crossed, "{x}");
+        }
+    }
+
+    #[test]
+    fn a_single_monitor_has_no_guard() {
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        assert_eq!(monitors.len(), 1);
+        let mut edge = watch(&c, NodeId::Windows);
+        for x in [0, 1, 47, 2559] {
+            assert!(!edge.guarded(&monitors, (x, 0)), "{x}");
+        }
+        assert_eq!(edge.cross(&monitors, (0, 0), (0, -99), false, LATER), Push::Crossed);
+    }
+
+    #[test]
+    fn a_monitor_that_touches_the_other_device_is_no_reason_for_a_guard() {
+        // Under both of Debian's monitors, the span runs across the join, and nothing is guarded.
+        let c = layout(TouchSide::Bottom, 1500, 1440);
+        let edge = watch(&c, NodeId::Debian);
+        for x in [1500, 1919, 1920, 1967, 3419] {
+            assert!(!edge.guarded(c.monitors(NodeId::Debian), (x, 1439)), "{x}");
+        }
+        // Beside the desktop, DP-3's right side isn't on DP-2's line, so it guards nothing either.
+        let c = layout(TouchSide::Right, 4480, 0);
+        let edge = watch(&c, NodeId::Debian);
+        assert!(!edge.guarded(c.monitors(NodeId::Debian), (4479, 0)));
+    }
+
+    #[test]
+    fn a_guard_works_along_a_side_edge_too() {
+        // Two monitors stacked on the right, the laptop beside the lower one only.
+        let mut c = layout(TouchSide::Right, 1920, 1080);
+        debian_mut(&mut c).monitors = vec![rect("Top", 0, 0, 1920, 1080), rect("Bottom", 0, 1080, 1920, 1080)];
+        laptop_mut(&mut c).monitors = vec![rect("Laptop", 0, 0, 1920, 1080)];
+        c.resnap();
+        let edge = watch(&c, NodeId::Debian);
+        let monitors = c.monitors(NodeId::Debian);
+        assert_eq!(c.edge_span(NodeId::Debian), span(SwitchEdge::Right, 1080, 2159));
+        assert!(edge.guarded(monitors, (1919, 1080)) && edge.guarded(monitors, (1919, 1127)));
+        assert!(!edge.guarded(monitors, (1919, 1128)) && !edge.guarded(monitors, (1919, 2159)));
+    }
+
+    /// The laptop's view of its top edge, just after control arrived at `0` ms.
+    fn just_arrived_on_the_laptop() -> (SpatialConfig, EdgeWatch) {
+        let c = real_layout();
+        let mut edge = watch(&c, NodeId::Windows);
+        edge.arrived(0);
+        (c, edge)
+    }
+
+    #[test]
+    fn a_quick_deliberate_return_crosses_at_about_100_ms() {
+        let (c, mut edge) = just_arrived_on_the_laptop();
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        let entry = c.entry_on_peer(NodeId::Debian, 3000, 1439);
+        assert_eq!(entry, (1080, SHARED_EDGE_INSET));
+        // In, on down the screen 30 px, then straight back up and against the edge.
+        assert_eq!(edge.cross(&monitors, entry, (0, 0), false, 5), Push::Pushing);
+        assert_eq!(edge.cross(&monitors, (1080, 42), (0, 30), false, 40), Push::Pushing);
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -42), false, 80), Push::Pushing);
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -60), false, 100), Push::Crossed);
+    }
+
+    #[test]
+    fn a_cursor_that_stays_at_the_edge_does_not_bounce_back() {
+        let (c, mut edge) = just_arrived_on_the_laptop();
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        // Never more than 11 px further in than it came, and pushing back at the edge all the while.
+        for t in (0..250).step_by(10) {
+            let y = if t % 20 == 0 { 0 } else { SHARED_EDGE_INSET + SETTLE_CLEAR - 1 };
+            let got = edge.cross(&monitors, (1080, y), (0, -99), false, t);
+            assert_ne!(got, Push::Crossed, "at {t} ms");
+        }
+        // The full settle over, a push crosses as it always did.
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -99), false, 250), Push::Crossed);
+    }
+
+    #[test]
+    fn a_push_refused_for_the_settle_says_so_and_starts_again() {
+        let (c, mut edge) = just_arrived_on_the_laptop();
+        let monitors = c.monitors(NodeId::Windows).to_vec();
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -99), false, 50), Push::Refused(Refusal::Settle));
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -10), false, 260), Push::Pushing, "the count started again");
+        assert_eq!(edge.cross(&monitors, (1080, 0), (0, -50), false, 270), Push::Crossed);
+    }
+
+    /// What Debian's input loop does with a push, step by step: count it at KWin's position, judge
+    /// it, hold it, and decide it again when the next position arrives. The loop itself needs uinput
+    /// and a socket, so this goes through the same calls without them.
+    #[test]
+    fn a_held_push_on_debian_crosses_when_the_next_position_arrives() {
+        use crate::crossing::{judge, CursorTrack, Gate, Sample, Spot};
+        let c = real_layout();
+        let monitors = c.monitors(NodeId::Debian);
+        let mut edge = watch(&c, NodeId::Debian);
+        let ms = 1000;
+        let mut track = CursorTrack::new(0, (3200, 720));
+        track.heard(Sample { x: 2000, y: 1439, seq: 1, taken_us: 0, received_us: 0 });
+        let decide = |edge: &EdgeWatch, track: &mut CursorTrack, now_us| {
+            let here = track.locate(now_us, monitors, edge.along_x());
+            let spot = |p| Spot { on_span: edge.on_span(monitors, p), guarded: edge.guarded(monitors, p), monitor: monitors.iter().position(|m| contains(m, p)) };
+            (here, judge(&here, edge.along_x(), spot))
+        };
+        // Pushing down while drifting left towards DP-3, with KWin 60 ms behind.
+        track.moved(40 * ms, -15, 30);
+        let (here, _) = decide(&edge, &mut track, 40 * ms);
+        assert!(!edge.press(monitors, here.sample, (-15, 30), false));
+        track.moved(50 * ms, -15, 30);
+        let (here, gate) = decide(&edge, &mut track, 60 * ms);
+        assert!(edge.press(monitors, here.sample, (-15, 30), false));
+        assert_eq!(gate, Gate::Hold(Refusal::Stale), "within reach of the guard strip");
+        // KWin's position, taken after the last move, arrives: 1970, clear of the strip. The held push
+        // is looked at again.
+        track.heard(Sample { x: 1970, y: 1439, seq: 2, taken_us: 59 * ms, received_us: 60 * ms });
+        let (here, gate) = decide(&edge, &mut track, 61 * ms);
+        assert!(edge.press(monitors, here.sample, (0, 0), false), "still complete");
+        let Gate::Cross { at } = gate else { panic!("{gate:?}") };
+        assert_eq!(at, (1970, 1439));
+        assert_eq!(c.entry_on_peer(NodeId::Debian, at.0, at.1), (50, SHARED_EDGE_INSET));
     }
 
     #[test]

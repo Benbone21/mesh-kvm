@@ -29,6 +29,74 @@ pub const KEYEVENTF_EXTENDEDKEY: u32 = 0x1;
 pub const KEYEVENTF_KEYUP: u32 = 0x2;
 pub const KEYEVENTF_SCANCODE: u32 = 0x8;
 
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+pub const WS_EX_LAYERED: u32 = 0x0008_0000;
+pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+pub const CURSOR_SHOWING: u32 = 0x1;
+pub const CURSOR_SUPPRESSED: u32 = 0x2;
+
+/// The cloak: a small window under the parked cursor whose cursor is blank, so the laptop shows no
+/// second cursor while the other device has control. Topmost, so the cursor is over it whatever is
+/// on the screen; never activated and a tool window, so it takes no focus and has no place in the
+/// taskbar or Alt+Tab; layered, so it is drawn almost clear. It takes the hit test, as a window
+/// the cursor passes through can't give it its own cursor.
+pub const CLOAK_EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+pub const CLOAK_STYLE: u32 = WS_POPUP;
+const CLOAK_SIZE: i32 = 64;
+
+/// The cloak's `(x, y, w, h)`, centred on where the cursor is parked.
+pub fn cloak_rect((x, y): (i32, i32)) -> (i32, i32, i32, i32) {
+    (x - CLOAK_SIZE / 2, y - CLOAK_SIZE / 2, CLOAK_SIZE, CLOAK_SIZE)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CloakStep {
+    Create,
+    Destroy,
+    Keep,
+}
+
+/// What to do about the cloak, given whether the cursor is parked and whether the cloak is there.
+/// Done on the window thread from whatever it finds then, so steps asked for out of order still end
+/// up right.
+pub fn cloak_step(pinned: bool, exists: bool) -> CloakStep {
+    match (pinned, exists) {
+        (true, false) => CloakStep::Create,
+        (false, true) => CloakStep::Destroy,
+        _ => CloakStep::Keep,
+    }
+}
+
+/// How long after the cursor comes off the park its looks say nothing about a game. Our cloak's
+/// blank cursor, or an app that hid the idle cursor, lasts until the cursor next moves.
+pub const GAME_LOOK_GRACE_MS: u64 = 500;
+
+/// What a hidden cursor has to be judged against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameLook {
+    /// This laptop is the active device.
+    pub active_here: bool,
+    /// The cursor is parked for the other device.
+    pub pinned: bool,
+    /// Our cloak is up.
+    pub cloaked: bool,
+    pub since_unpinned_ms: u64,
+}
+
+/// True if `GetCursorInfo`'s `flags` say a game has the cursor: hidden outright, on the laptop in
+/// use. Suppressed is the system not drawing it after touch or pen input, which is no game. While
+/// the other device has control the cursor sits still at the park, under the cloak or an app that
+/// hides an idle cursor, so then it says nothing, and a game lock from it would refuse the next
+/// crossing back and stop control returning after a dropout.
+pub fn game_holds_cursor(flags: u32, look: GameLook) -> bool {
+    let judged = look.active_here && !look.pinned && !look.cloaked && look.since_unpinned_ms >= GAME_LOOK_GRACE_MS;
+    judged && flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED) == 0
+}
+
 /// Held-key table size: every evdev key that `evdev_to_win_scan` maps is below this.
 pub const KEY_SLOTS: usize = 256;
 
@@ -331,6 +399,49 @@ mod tests {
     const PIN: (i32, i32) = (960, 540);
     const OS_DOWN: OsModifiers = OsModifiers { ctrl: true, alt: true };
     const OS_UP: OsModifiers = OsModifiers { ctrl: false, alt: false };
+
+    #[test]
+    fn the_cloak_comes_while_the_cursor_is_parked_and_goes_with_it() {
+        assert_eq!(cloak_step(true, false), CloakStep::Create);
+        assert_eq!(cloak_step(true, true), CloakStep::Keep);
+        assert_eq!(cloak_step(false, true), CloakStep::Destroy);
+        assert_eq!(cloak_step(false, false), CloakStep::Keep);
+    }
+
+    #[test]
+    fn the_cloak_never_takes_focus_or_shows_in_alt_tab_and_sits_under_the_park() {
+        assert_ne!(CLOAK_EX_STYLE & WS_EX_NOACTIVATE, 0, "never activated");
+        assert_ne!(CLOAK_EX_STYLE & WS_EX_TOOLWINDOW, 0, "no taskbar button and not in Alt+Tab");
+        assert_ne!(CLOAK_EX_STYLE & WS_EX_TOPMOST, 0, "over whatever the cursor is parked on");
+        assert_eq!(CLOAK_EX_STYLE & WS_EX_APPWINDOW, 0);
+        // The cursor is over it only if it takes the hit test: click-through would show the window
+        // below's cursor instead.
+        assert_eq!(CLOAK_EX_STYLE & WS_EX_TRANSPARENT, 0);
+        assert_eq!(CLOAK_STYLE, WS_POPUP, "no frame, caption or menu");
+        let (x, y, w, h) = cloak_rect(PIN);
+        assert!(x < PIN.0 && PIN.0 < x + w && y < PIN.1 && PIN.1 < y + h);
+        assert_eq!((x + w / 2, y + h / 2), PIN);
+    }
+
+    #[test]
+    fn a_hidden_cursor_is_a_game_only_on_the_laptop_in_use() {
+        let in_use = GameLook { active_here: true, pinned: false, cloaked: false, since_unpinned_ms: 10_000 };
+        assert!(game_holds_cursor(0, in_use));
+        assert!(!game_holds_cursor(CURSOR_SHOWING, in_use));
+        // Touch or pen input has the system not draw the cursor. That's no game.
+        assert!(!game_holds_cursor(CURSOR_SUPPRESSED, in_use));
+        // While the other device has control, the cursor sits still at the park, under our own cloak
+        // or an app that hides an idle cursor: nothing about it says a game has it.
+        for look in [
+            GameLook { active_here: false, ..in_use },
+            GameLook { pinned: true, ..in_use },
+            GameLook { cloaked: true, ..in_use },
+            GameLook { since_unpinned_ms: GAME_LOOK_GRACE_MS - 1, ..in_use },
+        ] {
+            assert!(!game_holds_cursor(0, look), "{look:?}");
+        }
+        assert!(game_holds_cursor(0, GameLook { since_unpinned_ms: GAME_LOOK_GRACE_MS, ..in_use }));
+    }
 
     #[test]
     fn modifiers_map_to_the_left_and_right_keys_windows_tracks() {

@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod clipboard;
+mod crossing;
 mod displays;
 mod keymap;
 mod input;

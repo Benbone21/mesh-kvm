@@ -921,12 +921,23 @@ impl EdgeTracker {
         self.resistance = resistance;
     }
 
-    /// True when this movement completes a push across `span`.
+    /// True when this movement completes a push across `span`, which starts the count again.
     ///
     /// Only outward movement while the pointer sits on the edge pixel inside the span
     /// accumulates. Moving away, leaving the span, or holding a button clears it.
     #[allow(clippy::too_many_arguments)]
-    pub fn push(
+    pub fn push(&mut self, span: EdgeSpan, x: i32, y: i32, w: i32, h: i32, dx: i32, dy: i32, buttons_held: bool) -> bool {
+        let done = self.press(span, x, y, w, h, dx, dy, buttons_held);
+        if done {
+            self.pushed = 0;
+        }
+        done
+    }
+
+    /// As `push`, but a completed push stays complete, for as long as the pointer stays on the
+    /// span without moving in, until `clear`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn press(
         &mut self,
         span: EdgeSpan,
         x: i32,
@@ -952,11 +963,12 @@ impl EdgeTracker {
             return false;
         }
         self.pushed = self.pushed.saturating_add(outward);
-        if self.pushed >= self.resistance {
-            self.pushed = 0;
-            return true;
-        }
-        false
+        self.pushed >= self.resistance
+    }
+
+    /// Starts the count again.
+    pub fn clear(&mut self) {
+        self.pushed = 0;
     }
 }
 
