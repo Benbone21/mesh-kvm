@@ -102,3 +102,9 @@ tokio = [
     "atspi/tokio",
     "zbus/tokio",
 ]
+
+# MESH-KVM PATCH: for the patch's tests only.
+[dev-dependencies.zbus]
+version = "4.4"
+features = ["p2p"]
+default-features = false

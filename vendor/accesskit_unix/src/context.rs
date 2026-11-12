@@ -51,7 +51,10 @@ pub(crate) fn get_or_init_messages() -> Sender<Message> {
                     if let Ok(session_bus) = ConnectionBuilder::session() {
                         if let Ok(session_bus) = session_bus.internal_executor(false).build().await
                         {
-                            run_event_loop(&executor, session_bus, rx).await.unwrap();
+                            // MESH-KVM PATCH: was `.unwrap()`, which aborted the program.
+                            if let Err(error) = run_event_loop(&executor, session_bus, rx).await {
+                                accessibility_is_off(&error);
+                            }
                         }
                     }
                 }))
@@ -128,6 +131,29 @@ fn deactivate_adapter(entry: &mut AdapterEntry) {
     }
 }
 
+// MESH-KVM PATCH: a bus that can't be reached or talked to leaves accessibility off until the next
+// IsEnabled change, with one line on stderr, rather than ending the event loop.
+fn accessibility_is_off(error: &zbus::Error) {
+    eprintln!("accessibility is off: {error}");
+}
+
+// MESH-KVM PATCH
+async fn bus_if_enabled(
+    enabled: zbus::Result<bool>,
+    session_bus: &Connection,
+    executor: &Executor<'_>,
+) -> Option<Bus> {
+    let bus = match enabled {
+        Ok(true) => map_or_ignoring_broken_pipe(Bus::new(session_bus, executor).await, None, Some),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error),
+    };
+    bus.unwrap_or_else(|error| {
+        accessibility_is_off(&error);
+        None
+    })
+}
+
 async fn run_event_loop(
     executor: &Executor<'_>,
     session_bus: Connection,
@@ -161,9 +187,8 @@ async fn run_event_loop(
             change = changes.next() => {
                 atspi_bus = None;
                 if let Some(change) = change {
-                    if change.get().await? {
-                        atspi_bus = map_or_ignoring_broken_pipe(Bus::new(&session_bus, executor).await, None, Some)?;
-                    }
+                    // MESH-KVM PATCH: was `?` on both, which ended the loop and aborted the program.
+                    atspi_bus = bus_if_enabled(change.get().await, &session_bus, executor).await;
                 }
                 for entry in &mut adapters {
                     if atspi_bus.is_some() {
@@ -175,7 +200,14 @@ async fn run_event_loop(
             }
             message = messages.next() => {
                 if let Some(message) = message {
-                    process_adapter_message(&atspi_bus, &mut adapters, message).await?;
+                    // MESH-KVM PATCH: was `?`. A bus that fails is let go, as when IsEnabled goes false.
+                    if let Err(error) = process_adapter_message(&atspi_bus, &mut adapters, message).await {
+                        accessibility_is_off(&error);
+                        atspi_bus = None;
+                        for entry in &mut adapters {
+                            deactivate_adapter(entry);
+                        }
+                    }
                 }
             }
         }
@@ -250,4 +282,97 @@ async fn process_adapter_message(
     }
 
     Ok(())
+}
+
+// MESH-KVM PATCH: the failures that used to abort, without a D-Bus daemon. The "session bus" is a
+// private peer-to-peer pair, and the accessibility bus is AT_SPI_BUS_ADDRESS, in a directory of
+// the test's own. Only with the async-io executor, which is the one mesh-kvm builds.
+#[cfg(all(test, not(feature = "tokio")))]
+mod mesh_kvm_patch_tests {
+    use super::*;
+    use std::{
+        env, fs,
+        os::unix::net::{UnixListener, UnixStream},
+        path::PathBuf,
+    };
+    use zbus::Guid;
+
+    fn private_dir() -> PathBuf {
+        let dir = env::temp_dir().join(format!("accesskit-unix-patch-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn peer_to_peer_pair() -> (Connection, Connection) {
+        let (one, other) = UnixStream::pair().unwrap();
+        let server = ConnectionBuilder::unix_stream(one)
+            .server(Guid::generate())
+            .unwrap()
+            .p2p()
+            .build();
+        let client = ConnectionBuilder::unix_stream(other).p2p().build();
+        let (server, client) = futures_lite::future::zip(server, client).await;
+        (server.unwrap(), client.unwrap())
+    }
+
+    #[test]
+    fn a_bus_that_cant_be_reached_leaves_accessibility_off() {
+        let dir = private_dir();
+        // Nothing here may reach the desktop's own buses, even by mistake.
+        env::set_var(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", dir.join("no-session-bus").display()),
+        );
+
+        // A server with one GUID, at an address that says another: the bug as it was seen.
+        let socket = dir.join("wrong-guid");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = block_on(
+                    ConnectionBuilder::unix_stream(stream)
+                        .server(Guid::generate())
+                        .unwrap()
+                        .p2p()
+                        .build(),
+                );
+            }
+        });
+
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let (_peer, session_bus) = peer_to_peer_pair().await;
+
+            env::set_var(
+                "AT_SPI_BUS_ADDRESS",
+                format!("unix:path={},guid={}", socket.display(), Guid::generate()),
+            );
+            let error = Bus::new(&session_bus, &executor).await.err().unwrap();
+            assert!(error.to_string().contains("GUID mismatch"), "{error}");
+            assert!(bus_if_enabled(Ok(true), &session_bus, &executor)
+                .await
+                .is_none());
+
+            env::set_var(
+                "AT_SPI_BUS_ADDRESS",
+                format!("unix:path={}", dir.join("nobody-listens").display()),
+            );
+            assert!(bus_if_enabled(Ok(true), &session_bus, &executor)
+                .await
+                .is_none());
+
+            let failed_get = Err(zbus::Error::Failure("IsEnabled couldn't be read".into()));
+            assert!(bus_if_enabled(failed_get, &session_bus, &executor)
+                .await
+                .is_none());
+
+            assert!(bus_if_enabled(Ok(false), &session_bus, &executor)
+                .await
+                .is_none());
+        }));
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
