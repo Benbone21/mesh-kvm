@@ -87,3 +87,8 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# accesskit_unix 0.13.1 with one fix: a broken accessibility bus no longer aborts the program.
+# See vendor/accesskit_unix/MESH-KVM-PATCH.md.
+[patch.crates-io]
+accesskit_unix = { path = "vendor/accesskit_unix" }
