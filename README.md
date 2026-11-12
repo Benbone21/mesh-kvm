@@ -74,6 +74,8 @@ The window is a flat dark readout. From the top down:
 - Below is one table with every setting for both devices side by side, this device first. It is grouped INPUT, SCREENS, CLIPBOARD, AUDIO, GAMES, STARTUP, BOTH DEVICES and UPDATES.
 - The layout, your desk with every monitor of both devices to scale, sits beside the table, or under it in a narrow window. The screens of the device that has the keyboard and mouse are lit.
 
+If the desktop's accessibility bus can't be reached, for example after its socket was taken over by another program, the window opens anyway with accessibility off and prints `accessibility is off: <reason>`. A screen reader sees the window again the next time accessibility is turned on and the bus works, or after signing out and back in.
+
 The window scrolls if it doesn't all fit. Everything sizes from the window, and a big window enlarges the text and controls a little. To change that, use App size under BOTH DEVICES, or Ctrl with plus, minus or 0. A larger app size raises the smallest size the window can go to, so nothing runs out of room. Motion is cut back if the system asks for reduced motion.
 
 The window remembers its size and app size. It remembers its position on Windows and on X11. On Wayland the desktop chooses where windows open, so the position isn't kept. These are saved in `~/.local/share/mesh-kvm` on Debian and `%APPDATA%\mesh-kvm\data` on Windows.
