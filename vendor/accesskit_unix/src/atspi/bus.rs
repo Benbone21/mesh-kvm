@@ -178,11 +178,13 @@ impl Bus {
     where
         T: zbus::Interface,
     {
-        map_or_ignoring_broken_pipe(
-            self.conn.object_server().remove::<T, _>(path).await,
-            false,
-            |result| result,
-        )
+        // MESH-KVM PATCH: an interface that isn't there (one queued for removal from before the
+        // bus was made again) is nothing to remove, not a failure that lets go of the bus.
+        let removed = match self.conn.object_server().remove::<T, _>(path).await {
+            Err(zbus::Error::InterfaceNotFound) => Ok(false),
+            removed => removed,
+        };
+        map_or_ignoring_broken_pipe(removed, false, |result| result)
     }
 
     pub(crate) async fn emit_object_event(
@@ -488,5 +490,47 @@ where
             Ok(default)
         }
         Err(error) => Err(error),
+    }
+}
+
+// MESH-KVM PATCH: removing interfaces that were never registered isn't an error. Over a private
+// peer-to-peer connection, with no D-Bus daemon.
+#[cfg(all(test, not(feature = "tokio")))]
+mod mesh_kvm_patch_tests {
+    use super::*;
+    use crate::util::block_on;
+    use std::os::unix::net::UnixStream;
+    use zbus::Guid;
+
+    #[test]
+    fn removing_what_was_never_registered_keeps_the_bus() {
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            let (one, other) = UnixStream::pair().unwrap();
+            let server = ConnectionBuilder::unix_stream(one)
+                .server(Guid::generate())
+                .unwrap()
+                .p2p()
+                .build();
+            let client = ConnectionBuilder::unix_stream(other).p2p().build();
+            let (_server, conn) = futures_lite::future::zip(server, client).await;
+            let conn = conn.unwrap();
+            let socket_proxy = SocketProxy::new(&conn).await.unwrap();
+            let bus = Bus {
+                conn,
+                _task: executor.spawn(async {}, "test"),
+                socket_proxy,
+            };
+            let everything = InterfaceSet::new(
+                Interface::Accessible
+                    | Interface::Action
+                    | Interface::Component
+                    | Interface::Text
+                    | Interface::Value,
+            );
+            bus.unregister_interfaces(1, NodeId(5), everything)
+                .await
+                .unwrap();
+        }));
     }
 }

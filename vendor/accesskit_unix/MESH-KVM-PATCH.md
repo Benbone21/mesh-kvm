@@ -17,8 +17,8 @@ No 0.13.x release fixes it; later upstream releases go with newer accesskit and 
 
 ## What changed
 
-Only `src/context.rs`, and a test-only dev-dependency in `Cargo.toml`. Every change is marked
-`MESH-KVM PATCH`.
+`src/context.rs`, `src/atspi/bus.rs`, and a test-only dev-dependency in `Cargo.toml`. Every
+change is marked `MESH-KVM PATCH`.
 
 - The thread no longer unwraps the loop's result. An error prints
   `accessibility is off: <error>` to stderr and the thread ends. The channel's senders all ignore a
@@ -28,8 +28,13 @@ Only `src/context.rs`, and a test-only dev-dependency in `Cargo.toml`. Every cha
 - A failed register, unregister or event emit lets go of the bus and deactivates the adapters,
   just as IsEnabled turning false does, prints the same line, and the loop carries on.
 
+- In `src/atspi/bus.rs`, removing an interface that isn't registered (zbus's `InterfaceNotFound`,
+  for example a removal queued from before the bus was made again) counts as nothing removed rather
+  than an error. Otherwise the change above would let go of a healthy bus for it.
+
 When the bus works, nothing is different.
 
 The test `mesh_kvm_patch_tests` (`cargo test -p accesskit_unix`) uses no D-Bus daemon: a private
 peer-to-peer connection stands in for the session bus, and AT_SPI_BUS_ADDRESS points at a server
-with the wrong GUID, and at a socket nobody listens on, in a directory of the test's own.
+with the wrong GUID, and at a socket nobody listens on, in a directory of the test's own. A second one, in `src/atspi/bus.rs`, removes interfaces that were
+never registered and expects no error.
