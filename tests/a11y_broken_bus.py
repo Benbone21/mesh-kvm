@@ -96,7 +96,9 @@ def real_session():
             return done.stdout.strip()
         except (OSError, subprocess.TimeoutExpired) as e:
             return f"({e})"
-    processes = sorted(set(run("pgrep", "-a", "at-spi").splitlines()) | set(run("pgrep", "-af", "accessibility.conf").splitlines()))
+    # By process name, so no shell whose command line happens to mention them is counted.
+    daemons = [line for line in run("pgrep", "-a", "dbus-daemon").splitlines() if "accessibility.conf" in line]
+    processes = sorted(set(run("pgrep", "-a", "at-spi").splitlines()) | set(daemons))
     address = run("busctl", "--user", "call", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress")
     return {"processes": processes, "address": address}
 
