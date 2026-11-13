@@ -15,7 +15,7 @@ use crate::secure::datagram::{Channel, LinkSecurity};
 use super::debian_edge::{self, DebianEdge, LinkLog, Now};
 use crate::crossing::{taken_at, Sample, SampleSlot, RESPAWN_GAP_MS};
 use crate::spatial::{take_studio_requests, SharedSpatialState, SpatialConfig};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -409,7 +409,7 @@ fn button_code(button: u8) -> Option<u16> {
 }
 
 /// Relative pointer that replays the laptop's mouse on Debian. Its name must keep the
-/// `mesh-kvm` prefix: `discover_devices` would otherwise read it back as a physical mouse.
+/// `mesh-kvm` prefix: the device scan would otherwise read it back as a physical mouse.
 pub struct VirtualRelMouse {
     fd: RawFd,
     held_buttons: HashSet<u16>,
@@ -717,7 +717,7 @@ impl EvdevDevice {
                 self.name,
                 self.path
             ),
-            GrabNews::Gone => eprintln!("[Debian] '{}' ({}) has gone; it's left alone until a restart.", self.name, self.path),
+            GrabNews::Gone => eprintln!("[Debian] '{}' ({}) has gone.", self.name, self.path),
             GrabNews::Failed { grab, error } => eprintln!(
                 "[Debian] EVIOCGRAB {} failed on '{}' ({}): {}",
                 if grab { "grab" } else { "release" },
@@ -749,80 +749,140 @@ impl Drop for EvdevDevice {
 /// as dbus-monitor would otherwise keep the keyboard grabbed after this process died.
 const EVDEV_OPEN_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
 
-fn discover_devices(explicit_mouse: Option<&str>) -> (Vec<EvdevDevice>, Vec<EvdevDevice>) {
-    let mut mice = Vec::new();
-    let mut keyboards = Vec::new();
+/// How often `/dev/input` is looked at for devices plugged in since the last look.
+const SCAN_EVERY: Duration = Duration::from_secs(1);
 
-    if let Some(mouse_path) = explicit_mouse {
-        if let Ok(cpath) = CString::new(mouse_path) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Mouse,
+    Keyboard,
+    Neither,
+}
+
+/// What an evdev device is to this program, from its name and what it can report. Our own
+/// virtual devices and ydotool's are never read back. With a mouse named on the command line,
+/// no other mouse is taken.
+fn device_kind(name: &str, moves: bool, left_button: bool, keyboard_keys: bool, any_mouse: bool) -> DeviceKind {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("mesh-kvm") || lower.contains("ydotool") {
+        DeviceKind::Neither
+    } else if any_mouse && moves && left_button {
+        DeviceKind::Mouse
+    } else if keyboard_keys {
+        DeviceKind::Keyboard
+    } else {
+        DeviceKind::Neither
+    }
+}
+
+/// Which device node a path is now: the kernel gives the same `eventN` to the next device
+/// plugged in, and that one is a new node.
+type NodeStamp = (u64, i64, i64);
+
+fn node_id(path: &str) -> Option<NodeStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
+}
+
+/// Whether a node is worth opening: not one in use, and not one already found to be neither a
+/// mouse nor a keyboard.
+fn worth_opening(path: &str, id: NodeStamp, in_use: &HashSet<String>, passed_over: &HashMap<String, NodeStamp>) -> bool {
+    !in_use.contains(path) && passed_over.get(path) != Some(&id)
+}
+
+/// Finds mice and keyboards, at the start and whenever one is plugged in afterwards: a mouse
+/// moved from its wireless receiver to a cable is a new device under a new name.
+struct DeviceScan {
+    explicit_mouse: Option<String>,
+    passed_over: HashMap<String, NodeStamp>,
+    last: Option<Instant>,
+}
+
+impl DeviceScan {
+    fn new(explicit_mouse: Option<String>) -> DeviceScan {
+        DeviceScan { explicit_mouse, passed_over: HashMap::new(), last: None }
+    }
+
+    /// True once every `SCAN_EVERY`.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.last.is_some_and(|last| now.duration_since(last) < SCAN_EVERY) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// Opens every mouse and keyboard not yet in the lists, and returns how many it added. A node
+    /// that can't be opened yet, as udev hasn't set its permissions, is tried again next time.
+    fn look(&mut self, mice: &mut Vec<EvdevDevice>, keyboards: &mut Vec<EvdevDevice>) -> usize {
+        let in_use: HashSet<String> = mice.iter().chain(keyboards.iter()).map(|d| d.path.clone()).collect();
+        let mut added = 0;
+        let open = |path: &str| {
+            let cpath = CString::new(path).ok()?;
             let fd = unsafe { libc::open(cpath.as_ptr(), EVDEV_OPEN_FLAGS) };
-            if fd >= 0 {
+            (fd >= 0).then_some(fd)
+        };
+        if let Some(path) = self.explicit_mouse.as_deref().filter(|p| !in_use.contains(*p)) {
+            if let Some(fd) = open(path) {
                 let name = get_device_name(fd);
-                mice.push(EvdevDevice::new(mouse_path.to_string(), name, fd));
+                println!("[Debian] Mouse: '{}' ({})", name, path);
+                mice.push(EvdevDevice::new(path.to_string(), name, fd));
+                added += 1;
             }
         }
+        let Ok(entries) = fs::read_dir("/dev/input") else { return added };
+        let mut paths: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().to_string_lossy().to_string())
+            .filter(|p| p.contains("/event"))
+            .collect();
+        paths.sort();
+        self.passed_over.retain(|path, _| paths.contains(path));
+        for path in paths {
+            if self.explicit_mouse.as_deref() == Some(path.as_str()) {
+                continue;
+            }
+            let Some(id) = node_id(&path) else { continue };
+            if !worth_opening(&path, id, &in_use, &self.passed_over) {
+                continue;
+            }
+            let Some(fd) = open(&path) else { continue };
+            let name = get_device_name(fd);
+
+            let mut ev_bits = [0u8; 4];
+            let mut rel_bits = [0u8; 4];
+            let mut key_bits = [0u8; 96];
+            unsafe {
+                libc::ioctl(fd, eviocgbit(0, ev_bits.len()), ev_bits.as_mut_ptr());
+                libc::ioctl(fd, eviocgbit(EV_REL, rel_bits.len()), rel_bits.as_mut_ptr());
+                libc::ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr());
+            }
+            let moves = test_bit(&ev_bits, EV_REL as usize)
+                && test_bit(&rel_bits, REL_X as usize)
+                && test_bit(&rel_bits, REL_Y as usize);
+            let left_button = test_bit(&key_bits, BTN_LEFT as usize);
+            let keyboard_keys = test_bit(&key_bits, KEY_LEFTCTRL as usize) && test_bit(&key_bits, KEY_F12 as usize);
+
+            match device_kind(&name, moves, left_button, keyboard_keys, self.explicit_mouse.is_none()) {
+                DeviceKind::Mouse => {
+                    println!("[Debian] Mouse: '{}' ({})", name, path);
+                    mice.push(EvdevDevice::new(path, name, fd));
+                    added += 1;
+                }
+                DeviceKind::Keyboard => {
+                    println!("[Debian] Keyboard: '{}' ({})", name, path);
+                    keyboards.push(EvdevDevice::new(path, name, fd));
+                    added += 1;
+                }
+                DeviceKind::Neither => {
+                    unsafe { libc::close(fd) };
+                    self.passed_over.insert(path, id);
+                }
+            }
+        }
+        added
     }
-
-    let entries = match fs::read_dir("/dev/input") {
-        Ok(e) => e,
-        Err(_) => return (mice, keyboards),
-    };
-
-    let mut paths: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().to_string_lossy().to_string())
-        .filter(|p| p.contains("/event"))
-        .collect();
-    paths.sort();
-
-    for path in paths {
-        if explicit_mouse == Some(path.as_str()) {
-            continue;
-        }
-        let cpath = match CString::new(path.as_str()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let fd = unsafe { libc::open(cpath.as_ptr(), EVDEV_OPEN_FLAGS) };
-        if fd < 0 {
-            continue;
-        }
-
-        let name = get_device_name(fd);
-        let lower_name = name.to_ascii_lowercase();
-        if lower_name.contains("mesh-kvm") || lower_name.contains("ydotool") {
-            unsafe { libc::close(fd) };
-            continue;
-        }
-
-        let mut ev_bits = [0u8; 4];
-        let mut rel_bits = [0u8; 4];
-        let mut key_bits = [0u8; 96];
-
-        unsafe {
-            libc::ioctl(fd, eviocgbit(0, ev_bits.len()), ev_bits.as_mut_ptr());
-            libc::ioctl(fd, eviocgbit(EV_REL, rel_bits.len()), rel_bits.as_mut_ptr());
-            libc::ioctl(fd, eviocgbit(EV_KEY, key_bits.len()), key_bits.as_mut_ptr());
-        }
-
-        let has_rel = test_bit(&ev_bits, EV_REL as usize)
-            && test_bit(&rel_bits, REL_X as usize)
-            && test_bit(&rel_bits, REL_Y as usize);
-        let has_btn_left = test_bit(&key_bits, BTN_LEFT as usize);
-        let has_kbd_keys = test_bit(&key_bits, KEY_LEFTCTRL as usize)
-            && test_bit(&key_bits, KEY_F12 as usize);
-
-        if explicit_mouse.is_none() && has_rel && has_btn_left {
-            println!("[Debian] Auto-discovered physical mouse: '{}' ({})", name, path);
-            mice.push(EvdevDevice::new(path, name, fd));
-        } else if has_kbd_keys {
-            keyboards.push(EvdevDevice::new(path, name, fd));
-        } else {
-            unsafe { libc::close(fd) };
-        }
-    }
-
-    (mice, keyboards)
 }
 
 fn get_device_name(fd: RawFd) -> String {
@@ -1447,6 +1507,22 @@ impl LinuxBackend {
         }
     }
 
+    /// Drops the devices that have gone, and returns what was down on them as (code, from a
+    /// keyboard), for the router to hear released: the peer may be holding it.
+    fn take_gone(&mut self) -> Vec<(u16, bool)> {
+        self.let_go_of_gone();
+        let mut down = Vec::new();
+        for (devices, keyboard) in [(&mut self.keyboards, true), (&mut self.mice, false)] {
+            devices.retain(|device| {
+                if device.grab.gone() {
+                    down.extend(device.held.iter().map(|&code| (code, keyboard)));
+                }
+                !device.grab.gone()
+            });
+        }
+        down
+    }
+
     /// Waits a little for releases under way, so a clean stop leaves nothing grabbed and says so.
     fn finish_releases(&mut self, limit: Duration) {
         let devices: Vec<&mut EvdevDevice> = self.keyboards.iter_mut().chain(self.mice.iter_mut()).collect();
@@ -1688,9 +1764,13 @@ pub fn run_debian_node(
     let tracker = Arc::new(TrackerControl::default());
     spawn_kwin_cursor_tracker(Arc::clone(&positions), Arc::clone(&kwin_game_active), Arc::clone(&tracker));
 
-    let (mice, keyboards) = discover_devices(explicit_mouse.as_deref());
+    let mut scan = DeviceScan::new(explicit_mouse);
+    let (mut mice, mut keyboards) = (Vec::new(), Vec::new());
+    scan.due(Instant::now());
+    scan.look(&mut mice, &mut keyboards);
     if mice.is_empty() {
-        return Err("No physical mouse devices found in /dev/input/event*".to_string());
+        // One plugged in later is picked up, so this is no reason to stop.
+        eprintln!("[Debian] No mouse found yet; waiting for one to be plugged in.");
     }
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", listen_port).parse().unwrap();
@@ -1921,6 +2001,20 @@ pub fn run_debian_node(
             core.hear_position(&cfg_snapshot, sample);
         }
 
+        // Devices that have gone are dropped, and ones plugged in since are picked up.
+        if scan.due(Instant::now()) {
+            for (code, keyboard) in core.backend.take_gone() {
+                if keyboard {
+                    if let KeyRoute::Forward { scancode, .. } = hotkeys.feed(code, 0) {
+                        core.route(Event::LocalKey { scancode, pressed: false });
+                    }
+                } else if let Some(button) = button_id(code) {
+                    core.route(Event::LocalButton { button, pressed: false });
+                }
+            }
+            scan.look(&mut core.backend.mice, &mut core.backend.keyboards);
+        }
+
         // 2. Read local keyboards. Grabbing only hides events from the desktop, so hotkeys are
         // seen here whichever device is active.
         for i in 0..core.backend.keyboards.len() {
@@ -2120,6 +2214,51 @@ pub fn run_debian_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_is_a_mouse_or_a_keyboard_by_what_it_reports_and_never_one_of_ours() {
+        assert_eq!(device_kind("Hitscan Hyperlight", true, true, false, true), DeviceKind::Mouse);
+        assert_eq!(device_kind("Hitscan USB Receiver", true, true, false, true), DeviceKind::Mouse);
+        assert_eq!(device_kind("qmkbuilder KBD75", false, false, true, true), DeviceKind::Keyboard);
+        assert_eq!(device_kind("Power Button", false, false, false, true), DeviceKind::Neither);
+        assert_eq!(device_kind("mesh-kvm Relative Pointer", true, true, false, true), DeviceKind::Neither);
+        assert_eq!(device_kind("ydotoold virtual device", true, true, true, true), DeviceKind::Neither);
+        assert_eq!(device_kind("Another mouse", true, true, false, false), DeviceKind::Neither, "a mouse was named");
+    }
+
+    #[test]
+    fn a_node_is_opened_once_unless_a_new_device_takes_its_path() {
+        let path = "/dev/input/event10";
+        let (old, new) = ((7, 100, 0), (9, 160, 0));
+        let mut in_use = HashSet::new();
+        let mut passed_over = HashMap::new();
+        assert!(worth_opening(path, old, &in_use, &passed_over));
+        passed_over.insert(path.to_string(), old);
+        assert!(!worth_opening(path, old, &in_use, &passed_over), "already found to be neither");
+        assert!(worth_opening(path, new, &in_use, &passed_over), "a new device under the old path");
+        in_use.insert(path.to_string());
+        assert!(!worth_opening(path, new, &in_use, &passed_over), "one being read");
+    }
+
+    #[test]
+    fn the_scan_is_due_once_a_second() {
+        let mut scan = DeviceScan::new(None);
+        let start = Instant::now();
+        assert!(scan.due(start));
+        assert!(!scan.due(start + Duration::from_millis(900)));
+        assert!(scan.due(start + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn a_second_look_adds_nothing_and_keeps_what_the_first_found() {
+        let mut scan = DeviceScan::new(None);
+        let (mut mice, mut keyboards) = (Vec::new(), Vec::new());
+        scan.look(&mut mice, &mut keyboards);
+        let found = (mice.len(), keyboards.len());
+        assert_eq!(scan.look(&mut mice, &mut keyboards), 0);
+        assert_eq!((mice.len(), keyboards.len()), found);
+    }
+
 
     fn press(f: &mut HotkeyFilter, code: u16) -> KeyRoute {
         f.feed(code, 1)
